@@ -12,6 +12,8 @@
 
   <!-- C++ dependencies -->
   <depend>hardware_interface</depend>
+  <depend>ros2_control</depend>
+  <depend>ros2_controllers</depend>
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>

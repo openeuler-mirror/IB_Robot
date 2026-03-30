@@ -22,7 +22,22 @@ WORKSPACE="${WORKSPACE:-$(pwd)}"
 PARALLEL_WORKERS=$(($(nproc) / 2))
 AUTO_YES=false
 GIT_HTTP=false
+USE_SUDO=true
 SUMMARY=()
+
+# Detect if running as root
+if [[ $EUID -eq 0 ]]; then
+    USE_SUDO=false
+fi
+
+# Helper to run commands with or without sudo
+run_sudo() {
+    if [[ "${USE_SUDO}" == true ]]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 # Colors for output
 RED='\033[0;31m'
@@ -43,7 +58,7 @@ ask_yn() {
     local prompt="$1"
     local default="${2:-n}"
     if [[ "${AUTO_YES}" == true ]]; then
-        echo -e "${prompt} [auto-yes]"
+        echo -e "${prompt} [auto-yes: YES]"
         return 0
     fi
     local hint
@@ -69,6 +84,20 @@ check_conda() {
 # ============================================================================
 # Repository Management
 # ============================================================================
+apply_git_http_config() {
+    if [[ "${GIT_HTTP}" == true ]]; then
+        log_info "Configuring git to use HTTPS instead of SSH globally for this session..."
+        # Use git config insteadOf for all major domains
+        # We use 'git config' without --global to keep it local to this repo
+        git config url."https://gitcode.com/".insteadOf "git@gitcode.com:" || true
+        git config url."https://github.com/".insteadOf "git@github.com:" || true
+        git config url."https://atomgit.com/".insteadOf "git@atomgit.com:" || true
+
+        # Sync submodule URLs to apply the insteadOf mapping to .git/config
+        log_info "Syncing submodule URLs..."
+        git submodule sync --recursive
+    fi
+}
 update_submodules() {
     echo ""
     echo -e "${YELLOW}--- Git Submodule Management ---${NC}"
@@ -196,15 +225,12 @@ setup_developer_forks() {
 
     if [[ -n "${USERNAME}" ]]; then
         local MAIN_FORK LEROBOT_FORK UPSTREAM_URL
-        if [[ "${GIT_HTTP}" == true ]]; then
-            MAIN_FORK="https://gitcode.com/${USERNAME}/IB_Robot.git"
-            LEROBOT_FORK="https://gitcode.com/${USERNAME}/lerobot_ros2.git"
-            UPSTREAM_URL="https://atomgit.com/openeuler/IB_Robot.git"
-        else
-            MAIN_FORK="git@gitcode.com:${USERNAME}/IB_Robot.git"
-            LEROBOT_FORK="git@gitcode.com:${USERNAME}/lerobot_ros2.git"
-            UPSTREAM_URL="git@atomgit.com:openeuler/IB_Robot.git"
-        fi
+
+        # We define as SSH format, which will be auto-translated to HTTPS 
+        # if GIT_HTTP is true due to 'insteadOf' config applied in main()
+        MAIN_FORK="git@gitcode.com:${USERNAME}/IB_Robot.git"
+        LEROBOT_FORK="git@gitcode.com:${USERNAME}/lerobot_ros2.git"
+        UPSTREAM_URL="git@atomgit.com:openeuler/IB_Robot.git"
 
         echo -e "\nProposed Fork URLs:"
         echo -e "  Main Repo:    ${MAIN_FORK}"
@@ -242,23 +268,47 @@ check_ros_installation() {
     # Check if ROS 2 Humble is installed
     if [[ ! -f /opt/ros/humble/setup.bash ]]; then
         log_warn "ROS 2 Humble not found at /opt/ros/humble/setup.bash"
-        log_info "Running ROS 2 and colcon installation script..."
+        log_info "Running ROS 2 installation script..."
 
         local install_args=()
         if [[ "${AUTO_YES}" == true ]]; then
             install_args+=("--yes")
         fi
+        if [[ "${USE_SUDO}" == false ]]; then
+            install_args+=("--no-sudo")
+        fi
 
-        if "${WORKSPACE}/scripts/install_ros_colcon.sh" "${install_args[@]}"; then
-            log_done "ROS 2 Humble and colcon installed"
+        if "${WORKSPACE}/scripts/install_ros.sh" "${install_args[@]}"; then
+            log_done "ROS 2 Humble installed"
         else
             log_error "ROS 2 installation failed"
-            log_error "Please run ${WORKSPACE}/scripts/install_ros_colcon.sh manually to diagnose the issue"
+            log_error "Please run ${WORKSPACE}/scripts/install_ros.sh manually to diagnose the issue"
             exit 1
         fi
     else
         log_info "ROS 2 Humble is already installed"
     fi
+}
+
+ensure_colcon() {
+    if command -v colcon &>/dev/null; then
+        log_info "colcon is already installed"
+        return 0
+    fi
+
+    log_info "Installing colcon build tool..."
+    if command -v apt-get &> /dev/null; then
+        run_sudo apt-get install -y python3-colcon-common-extensions
+    elif command -v dnf &> /dev/null; then
+        # On openEuler, we usually install colcon via pip to get the latest extensions
+        if command -v pip3 &> /dev/null; then
+            pip3 install colcon-common-extensions --quiet
+        else
+            log_error "pip3 not found, cannot install colcon."
+            exit 1
+        fi
+    fi
+    log_done "colcon installed"
 }
 
 check_openeuler() {
@@ -270,14 +320,14 @@ check_openeuler() {
             local arch
             arch=$(uname -m)
             log_info "Adding openEuler repo for ${arch}..."
-            sudo dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
-            sudo dnf clean all && sudo dnf makecache
+            run_sudo dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
+            run_sudo dnf clean all && run_sudo dnf makecache
         else
             log_info "openEuler repo already configured, skipping add-repo."
         fi
 
         log_info "Installing gcc-c++, vim-enhanced, ffmpeg-devel, libvpx, and libvpx-devel..."
-        sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel
+        run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel
 
         # usb_cam is not available as a system package on openEuler,
         # so we initialize the submodule to build from source.
@@ -309,7 +359,7 @@ ensure_rosdepc() {
     if [[ ! -d /etc/ros/rosdep/sources.list.d ]]; then
         log_info "Initializing rosdepc..."
         local init_output
-        init_output=$(sudo rosdepc init 2>&1)
+        init_output=$(run_sudo rosdepc init 2>&1)
         local init_exit=$?
 
         # Check both exit code and output for SSL/network errors
@@ -356,28 +406,28 @@ ensure_rosdepc() {
             log_warn "This is a global change that may affect other Python applications."
             if ask_yn "Apply SSL certificate fix (copy system CA bundle to Python SSL path)?" "n"; then
                 log_info "Creating directory: $(dirname "${ssl_pem}")"
-                sudo mkdir -p "$(dirname "${ssl_pem}")"
+                run_sudo mkdir -p "$(dirname "${ssl_pem}")"
 
                 if [[ -f "${ssl_pem}" ]]; then
                     log_info "Backing up existing cert: ${ssl_pem} -> ${ssl_pem}.bak"
-                    sudo cp "${ssl_pem}" "${ssl_pem}.bak"
+                    run_sudo cp "${ssl_pem}" "${ssl_pem}.bak"
                 fi
 
                 log_info "Copying ${ca_bundle} -> ${ssl_pem}"
-                sudo cp "${ca_bundle}" "${ssl_pem}"
+                run_sudo cp "${ca_bundle}" "${ssl_pem}"
                 log_done "SSL certificate fix applied"
 
                 # Retry init, capture output again
                 local retry_output
-                if ! retry_output=$(sudo rosdepc init 2>&1) || echo "${retry_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
+                if ! retry_output=$(run_sudo rosdepc init 2>&1) || echo "${retry_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
                     log_error "rosdepc init failed even after SSL fix."
                     echo "${retry_output}"
-                    log_error "Try running manually: sudo rosdepc init"
+                    log_error "Try running manually: run_sudo rosdepc init"
                     exit 1
                 fi
             else
                 log_warn "Skipped SSL fix. Please manually check your network or certificate configuration."
-                log_warn "You can also try running: sudo rosdepc init"
+                log_warn "You can also try running: run_sudo rosdepc init"
                 exit 1
             fi
         fi
@@ -387,13 +437,14 @@ ensure_rosdepc() {
 install_system_deps() {
     # Check for ROS 2 installation first
     check_ros_installation
+    ensure_colcon
 
     check_openeuler
     ensure_rosdepc
 
     if command -v apt-get &> /dev/null; then
         log_info "Updating apt package lists..."
-        sudo apt-get update -qq
+        run_sudo apt-get update -qq
 
         log_info "Updating rosdepc database..."
         rosdepc update --rosdistro=humble
@@ -440,10 +491,10 @@ setup_python_venv() {
     # 1. Ensure system-level venv tools are installed
     log_info "Checking for Python venv and pip..."
     if command -v apt-get &> /dev/null; then
-        sudo apt-get update -qq
-        sudo apt-get install -y python3-venv python3-pip -qq
+        run_sudo apt-get update -qq
+        run_sudo apt-get install -y python3-venv python3-pip -qq
     elif command -v dnf &> /dev/null; then
-        sudo dnf install -y --nogpgcheck python3-virtualenv python3-pip python3-devel -q
+        run_sudo dnf install -y --nogpgcheck python3-virtualenv python3-pip python3-devel -q
     fi
 
     # 2. 创建虚拟环境 (必须包含 --system-site-packages 以使用系统的 rclpy)
@@ -487,7 +538,7 @@ setup_python_venv() {
     log_info "Pinning NumPy to 1.26.4 for ROS 2 compatibility..."
     python3 -m pip install "numpy==1.26.4" --quiet
     log_info "Installing gitlint pre-commit hook..."
-    gitlint install-hook
+    yes | gitlint install-hook
 
     # 4. 环境验证
     log_info "Verifying ROS 2 connection..."
@@ -508,6 +559,8 @@ main() {
         case "${arg}" in
             --yes|-y) AUTO_YES=true ;;
             --git-http) GIT_HTTP=true ;;
+            --no-sudo) USE_SUDO=false ;;
+            --sudo) USE_SUDO=true ;;
             *) log_warn "Unknown argument: ${arg}" ;;
         esac
     done
@@ -517,6 +570,9 @@ main() {
     # Check for conflicting environments
     check_conda
     
+    # Apply git HTTP config if requested
+    apply_git_http_config
+
     log_info "Setting up workspace at ${WORKSPACE}"
     
     # Update submodules
