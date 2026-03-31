@@ -66,9 +66,9 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Logging functions
-log_info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
-log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+log_info()    { echo -e "\033[0;32m[INFO] $*${NC}"; }
+log_error()   { echo -e "${RED}[ERROR] $*${NC}"; }
+log_warn()    { echo -e "\033[1;33m[WARNING] $*${NC}"; }
 
 # ============================================================================
 # Argument Parsing

@@ -18,9 +18,12 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from robot_config.logger_utils import get_colored_logger
 
 from robot_config.utils import resolve_ros_path, parse_bool
 from .base_adapter import SimBackendAdapter
+
+logger = get_colored_logger("robot_config.sim_backend.gazebo")
 
 
 def _start_actions_on_success(start_actions, success_message: str, failure_reason: str):
@@ -28,12 +31,11 @@ def _start_actions_on_success(start_actions, success_message: str, failure_reaso
 
     def _handler(event, _context):
         if event.returncode == 0:
-            print(f"[robot_config] {success_message}")
+            logger.info(success_message)
             return start_actions
 
-        print(
-            f"[robot_config] ERROR: {failure_reason} "
-            f"(returncode={event.returncode})"
+        logger.error(
+            f"{failure_reason} (returncode={event.returncode})"
         )
         return [EmitEvent(event=Shutdown(reason=failure_reason))]
 
@@ -71,21 +73,21 @@ class GazeboAdapter(SimBackendAdapter):
 
         try:
             install_share = os.path.dirname(
-                FindPackageShare('robot_description').find('robot_description')
+                FindPackageShare("robot_description").find("robot_description")
             )
             gazebo_resource_paths.append(install_share)
             gazebo_model_paths.append(install_share)
-            print(f"[robot_config] Added install share path for Gazebo: {install_share}")
+            logger.info(f"Added install share path for Gazebo: {install_share}")
 
             robot_desc_share = FindPackageShare('robot_description').find('robot_description')
             mesh_path = os.path.join(robot_desc_share, 'meshes', 'lerobot', 'so101')
             if Path(mesh_path).exists():
                 mesh_files = list(Path(mesh_path).glob('*.stl'))
-                print(f"[robot_config] Verified {len(mesh_files)} mesh files at {mesh_path}")
+                logger.info(f"Verified {len(mesh_files)} mesh files at {mesh_path}")
             else:
-                print(f"[robot_config] WARNING: Mesh directory not found at {mesh_path}")
+                logger.info(f"WARNING: Mesh directory not found at {mesh_path}")
         except Exception as e:
-            print(f"[robot_config] WARNING: Could not find robot_description package: {e}")
+            logger.info(f"WARNING: Could not find robot_description package: {e}")
 
         if gazebo_resource_paths:
             combined_resource = ':'.join(gazebo_resource_paths)
@@ -105,12 +107,12 @@ class GazeboAdapter(SimBackendAdapter):
         qt_platform = gz_gui.get("qt_platform") or robot_config.get("gazebo_qt_platform")
         if qt_platform:
             actions.append(SetEnvironmentVariable("QT_QPA_PLATFORM", str(qt_platform)))
-            print(f"[robot_config] Gazebo GUI: QT_QPA_PLATFORM={qt_platform}")
+            logger.info(f"Gazebo GUI: QT_QPA_PLATFORM={qt_platform}")
         libgl_sw = gz_gui.get("libgl_always_software", robot_config.get("gazebo_libgl_always_software"))
         if parse_bool(libgl_sw, default=False):
             actions.append(SetEnvironmentVariable("LIBGL_ALWAYS_SOFTWARE", "1"))
-            print(
-                "[robot_config] Gazebo GUI: LIBGL_ALWAYS_SOFTWARE=1 "
+            logger.info(
+                "Gazebo GUI: LIBGL_ALWAYS_SOFTWARE=1 "
                 "(software GL; set gazebo_gui.libgl_always_software: false if GPU view works)"
             )
 
@@ -132,33 +134,30 @@ class GazeboAdapter(SimBackendAdapter):
             try:
                 from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
                 world_path = str(get_gazebo_world_path(_scene_name))
-                print(f"[robot_config] sim_models scene '{_scene_name}' → {world_path}")
+                logger.info(f"sim_models scene '{_scene_name}' → {world_path}")
                 layout = get_scene_layout(_scene_name)
                 spawn = layout.get("robot_spawn", {})
                 for axis in ("x", "y", "z"):
                     key = f"initial_pose_{axis}"
                     if axis in spawn:
                         robot_config[key] = spawn[axis]
-                        print(f"[robot_config] scene robot_spawn.{axis} = {spawn[axis]}")
+                        logger.info(f"scene robot_spawn.{axis} = {spawn[axis]}")
             except ImportError:
-                print(
-                    "[robot_config] WARNING: sim_models not installed; "
-                    "ignoring simulation.scene"
-                )
+                logger.warning("sim_models not installed; ignoring simulation.scene")
             except Exception as e:
-                print(
-                    f"[robot_config] WARNING: scene '{_scene_name}' load failed: {e}; "
+                logger.warning(
+                    f"scene '{_scene_name}' load failed: {e}; "
                     "falling back to default world"
                 )
 
         if not Path(world_path).exists():
-            print(f"[robot_config] WARNING: World file not found at {world_path}")
+            logger.info(f"WARNING: World file not found at {world_path}")
 
         # Must match <world name="..."> inside the loaded .world/.sdf (simulation.world uses "demo").
         # ros_gz_sim create: if -world is omitted, it picks worlds_msg.data(0) from /gazebo/worlds
         # (order not guaranteed) — entity can end up in the wrong world. Always pass -world explicitly.
         gazebo_world_name = robot_config.get("gazebo_world_name", "demo")
-        print(f"[robot_config] Gazebo world name (create + bridges): {gazebo_world_name}")
+        logger.info(f"Gazebo world name (create + bridges): {gazebo_world_name}")
 
         # ---- Entity creation (spawn robot from /robot_description) ----
         # gflags names use underscores (see `ros2 run ros_gz_sim create --help`):
@@ -203,7 +202,7 @@ class GazeboAdapter(SimBackendAdapter):
         if Path(world_path).exists():
             gz_args = f"-r {world_path}"
         else:
-            print("[robot_config] Using empty Gazebo world (world file not found)")
+            logger.info("Using empty Gazebo world (world file not found)")
 
         gazebo_launch = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -228,8 +227,10 @@ class GazeboAdapter(SimBackendAdapter):
             ],
             output="screen",
         )
-        print("[robot_config] Gazebo spawn: waiting for /clock before creating robot entity")
-        print(f"[robot_config] ros_gz_sim create argv: {create_args}")
+        logger.info(
+            "Gazebo spawn: waiting for /clock before creating robot entity"
+        )
+        logger.info(f"ros_gz_sim create argv: {create_args}")
 
         actions.extend([
             gazebo_launch,
@@ -256,7 +257,7 @@ class GazeboAdapter(SimBackendAdapter):
 
     def load_scene(self, scene_file_path: str) -> list:
         """Stub: scene loading for Gazebo (T5 implementation)."""
-        print(f"[robot_config] GazeboAdapter.load_scene: not implemented yet (T5)")
+        logger.info(f"GazeboAdapter.load_scene: not implemented yet (T5)")
         return []
 
     def ensure_controller_manager(self, robot_config: dict) -> list:
@@ -285,8 +286,8 @@ class GazeboAdapter(SimBackendAdapter):
         )
         model_name = getattr(self, "_model_name", "so101")
         world_name = getattr(self, "_gazebo_world_name", "demo")
-        print(
-            f"[robot_config] Gazebo: spawning peripheral bridges "
+        logger.info(
+            f"Gazebo: spawning peripheral bridges "
             f"(world: {world_name}, model: {model_name})"
         )
         return generate_peripheral_sim_bridges(peripherals, model_name, world_name)

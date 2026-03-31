@@ -21,9 +21,12 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from launch_ros.actions import Node
+from robot_config.logger_utils import get_colored_logger
 
 from robot_config.utils import resolve_ros_path
 from .base_adapter import SimBackendAdapter
+
+logger = get_colored_logger("robot_config.sim_backend.mujoco")
 
 
 class MujocoAdapter(SimBackendAdapter):
@@ -49,7 +52,7 @@ class MujocoAdapter(SimBackendAdapter):
                 layout = get_scene_layout(scene_name)
                 robot_spawn = layout.get("robot_spawn", {})
             except Exception as e:
-                print(f"[mujoco_adapter] WARNING: could not load layout for '{scene_name}': {e}")
+                logger.warning(f"could not load layout for '{scene_name}': {e}")
 
         peripherals = robot_config.get("peripherals", [])
         robot_xml_path = self._generate_robot_mujoco_xml(robot_spawn, peripherals)
@@ -58,9 +61,11 @@ class MujocoAdapter(SimBackendAdapter):
         if scene_name:
             try:
                 mujoco_model_path = str(get_mujoco_scene_path(scene_name, robot_xml_path))
-                print(f"[mujoco_adapter] MuJoCo scene: {mujoco_model_path}")
+                logger.info(f"MuJoCo scene: {mujoco_model_path}")
             except Exception as e:
-                print(f"[mujoco_adapter] WARNING: scene '{scene_name}' failed: {e}; using robot-only XML")
+                logger.warning(
+                    f"scene '{scene_name}' failed: {e}; using robot-only XML"
+                )
                 mujoco_model_path = robot_xml_path
         else:
             mujoco_model_path = robot_xml_path
@@ -90,12 +95,12 @@ class MujocoAdapter(SimBackendAdapter):
         if controllers_cfg and Path(controllers_cfg).exists():
             params.append(controllers_cfg)
         else:
-            print(f"[mujoco_adapter] WARNING: controllers_config not found at '{controllers_cfg}'")
+            logger.warning(f"controllers_config not found at '{controllers_cfg}'")
 
         additional_env = {}
         if mujoco_plugin_path:
             additional_env['MUJOCO_PLUGIN_PATH'] = mujoco_plugin_path
-            print(f"[mujoco_adapter] MUJOCO_PLUGIN_PATH={mujoco_plugin_path}")
+            logger.info(f"MUJOCO_PLUGIN_PATH={mujoco_plugin_path}")
 
         mujoco_node = Node(
             package='mujoco_ros2_control',
@@ -105,7 +110,7 @@ class MujocoAdapter(SimBackendAdapter):
             remappings=remappings,
             additional_env=additional_env,
         )
-        print(f"[mujoco_adapter] Starting ros2_control_node, model={mujoco_model_path}")
+        logger.info(f"Starting ros2_control_node, model={mujoco_model_path}")
         return [mujoco_node], None  # None → spawners start immediately (30s timeout)
 
     def load_scene(self, scene_file_path: str) -> list:
@@ -138,10 +143,11 @@ class MujocoAdapter(SimBackendAdapter):
             plugin_dir = os.path.join(os.path.dirname(mujoco.__file__), "plugin")
             if os.path.isdir(plugin_dir):
                 return plugin_dir
-            print(f"[mujoco_adapter] WARNING: mujoco plugin dir not found at {plugin_dir}")
+            logger.warning(f"mujoco plugin dir not found at {plugin_dir}")
         except ImportError:
-            print("[mujoco_adapter] WARNING: mujoco Python package not found; "
-                  "MUJOCO_PLUGIN_PATH will not be set")
+            logger.warning(
+                "mujoco Python package not found; MUJOCO_PLUGIN_PATH will not be set"
+            )
         return ""
 
     def _generate_robot_mujoco_xml(self, robot_spawn: dict, peripherals: list) -> str:
@@ -228,15 +234,17 @@ class MujocoAdapter(SimBackendAdapter):
 
             if parent_frame in ('world', 'worldbody'):
                 worldbody.append(cam_elem)
-                print(f"[mujoco_adapter] Injected camera '{cam_name}' into worldbody")
+                logger.info(f"Injected camera '{cam_name}' into worldbody")
             else:
                 body = worldbody.find(f'.//body[@name="{parent_frame}"]')
                 if body is not None:
                     body.append(cam_elem)
-                    print(f"[mujoco_adapter] Injected camera '{cam_name}' into body '{parent_frame}'")
+                    logger.info(
+                        f"Injected camera '{cam_name}' into body '{parent_frame}'"
+                    )
                 else:
-                    print(
-                        f"[mujoco_adapter] WARNING: body '{parent_frame}' not found "
+                    logger.warning(
+                        f"body '{parent_frame}' not found "
                         f"for camera '{cam_name}'; skipping"
                     )
 
@@ -244,7 +252,7 @@ class MujocoAdapter(SimBackendAdapter):
         out_path = '/tmp/so101_mujoco.xml'
         ET.indent(root, space='  ')
         ET.ElementTree(root).write(out_path, encoding='unicode', xml_declaration=True)
-        print(f"[mujoco_adapter] Robot MJCF written to {out_path}")
+        logger.info(f"Robot MJCF written to {out_path}")
         return out_path
 
     def _build_camera_remappings(self, peripherals: list) -> list:

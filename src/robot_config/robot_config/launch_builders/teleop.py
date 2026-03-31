@@ -9,9 +9,12 @@ import re
 import json
 from pathlib import Path
 from launch_ros.actions import Node
+from robot_config.logger_utils import get_colored_logger
 from typing import Dict, List, Any
 
 from robot_config.utils import resolve_ros_path, prepare_lerobot_env
+
+logger = get_colored_logger('robot_config.teleop')
 
 
 def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = None) -> List[Node]:
@@ -55,13 +58,13 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     # Get teleoperation config
     teleop_config = robot_config.get('teleoperation', {})
     if not teleop_config.get('enabled', False):
-        print("[teleop_builder] Teleoperation not enabled, skipping")
+        logger.info("Teleoperation not enabled, skipping")
         return nodes
 
     # Get active device
     active_device_name = teleop_config.get('active_device', '')
     if not active_device_name:
-        print("[teleop_builder] No active_device specified")
+        logger.warning("No active_device specified")
         return nodes
 
     # Find device config
@@ -72,7 +75,7 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
             break
 
     if not device_config:
-        print(f"[teleop_builder] Active device '{active_device_name}' not found")
+        logger.error(f"Active device '{active_device_name}' not found")
         return nodes
 
     # Get joint limits from safety config
@@ -97,24 +100,24 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         # Expand environment variables in calib_file path
         calib_file_raw = device_config['calib_file']
         calib_file_expanded = resolve_ros_path(device_config['calib_file'])
-        print(f"[DEBUG] teleop.py: calib_file_raw: {calib_file_raw}")
-        print(f"[DEBUG] teleop.py: calib_file_expanded: {calib_file_expanded}")
+        logger.debug(f"calib_file_raw: {calib_file_raw}")
+        logger.debug(f"calib_file_expanded: {calib_file_expanded}")
         device_param['calib_file'] = calib_file_expanded
         if not Path(calib_file_expanded).exists():
-            print("[teleop_builder] " + "=" * 60)
-            print(f"[teleop_builder] ERROR: Leader arm calibration file not found!")
-            print(f"[teleop_builder]   Resolved path: {calib_file_expanded}")
-            print(f"[teleop_builder]   Raw path:      {calib_file_raw}")
-            print(
-                f"[teleop_builder]   HOME=$HOME -> {os.environ.get('HOME', '(unset)')}"
+            logger.error("=" * 60)
+            logger.error("Leader arm calibration file not found!")
+            logger.error(f"  Resolved path: {calib_file_expanded}")
+            logger.error(f"  Raw path:      {calib_file_raw}")
+            logger.error(
+                f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}"
             )
             calib_port = device_config.get("port", "/dev/ttyACM0")
-            print("[teleop_builder] ")
-            print("[teleop_builder]   Please run calibration first:")
-            print(
-                "[teleop_builder]     ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port
+            logger.error("")
+            logger.error("  Please run calibration first:")
+            logger.error(
+                "    ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port
             )
-            print("[teleop_builder] " + "=" * 60)
+            logger.error("=" * 60)
             raise RuntimeError(
                 f"Calibration file not found: {calib_file_expanded}. "
                 f"Run: ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port
@@ -152,8 +155,8 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     # Convert dicts to JSON strings for ROS 2 parameter passing
     device_param_json = json.dumps(device_param)
     joint_limits_json = json.dumps(joint_limits)
-    print(f"[DEBUG] teleop.py: device_param_json: {device_param_json}")
-    print(f"[DEBUG] teleop.py: device_param dict: {device_param}")
+    logger.debug(f"device_param_json: {device_param_json}")
+    logger.debug(f"device_param dict: {device_param}")
 
     moveit_config = robot_config.get('moveit', {})
 
@@ -190,7 +193,10 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         }],
     )
     nodes.append(teleop_node)
-    print(f"[teleop_builder] Generated teleop_node for device: {active_device_name} (type: {device_type})")
+    logger.info(
+        f"Generated teleop_node for device: {active_device_name} "
+        f"(type: {device_type})"
+    )
 
     # Add joy_node to read physical joystick and publish to /joy
     if device_config.get('type') == 'xbox_controller':
@@ -209,13 +215,13 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
             output='screen'
         )
         nodes.append(joy_node)
-        print(f"[teleop_builder] Added joy_node for input device: {input_dev}")
+        logger.info(f"Added joy_node for input device: {input_dev}")
 
     # Add MoveIt Servo node for Xbox controller and phone (both use Cartesian Servo control)
     if device_config.get('type') in ('xbox_controller', 'phone'):
         servo_node = _create_servo_node(robot_config, device_config, robot_description_dict)
         nodes.append(servo_node)
-        print(f"[teleop_builder] Generated servo_node for Cartesian control")
+        logger.info("Generated servo_node for Cartesian control")
 
     return nodes
 
@@ -243,16 +249,16 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
         if os.path.exists(srdf_path):
             with open(srdf_path, 'r') as f:
                 moveit_params["robot_description_semantic"] = f.read()
-            print(f"[teleop_builder] Loaded SRDF from {srdf_path}")
+            logger.info(f"Loaded SRDF from {srdf_path}")
         else:
-            print(f"[teleop_builder] WARNING: SRDF not found at {srdf_path}")
+            logger.warning(f"SRDF not found at {srdf_path}")
 
         # Load Kinematics
         kinematics_path = resolve_ros_path(f"$(find robot_moveit)/config/lerobot/{robot_type}/kinematics.yaml")
         if os.path.exists(kinematics_path):
             with open(kinematics_path, 'r') as f:
                 moveit_params["robot_description_kinematics"] = yaml.safe_load(f)
-            print(f"[teleop_builder] Loaded kinematics from {kinematics_path}")
+            logger.info(f"Loaded kinematics from {kinematics_path}")
 
         # Load Joint Limits
         joint_limits_path = resolve_ros_path(f"$(find robot_moveit)/config/lerobot/{robot_type}/joint_limits.yaml")
@@ -262,9 +268,9 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
                 moveit_params.update(joint_limits_data)
                 # MoveIt 2 nodes also look for joint_limits under robot_description_planning
                 moveit_params["robot_description_planning"] = joint_limits_data
-            print(f"[teleop_builder] Loaded joint limits from {joint_limits_path}")
+            logger.info(f"Loaded joint limits from {joint_limits_path}")
     except Exception as e:
-        print(f"[teleop_builder] WARNING: Failed to manually load MoveIt configs: {e}")
+        logger.warning(f"Failed to manually load MoveIt configs: {e}")
 
     # Merge robot_description_dict to ensure robot_description
     # and use_sim_time are always present (from description layer)

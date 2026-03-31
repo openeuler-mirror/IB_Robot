@@ -13,8 +13,11 @@ Execution Modes:
 
 import os
 from launch_ros.actions import Node
+from robot_config.logger_utils import get_colored_logger
 
 from robot_config.utils import parse_bool, prepare_lerobot_env
+
+logger = get_colored_logger("robot_config.execution")
 
 
 def generate_inference_node(robot_config, control_mode, use_sim=False,
@@ -42,14 +45,14 @@ def generate_inference_node(robot_config, control_mode, use_sim=False,
 
     control_modes = robot_config.get("control_modes", {})
     if control_mode not in control_modes:
-        print(f"[robot_config] WARNING: Control mode '{control_mode}' not found")
+        logger.info(f"WARNING: Control mode '{control_mode}' not found")
         return None
 
     mode_config = control_modes[control_mode]
     inference_config = mode_config.get("inference", {})
 
     if not inference_config.get("enabled", False):
-        print(f"[robot_config] Inference not enabled for mode '{control_mode}'")
+        logger.info(f"Inference not enabled for mode '{control_mode}'")
         return None
 
     execution_mode = inference_config.get("execution_mode", "monolithic")
@@ -74,11 +77,9 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     cloud_inference_topic = inference_config.get("cloud_inference_topic", "/preprocessed/batch")
     cloud_result_topic = inference_config.get("cloud_result_topic", "/inference/action")
 
-    print(
-        f"[robot_config] ========== Generating Inference Node (Monolithic) =========="
-    )
-    print(f"[robot_config] Control mode: {control_mode}")
-    print(f"[robot_config] Execution mode: {execution_mode}")
+    logger.info("========== Generating Inference Node (Monolithic) ==========")
+    logger.info(f"Control mode: {control_mode}")
+    logger.info(f"Execution mode: {execution_mode}")
 
     robot_config_path = robot_config.get('_config_path', '')
     if not robot_config_path:
@@ -89,19 +90,19 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
     if model_name not in models:
-        print(f"[robot_config] ERROR: Model '{model_name}' not found in config")
+        logger.info(f"ERROR: Model '{model_name}' not found in config")
         return None
 
     model_config = models[model_name]
 
-    print(f"[robot_config] Model: {model_name}")
-    print(f"[robot_config]   Path: {model_config['path']}")
-    print(f"[robot_config]   Policy type: {model_config.get('policy_type', 'unknown')}")
-    print(f"[robot_config]   Robot config: {robot_config_path}")
+    logger.info(f"Model: {model_name}")
+    logger.info(f"  Path: {model_config['path']}")
+    logger.info(f"  Policy type: {model_config.get('policy_type', 'unknown')}")
+    logger.info(f"  Robot config: {robot_config_path}")
 
     env = prepare_lerobot_env()
     if env.get("PYTHONPATH"):
-        print(f"[robot_config] Injected PYTHONPATH: {env['PYTHONPATH']}")
+        logger.info(f"Injected PYTHONPATH: {env['PYTHONPATH']}")
 
     node_params = {
         "checkpoint": model_config["path"],
@@ -126,7 +127,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
         output="screen",
     )
 
-    print(f"[robot_config] ✓ Monolithic inference node configured")
+    logger.info(f"✓ Monolithic inference node configured")
     return inference_node
 
 
@@ -160,12 +161,10 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     cloud_inference_topic = inference_config.get("cloud_inference_topic", "/preprocessed/batch")
     cloud_result_topic = inference_config.get("cloud_result_topic", "/inference/action")
 
-    print(
-        f"[robot_config] ========== Generating Inference Nodes (Distributed) =========="
-    )
-    print(f"[robot_config] Control mode: {control_mode}")
-    print(f"[robot_config] Architecture: Edge Proxy + Cloud Inference")
-    print(f"[robot_config] Cloud co-located: {cloud_local}")
+    logger.info("========== Generating Inference Nodes (Distributed) ==========")
+    logger.info(f"Control mode: {control_mode}")
+    logger.info(f"Architecture: Edge Proxy + Cloud Inference")
+    logger.info(f"Cloud co-located: {cloud_local}")
 
     robot_config_path = robot_config.get('_config_path', '')
     if not robot_config_path:
@@ -176,16 +175,16 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
     if model_name not in models:
-        print(f"[robot_config] ERROR: Model '{model_name}' not found in config")
+        logger.info(f"ERROR: Model '{model_name}' not found in config")
         return None
 
     model_config = models[model_name]
     policy_path = model_config["path"]
 
-    print(f"[robot_config] Model: {model_name}")
-    print(f"[robot_config]   Path: {policy_path}")
-    print(f"[robot_config]   Policy type: {model_config.get('policy_type', 'unknown')}")
-    print(f"[robot_config]   Robot config: {robot_config_path}")
+    logger.info(f"Model: {model_name}")
+    logger.info(f"  Path: {policy_path}")
+    logger.info(f"  Policy type: {model_config.get('policy_type', 'unknown')}")
+    logger.info(f"  Robot config: {robot_config_path}")
 
     env = prepare_lerobot_env()
 
@@ -215,9 +214,11 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         output="screen",
     )
     nodes.append(edge_node)
-    print(f"[robot_config]   Edge Node (lerobot_policy_node): Action Server + Pre/Post processing")
-    print(f"[robot_config]     Publishing to: {cloud_inference_topic}")
-    print(f"[robot_config]     Subscribed to: {cloud_result_topic}")
+    logger.info(
+        f"  Edge Node (lerobot_policy_node): Action Server + Pre/Post processing"
+    )
+    logger.info(f"    Publishing to: {cloud_inference_topic}")
+    logger.info(f"    Subscribed to: {cloud_result_topic}")
 
     # --- Cloud node: only launched locally when cloud_local=True ---
     if cloud_local:
@@ -238,18 +239,16 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
             output="screen",
         )
         nodes.append(cloud_node)
-        print(f"[robot_config]   Cloud Node (pure_inference_node): GPU Inference (co-located)")
-        print(f"[robot_config]     Subscribed to: {cloud_inference_topic}")
-        print(f"[robot_config]     Publishing to: {cloud_result_topic}")
+        logger.info("  Cloud Node (pure_inference_node): GPU Inference (co-located)")
+        logger.info(f"    Subscribed to: {cloud_inference_topic}")
+        logger.info(f"    Publishing to: {cloud_result_topic}")
     else:
-        print(f"[robot_config]   ⚠ Cloud node NOT launched locally.")
-        print(f"[robot_config]     Launch it on the GPU machine with:")
-        print(f"[robot_config]       ros2 launch inference_service cloud_inference.launch.py \\")
-        print(f"[robot_config]         policy_path:={policy_path} device:=cuda")
+        logger.warning("Cloud node NOT launched locally.")
+        logger.info("  Launch it on the GPU machine with:")
+        logger.info("    ros2 launch inference_service cloud_inference.launch.py \\")
+        logger.info(f"      policy_path:={policy_path} device:=cuda")
 
-    print(
-        f"[robot_config] ✓ Distributed inference nodes configured ({len(nodes)} nodes)"
-    )
+    logger.info(f"✓ Distributed inference nodes configured ({len(nodes)} nodes)")
     return nodes
 
 
@@ -283,11 +282,11 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
     executor_type = executor_config.get("type", "topic")
     executor_mode = executor_config.get("mode", control_mode)
 
-    print(f"[robot_config] ========== Generating Action Dispatcher ==========")
-    print(f"[robot_config] Robot: {robot_name}")
-    print(f"[robot_config] Control mode: {control_mode}")
-    print(f"[robot_config] Executor type: {executor_type}")
-    print(f"[robot_config] Use sim time: {is_sim}")
+    logger.info(f"========== Generating Action Dispatcher ==========")
+    logger.info(f"Robot: {robot_name}")
+    logger.info(f"Control mode: {control_mode}")
+    logger.info(f"Executor type: {executor_type}")
+    logger.info(f"Use sim time: {is_sim}")
 
     inference_config = mode_config.get("inference", {})
 
@@ -329,7 +328,7 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
         output="screen",
     )
 
-    print(f"[robot_config] ✓ Action dispatcher configured")
+    logger.info(f"✓ Action dispatcher configured")
     return action_dispatcher_node
 
 
@@ -364,7 +363,7 @@ def generate_execution_nodes(robot_config, control_mode="model_inference",
             else:
                 nodes.append(inference_result)
     except Exception as e:
-        print(f"[robot_config] ERROR generating inference node: {e}")
+        logger.error(f"generating inference node: {e}")
 
     try:
         dispatcher_node = generate_action_dispatcher_node(
@@ -372,7 +371,7 @@ def generate_execution_nodes(robot_config, control_mode="model_inference",
         )
         nodes.append(dispatcher_node)
     except Exception as e:
-        print(f"[robot_config] ERROR generating action dispatcher: {e}")
+        logger.error(f"generating action dispatcher: {e}")
         raise
 
     return nodes

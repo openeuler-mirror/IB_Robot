@@ -17,12 +17,16 @@ WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
 PYTHON_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 export PYTHONPATH="${WORKSPACE_DIR}/libs/lerobot/src:${WORKSPACE_DIR}/libs/atomgit_sdk/src:${WORKSPACE_DIR}/venv/lib/${PYTHON_VER}/site-packages:${PYTHONPATH}"
 
-# 4. 加载本地编译后的包 (如果已编译)
+# 4. 日志与调试增强
+export RCUTILS_COLORIZED_OUTPUT=1
+export PYTHONUNBUFFERED=1
+
+# 5. 加载本地编译后的包 (如果已编译)
 if [ -f "${WORKSPACE_DIR}/install/setup.sh" ]; then
     source "${WORKSPACE_DIR}/install/setup.sh"
 fi
 
-# 5. 别名设置
+# 6. 别名设置
 alias cb='colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='colcon build --symlink-install --packages-select'
 alias src='source install/setup.sh'

@@ -12,10 +12,14 @@ import json
 import math
 import os
 import re
+import sys
 import yaml
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from ament_index_python.packages import get_package_share_directory
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_ros_path(path):
@@ -49,7 +53,7 @@ def resolve_ros_path(path):
             pkg_path = get_package_share_directory(pkg_name)
             path = path.replace(f"$(find {pkg_name})", pkg_path)
         except Exception as e:
-            print(f"[robot_config] WARNING: Could not find package '{pkg_name}': {e}")
+            logger.warning(f"Could not find package '{pkg_name}': {e}")
 
     # Resolve $(env VAR)
     env_pattern = re.compile(r'\$\(env\s+(\w+)\)')
@@ -58,7 +62,7 @@ def resolve_ros_path(path):
         var_value = os.environ.get(var_name, "")
         path = path.replace(f"$(env {var_name})", var_value)
         if not var_value:
-            print(f"[robot_config] WARNING: Environment variable '{var_name}' is not set or empty")
+            logger.info(f"WARNING: Environment variable '{var_name}' is not set or empty")
 
     return path
 
@@ -127,34 +131,34 @@ def validate_joint_config(robot_config):
     Raises:
         Prints warnings/errors but does not raise exceptions to avoid blocking startup
     """
-    print("[robot_config] ========== Joint Configuration Validation ==========")
+    logger.info("[robot_config] ========== Joint Configuration Validation ==========")
 
     joints_config = robot_config.get("joints", {})
     if not joints_config:
-        print("[robot_config] WARNING: No 'joints' configuration found")
+        logger.info("[robot_config] WARNING: No 'joints' configuration found")
         return True
 
     expected_arm_joints = set(joints_config.get("arm", []))
     expected_gripper_joints = set(joints_config.get("gripper", []))
     expected_all_joints = set(joints_config.get("all", []))
 
-    print(f"[robot_config] Canonical joints from robot_config:")
-    print(f"[robot_config]   arm: {sorted(expected_arm_joints)}")
-    print(f"[robot_config]   gripper: {sorted(expected_gripper_joints)}")
-    print(f"[robot_config]   all: {sorted(expected_all_joints)}")
+    logger.info(f"Canonical joints from robot_config:")
+    logger.info(f"  arm: {sorted(expected_arm_joints)}")
+    logger.info(f"  gripper: {sorted(expected_gripper_joints)}")
+    logger.info(f"  all: {sorted(expected_all_joints)}")
 
     # Load controllers configuration
     ros2_control_config = robot_config.get("ros2_control", {})
     controllers_config_path = ros2_control_config.get("controllers_config", "")
 
     if not controllers_config_path:
-        print("[robot_config] WARNING: No controllers_config path specified")
+        logger.info("[robot_config] WARNING: No controllers_config path specified")
         return True
 
     controllers_config_path = resolve_ros_path(controllers_config_path)
 
     if not Path(controllers_config_path).exists():
-        print(f"[robot_config] WARNING: Controllers config not found at {controllers_config_path}")
+        logger.info(f"WARNING: Controllers config not found at {controllers_config_path}")
         return True
 
     # Load controllers YAML
@@ -162,7 +166,7 @@ def validate_joint_config(robot_config):
         with open(controllers_config_path, 'r') as f:
             controllers_yaml = yaml.safe_load(f)
     except Exception as e:
-        print(f"[robot_config] ERROR: Failed to load controllers config: {e}")
+        logger.error(f"Failed to load controllers config: {e}")
         return False
 
     validation_passed = True
@@ -173,10 +177,10 @@ def validate_joint_config(robot_config):
     if arm_pos_ctrl:
         ctrl_joints = set(arm_pos_ctrl.get("joints", []))
         if ctrl_joints != expected_arm_joints:
-            print(f"[robot_config] ERROR: arm_position_controller joints mismatch!")
+            logger.error("[robot_config] ERROR: arm_position_controller joints mismatch!")
             validation_passed = False
         else:
-            print(f"[robot_config] ✓ arm_position_controller joints match")
+            logger.info(f"✓ arm_position_controller joints match")
         controllers_checked += 1
 
     # Check gripper_position_controller
@@ -184,10 +188,10 @@ def validate_joint_config(robot_config):
     if grip_pos_ctrl:
         ctrl_joints = set(grip_pos_ctrl.get("joints", []))
         if ctrl_joints != expected_gripper_joints:
-            print(f"[robot_config] ERROR: gripper_position_controller joints mismatch!")
+            logger.error("[robot_config] ERROR: gripper_position_controller joints mismatch!")
             validation_passed = False
         else:
-            print(f"[robot_config] ✓ gripper_position_controller joints match")
+            logger.info(f"✓ gripper_position_controller joints match")
         controllers_checked += 1
 
     # Check joint_state_broadcaster
@@ -195,20 +199,20 @@ def validate_joint_config(robot_config):
     if jsb_ctrl:
         ctrl_joints = set(jsb_ctrl.get("joints", []))
         if ctrl_joints != expected_all_joints:
-            print(f"[robot_config] ERROR: joint_state_broadcaster joints mismatch!")
+            logger.error("[robot_config] ERROR: joint_state_broadcaster joints mismatch!")
             validation_passed = False
         else:
-            print(f"[robot_config] ✓ joint_state_broadcaster joints match")
+            logger.info(f"✓ joint_state_broadcaster joints match")
         controllers_checked += 1
 
-    print(f"[robot_config] Validated {controllers_checked} controller configurations")
+    logger.info(f"Validated {controllers_checked} controller configurations")
 
     if validation_passed:
-        print("[robot_config] ✓ All joint configurations are consistent")
+        logger.info("[robot_config] ✓ All joint configurations are consistent")
     else:
-        print("[robot_config] ✗ Joint configuration validation FAILED")
+        logger.info("[robot_config] ✗ Joint configuration validation FAILED")
 
-    print("[robot_config] =========================================================")
+    logger.info("[robot_config] =========================================================")
 
     return validation_passed
 

@@ -10,6 +10,9 @@ from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from robot_config.logger_utils import get_colored_logger
+
+logger = get_colored_logger("robot_config.moveit")
 
 
 def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=True):
@@ -33,9 +36,7 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
     if not with_moveit:
         return actions
 
-    print(f"[robot_config] ========== Generating MoveIt Nodes ==========")
-    print(f"[robot_config] Control mode: {control_mode}")
-    print(f"[robot_config] MoveIt Display: {display}")
+    logger.info(f"Generating MoveIt Nodes (mode: {control_mode}, display: {display})")
 
     # Find MoveIt launch file
     try:
@@ -68,11 +69,11 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
                 }.items()
             )
             actions.append(moveit_launch)
-            print(f"[robot_config] Added MoveIt launch (is_sim={use_sim}, display={display}, joint_names={joint_names_str})")
+            logger.info(f"Added MoveIt launch (is_sim={use_sim}, display={display})")
         else:
-            print(f"[robot_config] WARNING: MoveIt launch file not found at {moveit_launch_file}")
+            logger.warning(f"MoveIt launch file not found at {moveit_launch_file}")
     except Exception as e:
-        print(f"[robot_config] WARNING: Could not find robot_moveit package: {e}")
-        print(f"[robot_config] Continuing without MoveIt...")
+        logger.warning(f"Could not find robot_moveit package: {e}")
+        logger.info("Continuing without MoveIt...")
 
     return actions

@@ -14,6 +14,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${WORKSPACE:-$(dirname "${SCRIPT_DIR}")}"
 MIXIN_DIR="${WORKSPACE}/.colcon/mixin"
 
+# Logging Utilities
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+log_info()    { echo -e "\033[0;32m[INFO] $*${NC}"; }
+log_error()   { echo -e "${RED}[ERROR] $*${NC}"; }
+log_warning() { echo -e "\033[1;33m[WARNING] $*${NC}"; }
+
 # ============================================================================
 # Help & Mixin Listing
 # ============================================================================
@@ -163,19 +170,20 @@ if [[ -d "${WORKSPACE}/libs/lerobot" ]]; then
     # Force use of venv pip to prevent pollution of ROS 2 install directory
     PIP_BIN="${WORKSPACE}/venv/bin/pip"
     if [[ ! -f "${PIP_BIN}" ]]; then
-        echo "[ERROR] Virtual environment not found at ${WORKSPACE}/venv. Please run setup.sh first."
+        log_error "Virtual environment not found at ${WORKSPACE}/venv. Please run setup.sh first."
         exit 1
     fi
 
-    echo "[INFO] Installing lerobot into venv (editable mode)..."
+    log_info "Installing lerobot into venv (editable mode)..."
     # Use -e to handle src-layout correctly and point to source instead of copying
     "${PIP_BIN}" install -e "${WORKSPACE}/libs/lerobot" --quiet
-    
+
     # Critical Fix: Force-reinstall compatible versions WITHIN venv
     # This ensures NumPy 1.x for ROS 2 Humble compatibility and avoids NumPy 2.x/OpenCV 4.12 issues
-    echo "[INFO] Re-aligning dependencies for ROS 2 compatibility..."
+    log_info "Re-aligning dependencies for ROS 2 compatibility..."
     "${PIP_BIN}" install "numpy<2" "opencv-python-headless<4.12" --quiet
 fi
+
 
 # ============================================================================
 # ROS 2 Environment

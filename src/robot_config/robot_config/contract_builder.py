@@ -1,6 +1,9 @@
 """Contract validation for robot configuration."""
 
+import logging
 from typing import Dict
+
+logger = logging.getLogger(__name__)
 
 class ContractSynthesisError(Exception):
     """Raised when contract synthesis fails due to architectural errors."""
@@ -90,14 +93,14 @@ def validate_control_mode_config(robot_config: Dict, control_mode: str) -> None:
 
     # Report results
     if warnings:
-        print(f"[robot_config] ⚠ Configuration warnings for mode '{control_mode}':")
+        logger.warning(f"Configuration warnings for mode '{control_mode}':")
         for warning in warnings:
-            print(f"  - {warning}")
+            logger.warning(f"  - {warning}")
 
     if errors:
         error_msg = (
-            f"❌ Architectural errors in control mode '{control_mode}':\n" +
+            f"Architectural errors in control mode '{control_mode}':\n" +
             "\n".join(f"  - {e}" for e in errors)
         )
-        print(f"[robot_config] {error_msg}")
+        logger.error(error_msg)
         raise ContractSynthesisError(error_msg)

@@ -15,6 +15,7 @@ from datetime import datetime
 from typing import List, Union
 from launch_ros.actions import Node
 from launch.actions import ExecuteProcess
+from robot_config.logger_utils import get_colored_logger
 
 from robot_config.utils import (
     resolve_calibration_path_from_config,
@@ -29,6 +30,8 @@ def _sanitize_dataset_name(value: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     normalized = normalized.strip("._-")
     return normalized or "dataset"
+
+logger = get_colored_logger("robot_config.recording")
 
 
 def generate_recording_nodes(robot_config: dict, active_control_mode: str, record_mode: str = 'continuous') -> List[Union[Node, ExecuteProcess]]:
@@ -86,7 +89,7 @@ def generate_continuous_recording_action(robot_config: dict) -> List[ExecuteProc
         - Generates filename: ~/rosbag/<robot_name>_<timestamp>.mcap
         - Records continuously until node shutdown
     """
-    print(f"[recording_builder] Using CONTINUOUS recording (ros2 bag record)")
+    logger.info(f"Using CONTINUOUS recording (ros2 bag record)")
 
     # Auto-discover topics to record
     topics = get_recording_topics(robot_config)
@@ -99,8 +102,8 @@ def generate_continuous_recording_action(robot_config: dict) -> List[ExecuteProc
     # Expand ~ to actual home directory
     output_file = str(Path(output_file).expanduser())
 
-    print(f"[recording_builder] Recording {len(topics)} topics to: {output_file}")
-    print(f"[recording_builder] Topics: {topics}")
+    logger.info(f"Recording {len(topics)} topics to: {output_file}")
+    logger.info(f"Topics: {topics}")
 
     # Create recording action
     recording_action = ExecuteProcess(
@@ -108,7 +111,7 @@ def generate_continuous_recording_action(robot_config: dict) -> List[ExecuteProc
         output='screen'
     )
 
-    print(f"[recording_builder] ✓ Continuous recording action created")
+    logger.info(f"✓ Continuous recording action created")
     return [recording_action]
 
 
@@ -136,13 +139,13 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
         - Each episode saved as: <bag_base_dir>/<dataset_name>/episodes/episode_XXXXXX
         - Operator prompt embedded in bag metadata
     """
-    print(f"[recording_builder] Using EPISODIC recording (episode_recorder Action Server)")
+    logger.info(f"Using EPISODIC recording (episode_recorder Action Server)")
 
     # Check if contract section exists in robot_config
-    contract = robot_config.get('contract')
-    if not contract:
-        print(f"[recording_builder] ERROR: No 'contract' section found in robot configuration.")
-        print(f"[recording_builder] Please add 'contract' section with observations and actions.")
+    contract_config = robot_config.get("contract")
+    if not contract_config:
+        logger.error("No 'contract' section found in robot configuration.")
+        logger.info("  Please add 'contract' section with observations and actions.")
         return []
 
     # Determine bag output directory
@@ -194,16 +197,19 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
         ],
     )
 
-    print(f"[recording_builder] ✓ Episode recorder node created")
-    print(f"[recording_builder] Dataset root: {dataset_root}")
-    print(f"[recording_builder] LeRobot norm mode: {lerobot_norm_mode}")
-    print(f"[recording_builder]")
-    print(f"[recording_builder] " + "="*70)
-    print(f"[recording_builder] ⚠️  IMPORTANT: Use SEPARATE TERMINAL to trigger recordings:")
-    print(f"[recording_builder]     ros2 run dataset_tools record_cli")
-    print(f"[recording_builder] Convert later with:")
-    print(f"[recording_builder]     ros2 run dataset_tools bag_to_lerobot --bags-dir {dataset_root} --robot-config {robot_config_path} --out /path/to/output_dataset")
-    print(f"[recording_builder] " + "="*70)
+    logger.info("✓ Episode recorder node created")
+    logger.info(f"Dataset root: {dataset_root}")
+    logger.info(f"LeRobot norm mode: {lerobot_norm_mode}")
+    logger.info("")
+    logger.info("=" * 70)
+    logger.warning("IMPORTANT: Use SEPARATE TERMINAL to trigger recordings:")
+    logger.info("    ros2 run dataset_tools record_cli")
+    logger.info("Convert later with:")
+    logger.info(
+        f"    ros2 run dataset_tools bag_to_lerobot --bags-dir {dataset_root} "
+        f"--robot-config {robot_config_path} --out /path/to/output_dataset"
+    )
+    logger.info("=" * 70)
 
     return [episode_recorder_node]
 

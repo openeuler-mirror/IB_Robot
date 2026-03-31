@@ -13,8 +13,10 @@ import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
 import xacro as _xacro_lib
-
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path, parse_bool
+
+logger = get_colored_logger("robot_config.description")
 
 
 def _build_cameras_urdf_from_yaml(peripherals: list, platform: str = "gazebo") -> str:
@@ -148,10 +150,12 @@ def _inject_mujoco_camera_sensors(full_urdf: str, peripherals: list) -> str:
             ]:
                 p = ET.SubElement(sensor, "param", name=param_key)
                 p.text = param_val
-        print(f"[robot_config] Injected {len(opencv_cams)} MuJoCo camera sensor(s) into ros2_control block")
+        logger.info(
+            f"Injected {len(opencv_cams)} MuJoCo camera sensor(s) into ros2_control block"
+        )
         return ET.tostring(root, encoding="unicode")
     except ET.ParseError as e:
-        print(f"[robot_config] WARNING: could not inject MuJoCo camera sensors: {e}")
+        logger.warning(f"could not inject MuJoCo camera sensors: {e}")
         return full_urdf
 
 
@@ -181,12 +185,12 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
     # Resolve and validate URDF path
     urdf_path = ros2_control_config.get("urdf_path")
     if not urdf_path:
-        print("[robot_config] WARNING: No urdf_path specified")
+        logger.warning("No urdf_path specified")
         return None
     urdf_path = resolve_ros_path(urdf_path)
-    print(f"[robot_config] URDF path: {urdf_path}")
+    logger.info(f"URDF path: {urdf_path}")
     if not Path(urdf_path).exists():
-        print(f"[robot_config] WARNING: URDF file not found at {urdf_path}")
+        logger.warning(f"URDF file not found at {urdf_path}")
         return None
 
     # Build xacro parameter mappings from YAML
@@ -220,7 +224,7 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
         doc = _xacro_lib.process_file(urdf_path, mappings=xacro_mappings)
         base_urdf = doc.toxml()
     except Exception as e:
-        print(f"[robot_config] ERROR: xacro processing failed: {e}")
+        logger.error(f"xacro processing failed: {e}")
         return None
 
     # Dynamically inject camera URDF blocks from YAML peripherals
@@ -229,7 +233,9 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
     cameras_xml = _build_cameras_urdf_from_yaml(peripherals, platform=sim_platform)
     if cameras_xml:
         full_urdf = base_urdf.replace("</robot>", cameras_xml + "\n</robot>", 1)
-        print(f"[robot_config] Injected {sum(1 for p in peripherals if p.get('type') == 'camera')} camera(s) into URDF from YAML")
+        logger.info(
+            f"Injected {sum(1 for p in peripherals if p.get('type') == 'camera')} camera(s) into URDF from YAML"
+        )
     else:
         full_urdf = base_urdf
 

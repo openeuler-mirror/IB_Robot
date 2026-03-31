@@ -14,10 +14,13 @@ import tempfile
 from pathlib import Path
 
 import yaml
+from robot_config.logger_utils import get_colored_logger
 from launch_ros.actions import Node
 
 from robot_config.utils import resolve_ros_path, parse_bool, validate_joint_config
 from robot_config.launch_builders.description import generate_robot_description
+
+logger = get_colored_logger("robot_config.control")
 
 
 def generate_controller_spawners(controller_names, use_sim=True, controller_manager_name="controller_manager"):
@@ -82,10 +85,10 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
     ros2_control_config = robot_config.get("ros2_control")
 
     if not ros2_control_config:
-        print("[robot_config] No ros2_control configuration found")
+        logger.warning("No ros2_control configuration found")
         return nodes, [], deferred_sim_spawners, {}
 
-    print("[robot_config] Creating ros2_control nodes")
+    logger.info("Creating ros2_control nodes")
 
     # Pre-flight check: calibration file must exist for real hardware
     if not is_sim:
@@ -93,20 +96,18 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
         if calib_file_raw:
             calib_file_resolved = resolve_ros_path(calib_file_raw)
             if not Path(calib_file_resolved).exists():
-                print("[robot_config] " + "=" * 60)
-                print(f"[robot_config] ERROR: Calibration file not found!")
-                print(f"[robot_config]   Resolved path: {calib_file_resolved}")
-                print(f"[robot_config]   Raw path:      {calib_file_raw}")
-                print(
-                    f"[robot_config]   HOME=$HOME -> {os.environ.get('HOME', '(unset)')}"
+                logger.error("Calibration file not found!")
+                logger.error(f"  Resolved path: {calib_file_resolved}")
+                logger.error(f"  Raw path:      {calib_file_raw}")
+                logger.error(
+                    f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}"
                 )
-                print("[robot_config] ")
-                print("[robot_config]   Please run calibration first:")
+                logger.error("")
+                logger.error("  Please run calibration first:")
                 calib_port = ros2_control_config.get("port", "/dev/ttyACM0")
-                print(
-                    "[robot_config]     ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port
+                logger.error(
+                    "    ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port
                 )
-                print("[robot_config] " + "=" * 60)
                 raise RuntimeError(
                     f"Calibration file not found: {calib_file_resolved}. "
                     f"Run: ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port
@@ -137,8 +138,8 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
     if control_modes:
         if control_mode_name not in control_modes:
             available_modes = list(control_modes.keys())
-            print(f"[robot_config] ERROR: Control mode '{control_mode_name}' not found")
-            print(f"[robot_config] Available modes: {available_modes}")
+            logger.error(f"Control mode '{control_mode_name}' not found")
+            logger.info(f"Available modes: {available_modes}")
             if available_modes:
                 control_mode_name = available_modes[0]
 
@@ -146,9 +147,9 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
             mode_config = control_modes[control_mode_name]
             controller_names = mode_config.get("controllers", [])
             mode_description = mode_config.get("description", "No description")
-            print(f"[robot_config] Using control mode: {control_mode_name}")
-            print(f"[robot_config]   Description: {mode_description}")
-            print(f"[robot_config]   Controllers: {controller_names}")
+            logger.info(f"Using control mode: {control_mode_name}")
+            logger.info(f"  Description: {mode_description}")
+            logger.info(f"  Controllers: {controller_names}")
         else:
             controller_names = []
     else:
@@ -158,10 +159,10 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
 
     if not is_sim:
         # Real hardware mode
-        print("[robot_config] Real hardware mode")
+        logger.info("Real hardware mode")
 
         if controllers_config and Path(controllers_config).exists():
-            print(f"[robot_config] Controllers config: {controllers_config}")
+            logger.info(f"Controllers config: {controllers_config}")
 
             # Write robot_description to a temp YAML under the 'controller_manager'
             # node name.  ros2_control_node internally creates a node called
@@ -182,7 +183,7 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
                 default_flow_style=False,
             )
             cm_params_file.close()
-            print(f"[robot_config] Controller manager params: {cm_params_file.name}")
+            logger.info(f"Controller manager params: {cm_params_file.name}")
 
             nodes.append(Node(
                 package="controller_manager",
@@ -202,11 +203,14 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
         # gz_ros2_control plugin provides controller_manager, but spawners
         # must wait until the Gazebo entity is fully created and the plugin
         # has initialized the hardware interface.
-        print("[robot_config] Simulation mode: Gazebo provides controller_manager")
-        print(f"[robot_config] Controllers to spawn (deferred until after gz spawn): {controller_names}")
+        logger.info("Simulation mode: Gazebo provides controller_manager")
+        logger.info(f"Controllers to spawn (deferred until after gz spawn): {controller_names}")
 
         if is_auto_start and controller_names:
             deferred_sim_spawners = generate_controller_spawners(controller_names, use_sim=True)
-            print(f"[robot_config] Deferring {len(deferred_sim_spawners)} controller spawners by (handled by caller)")
+            logger.info(
+                f"Deferring {len(deferred_sim_spawners)} controller spawners "
+                "(handled by caller)"
+            )
 
     return nodes, controller_names, deferred_sim_spawners, robot_description

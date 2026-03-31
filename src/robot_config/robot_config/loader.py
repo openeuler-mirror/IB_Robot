@@ -4,8 +4,8 @@ import os
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
 
+import logging
 import yaml
-from rclpy.logging import get_logger
 
 from robot_config.config import (
     RobotConfig,
@@ -20,7 +20,7 @@ from robot_config.config import (
 
 from .utils import resolve_ros_path
 
-logger = get_logger("robot_config.loader")
+logger = logging.getLogger(__name__)
 
 
 def load_camera_config(data: Dict[str, Any]) -> CameraConfig:

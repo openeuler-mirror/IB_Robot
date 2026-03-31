@@ -3,15 +3,18 @@
 from typing import Any, Dict, List
 
 from launch_ros.actions import Node
+from robot_config.logger_utils import get_colored_logger
 
 from robot_config.utils import resolve_ros_path
+
+logger = get_colored_logger("robot_config.voice_asr")
 
 
 def generate_voice_asr_nodes(robot_config: Dict[str, Any]) -> List[Node]:
     """Generate voice ASR nodes from robot_config YAML."""
     voice_asr_config = robot_config.get("voice_asr", {})
     if not voice_asr_config.get("enabled", False):
-        print("[voice_asr_builder] Voice ASR disabled, skipping")
+        logger.info("Voice ASR disabled, skipping")
         return []
 
     model_path = voice_asr_config.get("model_path", "")
@@ -40,8 +43,8 @@ def generate_voice_asr_nodes(robot_config: Dict[str, Any]) -> List[Node]:
     }
 
     node_name = voice_asr_config.get("node_name", "voice_asr_node")
-    print(f"[voice_asr_builder] Voice ASR enabled, launching node '{node_name}'")
-    print(f"[voice_asr_builder]   output_topic: {node_params['output_topic']}")
+    logger.info(f"Voice ASR enabled, launching node '{node_name}'")
+    logger.info(f"  output_topic: {node_params['output_topic']}")
 
     return [
         Node(

@@ -6,9 +6,12 @@ This module handles:
 - Virtual camera relays
 """
 
+from robot_config.logger_utils import get_colored_logger
 from launch_ros.actions import Node
 
 from robot_config.utils import parse_bool
+
+logger = get_colored_logger("robot_config.perception")
 
 
 def generate_camera_nodes(robot_config, use_sim=False):
@@ -23,13 +26,15 @@ def generate_camera_nodes(robot_config, use_sim=False):
     """
     is_sim = parse_bool(use_sim, default=False)
     if is_sim:
-        print("[robot_config] Skipping physical camera drivers in sim mode")
+        logger.info("Skipping physical camera drivers in sim mode")
         return []
 
     nodes = []
 
     peripherals = robot_config.get("peripherals", [])
-    print(f"[robot_config] Generating nodes for {len(peripherals)} peripherals (use_sim={is_sim})")
+    logger.info(
+        f"Generating nodes for {len(peripherals)} peripherals (use_sim={is_sim})"
+    )
 
     for periph in peripherals:
         periph_type = periph.get("type")
@@ -43,7 +48,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
 
         name = periph["name"]
         driver = periph.get("driver", "opencv")
-        print(f"[robot_config] Creating camera node: {name} (driver={driver})")
+        logger.info(f"Creating camera node: {name} (driver={driver})")
 
         if driver == "opencv":
             # Use usb_cam package
@@ -69,7 +74,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 if key in periph:
                     params[key] = periph[key]
 
-            print(f"[robot_config]   Camera params: {params}")
+            logger.info(f"  Camera params: {params}")
 
             nodes.append(Node(
                 package="usb_cam",
@@ -114,7 +119,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
             if "serial_number" in periph:
                 params["serial_no"] = str(periph["serial_number"])
 
-            print(f"[robot_config]   RealSense params: {params}")
+            logger.info(f"  RealSense params: {params}")
 
             nodes.append(Node(
                 package="realsense2_camera",
@@ -163,11 +168,11 @@ def generate_virtual_camera_relays(robot_config):
         target_topic = f"/camera/{name}/image_raw"
 
         if not source_topic:
-            print(f"[robot_config] WARNING: Virtual camera {name} missing source_topic")
+            logger.warning(f"Virtual camera {name} missing source_topic")
             continue
 
-        print(f"[robot_config] Creating virtual camera relay: {name}")
-        print(f"[robot_config]   {source_topic} -> {target_topic}")
+        logger.info(f"Creating virtual camera relay: {name}")
+        logger.info(f"  {source_topic} -> {target_topic}")
 
         nodes.append(Node(
             package="topic_tools",
