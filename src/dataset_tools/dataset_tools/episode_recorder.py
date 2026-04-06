@@ -94,6 +94,7 @@ import rosbag2_py
 
 from ibrobot_msgs.action import RecordEpisode
 from robot_config.contract_utils import contract_fingerprint, qos_profile_from_dict
+from robot_config.utils import build_lerobot_conversion_metadata
 
 
 # ------------------------------ Constants ------------------------------
@@ -213,6 +214,10 @@ class EpisodeRecorderServer(Node):
         self.declare_parameter("control_mode", "")
         self.declare_parameter("default_task", "")
         self.declare_parameter("task_family", "")
+        self.declare_parameter("lerobot_norm_mode", "")
+        self.declare_parameter("joint_names", [])
+        self.declare_parameter("gripper_joints", [])
+        self.declare_parameter("calibration_file", "")
         # Storage tuning (kept optional & conservative by default)
         self.declare_parameter("storage_preset_profile", "")  # e.g., "zstd_fast"
         self.declare_parameter("storage_config_uri", "")  # file:// or path
@@ -254,6 +259,18 @@ class EpisodeRecorderServer(Node):
         self._task_family = (
             self.get_parameter("task_family").get_parameter_value().string_value
         )
+        self._lerobot_norm_mode = (
+            self.get_parameter("lerobot_norm_mode").get_parameter_value().string_value
+        )
+        self._joint_names = list(
+            self.get_parameter("joint_names").get_parameter_value().string_array_value
+        )
+        self._gripper_joints = list(
+            self.get_parameter("gripper_joints").get_parameter_value().string_array_value
+        )
+        self._calibration_file = (
+            self.get_parameter("calibration_file").get_parameter_value().string_value
+        )
         self._dataset_root = self._bag_base / self._dataset_name
         self._episodes_dir = self._dataset_root / "episodes"
         self._dataset_metadata_path = self._dataset_root / "dataset.yaml"
@@ -264,6 +281,19 @@ class EpisodeRecorderServer(Node):
             self._contract_fingerprint = contract_fingerprint(self._contract)
         except Exception:
             self._contract_fingerprint = ""
+        self._lerobot_conversion_meta: Dict[str, Any] = {}
+        if self._joint_names and self._lerobot_norm_mode:
+            try:
+                self._lerobot_conversion_meta = build_lerobot_conversion_metadata(
+                    calib_file=self._calibration_file,
+                    joint_names=self._joint_names,
+                    gripper_joints=self._gripper_joints,
+                    norm_mode=self._lerobot_norm_mode,
+                )
+            except (FileNotFoundError, KeyError, OSError, ValueError) as exc:
+                self.get_logger().warning(
+                    f"Failed to build LeRobot conversion metadata: {exc!r}"
+                )
 
         self._storage_preset_profile = (
             self.get_parameter("storage_preset_profile")
@@ -610,6 +640,21 @@ class EpisodeRecorderServer(Node):
             meta.setdefault("task_family", self._task_family)
         if self._contract_fingerprint:
             meta.setdefault("contract_fingerprint", self._contract_fingerprint)
+        if self._lerobot_conversion_meta:
+            lerobot_meta = meta.get("lerobot") if isinstance(meta.get("lerobot"), dict) else {}
+            conversions = (
+                lerobot_meta.get("conversions")
+                if isinstance(lerobot_meta.get("conversions"), dict)
+                else {}
+            )
+            conversion_fp = str(
+                self._lerobot_conversion_meta.get("conversion_fingerprint", "")
+            )
+            if conversion_fp:
+                conversions[conversion_fp] = dict(self._lerobot_conversion_meta)
+                lerobot_meta["default_conversion_fingerprint"] = conversion_fp
+                lerobot_meta["conversions"] = conversions
+                meta["lerobot"] = lerobot_meta
         meta["updated_at"] = now_iso
         meta["total_episodes"] = int(total_episodes)
 
@@ -809,6 +854,16 @@ class EpisodeRecorderServer(Node):
                     custom["ibrobot.task_family"] = self._task_family
                 if self._contract_fingerprint:
                     custom["ibrobot.contract_fingerprint"] = self._contract_fingerprint
+                if self._lerobot_conversion_meta:
+                    if self._lerobot_norm_mode:
+                        custom["ibrobot.lerobot_norm_mode"] = self._lerobot_norm_mode
+                    conversion_fp = self._lerobot_conversion_meta.get(
+                        "conversion_fingerprint", ""
+                    )
+                    if conversion_fp:
+                        custom["ibrobot.lerobot_conversion_fingerprint"] = str(
+                            conversion_fp
+                        )
                 info["custom_data"] = custom
                 meta["rosbag2_bagfile_information"] = info
                 with meta_path.open("w", encoding="utf-8") as f:

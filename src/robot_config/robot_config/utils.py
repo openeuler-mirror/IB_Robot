@@ -7,10 +7,14 @@ This module contains common utility functions used across the robot_config packa
 - Joint configuration validation
 """
 
+import hashlib
+import json
+import math
 import os
 import re
 import yaml
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 from ament_index_python.packages import get_package_share_directory
 
 
@@ -225,12 +229,10 @@ def prepare_lerobot_env():
 # ---------------------------------------------------------------------------
 # Joint unit-conversion helpers  (LeRobot percentage  ↔  ros2_control radians)
 # ---------------------------------------------------------------------------
-import json
-import math
-from typing import List, Optional, Tuple
 
 # Each entry: (rad_min, rad_max, pct_span, pct_offset)
 JointConversionEntry = Tuple[float, float, float, float]
+CalibrationSnapshot = Dict[str, Dict[str, Any]]
 
 _TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 
@@ -242,6 +244,209 @@ NORM_MODE_DEGREES = "degrees"         # centred degrees
 NORM_MODE_NONE = "none"               # pass-through (no conversion)
 
 _MODEL_RESOLUTION = 4096              # Feetech STS3215 12-bit encoder
+_CALIBRATION_SNAPSHOT_FIELDS = (
+    "id",
+    "model",
+    "drive_mode",
+    "homing_offset",
+    "range_min",
+    "range_max",
+)
+
+
+def normalize_lerobot_norm_mode(norm_mode: str) -> str:
+    """Normalize and validate LeRobot motor normalization mode."""
+    mode = str(norm_mode or NORM_MODE_RANGE).strip().lower()
+    if mode not in (NORM_MODE_RANGE, NORM_MODE_DEGREES, NORM_MODE_NONE):
+        raise ValueError(
+            f"Unsupported LeRobot normalization mode '{norm_mode}'. "
+            f"Expected one of: {NORM_MODE_RANGE}, {NORM_MODE_DEGREES}, {NORM_MODE_NONE}"
+        )
+    return mode
+
+
+def resolve_joint_names_from_config(robot_config: Dict[str, Any]) -> List[str]:
+    """Resolve ordered joint names from raw robot_config YAML content."""
+    ros2_control = robot_config.get("ros2_control", {}) or {}
+    joints_cfg = robot_config.get("joints", {}) or {}
+    joint_names = ros2_control.get("joint_names") or joints_cfg.get("all") or []
+    return [str(name) for name in joint_names]
+
+
+def resolve_gripper_joints_from_config(robot_config: Dict[str, Any]) -> List[str]:
+    """Resolve gripper joint names from raw robot_config YAML content."""
+    ros2_control = robot_config.get("ros2_control", {}) or {}
+    joints_cfg = robot_config.get("joints", {}) or {}
+    gripper_joints = ros2_control.get("gripper_joints") or joints_cfg.get("gripper") or []
+    return [str(name) for name in gripper_joints]
+
+
+def resolve_calibration_path_from_config(robot_config: Dict[str, Any]) -> str:
+    """Resolve the ros2_control calibration file path from raw robot_config."""
+    ros2_control = robot_config.get("ros2_control", {}) or {}
+    calib_file = str(ros2_control.get("calib_file", "") or "")
+    return resolve_ros_path(calib_file) if calib_file else ""
+
+
+def resolve_lerobot_norm_mode(
+    robot_config: Dict[str, Any],
+    preferred_control_mode: Optional[str] = None,
+) -> str:
+    """Resolve the LeRobot normalization mode from robot_config semantics."""
+    recording_cfg = robot_config.get("recording", {}) or {}
+    explicit_mode = recording_cfg.get("lerobot_norm_mode")
+    if explicit_mode:
+        return normalize_lerobot_norm_mode(str(explicit_mode))
+
+    control_modes = robot_config.get("control_modes", {}) or {}
+    models = robot_config.get("models", {}) or {}
+    mode_candidates: List[str] = []
+    for mode_name in (
+        preferred_control_mode,
+        robot_config.get("default_control_mode"),
+        "model_inference",
+    ):
+        if mode_name and mode_name not in mode_candidates:
+            mode_candidates.append(str(mode_name))
+
+    for mode_name in mode_candidates:
+        inference_cfg = (control_modes.get(mode_name, {}) or {}).get("inference", {}) or {}
+        model_name = inference_cfg.get("model")
+        if model_name and isinstance(models.get(model_name), dict):
+            model_mode = models[model_name].get("lerobot_norm_mode")
+            if model_mode:
+                return normalize_lerobot_norm_mode(str(model_mode))
+
+    for model_cfg in models.values():
+        if isinstance(model_cfg, dict) and model_cfg.get("lerobot_norm_mode"):
+            return normalize_lerobot_norm_mode(str(model_cfg["lerobot_norm_mode"]))
+
+    return NORM_MODE_RANGE
+
+
+def load_calibration_data(calib_file: str) -> Dict[str, Any]:
+    """Load a calibration JSON file from disk."""
+    resolved_path = resolve_ros_path(calib_file)
+    if not resolved_path:
+        raise FileNotFoundError("Calibration file path is empty")
+
+    calib_path = Path(resolved_path).expanduser().resolve()
+    if not calib_path.exists():
+        raise FileNotFoundError(f"Calibration file not found: {calib_path}")
+
+    with calib_path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"Calibration file must contain a JSON object: {calib_path}")
+    return data
+
+
+def extract_calibration_snapshot(
+    calibration: Dict[str, Any],
+    joint_names: List[str],
+) -> CalibrationSnapshot:
+    """Extract a canonical calibration snapshot for the selected joints."""
+    snapshot: CalibrationSnapshot = {}
+    for joint_name in [str(name) for name in joint_names]:
+        if joint_name not in calibration:
+            raise KeyError(f"Joint '{joint_name}' missing from calibration data")
+
+        entry = calibration[joint_name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"Calibration entry for joint '{joint_name}' must be an object")
+
+        joint_snapshot: Dict[str, Any] = {}
+        for field in _CALIBRATION_SNAPSHOT_FIELDS:
+            if field not in entry:
+                continue
+            if field == "model":
+                joint_snapshot[field] = str(entry[field])
+            else:
+                joint_snapshot[field] = int(entry[field])
+
+        if "range_min" not in joint_snapshot or "range_max" not in joint_snapshot:
+            raise KeyError(
+                f"Calibration entry for joint '{joint_name}' must contain range_min/range_max"
+            )
+        joint_snapshot.setdefault("drive_mode", 0)
+        snapshot[joint_name] = joint_snapshot
+
+    return snapshot
+
+
+def lerobot_conversion_fingerprint(
+    calibration: CalibrationSnapshot,
+    joint_names: List[str],
+    gripper_joints: Optional[List[str]] = None,
+    norm_mode: str = NORM_MODE_RANGE,
+) -> str:
+    """Compute a stable fingerprint for LeRobot conversion semantics."""
+    mode = normalize_lerobot_norm_mode(norm_mode)
+    ordered_joints = [str(name) for name in joint_names]
+    ordered_gripper_joints = [str(name) for name in (gripper_joints or [])]
+
+    payload: Dict[str, Any] = {
+        "norm_mode": mode,
+        "joint_names": ordered_joints,
+        "gripper_joints": ordered_gripper_joints,
+        "joints": {},
+    }
+
+    for joint_name in ordered_joints:
+        entry = calibration.get(joint_name, {})
+        joint_payload: Dict[str, int] = {}
+        if mode != NORM_MODE_NONE:
+            if "range_min" not in entry or "range_max" not in entry:
+                raise KeyError(
+                    f"Calibration snapshot for joint '{joint_name}' must contain range_min/range_max"
+                )
+            joint_payload["range_min"] = int(entry["range_min"])
+            joint_payload["range_max"] = int(entry["range_max"])
+            joint_payload["drive_mode"] = int(entry.get("drive_mode", 0))
+        payload["joints"][joint_name] = joint_payload
+
+    json_str = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(json_str.encode("utf-8")).hexdigest()[:16]
+
+
+def build_lerobot_conversion_metadata(
+    calib_file: str,
+    joint_names: List[str],
+    gripper_joints: Optional[List[str]] = None,
+    norm_mode: str = NORM_MODE_RANGE,
+) -> Dict[str, Any]:
+    """Build a dataset-storable snapshot of LeRobot conversion semantics."""
+    mode = normalize_lerobot_norm_mode(norm_mode)
+    ordered_joints = [str(name) for name in joint_names]
+    ordered_gripper_joints = [str(name) for name in (gripper_joints or [])]
+
+    metadata: Dict[str, Any] = {
+        "norm_mode": mode,
+        "joint_names": ordered_joints,
+        "gripper_joints": ordered_gripper_joints,
+    }
+
+    if mode == NORM_MODE_NONE:
+        metadata["conversion_fingerprint"] = lerobot_conversion_fingerprint(
+            calibration={},
+            joint_names=ordered_joints,
+            gripper_joints=ordered_gripper_joints,
+            norm_mode=mode,
+        )
+        return metadata
+
+    calibration_source = resolve_ros_path(calib_file)
+    calibration = load_calibration_data(calibration_source)
+    snapshot = extract_calibration_snapshot(calibration, ordered_joints)
+    metadata["calibration_source"] = str(Path(calibration_source).expanduser().resolve())
+    metadata["calibration"] = snapshot
+    metadata["conversion_fingerprint"] = lerobot_conversion_fingerprint(
+        calibration=snapshot,
+        joint_names=ordered_joints,
+        gripper_joints=ordered_gripper_joints,
+        norm_mode=mode,
+    )
+    return metadata
 
 
 def build_joint_conversion_table(
@@ -294,6 +499,7 @@ def build_joint_conversion_table(
         degree endpoints, and ``span / offset`` encode the degree range so that
         the same linear formula works.
     """
+    norm_mode = normalize_lerobot_norm_mode(norm_mode)
     if norm_mode == NORM_MODE_NONE:
         return []
 

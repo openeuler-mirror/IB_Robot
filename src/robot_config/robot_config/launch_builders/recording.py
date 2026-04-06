@@ -16,7 +16,12 @@ from typing import List, Union
 from launch_ros.actions import Node
 from launch.actions import ExecuteProcess
 
-from robot_config.utils import resolve_ros_path
+from robot_config.utils import (
+    resolve_calibration_path_from_config,
+    resolve_gripper_joints_from_config,
+    resolve_joint_names_from_config,
+    resolve_lerobot_norm_mode,
+)
 
 
 def _sanitize_dataset_name(value: str) -> str:
@@ -164,6 +169,10 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     dataset_root = Path(bag_base_dir).expanduser() / str(dataset_name)
     default_task = str(recording_config.get('default_task', '') or '')
     task_family = str(recording_config.get('task_family', '') or '')
+    lerobot_norm_mode = resolve_lerobot_norm_mode(robot_config, preferred_control_mode=active_control_mode)
+    joint_names = resolve_joint_names_from_config(robot_config)
+    gripper_joints = resolve_gripper_joints_from_config(robot_config)
+    calibration_file = resolve_calibration_path_from_config(robot_config)
 
     # Create episode_recorder node (Action Server)
     episode_recorder_node = Node(
@@ -178,11 +187,16 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
             {'control_mode': active_control_mode},
             {'default_task': default_task},
             {'task_family': task_family},
+            {'lerobot_norm_mode': lerobot_norm_mode},
+            {'joint_names': joint_names},
+            {'gripper_joints': gripper_joints},
+            {'calibration_file': calibration_file},
         ],
     )
 
     print(f"[recording_builder] ✓ Episode recorder node created")
     print(f"[recording_builder] Dataset root: {dataset_root}")
+    print(f"[recording_builder] LeRobot norm mode: {lerobot_norm_mode}")
     print(f"[recording_builder]")
     print(f"[recording_builder] " + "="*70)
     print(f"[recording_builder] ⚠️  IMPORTANT: Use SEPARATE TERMINAL to trigger recordings:")
