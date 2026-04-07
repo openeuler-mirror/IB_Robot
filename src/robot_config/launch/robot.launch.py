@@ -74,11 +74,13 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
+    EmitEvent,
     OpaqueFunction,
     RegisterEventHandler,
-    TimerAction
 )
 from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
+from launch_ros.actions import Node
 
 # Import utility functions
 from robot_config.utils import resolve_ros_path, parse_bool
@@ -129,6 +131,74 @@ def load_robot_config(robot_config_name, config_path_override=None):
     return robot_config
 
 
+def _start_actions_on_success(start_actions, success_message: str, failure_reason: str):
+    """Run launch actions only when the target process exits successfully."""
+    frozen_actions = tuple(start_actions)
+
+    def _handler(event, _context):
+        if event.returncode == 0:
+            print(f"[robot_config] {success_message}")
+            return list(frozen_actions)
+
+        print(
+            f"[robot_config] ERROR: {failure_reason} "
+            f"(returncode={event.returncode})"
+        )
+        return [EmitEvent(event=Shutdown(reason=failure_reason))]
+
+    return _handler
+
+
+def _resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> float:
+    """Resolve controller startup timeout from robot YAML."""
+    configured_timeout = robot_config.get("controller_startup_timeout")
+    if configured_timeout is None:
+        return 120.0 if use_sim else 30.0
+
+    timeout_value = configured_timeout
+    if isinstance(configured_timeout, dict):
+        profile_key = "sim" if use_sim else "hardware"
+        timeout_value = configured_timeout.get(profile_key)
+        if timeout_value is None:
+            timeout_value = configured_timeout.get("default")
+
+    if timeout_value is None:
+        raise ValueError(
+            "robot.controller_startup_timeout must define a value for the active launch profile."
+        )
+
+    try:
+        timeout = float(timeout_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "robot.controller_startup_timeout must be a number or a mapping of numbers."
+        ) from exc
+
+    if timeout <= 0.0:
+        raise ValueError("robot.controller_startup_timeout must be greater than zero.")
+
+    return timeout
+
+
+def _create_controller_ready_waiter(robot_config: dict, controller_names, use_sim: bool):
+    """Create a probe that exits when the required controllers are active."""
+    timeout = _resolve_controller_startup_timeout(robot_config, use_sim)
+    return Node(
+        package="robot_config",
+        executable="wait_for_controllers",
+        name="wait_for_active_controllers",
+        parameters=[{"use_sim_time": use_sim}],
+        arguments=[
+            *controller_names,
+            "--controller-manager",
+            "controller_manager",
+            "--timeout",
+            str(timeout),
+        ],
+        output="screen",
+    )
+
+
 def launch_setup(context, *args, **kwargs):
     """Launch setup function that generates all nodes.
 
@@ -144,6 +214,7 @@ def launch_setup(context, *args, **kwargs):
         List of launch actions
     """
     actions = []
+    controller_dependent_actions = []
 
     # ========== 1. Get and normalize launch parameters ==========
     robot_config_name = context.launch_configurations.get('robot_config', 'test_cam')
@@ -207,9 +278,10 @@ def launch_setup(context, *args, **kwargs):
     # ========== 4. Generate Control System Nodes ==========
     print(f"[robot_config] ========== Generating Control Nodes ==========")
     deferred_sim_spawners = []
+    controller_names = []
     robot_description = {}
     try:
-        control_nodes, spawners_dict, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
+        control_nodes, controller_names, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
             robot_config, use_sim, auto_start_controllers
         )
         actions.extend(control_nodes)
@@ -217,6 +289,14 @@ def launch_setup(context, *args, **kwargs):
     except Exception as e:
         print(f"[robot_config] ERROR generating control nodes: {e}")
         raise
+
+    controller_ready_waiter = None
+    if parse_bool(auto_start_controllers, default=True) and controller_names:
+        controller_ready_waiter = _create_controller_ready_waiter(
+            robot_config,
+            controller_names,
+            use_sim,
+        )
 
     # ========== 5. Generate Simulation Nodes (only in simulation mode) ==========
     gz_create_entity = None
@@ -242,26 +322,29 @@ def launch_setup(context, *args, **kwargs):
             raise
 
     if deferred_sim_spawners:
+        startup_sequence = list(deferred_sim_spawners)
+        if controller_ready_waiter is not None:
+            startup_sequence.append(controller_ready_waiter)
         if use_sim and gz_create_entity is not None:
             print(
-                "[robot_config] Scheduling controller spawners after ros_gz_sim create exits "
-                "(+3s for gz_ros2_control to initialize)"
+                "[robot_config] Scheduling controller startup after ros_gz_sim create exits"
             )
             actions.append(
                 RegisterEventHandler(
                     event_handler=OnProcessExit(
                         target_action=gz_create_entity,
-                        on_exit=[
-                            TimerAction(
-                                period=3.0,
-                                actions=deferred_sim_spawners,
-                            )
-                        ],
+                        on_exit=_start_actions_on_success(
+                            startup_sequence,
+                            success_message="Robot entity created; starting controller startup sequence.",
+                            failure_reason="Robot entity creation failed; aborting launch.",
+                        ),
                     )
                 )
             )
         else:
-            actions.extend(deferred_sim_spawners)
+            actions.extend(startup_sequence)
+    elif controller_ready_waiter is not None:
+        actions.append(controller_ready_waiter)
 
     # ========== 6. Generate Perception Nodes ==========
     print(f"[robot_config] ========== Generating Perception Nodes ==========")
@@ -302,21 +385,9 @@ def launch_setup(context, *args, **kwargs):
                 # Generate teleop nodes
                 teleop_nodes = generate_teleop_nodes(robot_config, robot_description)
 
-                # Find a trigger spawner (arm_position_controller is best for teleop)
-                trigger_spawner = spawners_dict.get('arm_position_controller')
-                if not trigger_spawner and deferred_sim_spawners:
-                    # In sim, we might need to find it in the deferred list
-                    trigger_spawner = deferred_sim_spawners[-1]
-
-                if trigger_spawner:
-                    print(f"[robot_config] Delaying teleop nodes until controller spawner exits...")
-                    _teleop_nodes = teleop_nodes
-                    actions.append(RegisterEventHandler(
-                        event_handler=OnProcessExit(
-                            target_action=trigger_spawner,
-                            on_exit=lambda event, context: _teleop_nodes,
-                        )
-                    ))
+                if controller_ready_waiter is not None:
+                    print("[robot_config] Deferring teleop nodes until required controllers are active...")
+                    controller_dependent_actions.extend(teleop_nodes)
                 else:
                     print(f"[robot_config] No controller spawner found, launching teleop immediately")
                     actions.extend(teleop_nodes)
@@ -344,8 +415,12 @@ def launch_setup(context, *args, **kwargs):
     try:
         if with_inference:
             execution_nodes = generate_execution_nodes(robot_config, active_control_mode, use_sim)
-            actions.extend(execution_nodes)
-            print(f"[robot_config] Added {len(execution_nodes)} execution nodes")
+            if controller_ready_waiter is not None:
+                print("[robot_config] Deferring execution nodes until required controllers are active...")
+                controller_dependent_actions.extend(execution_nodes)
+            else:
+                actions.extend(execution_nodes)
+            print(f"[robot_config] Prepared {len(execution_nodes)} execution nodes")
         else:
             print(f"[robot_config] Skipping execution nodes")
     except Exception as e:
@@ -368,21 +443,12 @@ def launch_setup(context, *args, **kwargs):
         if with_moveit:
             from robot_config.launch_builders.moveit import generate_moveit_nodes
             moveit_nodes = generate_moveit_nodes(robot_config, active_control_mode, use_sim, moveit_display)
-            
-            # Find the joint_state_broadcaster spawner to use as a trigger
-            jsb_spawner = spawners_dict.get('joint_state_broadcaster')
-            
-            if jsb_spawner:
-                print(f"[robot_config] Delaying MoveIt nodes until joint_state_broadcaster_spawner exits...")
-                _moveit_nodes = moveit_nodes  # capture for lambda closure
-                actions.append(RegisterEventHandler(
-                    event_handler=OnProcessExit(
-                        target_action=jsb_spawner,
-                        on_exit=lambda event, context: _moveit_nodes,
-                    )
-                ))
+
+            if controller_ready_waiter is not None:
+                print("[robot_config] Deferring MoveIt nodes until required controllers are active...")
+                controller_dependent_actions.extend(moveit_nodes)
             else:
-                print(f"[robot_config] Warning: joint_state_broadcaster spawner not found in spawners_dict, launching MoveIt immediately")
+                print(f"[robot_config] No controller readiness probe active, launching MoveIt immediately")
                 actions.extend(moveit_nodes)
         else:
             print(f"[robot_config] Skipping MoveIt nodes")
@@ -410,6 +476,27 @@ def launch_setup(context, *args, **kwargs):
     except Exception as e:
         print(f"[robot_config] ERROR setting up recording: {e}")
         print(f"[robot_config] Continuing without recording...")
+
+    if controller_dependent_actions:
+        if controller_ready_waiter is not None:
+            print(
+                f"[robot_config] Controller readiness barrier armed for "
+                f"{len(controller_dependent_actions)} control-dependent action(s)"
+            )
+            actions.append(
+                RegisterEventHandler(
+                    event_handler=OnProcessExit(
+                        target_action=controller_ready_waiter,
+                        on_exit=_start_actions_on_success(
+                            controller_dependent_actions,
+                            success_message="Required controllers are active; starting control-dependent nodes.",
+                            failure_reason="Controller readiness probe failed; aborting launch.",
+                        ),
+                    )
+                )
+            )
+        else:
+            actions.extend(controller_dependent_actions)
 
     print(f"[robot_config] ========== Total nodes to launch: {len(actions)} ==========")
 

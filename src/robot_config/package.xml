@@ -12,6 +12,8 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp_components</depend>
+  <depend>rosgraph_msgs</depend>
+  <depend>controller_manager_msgs</depend>
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
