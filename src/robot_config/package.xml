@@ -29,7 +29,7 @@
   <exec_depend>robot_state_publisher</exec_depend>
 
   <!-- Gazebo simulation -->
-  <exec_depend>gazebo_ros2_control</exec_depend>
+  <exec_depend>gz_ros2_control</exec_depend>
 
   <!-- MuJoCo simulation -->
   <exec_depend>mujoco_ros2_control</exec_depend>

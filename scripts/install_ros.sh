@@ -310,13 +310,13 @@ install_ubuntu_ros() {
         fi
     done
 
-    # Install ROS 2 Humble desktop
-    log_info "Installing ROS 2 ${ROS_DISTRO} desktop..."
-    if ! run_sudo apt-get install -y ros-${ROS_DISTRO}-desktop; then
-        log_error "Failed to install ROS 2 ${ROS_DISTRO} desktop"
+    # Install ROS 2 Humble desktop-full
+    log_info "Installing ROS 2 ${ROS_DISTRO} desktop-full..."
+    if ! run_sudo apt-get install -y ros-${ROS_DISTRO}-desktop-full; then
+        log_error "Failed to install ROS 2 ${ROS_DISTRO} desktop-full"
         return 1
     fi
-    log_info "ROS 2 ${ROS_DISTRO} desktop installed successfully"
+    log_info "ROS 2 ${ROS_DISTRO} desktop-full installed successfully"
 }
 
 # ============================================================================
@@ -332,16 +332,25 @@ install_openeuler_ros() {
 
     # Create ROS.repo with dynamic architecture
     log_info "Creating ROS repository configuration..."
-    run_sudo bash -c "cat << EOF > /etc/yum.repos.d/ROS.repo
-[openEulerROS-${ROS_DISTRO}]
-name=openEulerROS-${ROS_DISTRO}
-baseurl=${ROS_REPO_URL}
+    run_sudo bash -c "cat << 'EOF' > /etc/yum.repos.d/openEulerROS.repo
+[openEuler-Embedded-ROS-humble]
+name=openEuler-Embedded-ROS-humble
+baseurl=https://eur.openeuler.openatom.cn/results/openEuler_Embedded/IB_Robot-ROS_humble-release_1/openeuler-24.03_LTS-\$basearch/
+skip_if_unavailable=True
 enabled=1
 gpgcheck=0
+priority=1
+
+[openEulerROS-humble]
+name=openEulerROS-humble
+baseurl=https://eulermaker.compass-ci.openeuler.openatom.cn/api/ems1/repositories/ROS-SIG-Multi-Version_ros-humble_openEuler-24.03-LTS-TEST4/openEuler%3A24.03-LTS/\$basearch/
+enabled=1
+gpgcheck=0
+priority=2
 EOF"
 
-    if [[ ! -f /etc/yum.repos.d/ROS.repo ]]; then
-        log_error "Failed to create /etc/yum.repos.d/ROS.repo"
+    if [[ ! -f /etc/yum.repos.d/openEulerROS.repo ]]; then
+        log_error "Failed to create /etc/yum.repos.d/openEulerROS.repo"
         return 1
     fi
 
@@ -371,16 +380,6 @@ install_openeuler_ros_packages() {
     # List of ROS 2 packages to install
     local ros_packages=(
         "ros-${ROS_DISTRO}-ros-base"
-        "ros-${ROS_DISTRO}-xacro"
-        "ros-${ROS_DISTRO}-controller-manager"
-        "ros-${ROS_DISTRO}-ros2-control"
-        "ros-${ROS_DISTRO}-ros2-controllers"
-        "ros-${ROS_DISTRO}-moveit-configs-utils"
-        "ros-${ROS_DISTRO}-moveit-ros-move-group"
-        "ros-${ROS_DISTRO}-moveit-planners-ompl"
-        "ros-${ROS_DISTRO}-joy"
-        "ros-${ROS_DISTRO}-moveit-servo"
-        "ros-${ROS_DISTRO}-cv-bridge"
     )
 
     for pkg in "${ros_packages[@]}"; do

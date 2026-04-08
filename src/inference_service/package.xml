@@ -12,8 +12,8 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
+
   <depend>rclpy</depend>
-  <depend>rclpy_interfaces</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
@@ -25,8 +25,6 @@
   <depend>tensormsg</depend>
   <depend>robot_config</depend>
 
-  <exec_depend>ros2python</exec_depend>
-  <exec_depend>ros2idl_runtime_py</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

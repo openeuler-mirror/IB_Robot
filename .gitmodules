@@ -11,7 +11,3 @@
 [submodule "src/rosclaw"]
 	path = src/rosclaw
 	url = https://github.com/PlaiPin/rosclaw
-[submodule "src/usb_cam"]
-	path = src/usb_cam
-	url = https://github.com/ros-drivers/usb_cam.git
-	branch = main

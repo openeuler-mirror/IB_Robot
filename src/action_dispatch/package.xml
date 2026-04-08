@@ -8,7 +8,6 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
-  <depend>rclpy_action</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>

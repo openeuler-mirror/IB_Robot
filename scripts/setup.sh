@@ -312,7 +312,7 @@ ensure_colcon() {
 }
 
 check_openeuler() {
-    if uname -r | grep -qi "openeuler"; then
+    if uname -r | grep -qi "openeuler" || grep -qi "openeuler" /etc/os-release 2>/dev/null; then
         log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
         export ROS_OS_OVERRIDE=rhel:8
 
@@ -326,19 +326,8 @@ check_openeuler() {
             log_info "openEuler repo already configured, skipping add-repo."
         fi
 
-        log_info "Installing gcc-c++, vim-enhanced, ffmpeg-devel, libvpx, and libvpx-devel..."
-        run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel
-
-        # usb_cam is not available as a system package on openEuler,
-        # so we initialize the submodule to build from source.
-        if [[ ! -d "${WORKSPACE}/src/usb_cam/.git" ]]; then
-            log_info "usb_cam package not available on openEuler, initializing submodule for source build..."
-            export GIT_LFS_SKIP_SMUDGE=1
-            git submodule update --init --recursive src/usb_cam
-            log_done "usb_cam submodule initialized (source build for openEuler)"
-        else
-            log_info "usb_cam submodule already initialized."
-        fi
+        log_info "Installing gcc-c++, vim-enhanced, ffmpeg-devel, libvpx, libvpx-devel, and nlohmann-json-devel..."
+        run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel
     fi
 }
 
@@ -456,23 +445,45 @@ install_system_deps() {
         run_sudo apt-get update -qq
 
         log_info "Updating rosdepc database..."
-        rosdepc update --rosdistro=humble
+        if ! rosdepc update --rosdistro=humble; then
+            log_error "rosdepc update failed. This is usually due to network issues."
+            log_error "Please check your network connection and re-run ./scripts/setup.sh"
+            exit 1
+        fi
 
         log_info "Installing ROS dependencies via apt..."
-        rosdepc install \
+        if ! rosdepc install \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
             -y -r \
-            --skip-keys "catkin roscpp lerobot trimesh[easy] simple-parsing cupy-cuda12x ctl_system_interface numpy_lessthan_2 ament_python feetech-servo-sdk pyserial"
+            --skip-keys=catkin \
+            --skip-keys=roscpp \
+            --skip-keys=lerobot \
+            --skip-keys=trimesh\[easy\] \
+            --skip-keys=simple-parsing \
+            --skip-keys=cupy-cuda12x \
+            --skip-keys=ctl_system_interface \
+            --skip-keys=numpy_lessthan_2 \
+            --skip-keys=ament_python \
+            --skip-keys=feetech-servo-sdk \
+            --skip-keys=pyserial; then
+            log_error "rosdepc install failed."
+            log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
+            exit 1
+        fi
     elif command -v dnf &> /dev/null; then
         log_info "Updating dnf package repositories..."
 
         log_info "Updating rosdepc database..."
-        rosdepc update --rosdistro=humble
+        if ! rosdepc update --rosdistro=humble; then
+            log_error "rosdepc update failed. This is usually due to network issues."
+            log_error "Please check your network connection and re-run ./scripts/setup.sh"
+            exit 1
+        fi
 
         log_info "Installing ROS dependencies via dnf..."
-        rosdepc install \
+        if ! rosdepc install \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -487,8 +498,11 @@ install_system_deps() {
             --skip-keys=numpy_lessthan_2 \
             --skip-keys=ament_python \
             --skip-keys=feetech-servo-sdk \
-            --skip-keys=pyserial \
-            --skip-keys=usb_cam
+            --skip-keys=pyserial; then
+            log_error "rosdepc install failed."
+            log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
+            exit 1
+        fi
     else
         log_warn "Unknown package manager. Please ensure ROS 2 Humble dependencies are installed manually."
     fi
