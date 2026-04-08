@@ -11,7 +11,9 @@ This will be fixed in T3.
 import os
 from pathlib import Path
 
-from launch.actions import IncludeLaunchDescription, SetEnvironmentVariable, TimerAction
+from launch.actions import EmitEvent, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
@@ -19,6 +21,23 @@ from launch_ros.substitutions import FindPackageShare
 
 from robot_config.utils import resolve_ros_path, parse_bool
 from .base_adapter import SimBackendAdapter
+
+
+def _start_actions_on_success(start_actions, success_message: str, failure_reason: str):
+    """Run launch actions only when the target process exits successfully."""
+
+    def _handler(event, _context):
+        if event.returncode == 0:
+            print(f"[robot_config] {success_message}")
+            return start_actions
+
+        print(
+            f"[robot_config] ERROR: {failure_reason} "
+            f"(returncode={event.returncode})"
+        )
+        return [EmitEvent(event=Shutdown(reason=failure_reason))]
+
+    return _handler
 
 
 class GazeboAdapter(SimBackendAdapter):
@@ -197,23 +216,36 @@ class GazeboAdapter(SimBackendAdapter):
             launch_arguments={'gz_args': gz_args}.items(),
         )
 
-        # Spawn order: start Gazebo first, then bridges, then delayed create.
-        # Previously create ran before gz_sim in the action list; all processes still
-        # start in parallel, so the entity could be requested before the world is
-        # ready (intermittent empty world / missing arm). A short launch-side
-        # delay lets gz load the world before ros_gz_sim create injects the model.
-        spawn_delay_s = float(robot_config.get("gazebo_spawn_delay_sec", 4.0))
-        print(
-            f"[robot_config] Gazebo spawn: gz first, then spawn after {spawn_delay_s}s "
-            "(override with robot.gazebo_spawn_delay_sec in YAML)"
+        clock_ready_waiter = Node(
+            package="robot_config",
+            executable="wait_for_clock",
+            name="wait_for_gazebo_clock",
+            arguments=[
+                "--topic",
+                "/clock",
+                "--timeout",
+                "60.0",
+            ],
+            output="screen",
         )
+        print("[robot_config] Gazebo spawn: waiting for /clock before creating robot entity")
         print(f"[robot_config] ros_gz_sim create argv: {create_args}")
 
         actions.extend([
             gazebo_launch,
             clock_bridge,
             joint_state_bridge,
-            TimerAction(period=spawn_delay_s, actions=[create_entity]),
+            clock_ready_waiter,
+            RegisterEventHandler(
+                event_handler=OnProcessExit(
+                    target_action=clock_ready_waiter,
+                    on_exit=_start_actions_on_success(
+                        [create_entity],
+                        success_message="Gazebo clock detected; creating robot entity.",
+                        failure_reason="Gazebo clock probe failed before robot spawn.",
+                    ),
+                )
+            ),
         ])
 
         # Store model name for use by spawn_peripheral_bridges()

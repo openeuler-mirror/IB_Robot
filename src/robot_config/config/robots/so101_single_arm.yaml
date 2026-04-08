@@ -8,8 +8,7 @@ robot:
   robot_type: so_101  # For LeRobot dataset metadata
   # Gazebo：须与 config/worlds 里 <world name="..."> 一致；create 不传 -world 时会随机取 worlds 列表第一个
   gazebo_world_name: demo
-  # 在 gz 加载世界后再 spawn URDF，避免竞态（可按机器调大，如 6.0）
-  gazebo_spawn_delay_sec: 5.0
+  # Gazebo 实体创建现在基于 /clock ready 判定，不再依赖固定启动延时。
 
   # Gazebo 窗口灰屏、实体树空但 /joint_states 正常时，日志常见：
   #   libEGL warning: egl: failed to create dri2 screen
@@ -57,6 +56,9 @@ robot:
 
   # Control mode management
   default_control_mode: "model_inference"
+  controller_startup_timeout:
+    sim: 120.0
+    hardware: 30.0
 
   control_modes:
     # Human teleoperation mode (direct control via leader arm/gamepad)

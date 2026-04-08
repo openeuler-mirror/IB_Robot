@@ -33,28 +33,31 @@ def generate_controller_spawners(controller_names, use_sim=True, controller_mana
     """
     is_sim = parse_bool(use_sim, default=True)
 
-    nodes = []
+    if not controller_names:
+        return []
+
     timeout = 60 if is_sim else 10
+    switch_timeout = 30 if is_sim else 5
 
-    for controller_name in controller_names:
-        nodes.append(Node(
-            package="controller_manager",
-            executable="spawner",
-            name=f"spawner_{controller_name}",
-            parameters=[
-                {"use_sim_time": is_sim}
-            ],
-            arguments=[
-                controller_name,
-                "--controller-manager",
-                f"/{controller_manager_name}",
-                "--controller-manager-timeout",
-                str(timeout),
-            ],
-            output="screen",
-        ))
-
-    return nodes
+    return [Node(
+        package="controller_manager",
+        executable="spawner",
+        name=f"spawner_{controller_names[0]}_group",
+        parameters=[
+            {"use_sim_time": is_sim}
+        ],
+        arguments=[
+            *controller_names,
+            "--controller-manager",
+            controller_manager_name,
+            "--controller-manager-timeout",
+            str(timeout),
+            "--switch-timeout",
+            str(switch_timeout),
+            "--activate-as-group",
+        ],
+        output="screen",
+    )]
 
 
 def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='true'):
@@ -66,7 +69,7 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
         auto_start_controllers: Whether to automatically start controllers (string or bool)
 
     Returns:
-        Tuple: (nodes, spawners_dict, deferred_sim_spawners, robot_description)
+        Tuple: (nodes, controller_names, deferred_sim_spawners, robot_description)
         In Gazebo simulation, controller spawners are returned in
         ``deferred_sim_spawners`` (not included in ``nodes``) so launch can
         start them after ``ros_gz_sim create`` exits.
@@ -75,13 +78,12 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
     is_auto_start = parse_bool(auto_start_controllers, default=True)
 
     nodes = []
-    spawners_dict = {}
     deferred_sim_spawners = []
     ros2_control_config = robot_config.get("ros2_control")
 
     if not ros2_control_config:
         print("[robot_config] No ros2_control configuration found")
-        return nodes, spawners_dict, deferred_sim_spawners, {}
+        return nodes, [], deferred_sim_spawners, {}
 
     print("[robot_config] Creating ros2_control nodes")
 
@@ -116,7 +118,7 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
     # Build URDF (xacro processing + camera injection) via description layer
     _desc_result = generate_robot_description(robot_config, use_sim)
     if _desc_result is None:
-        return nodes, spawners_dict, deferred_sim_spawners, {}
+        return nodes, [], deferred_sim_spawners, {}
 
     robot_description_str, robot_description = _desc_result
 
@@ -195,10 +197,6 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
             if is_auto_start and controller_names:
                 spawners = generate_controller_spawners(controller_names, use_sim=False)
                 nodes.extend(spawners)
-                # Store spawners in dict
-                for i, name in enumerate(controller_names):
-                    if i < len(spawners):
-                        spawners_dict[name] = spawners[i]
     else:
         # Simulation mode
         # gz_ros2_control plugin provides controller_manager, but spawners
@@ -210,9 +208,5 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
         if is_auto_start and controller_names:
             deferred_sim_spawners = generate_controller_spawners(controller_names, use_sim=True)
             print(f"[robot_config] Deferring {len(deferred_sim_spawners)} controller spawners by (handled by caller)")
-            # Store spawners in dict (for downstream sequencing, e.g. MoveIt)
-            for i, name in enumerate(controller_names):
-                if i < len(deferred_sim_spawners):
-                    spawners_dict[name] = deferred_sim_spawners[i]
 
-    return nodes, spawners_dict, deferred_sim_spawners, robot_description
+    return nodes, controller_names, deferred_sim_spawners, robot_description
