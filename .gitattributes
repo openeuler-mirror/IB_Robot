@@ -1,0 +1,1 @@
+src/lekiwi_description/meshes/*.stl filter=lfs diff=lfs merge=lfs -text
