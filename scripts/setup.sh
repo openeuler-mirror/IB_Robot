@@ -332,6 +332,11 @@ check_openeuler() {
 }
 
 ensure_rosdepc() {
+    # 1. Ensure user's local bin is in PATH for pip installed tools
+    if [[ -d "${HOME}/.local/bin" && ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
+        export PATH="${HOME}/.local/bin:${PATH}"
+    fi
+
     if ! command -v rosdepc &> /dev/null; then
         log_warn "rosdepc not found. Installing rosdepc (rosdep with Chinese mirror support)..."
         if command -v pip3 &> /dev/null; then
@@ -342,14 +347,29 @@ ensure_rosdepc() {
             log_error "pip/pip3 not found. Cannot install rosdepc automatically."
             exit 1
         fi
+        
+        # Refresh bash hash so command -v finds the newly installed binary
+        hash -r
+    fi
+
+    if ! command -v rosdepc &> /dev/null; then
+        log_error "rosdepc was installed but cannot be found in PATH. Please check your python environment."
+        exit 1
     fi
 
     # Init if sources list doesn't exist yet
     if [[ ! -d /etc/ros/rosdep/sources.list.d ]]; then
         log_info "Initializing rosdepc..."
-        local init_output
-        init_output=$(run_sudo rosdepc init 2>&1)
-        local init_exit=$?
+        
+        # Pre-authenticate sudo so password prompt is visible
+        if [[ "${USE_SUDO}" == true ]]; then
+            sudo -v
+        fi
+
+        local init_output=""
+        local init_exit=0
+        
+        init_output=$(run_sudo -E env PATH="${PATH}" "$(command -v rosdepc)" init 2>&1) || init_exit=$?
 
         # Check both exit code and output for SSL/network errors
         if [[ ${init_exit} -ne 0 ]] || echo "${init_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
