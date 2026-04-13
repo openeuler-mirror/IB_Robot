@@ -59,6 +59,12 @@ def resolve_device(device: str = "auto") -> torch.device:
             return torch.device("cuda")
         if mps_available():
             return torch.device("mps")
+        try:
+            import torch_npu
+            if torch_npu.npu.is_available():
+                return torch.device("npu:0")
+        except ImportError:
+            pass
         return torch.device("cpu")
     
     if r.startswith("cuda"):
