@@ -16,7 +16,7 @@ from typing import List, Dict, Optional
 from datetime import datetime
 
 
-from atomgit_sdk import AtomGitClient, AtomGitConfig
+from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 
 
 def load_config(config_path: str = "config.json") -> dict:
@@ -55,6 +55,7 @@ def mode_fetch_info(args, api: AtomGitClient):
         pr = api.get_pull_request(args.pr)
         commits = api.get_pr_commits(args.pr)
         files = api.get_pr_files(args.pr)
+        comments = [] if args.no_comments else api.get_pr_comments(args.pr)
         
         # 统计信息
         additions = sum(f.get("additions", 0) for f in files)
@@ -71,7 +72,8 @@ def mode_fetch_info(args, api: AtomGitClient):
                 "stats": {
                     "files_changed": len(files),
                     "additions": additions,
-                    "deletions": deletions
+                    "deletions": deletions,
+                    "comments": len(comments),
                 }
             },
             "commits": [
@@ -89,7 +91,8 @@ def mode_fetch_info(args, api: AtomGitClient):
                     "deletions": f.get("deletions", 0),
                     "patch": f.get("patch", "")  # 关键：包含代码 Diff
                 } for f in files
-            ]
+            ],
+            "comments": comments,
         }
 
         # 保存为 Agent 可读的 JSON
@@ -97,13 +100,16 @@ def mode_fetch_info(args, api: AtomGitClient):
         output_dir.mkdir(parents=True, exist_ok=True)
         
         repo_name = api.config.repo.lower().replace("-", "_")
-        output_file = output_dir / f"pr_{args.pr}_context.json"
+        output_file = output_dir / f"{repo_name}_pr_{args.pr}_context.json"
         
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(pr_context, f, indent=2, ensure_ascii=False)
 
         print(f"\n✅ 上下文已准备就绪: {output_file}")
-        print(f"📊 统计: {len(commits)} 提交, {len(files)} 文件修改, +{additions}/-{deletions}")
+        print(
+            f"📊 统计: {len(commits)} 提交, {len(files)} 文件修改, +{additions}/-{deletions}, "
+            f"{len(comments)} 评论"
+        )
         print("\n💡 Agent 指令:")
         print(f"  请分析该 JSON 中的 patch 字段，总结变更背后的逻辑，然后调用:")
         print(f"  --update-pr <description_json>")
@@ -158,8 +164,7 @@ def mode_update_pr(args, api: AtomGitClient):
 def main():
     parser = argparse.ArgumentParser(description="AtomGit PR 管理工具 (Agent 驱动)")
 
-    # 必需参数
-    parser.add_argument("--pr", type=int, required=True, help="PR 编号")
+    parser.add_argument("--pr", type=int, help="PR 编号，可由 --url 自动解析")
 
     # 模式选择 (互斥)
     mode_group = parser.add_mutually_exclusive_group(required=True)
@@ -180,11 +185,23 @@ def main():
         default="config.json",
         help="配置文件路径 (默认: config.json)",
     )
+    parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
+    parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
+    parser.add_argument(
+        "--url",
+        type=str,
+        help="PR 链接，用于自动解析 owner/repo/PR 编号",
+    )
     parser.add_argument(
         "--output-dir",
         type=str,
         default="./tmp",
         help="上下文输出目录 (默认: ./tmp)",
+    )
+    parser.add_argument(
+        "--no-comments",
+        action="store_true",
+        help="在 --fetch-info 模式下跳过抓取 PR 评论",
     )
     parser.add_argument(
         "--ai-model", type=str, default="agent", help="AI 模型签名 (默认: agent)"
@@ -193,15 +210,24 @@ def main():
 
     args = parser.parse_args()
 
-    # 加载配置
     try:
-        load_config(args.config)
+        sdk_config, parsed_url = resolve_atomgit_context(
+            args.config, owner=args.owner, repo=args.repo, url=args.url
+        )
     except Exception as e:
         print(f"\n❌ 配置错误: {e}")
         sys.exit(1)
 
-    # 创建 API 实例
-    api = AtomGitClient(AtomGitConfig.from_json(args.config))
+    if args.pr is None:
+        args.pr = parsed_url.get("pr_number")
+    if args.pr is None:
+        print("\n❌ 缺少 PR 编号。请通过 --pr 指定，或传入包含 PR 编号的 --url。")
+        sys.exit(1)
+
+    api = AtomGitClient(sdk_config)
+    print(f"\n🏠 仓库: {sdk_config.owner}/{sdk_config.repo}")
+    if args.url:
+        print(f"🔗 链接: {args.url}")
 
     # 执行模式
     if args.fetch_info:

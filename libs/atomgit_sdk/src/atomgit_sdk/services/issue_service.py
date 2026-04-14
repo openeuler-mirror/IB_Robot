@@ -20,6 +20,10 @@ class IssueService:
         """Get issue details"""
         return self.client.get_issue(issue_number)
 
+    def get_issue_comments(self, issue_number: int) -> List[dict]:
+        """Get issue comments"""
+        return self.client.get_issue_comments(issue_number)
+
     def create_issue(
         self,
         title: str,

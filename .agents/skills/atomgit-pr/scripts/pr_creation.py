@@ -15,11 +15,7 @@ import argparse
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Optional
-from urllib.parse import quote as url_quote
-
-
-
-from atomgit_sdk import AtomGitClient, AtomGitConfig
+from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 
 
 
@@ -150,8 +146,13 @@ def main():
     parser.add_argument("--title", type=str, help="PR 标题")
     parser.add_argument("--body", type=str, help="PR 描述文本")
     parser.add_argument("--description-file", type=str, help="从文件读取 PR 描述 (Markdown 格式)")
+    parser.add_argument("--config", type=str, default="config.json", help="配置文件路径")
+    parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
+    parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
     parser.add_argument(
-        "--config", type=str, default="config.json", help="配置文件路径"
+        "--url",
+        type=str,
+        help="AtomGit/GitCode 仓库或 PR 链接，用于自动解析 owner/repo",
     )
     parser.add_argument(
         "--fork-owner",
@@ -171,7 +172,9 @@ def main():
     args = parser.parse_args()
 
     try:
-        config = load_config(args.config)
+        sdk_config, parsed_url = resolve_atomgit_context(
+            args.config, owner=args.owner, repo=args.repo, url=args.url
+        )
     except Exception as e:
         print(f"❌ 加载配置失败: {e}")
         sys.exit(1)
@@ -191,8 +194,14 @@ def main():
     print("=" * 60)
     print(f"源分支: {branch}")
     print(f"目标分支: {args.base}")
-    print(f"目标仓库: {config['atomgit']['owner']}/{config['atomgit']['repo']}")
+    print(f"目标仓库: {sdk_config.owner}/{sdk_config.repo}")
     print(f"Fork owner: {args.fork_owner}")
+    if args.url:
+        print(f"解析链接: {args.url}")
+        if parsed_url.get("pr_number") is not None:
+            print("ℹ️  已忽略链接中的 PR 编号，仅使用其中的仓库信息创建 PR")
+        if parsed_url.get("issue_number") is not None:
+            print("ℹ️  已忽略链接中的 Issue 编号，仅使用其中的仓库信息创建 PR")
     print()
 
     print(">>> 获取提交信息...")
@@ -261,7 +270,7 @@ def main():
 
     if answer in ("y", "yes"):
         print(">>> 创建 PR...")
-        api = AtomGitClient(AtomGitConfig.from_json(args.config))
+        api = AtomGitClient(sdk_config)
 
         pr_head = f"{args.fork_owner}:{branch}"
 

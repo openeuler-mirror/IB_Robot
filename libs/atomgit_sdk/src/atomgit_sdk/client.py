@@ -14,7 +14,7 @@ class AtomGitClient:
     """AtomGit API Client"""
 
     def __init__(
-        self, config: AtomGitConfig, user_agent: str = "IB-Robot-AtomGit-SDK/1.0"
+        self, config: AtomGitConfig, user_agent: str = "AtomGit-SDK/1.0"
     ):
         self.config = config
         self.session = requests.Session()
@@ -279,6 +279,13 @@ class AtomGitClient:
         return self.request(
             "GET",
             f"/api/v5/repos/{self.config.owner}/{self.config.repo}/issues/{issue_number}",
+        )
+
+    def get_issue_comments(self, issue_number: int) -> List[dict]:
+        """Get issue comments"""
+        return self.request(
+            "GET",
+            f"/api/v5/repos/{self.config.owner}/{self.config.repo}/issues/{issue_number}/comments",
         )
 
     def create_issue(

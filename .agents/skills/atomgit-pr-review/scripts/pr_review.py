@@ -14,7 +14,7 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from atomgit_sdk import AtomGitClient, AtomGitConfig, CodeIssue
+from atomgit_sdk import AtomGitClient, CodeIssue, resolve_atomgit_context
 from atomgit_sdk.utils import calculate_diff_position, add_line_numbers
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
@@ -303,7 +303,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("--pr", type=int, required=True, help="PR 编号")
+    parser.add_argument("--pr", type=int, help="PR 编号，可由 --url 自动解析")
 
     mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument(
@@ -323,6 +323,11 @@ def main():
 
     parser.add_argument(
         "--config", type=str, default="config.json", help="配置文件路径"
+    )
+    parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
+    parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
+    parser.add_argument(
+        "--url", type=str, help="PR 链接，用于自动解析 owner/repo/PR 编号"
     )
     parser.add_argument(
         "--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)"
@@ -373,7 +378,20 @@ def main():
         print(f"\n❌ 加载配置失败: {e}")
         sys.exit(1)
 
-    sdk_config = AtomGitConfig.from_json(args.config)
+    try:
+        sdk_config, parsed_url = resolve_atomgit_context(
+            args.config, owner=args.owner, repo=args.repo, url=args.url
+        )
+    except Exception as e:
+        print(f"\n❌ 解析仓库上下文失败: {e}")
+        sys.exit(1)
+
+    if args.pr is None:
+        args.pr = parsed_url.get("pr_number")
+    if args.pr is None:
+        print("\n❌ 缺少 PR 编号。请通过 --pr 指定，或传入包含 PR 编号的 --url。")
+        sys.exit(1)
+
     client = AtomGitClient(sdk_config)
     formatter = CommentFormatter(
         confidence_threshold=args.threshold, ai_model=args.ai_model
@@ -382,6 +400,8 @@ def main():
 
     print(f"\n📋 PR: #{args.pr}")
     print(f"🏠 仓库: {client.config.owner}/{client.config.repo}")
+    if args.url:
+        print(f"🔗 链接: {args.url}")
     print(f"🤖 AI模型: {args.ai_model}")
 
     if args.auto:

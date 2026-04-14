@@ -55,7 +55,6 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
 **PR 描述强制要求：**
 
 1.  **Markdown 渲染质量**: **必须**确保所有的 Markdown 语法（包括标题、加粗、列表、代码块、Mermaid 图表）都能被正确渲染。避免直接在 shell 命令中使用未处理的换行符。
-    *   **Mermaid 语法约束**: Mermaid 节点文本里如果包含 `()`、`&` 等特殊字符，**必须用引号包裹节点文本**，否则极易产生语法错误。例如使用 `A[\"Build & Verify (ROS 2)\"]`，不要直接写成 `A[Build & Verify (ROS 2)]`。
 2.  **超链接使用**: 对相关的 Issue、PR、技术规范或设计文档，**必须**使用 Markdown 超链接进行关联（如 `[PR #32](https://atomgit.com/openeuler/IB_Robot/pull/32)`），以方便审阅者查阅背景。
 3.  **深度结构化内容**:
     *   **Background & Motivation (背景与动机)**: 详细说明问题的根源、业务痛点或功能需求。

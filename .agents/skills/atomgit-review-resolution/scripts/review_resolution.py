@@ -18,8 +18,8 @@ from datetime import datetime
 
 
 
-from atomgit_sdk import AtomGitClient, AtomGitConfig
-from atomgit_sdk.services import RepairService, FixResult
+from atomgit_sdk import AtomGitClient, resolve_atomgit_context
+from atomgit_sdk.services import RepairService
 
 
 def load_config(config_path: str) -> dict:
@@ -192,7 +192,7 @@ def mode_fetch_comments(args, api: RepairService):
 
     # 从 API 配置获取仓库名称
     repo_name = api.config.repo.lower().replace("-", "_")
-    output_file = output_dir / f"{repo_name}_pr_{args.pr}_comments.json"
+    output_file = output_dir / f"{repo_name}_pr_{args.pr}_unresolved_comments.json"
 
     output_data = {
         "pr_number": args.pr,
@@ -466,7 +466,7 @@ def main():
     )
 
     # 必需参数
-    parser.add_argument("--pr", type=int, required=True, help="PR 编号")
+    parser.add_argument("--pr", type=int, help="PR 编号，可由 --url 自动解析")
 
     # 模式选择（互斥）
     mode_group = parser.add_mutually_exclusive_group(required=False)
@@ -489,6 +489,11 @@ def main():
         type=str,
         default="config.json",
         help="配置文件路径 (默认: config.json)",
+    )
+    parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
+    parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
+    parser.add_argument(
+        "--url", type=str, help="PR 链接，用于自动解析 owner/repo/PR 编号"
     )
     parser.add_argument(
         "--work-dir", type=str, default=".", help="工作目录 (默认: 当前目录)"
@@ -546,12 +551,27 @@ def main():
         print(f"\n❌ 加载配置失败: {e}")
         sys.exit(1)
 
-    # 创建 API 实例
-    api = AtomGitClient(AtomGitConfig.from_json(args.config))
+    try:
+        sdk_config, parsed_url = resolve_atomgit_context(
+            args.config, owner=args.owner, repo=args.repo, url=args.url
+        )
+    except Exception as e:
+        print(f"\n❌ 解析仓库上下文失败: {e}")
+        sys.exit(1)
+
+    if args.pr is None:
+        args.pr = parsed_url.get("pr_number")
+    if args.pr is None:
+        print("\n❌ 缺少 PR 编号。请通过 --pr 指定，或传入包含 PR 编号的 --url。")
+        sys.exit(1)
+
+    api = AtomGitClient(sdk_config)
     repair_service = RepairService(api)
 
     print(f"\n📋 PR: #{args.pr}")
     print(f"🏠 仓库: {api.config.owner}/{api.config.repo}")
+    if args.url:
+        print(f"🔗 链接: {args.url}")
     print(f"🤖 AI模型: {args.ai_model}")
 
     if args.auto:

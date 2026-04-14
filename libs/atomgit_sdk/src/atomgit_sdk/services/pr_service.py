@@ -34,6 +34,10 @@ class PRService:
         """Get PR diff"""
         return self.client.get_pr_diff(pr_number)
 
+    def get_pr_comments(self, pr_number: int) -> List[dict]:
+        """Get PR comments"""
+        return self.client.get_pr_comments(pr_number)
+
     def get_full_pr_context(self, pr_number: int) -> dict:
         """
         Get full PR context including details, files, commits, and diffs.
@@ -45,12 +49,14 @@ class PRService:
         files = self.get_pr_files(pr_number)
         commits = self.get_pr_commits(pr_number)
         diffs = self.get_pr_diff(pr_number)
+        comments = self.get_pr_comments(pr_number)
 
         return {
             "pr": pr,
             "files": files,
             "commits": commits,
             "diffs": diffs,
+            "comments": comments,
         }
 
     def extract_pr_info(self, pr_number: int) -> dict:

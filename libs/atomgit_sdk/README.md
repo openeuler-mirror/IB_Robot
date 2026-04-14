@@ -1,6 +1,6 @@
 # AtomGit SDK
 
-统一的 AtomGit API 封装 SDK，为 IB_Robot 项目提供 AtomGit/GitCode API 调用能力。
+统一的 AtomGit API 封装 SDK，可用于 AtomGit / GitCode 上的 PR、Issue、Review 与评论修复流程。
 
 ## 特性
 
@@ -12,12 +12,7 @@
 
 ## 安装
 
-SDK 已集成到 IB_Robot 项目的 PYTHONPATH 中，无需单独安装。
-
-确保已加载环境：
-```bash
-source .shrc_local
-```
+如果 SDK 以源码方式集成在仓库中，请将 `libs/atomgit_sdk/src` 加入 `PYTHONPATH`。未来若单独发布，也可直接按包方式安装。
 
 ## 快速开始
 
@@ -91,7 +86,7 @@ libs/atomgit_sdk/
 
 ## 配置
 
-在项目根目录的 `config.json` 中配置：
+在你的 `config.json` 中配置：
 
 ```json
 {
@@ -151,4 +146,4 @@ pytest tests/
 
 ## 许可证
 
-IB_Robot 项目内部使用。
+许可证遵循分发此 SDK 的仓库配置。

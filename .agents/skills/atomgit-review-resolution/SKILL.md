@@ -47,6 +47,9 @@ python3 review_resolution.py --pr 123
 # 直接从链接解析目标 PR
 python3 review_resolution.py --url https://atomgit.com/some-org/some-repo/pull/123
 
+# 直接从链接解析目标 PR
+python3 repair_pr.py --url https://atomgit.com/some-org/some-repo/pull/123
+
 # 步骤2: 你分析评论并生成修复方案
 
 # 步骤3: 人类确认修复方案

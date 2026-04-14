@@ -5,9 +5,10 @@ AtomGit SDK Configuration Management
 import json
 import os
 import re
-from typing import Optional
+from typing import Dict, Optional, Tuple, Union
 from pydantic import BaseModel, Field
 from atomgit_sdk.exceptions import ConfigurationError
+from atomgit_sdk.utils.url import parse_atomgit_url
 
 
 def _expand_env_var(value: str) -> str:
@@ -46,8 +47,29 @@ class AtomGitConfig(BaseModel):
     class Config:
         frozen = True
 
+    def with_overrides(
+        self,
+        owner: Optional[str] = None,
+        repo: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> "AtomGitConfig":
+        """Return a new config with selected fields overridden."""
+        return type(self)(
+            token=self.token,
+            owner=owner or self.owner,
+            repo=repo or self.repo,
+            base_url=base_url or self.base_url,
+        )
+
     @classmethod
-    def from_json(cls, config_path: str = "config.json") -> "AtomGitConfig":
+    def from_json(
+        cls,
+        config_path: str = "config.json",
+        owner: Optional[str] = None,
+        repo: Optional[str] = None,
+        url: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ) -> "AtomGitConfig":
         """
         Load configuration from JSON file.
 
@@ -69,18 +91,19 @@ class AtomGitConfig(BaseModel):
             raise ConfigurationError(f"Invalid JSON in configuration file: {e}")
 
         atomgit_section = config.get("atomgit", {})
+        parsed_url = parse_atomgit_url(url) if url else {}
 
         token = atomgit_section.get("token")
-        owner = atomgit_section.get("owner")
-        repo = atomgit_section.get("repo")
+        resolved_owner = owner or parsed_url.get("owner") or atomgit_section.get("owner")
+        resolved_repo = repo or parsed_url.get("repo") or atomgit_section.get("repo")
 
-        if not all([token, owner, repo]):
+        if not all([token, resolved_owner, resolved_repo]):
             missing = []
             if not token:
                 missing.append("token")
-            if not owner:
+            if not resolved_owner:
                 missing.append("owner")
-            if not repo:
+            if not resolved_repo:
                 missing.append("repo")
             raise ConfigurationError(
                 f"Missing required configuration fields: {', '.join(missing)}"
@@ -90,7 +113,26 @@ class AtomGitConfig(BaseModel):
 
         return cls(
             token=token,
-            owner=owner,
-            repo=repo,
-            base_url=atomgit_section.get("baseUrl", "https://api.atomgit.com"),
+            owner=resolved_owner,
+            repo=resolved_repo,
+            base_url=base_url
+            or atomgit_section.get("baseUrl", "https://api.atomgit.com"),
         )
+
+
+def resolve_atomgit_context(
+    config_path: str = "config.json",
+    owner: Optional[str] = None,
+    repo: Optional[str] = None,
+    url: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Tuple[AtomGitConfig, Dict[str, Union[str, int]]]:
+    """Resolve effective AtomGit config plus parsed URL metadata."""
+    parsed_url = parse_atomgit_url(url) if url else {}
+    config = AtomGitConfig.from_json(
+        config_path,
+        owner=owner or parsed_url.get("owner"),
+        repo=repo or parsed_url.get("repo"),
+        base_url=base_url,
+    )
+    return config, parsed_url

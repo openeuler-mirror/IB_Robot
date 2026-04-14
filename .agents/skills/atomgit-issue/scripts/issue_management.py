@@ -15,7 +15,7 @@ sdk_path = Path(__file__).parents[4] / "libs" / "atomgit_sdk" / "src"
 sys.path.append(str(sdk_path))
 
 try:
-    from atomgit_sdk import AtomGitConfig, AtomGitClient, IssueService
+    from atomgit_sdk import AtomGitClient, IssueService, resolve_atomgit_context
 except ImportError:
     print("Error: AtomGit SDK not found. Please run 'source .shrc_local' first.")
     sys.exit(1)
@@ -32,7 +32,15 @@ def parse_args():
     parser.add_argument("--issue", type=int, help="Issue number for update or fetch")
     parser.add_argument("--state", choices=["open", "closed"], help="Issue state for update")
     parser.add_argument("--fetch-info", action="store_true", help="Fetch issue info to JSON")
+    parser.add_argument(
+        "--no-comments",
+        action="store_true",
+        help="Skip fetching issue comments in --fetch-info mode",
+    )
     parser.add_argument("--config", default="config.json", help="Path to config.json")
+    parser.add_argument("--owner", help="Target repository owner override")
+    parser.add_argument("--repo", help="Target repository name override")
+    parser.add_argument("--url", help="Issue or repository URL for auto-resolving owner/repo/issue")
     parser.add_argument("--output-dir", default="tmp", help="Output directory for JSON")
     parser.add_argument("--dry-run", action="store_true", help="Preview action without executing")
 
@@ -44,13 +52,21 @@ def main():
 
     # Load configuration
     try:
-        # Use from_json to load from config.json which supports env expansion
-        config = AtomGitConfig.from_json(args.config)
+        config, parsed_url = resolve_atomgit_context(
+            args.config, owner=args.owner, repo=args.repo, url=args.url
+        )
         client = AtomGitClient(config)
         service = IssueService(client)
     except Exception as e:
         print(f"Error initializing AtomGit SDK: {e}")
         sys.exit(1)
+
+    if args.issue is None:
+        args.issue = parsed_url.get("issue_number")
+
+    print(f"Target repo: {config.owner}/{config.repo}")
+    if args.url:
+        print(f"Resolved from URL: {args.url}")
 
     # 1. Fetch info mode
     if args.fetch_info:
@@ -61,15 +77,22 @@ def main():
         print(f"Fetching info for issue #{args.issue}...")
         try:
             issue_data = service.get_issue(args.issue)
+            if not args.no_comments:
+                issue_data["comments_detail"] = service.get_issue_comments(args.issue)
             
             output_dir = Path(args.output_dir)
             output_dir.mkdir(exist_ok=True)
-            output_file = output_dir / f"issue_{args.issue}_context.json"
+            repo_name = config.repo.lower().replace("-", "_")
+            output_file = output_dir / f"{repo_name}_issue_{args.issue}_context.json"
             
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(issue_data, f, indent=2, ensure_ascii=False)
             
             print(f"Successfully saved issue info to {output_file}")
+            if not args.no_comments:
+                print(
+                    f"Included {len(issue_data.get('comments_detail', []))} issue comments"
+                )
             return
         except Exception as e:
             print(f"Error fetching issue info: {e}")

@@ -4,13 +4,15 @@ Test RepairService reply_to_comment functionality
 """
 
 import pytest
-from unittest.mock import Mock,from atomgit_sdk.services import RepairService
+from unittest.mock import Mock
+
+from atomgit_sdk.services import RepairService
 
 
 class TestRepairService:
     """Test suite for RepairService"""
     
-    def setup(self):
+    def setup_method(self):
         """Setup test fixtures"""
         self.mock_client = Mock()
         self.mock_client.config = Mock()
@@ -33,13 +35,19 @@ class TestRepairService:
         self.mock_client.request.return_value = expected_response
         
         result = self.service.reply_to_comment(1, 123, "Test reply")
+        assert result == expected_response
         
         # Verify correct API call
-        call_args = self.mock_client.request.call_args
-        assert call_args[0]["in_reply_to"] == 123
-        assert call_args[0]["discussion_id"] == "abc456"
-        assert "Test reply" in call_args[0]["body"]
-        
+        self.mock_client.request.assert_called_once()
+        args, kwargs = self.mock_client.request.call_args
+        assert args == (
+            "POST",
+            "/api/v5/repos/test_owner/test_repo/pulls/1/comments",
+        )
+        assert kwargs["body"]["in_reply_to"] == 123
+        assert kwargs["body"]["discussion_id"] == "abc456"
+        assert "Test reply" in kwargs["body"]["body"]
+    
     def test_reply_to_comment_without_discussion_id(self):
         """Test reply without discussion_id"""
         original_comment = {
@@ -47,13 +55,20 @@ class TestRepairService:
             "body": "Original comment"
         }
         self.mock_client.get_pr_comments.return_value = [original_comment]
+        self.mock_client.request.return_value = {"id": 789}
         
         result = self.service.reply_to_comment(1, 124, "Test reply")
+        assert result == {"id": 789}
         
         # Verify in_reply_to is set
-        call_args = self.mock_client.request.call_args
-        assert call_args[0]["in_reply_to"] == 124
-        assert "discussion_id" not in call_args[0]
+        self.mock_client.request.assert_called_once()
+        args, kwargs = self.mock_client.request.call_args
+        assert args == (
+            "POST",
+            "/api/v5/repos/test_owner/test_repo/pulls/1/comments",
+        )
+        assert kwargs["body"]["in_reply_to"] == 124
+        assert "discussion_id" not in kwargs["body"]
     
     def test_reply_to_nonexistent_comment(self):
         """Test reply to non-existent comment"""
