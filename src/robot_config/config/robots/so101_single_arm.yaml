@@ -120,7 +120,7 @@ robot:
   # Voice ASR is configured here and injected by robot_config/robot.launch.py.
   # The standalone voice_asr_service launch file is kept only for debugging.
   voice_asr:
-    enabled: true
+    enabled: false
     active_mode: manual
     language: zh
     model_path: "src/voice_asr_service/model/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx"

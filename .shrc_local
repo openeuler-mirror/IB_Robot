@@ -6,32 +6,37 @@ if [ -f "/opt/ros/humble/setup.sh" ]; then
     source /opt/ros/humble/setup.sh
 fi
 
-# 2. 激活虚拟环境
+# 2. 如果当前在 conda 虚拟环境中，先退出
+if [ -n "$CONDA_DEFAULT_ENV" ] && command -v conda &> /dev/null; then
+    conda deactivate
+fi
+
+# 3. 激活虚拟环境
 if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 fi
 
-# 3. 设置 PYTHONPATH
+# 4. 设置 PYTHONPATH
 # 确保优先使用 venv 和 libs 中的源码，使用绝对路径以支持跨目录调用
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
 PYTHON_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 export PYTHONPATH="${WORKSPACE_DIR}/libs/lerobot/src:${WORKSPACE_DIR}/libs/atomgit_sdk/src:${WORKSPACE_DIR}/venv/lib/${PYTHON_VER}/site-packages:${PYTHONPATH}"
 
-# 4. 日志与调试增强
+# 5. 日志与调试增强
 export RCUTILS_COLORIZED_OUTPUT=1
 export PYTHONUNBUFFERED=1
 
-# 5. 加载本地编译后的包 (如果已编译)
+# 6. 加载本地编译后的包 (如果已编译)
 if [ -f "${WORKSPACE_DIR}/install/setup.sh" ]; then
     source "${WORKSPACE_DIR}/install/setup.sh"
 fi
 
-# 6. 别名设置
+# 7. 别名设置
 alias cb='colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='colcon build --symlink-install --packages-select'
 alias src='source install/setup.sh'
 
-# 6. 欢迎信息 (跨 Shell 颜色处理)
+# 8. 欢迎信息 (跨 Shell 颜色处理)
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'

@@ -572,6 +572,14 @@ setup_python_venv() {
     log_info "Installing scipy for mathematical computations..."
     python3 -m pip install scipy --quiet
 
+    # 安装训练可视化依赖
+    log_info "Installing training visualization dependencies (tensorboard)..."
+    python3 -m pip install tensorboard --quiet
+
+    # 安装 ONNX 导出相关依赖
+    log_info "Installing ONNX export dependencies (onnx, onnxsim, onnxruntime)..."
+    python3 -m pip install onnx onnxsim onnxruntime --quiet
+
     # 安装 gitlint 并设置 git hook
     log_info "Installing gitlint..."
     python3 -m pip install gitlint --quiet
