@@ -3,6 +3,7 @@ AtomGit API Client
 """
 
 import base64
+import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote as url_quote
 import requests
@@ -25,6 +26,11 @@ class AtomGitClient:
                 "User-Agent": user_agent,
             }
         )
+
+    @staticmethod
+    def _is_safe_to_retry(method: str) -> bool:
+        """Return whether a request method is safe to retry on transport errors."""
+        return method.upper() in {"GET", "HEAD", "OPTIONS"}
 
     def request(
         self,
@@ -75,6 +81,14 @@ class AtomGitClient:
                 if attempt < retry_count - 1:
                     continue
                 raise AtomGitAPIError(f"Request timeout after {retry_count} attempts")
+            except (
+                requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError,
+            ) as e:
+                if self._is_safe_to_retry(method) and attempt < retry_count - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise AtomGitAPIError(f"Request failed: {str(e)}")
             except requests.exceptions.RequestException as e:
                 raise AtomGitAPIError(f"Request failed: {str(e)}")
 
@@ -288,6 +302,32 @@ class AtomGitClient:
             f"/api/v5/repos/{self.config.owner}/{self.config.repo}/issues/{issue_number}/comments",
         )
 
+    def get_labels(self) -> List[dict]:
+        """Get repository labels"""
+        return self.request(
+            "GET",
+            f"/api/v5/repos/{self.config.owner}/{self.config.repo}/labels",
+        )
+
+    def _validate_labels_exist(self, labels: List[str]) -> None:
+        """Ensure all requested labels already exist in the target repository."""
+        if isinstance(labels, str):
+            requested_labels = [label.strip() for label in labels.split(",") if label.strip()]
+        else:
+            requested_labels = labels
+
+        existing_labels = {
+            label.get("name")
+            for label in self.get_labels()
+            if isinstance(label, dict) and label.get("name")
+        }
+        missing_labels = [label for label in requested_labels if label not in existing_labels]
+        if missing_labels:
+            raise AtomGitAPIError(
+                "Unknown labels for target repository: "
+                + ", ".join(sorted(missing_labels))
+            )
+
     def create_issue(
         self,
         title: str,
@@ -298,6 +338,7 @@ class AtomGitClient:
         """Create issue"""
         payload = {"title": title, "body": body}
         if labels:
+            self._validate_labels_exist(labels)
             payload["labels"] = ",".join(labels) if isinstance(labels, list) else labels
         if assignees:
             payload["assignees"] = (
@@ -328,6 +369,7 @@ class AtomGitClient:
         if state is not None:
             payload["state"] = state
         if labels is not None:
+            self._validate_labels_exist(labels)
             payload["labels"] = ",".join(labels) if isinstance(labels, list) else labels
         if assignees is not None:
             payload["assignees"] = (

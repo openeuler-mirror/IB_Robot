@@ -27,7 +27,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | Skill | 一句话描述 |
 | :--- | :--- |
 | **atomgit-collaboration** | 拦截泛化的 AtomGit 协作请求，并分流到 PR / Issue / review / comment 对应流程 |
-| **atomgit-pr-review** | 对 PR 进行代码质量审查，发现 Bug 与逻辑问题 |
+| **atomgit-pr-review** | 对 PR 进行代码质量审查，并读取已有评论一起判断风险 |
 | **atomgit-pr-architecture-review** | 检查 PR 是否符合 SSOT、契约驱动等架构规范 |
 | **atomgit-review-resolution** | 根据 AtomGit 上的检视意见修复代码、回复评论并闭环 |
 
@@ -52,6 +52,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 ```
 帮我审查 #25 号 PR              → atomgit-pr-review
+帮我看看 PR #25 有没有问题      → atomgit-pr-review
 帮我看看 PR #25                 → atomgit-collaboration
 帮我看看这个 AtomGit PR 链接      → atomgit-collaboration
 帮我更新 PR 描述                → atomgit-pr

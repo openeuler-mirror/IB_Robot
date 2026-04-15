@@ -12,6 +12,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
+from datetime import datetime
 from typing import List, Dict, Optional
 
 from atomgit_sdk import AtomGitClient, CodeIssue, resolve_atomgit_context
@@ -30,11 +31,15 @@ class CodeReviewer:
         self.client = client
         self.formatter = formatter
 
-    def extract_pr_info(self, pr_number: int) -> dict:
-        """提取 PR 信息"""
+    def extract_pr_info(self, pr_number: int, include_comments: bool = True) -> dict:
+        """提取适合 review 场景的完整 PR 上下文"""
         pr = self.client.get_pull_request(pr_number)
         files = self.client.get_pr_files(pr_number)
+        commits = self.client.get_pr_commits(pr_number)
+        comments = [] if not include_comments else self.client.get_pr_comments(pr_number)
         head_sha = pr.get("head", {}).get("sha", "HEAD")
+        additions = sum(f.get("additions", 0) for f in files)
+        deletions = sum(f.get("deletions", 0) for f in files)
 
         changed_files = []
         for f in files:
@@ -55,15 +60,42 @@ class CodeReviewer:
 
                 changed_files.append(file_data)
 
+        inline_comment_count = sum(
+            1 for comment in comments if comment.get("path") or comment.get("diff_file")
+        )
+        unresolved_comment_count = sum(
+            1 for comment in comments if not comment.get("resolved_at")
+        )
+
         return {
+            "fetch_time": datetime.now().isoformat(),
             "pr": {
                 "number": pr.get("number"),
                 "title": pr.get("title"),
                 "author": pr.get("user", {}).get("login"),
+                "state": pr.get("state"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
                 "head_sha": head_sha,
+                "stats": {
+                    "files_changed": len(changed_files),
+                    "commits": len(commits),
+                    "comments": len(comments),
+                    "inline_comments": inline_comment_count,
+                    "unresolved_comments": unresolved_comment_count,
+                    "additions": additions,
+                    "deletions": deletions,
+                },
                 "changed_files": changed_files,
-            }
+            },
+            "commits": [
+                {
+                    "sha": commit.get("sha", ""),
+                    "author": commit.get("commit", {}).get("author", {}).get("name", ""),
+                    "message": commit.get("commit", {}).get("message", ""),
+                }
+                for commit in commits
+            ],
+            "comments": comments,
         }
 
     def load_issues_from_json(self, json_path: str) -> List[CodeIssue]:
@@ -145,7 +177,7 @@ def mode_extract_info(args, reviewer: CodeReviewer):
     print("📥 模式: 提取 PR 信息")
     print("=" * 60)
 
-    pr_info = reviewer.extract_pr_info(args.pr)
+    pr_info = reviewer.extract_pr_info(args.pr, include_comments=not args.no_comments)
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -160,12 +192,16 @@ def mode_extract_info(args, reviewer: CodeReviewer):
     print(f"   标题: {pr_info['pr']['title']}")
     print(f"   作者: {pr_info['pr']['author']}")
     print(f"   分支: {pr_info['pr']['branch']}")
-    print(f"   文件: {len(pr_info['pr']['changed_files'])} 个")
+    print(f"   文件: {pr_info['pr']['stats']['files_changed']} 个")
+    print(f"   提交: {pr_info['pr']['stats']['commits']} 个")
+    print(f"   评论: {pr_info['pr']['stats']['comments']} 条")
+    if not args.no_comments:
+        print(f"   未解决评论: {pr_info['pr']['stats']['unresolved_comments']} 条")
 
     print("\n💡 下一步:")
     print("  AI Agent 应该:")
     print("  1. 读取此文件并进行代码审查")
-    print("  2. 生成 issues.json（包含所有发现的问题和建议修复方案）")
+    print("  2. 结合 changed_files、commits 和 comments 生成 issues.json")
     print("  3. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
     print("  4. 用户确认后，运行提交命令")
     print(
@@ -331,6 +367,11 @@ def main():
     )
     parser.add_argument(
         "--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)"
+    )
+    parser.add_argument(
+        "--no-comments",
+        action="store_true",
+        help="在 --extract-info 模式下跳过抓取现有 PR 评论",
     )
     parser.add_argument("--threshold", type=int, default=80, help="置信度阈值")
     parser.add_argument(

@@ -56,9 +56,9 @@
 > 
 > Token 配置存储在项目根目录的 `config.json` 中，通过环境变量 `$ATOMGIT_TOKEN` 引用。
 
-- **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，覆盖创建、读取上下文、更新描述等全生命周期动作，支持 `--owner` / `--repo` / `--url` 进行跨仓库调用。
+- **PR 工作流 ([atomgit-pr](./atomgit-pr))**: 面向 PR 资源本身，覆盖创建、读取管理上下文、更新描述等全生命周期动作；如果目标是通用 review，应改用 `atomgit-pr-review`。
 - **Issue 工作流 ([atomgit-issue](./atomgit-issue))**: 面向 Issue 资源本身，覆盖创建、读取、更新与状态流转，支持 `--owner` / `--repo` / `--url` 进行跨仓库调用。
-- **通用评审 ([atomgit-pr-review](./atomgit-pr-review))**: 利用 LLM 充当第一道代码防线，支持直接从 PR 链接解析目标仓库与编号。
+- **通用评审 ([atomgit-pr-review](./atomgit-pr-review))**: 利用 LLM 充当第一道代码防线，默认提取变更、提交和已有评论，支持直接从 PR 链接解析目标仓库与编号。
 - **架构扫描 ([atomgit-pr-architecture-review](./atomgit-pr-architecture-review))**: 专门检查是否违背了 SSOT 等核心架构原则。
 - **意见处理 ([atomgit-review-resolution](./atomgit-review-resolution))**: 实现从“发现问题”到“修复代码/回复评论”的自动化闭环，支持直接从 PR 链接解析目标仓库与编号。
 - **协作路由 ([atomgit-collaboration](./atomgit-collaboration))**: 面向“看看这个 PR / 帮我跟进这个评论”这类泛化协作请求，先识别意图，再分流到具体 AtomGit skill。

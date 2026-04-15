@@ -10,6 +10,8 @@ license: MIT
 
 在 IB_Robot 仓库中，只要用户提到 PR 的架构评审、SSOT 合规性、契约驱动检查且未明确指定 GitHub，默认视为 AtomGit 架构评审流程并优先使用本 skill。
 
+如果只是通用代码 review、逻辑检查或“帮我看看这个 PR”，应优先使用 `atomgit-pr-review`，不要直接进入本 skill。
+
 ## ⚠️ 环境准备
 
 **重要**: 在使用此 skill 前，必须先加载环境配置：
