@@ -176,6 +176,9 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     joint_names = resolve_joint_names_from_config(robot_config)
     gripper_joints = resolve_gripper_joints_from_config(robot_config)
     calibration_file = resolve_calibration_path_from_config(robot_config)
+    max_cache_size = int(recording_config.get('max_cache_size', 100 * 1024 * 1024) or 0)
+    storage_preset_profile = str(recording_config.get('storage_preset_profile', '') or '')
+    storage_config_uri = str(recording_config.get('storage_config_uri', '') or '')
 
     # Create episode_recorder node (Action Server)
     episode_recorder_node = Node(
@@ -194,6 +197,9 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
             {'joint_names': joint_names},
             {'gripper_joints': gripper_joints},
             {'calibration_file': calibration_file},
+            {'max_cache_size': max_cache_size},
+            {'storage_preset_profile': storage_preset_profile},
+            {'storage_config_uri': storage_config_uri},
         ],
     )
 

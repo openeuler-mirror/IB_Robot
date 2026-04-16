@@ -75,6 +75,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -258,6 +259,123 @@ def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
 
 
+def _resolve_video_codec(requested_codec: str) -> str:
+    """Resolve a playback-friendly video codec supported by the local PyAV build."""
+    if requested_codec != "auto":
+        return requested_codec
+
+    try:
+        import av
+    except Exception:
+        return "libsvtav1"
+
+    for codec_name in ("h264", "libsvtav1"):
+        try:
+            if av.codec.Codec(codec_name, "w").is_encoder:
+                return codec_name
+        except Exception:
+            continue
+    return "libsvtav1"
+
+
+def _estimate_stream_rate_hz(ts_ns: List[int]) -> float:
+    """Estimate stream frequency from monotonically increasing nanosecond stamps."""
+    if len(ts_ns) < 2:
+        return 0.0
+
+    arr = np.asarray(ts_ns, dtype=np.int64)
+    span_ns = int(arr[-1] - arr[0])
+    if span_ns <= 0:
+        return 0.0
+    return float((len(arr) - 1) * 1e9 / span_ns)
+
+
+def _selected_indices_for_ticks(
+    policy: str,
+    ts_ns: np.ndarray,
+    ticks_ns: np.ndarray,
+    step_ns: int,
+    tol_ns: int,
+) -> np.ndarray:
+    """Return the source-message index selected for each output tick."""
+    out = np.full((len(ticks_ns),), -1, dtype=np.int64)
+    if len(ts_ns) == 0 or len(ticks_ns) == 0:
+        return out
+
+    if policy == "drop":
+        j, n = -1, len(ts_ns)
+        for i, tick in enumerate(ticks_ns):
+            while j + 1 < n and ts_ns[j + 1] <= tick:
+                j += 1
+            if j >= 0 and ts_ns[j] > tick - step_ns:
+                out[i] = j
+        return out
+
+    if policy == "asof":
+        if tol_ns <= 0:
+            policy = "hold"
+        else:
+            j = 0
+            for i, tick in enumerate(ticks_ns):
+                while j + 1 < len(ts_ns) and ts_ns[j + 1] <= tick:
+                    j += 1
+                if ts_ns[j] <= tick and (tick - ts_ns[j]) <= tol_ns:
+                    out[i] = j
+            return out
+
+    j = 0
+    last_idx = -1
+    if ticks_ns[0] < ts_ns[0]:
+        last_idx = 0
+    for i, tick in enumerate(ticks_ns):
+        while j + 1 < len(ts_ns) and ts_ns[j + 1] <= tick:
+            j += 1
+        if ts_ns[j] <= tick:
+            last_idx = j
+        out[i] = last_idx
+    return out
+
+
+def _log_image_stream_diagnostics(
+    streams: Dict[str, _Stream],
+    ticks_ns: np.ndarray,
+    step_ns: int,
+    target_fps: int,
+) -> None:
+    """Log observed image rates and repeated-frame ratios after resampling."""
+    for key, st in streams.items():
+        if st.spec.image_resize is None or not st.ts:
+            continue
+
+        ts = np.asarray(st.ts, dtype=np.int64)
+        rate_hz = _estimate_stream_rate_hz(st.ts)
+        selected = _selected_indices_for_ticks(
+            policy=st.spec.resample_policy,
+            ts_ns=ts,
+            ticks_ns=ticks_ns,
+            step_ns=step_ns,
+            tol_ns=max(0, int(st.spec.asof_tol_ms)) * 1_000_000,
+        )
+        used_frames = int(np.count_nonzero(selected >= 0))
+        unique_frames = int(np.unique(selected[selected >= 0]).size) if used_frames else 0
+        repeated_ratio = 1.0 - (unique_frames / len(ticks_ns)) if len(ticks_ns) else 0.0
+        print(
+            f"  [diag] {key}: source_frames={len(st.ts)} (~{rate_hz:.1f} Hz), "
+            f"unique_output_frames={unique_frames}/{len(ticks_ns)}, "
+            f"repeated_frame_ratio={repeated_ratio:.1%}"
+        )
+        if rate_hz > 0 and rate_hz < target_fps * 0.9:
+            print(
+                f"  [warn] {key}: source image rate (~{rate_hz:.1f} Hz) is below "
+                f"dataset rate ({target_fps} Hz); direct playback will repeat frames."
+            )
+        elif repeated_ratio > 0.15:
+            print(
+                f"  [warn] {key}: {repeated_ratio:.1%} of output ticks reuse an older frame. "
+                f"If playback still looks choppy, inspect camera timestamp jitter or try a lower contract rate."
+            )
+
+
 def _plan_streams(
     specs: Iterable[Any],
     tmap: Dict[str, str],
@@ -352,6 +470,7 @@ def export_bags_to_lerobot(
     data_mb: int = 100,
     video_mb: int = 500,
     timestamp_source: str = "contract",
+    video_codec: str = "auto",
 ) -> None:
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
 
@@ -393,6 +512,10 @@ def export_bags_to_lerobot(
     fps = int(contract.rate_hz)
     if fps <= 0:
         raise ValueError("Contract rate_hz must be > 0")
+    resolved_video_codec = _resolve_video_codec(video_codec)
+    if use_videos:
+        os.environ["LEROBOT_VIDEO_VCODEC"] = resolved_video_codec
+        print(f"[bag_to_lerobot] Using video codec: {resolved_video_codec}")
     step_ns = int(round(1e9 / fps))
     specs = list(iter_specs(contract))
 
@@ -659,6 +782,13 @@ def export_bags_to_lerobot(
         n_ticks = int(dur_ns // step_ns) + 1
         ticks_ns = start_ns + np.arange(n_ticks, dtype=np.int64) * step_ns
 
+        _log_image_stream_diagnostics(
+            streams=streams,
+            ticks_ns=ticks_ns,
+            step_ns=step_ns,
+            target_fps=fps,
+        )
+
 
         # Resample onto ticks
         resampled: Dict[str, List[Any]] = {}
@@ -839,9 +969,24 @@ def export_bags_to_lerobot(
             ds.add_frame(frame)
 
         ds.save_episode()
+        expected_duration_s = n_ticks / fps if fps > 0 else 0
         print(
-            f"  → saved {n_ticks} frames @ {int(round(fps))} FPS  | decoded_msgs={decoded_msgs}"
+            f"  → saved {n_ticks} frames @ {int(round(fps))} FPS "
+            f"({expected_duration_s:.1f}s)  | decoded_msgs={decoded_msgs}"
         )
+        # Warn when the majority of decoded messages are discarded during
+        # resampling – usually means the recording was cut short by a crash.
+        n_streams = len(streams)
+        if n_streams > 0 and decoded_msgs > 0:
+            avg_per_stream = decoded_msgs / n_streams
+            if avg_per_stream > 0 and n_ticks < avg_per_stream * 0.5:
+                print(
+                    f"  ⚠️  Warning: only {n_ticks} frames kept from "
+                    f"~{int(avg_per_stream)} msgs/stream. Possible causes:\n"
+                    f"      - Recording was interrupted or the recorder crashed\n"
+                    f"      - Bag metadata duration is inaccurate\n"
+                    f"      Check the recording logs for errors."
+                )
 
         # Write point cloud side-car (.npz CSR) for each key
         for pc_key in pc_keys:
@@ -936,6 +1081,15 @@ Example:
     ap.add_argument("--data-mb", type=int, default=100)
     ap.add_argument("--video-mb", type=int, default=500)
     ap.add_argument(
+        "--video-codec",
+        choices=("auto", "h264", "hevc", "libsvtav1", "h264_nvenc", "hevc_nvenc"),
+        default="auto",
+        help=(
+            "Codec for generated mp4 files. 'auto' prefers h264 for smoother local playback "
+            "and falls back to libsvtav1 when h264 is unavailable."
+        ),
+    )
+    ap.add_argument(
         "--timestamp",
         choices=("contract", "bag", "header"),
         default="contract",
@@ -986,6 +1140,7 @@ def main() -> None:
         data_mb=args.data_mb,
         video_mb=args.video_mb,
         timestamp_source=args.timestamp,
+        video_codec=args.video_codec,
     )
 
 

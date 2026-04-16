@@ -6,7 +6,8 @@ Episode Recorder (ROS 2): stream-to-bag writer with action control.
 Overview
 --------
 `EpisodeRecorderServer` writes incoming ROS 2 messages directly to a rosbag2
-as they arrive (no alignment or caching). The set of topics,
+as they arrive, using rosbag's internal cache to smooth short write bursts.
+The set of topics,
 their types, QoS, and runtime parameters come from `robot_config`, the
 project's Single Source of Truth.
 
@@ -103,6 +104,7 @@ FEEDBACK_PERIOD_S: float = 0.5
 METADATA_RETRIES: int = 20
 METADATA_RETRY_PERIOD_S: float = 0.1
 DEFAULT_QOS_DEPTH: int = 10
+DEFAULT_MAX_CACHE_SIZE: int = 100 * 1024 * 1024
 EPISODE_DIR_PREFIX = "episode_"
 EPISODE_DIR_WIDTH = 6
 DATASET_LAYOUT_VERSION = 1
@@ -186,6 +188,36 @@ class WriterState:
     counts: Dict[str, _TopicCounter] = field(default_factory=dict)
 
 
+def _normalize_max_cache_size(value: int) -> int:
+    """Normalize rosbag cache size values so negative inputs disable caching."""
+    return max(0, int(value))
+
+
+def _topic_counter_diagnostics(
+    counts: Dict[str, _TopicCounter],
+) -> List[Tuple[str, int, int, float]]:
+    """Summarize per-topic recorder counts as (topic, seen, written, drop_ratio)."""
+    rows: List[Tuple[str, int, int, float]] = []
+    for topic in sorted(counts.keys()):
+        counter = counts[topic]
+        seen = int(counter.seen)
+        written = int(counter.written)
+        drop_ratio = 0.0 if seen <= 0 else max(0.0, 1.0 - (written / seen))
+        rows.append((topic, seen, written, drop_ratio))
+    return rows
+
+
+def _ensure_serialized_message(msg: Any) -> bytes:
+    """Return CDR bytes for either raw subscriptions or typed ROS messages."""
+    if isinstance(msg, bytes):
+        return msg
+    if isinstance(msg, bytearray):
+        return bytes(msg)
+    if isinstance(msg, memoryview):
+        return msg.tobytes()
+    return serialize_message(msg)
+
+
 # ------------------------------ Node -----------------------------------
 
 
@@ -219,6 +251,7 @@ class EpisodeRecorderServer(Node):
         self.declare_parameter("gripper_joints", [""])
         self.declare_parameter("calibration_file", "")
         # Storage tuning (kept optional & conservative by default)
+        self.declare_parameter("max_cache_size", DEFAULT_MAX_CACHE_SIZE)
         self.declare_parameter("storage_preset_profile", "")  # e.g., "zstd_fast"
         self.declare_parameter("storage_config_uri", "")  # file:// or path
 
@@ -297,6 +330,9 @@ class EpisodeRecorderServer(Node):
             .string_value
             or ""
         )
+        self._max_cache_size = _normalize_max_cache_size(
+            self.get_parameter("max_cache_size").get_parameter_value().integer_value
+        )
         self._storage_config_uri = (
             self.get_parameter("storage_config_uri").get_parameter_value().string_value
             or ""
@@ -369,6 +405,10 @@ class EpisodeRecorderServer(Node):
             f"Recorder ready with contract '{self._contract.name}' "
             f"→ dataset root: {self._dataset_root}"
         )
+        self.get_logger().info(
+            f"Recorder storage tuning: max_cache_size={self._max_cache_size} bytes, "
+            f"preset='{self._storage_preset_profile or 'default'}'"
+        )
 
     # ---------- Action callbacks ----------
 
@@ -430,37 +470,38 @@ class EpisodeRecorderServer(Node):
         })
         return resp
 
-    def _info_service_cb(
-        self, _req: Trigger.Request, resp: Trigger.Response
-    ) -> Trigger.Response:
-        """Return current dataset path and episode count as JSON."""
-        import json
-        resp.success = True
-        resp.message = json.dumps({
-            "path": str(self._dataset_root),
-            "episodes": len(self._episode_dirs())
-        })
-        return resp
-
     def _shutdown_cb(self) -> None:
-        """Abort current goal cleanly on shutdown; do **not** destroy subscriptions."""
+        """Abort current goal cleanly on shutdown; do **not** destroy subscriptions.
+
+        Cancel per-episode timers first to prevent the executor from touching
+        already-invalidated handles (fixes ``InvalidHandle`` crash on exit).
+        """
+        # 1) Prevent late writes from subscription callbacks.
+        self._flags.shutting_down = True
 
         with self._ws.writer_lock:
             self._ws.writer = None
 
-        if self._flags.is_recording and self._current_goal_handle is not None:
-            # Set shutting down flag to prevent late writes in sub callbacks
-            self._flags.shutting_down = True
+        # 2) Cancel timers *before* aborting the goal so the executor never
+        #    attempts to take from a destroyed handle.
+        for attr in ("_feedback_timer", "_timeout_timer"):
+            tmr = getattr(self, attr, None)
+            if tmr is not None:
+                tmr.cancel()
+                setattr(self, attr, None)
 
-            # Now abort the goal
+        # 3) Signal stop so that execute_callback's wait loop exits.
+        self._flags.stop_requested = True
+        self._episode_done_evt.set()
+
+        if self._flags.is_recording and self._current_goal_handle is not None:
             try:
-                self._current_goal_handle.abort()  # TODO: should this be canceled?
+                self._current_goal_handle.abort()
             except Exception as exc:  # pragma: no cover (best-effort)
                 self.get_logger().warning(
                     f"Failed to abort goal during shutdown: {exc!r}"
                 )
         self._flags.is_recording = False
-        self._episode_done_evt.set()
 
     # ---------- rosbag2 helpers ----------
 
@@ -483,6 +524,7 @@ class EpisodeRecorderServer(Node):
         """
         # Base options
         storage_options = rosbag2_py.StorageOptions(uri=bag_uri, storage_id=storage_id)
+        storage_options.max_cache_size = self._max_cache_size
 
         # Optional tuning (MCAP supports preset/config; harmless if empty)
         if self._storage_preset_profile:
@@ -514,7 +556,7 @@ class EpisodeRecorderServer(Node):
         - updates per-topic counters,
         - takes a read-only snapshot of the current writer under a lock,
         - uses arrival time as the write timestamp,
-        - serializes and writes the message,
+        - writes the serialized payload,
         - signals a fatal error and ends the episode on write exceptions.
         """
         msg_cls = get_message(type_str)
@@ -540,7 +582,7 @@ class EpisodeRecorderServer(Node):
             # Timestamp: always use arrival time
             ts_ns = self.get_clock().now().nanoseconds
 
-            data = serialize_message(msg)
+            data = _ensure_serialized_message(msg)
             try:
                 with self._ws.writer_lock:
                     if self._ws.writer is not None:
@@ -557,7 +599,7 @@ class EpisodeRecorderServer(Node):
                 self._episode_done_evt.set()
 
         return self.create_subscription(
-            msg_cls, topic, cb, qos, callback_group=self._cbg
+            msg_cls, topic, cb, qos, callback_group=self._cbg, raw=True
         )
 
     # ---------- per-episode helpers ----------
@@ -612,9 +654,9 @@ class EpisodeRecorderServer(Node):
             self.get_logger().info("Episode timeout reached.")
             self._flags.stop_requested = True
             self._episode_done_evt.set()
-            # Destroy oneself (one-shot)
+            # Cancel oneself (one-shot); actual cleanup happens in _finalize_episode.
             if self._timeout_timer is not None:
-                self.destroy_timer(self._timeout_timer)
+                self._timeout_timer.cancel()
 
         self._timeout_timer = self.create_timer(
             float(max_duration_s), _on_timeout, callback_group=self._cbg
@@ -739,12 +781,20 @@ class EpisodeRecorderServer(Node):
         self._write_episode_metadata(bag_dir, prompt, episode_index)
         self._write_dataset_metadata()
 
-        # Kill timers
+        for topic, seen, written, drop_ratio in _topic_counter_diagnostics(self._ws.counts):
+            level = self.get_logger().warning if drop_ratio > 0.2 else self.get_logger().info
+            level(
+                f"Recorder topic stats: {topic} seen={seen} written={written} "
+                f"drop_ratio={drop_ratio:.1%}"
+            )
+
+        # Cancel timers (do NOT destroy — the executor may still reference the
+        # handles; destroying from within a callback causes InvalidHandle).
         if self._feedback_timer is not None:
-            self.destroy_timer(self._feedback_timer)
+            self._feedback_timer.cancel()
             self._feedback_timer = None
         if self._timeout_timer is not None:
-            self.destroy_timer(self._timeout_timer)
+            self._timeout_timer.cancel()
             self._timeout_timer = None
 
         # Clear latch and reset flags
@@ -903,16 +953,9 @@ class EpisodeRecorderServer(Node):
                     yaml.safe_dump(meta, f, sort_keys=False)
                 return
             except (OSError, yaml.YAMLError):
-                # Back off via a short ROS timer rather than wall clock sleep
-                def _release() -> None:
-                    pass
-
-                t = self.create_timer(
-                    METADATA_RETRY_PERIOD_S, _release, callback_group=self._cbg
-                )
-                # Wait for timer to fire
+                # Simple back-off; avoid creating timers during finalization
+                # (the executor may be shutting down).
                 time.sleep(METADATA_RETRY_PERIOD_S)
-                self.destroy_timer(t)
 
 
 def main() -> None:

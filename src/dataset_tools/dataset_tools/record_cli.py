@@ -169,8 +169,13 @@ def cli_loop(node):
             # Send cancel command
             node.cancel_recording()
             
-            # Wait for the server to acknowledge completion before looping
-            node._episode_finished_evt.wait()
+            # Wait for the server to acknowledge completion before looping.
+            # Use a timeout to avoid blocking forever if the recorder crashes.
+            if not node._episode_finished_evt.wait(timeout=15.0):
+                node.get_logger().warning(
+                    "Timed out waiting for recorder to finish. "
+                    "The recording server may have crashed — check its logs."
+                )
             
         except EOFError:
             break
