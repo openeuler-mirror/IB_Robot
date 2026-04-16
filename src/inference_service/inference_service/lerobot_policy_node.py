@@ -72,7 +72,12 @@ from robot_config.contract_utils import (
     zero_pad,
 )
 from robot_config.tracing_utils import create_trace_logger
-from robot_config.utils import build_joint_conversion_table
+from robot_config.utils import (
+    build_joint_conversion_table,
+    resolve_calibration_path_from_config,
+    resolve_gripper_joints_from_config,
+    resolve_joint_names_from_config,
+)
 from tensormsg.converter import TensorMsgConverter
 
 _trace = create_trace_logger("ib_trace.policy")
@@ -225,8 +230,8 @@ class LeRobotPolicyNode(Node):
             raise RuntimeError(f"Robot config file not found: {robot_config_path}")
 
         from robot_config.loader import (
-            load_robot_config_dict,
             build_contract_from_robot_config_dict,
+            load_robot_config_dict,
         )
 
         robot_cfg = load_robot_config_dict(robot_config_path)
@@ -247,6 +252,21 @@ class LeRobotPolicyNode(Node):
             self.get_logger().info(
                 f"Loaded joint conversion table (mode={norm_mode}): {len(self._joint_rad_limits)} joints"
             )
+
+            # Append base velocity normalization entries using physical units (rad/s).
+            # The raw steps ↔ physical unit conversion is handled by lekiwi_hardware.
+            # Here we only need the physical range for LeRobot [-100, +100] mapping.
+            velocity_joints = robot_cfg.get("ros2_control", {}).get("velocity_joints", [])
+            base_vel_max_rad = robot_cfg.get("ros2_control", {}).get("base_vel_max_rad", 0)
+            if velocity_joints and base_vel_max_rad > 0:
+                # (rad_min, rad_max, span, offset) with span=200, offset=-100
+                # maps [-max_rad/s, +max_rad/s] → [-100, +100]
+                for _vj in velocity_joints:
+                    self._joint_rad_limits.append((-float(base_vel_max_rad), float(base_vel_max_rad), 200.0, -100.0))
+                self.get_logger().info(
+                    f"Appended {len(velocity_joints)} velocity joints "
+                    f"(max_rad/s={base_vel_max_rad}) → total {len(self._joint_rad_limits)} entries"
+                )
         else:
             self._joint_rad_limits = []
             self.get_logger().warn("Missing calib_file or joint_names; rad↔pct conversion disabled")
@@ -536,7 +556,7 @@ class LeRobotPolicyNode(Node):
         """Convert radians to LeRobot units (observation input path)."""
         if not self._joint_rad_limits:
             return state  # no calibration loaded, pass-through
-        out = np.empty_like(state, dtype=np.float64)
+        out = state.astype(np.float64).copy()
         for i, (rmin, rmax, span, offset) in enumerate(self._joint_rad_limits):
             if i < len(state):
                 out[i] = (state[i] - rmin) / (rmax - rmin) * span + offset
@@ -546,7 +566,7 @@ class LeRobotPolicyNode(Node):
         """Convert LeRobot units to radians (action output path)."""
         if not self._joint_rad_limits:
             return action  # no calibration loaded, pass-through
-        out = np.empty_like(action, dtype=np.float64)
+        out = action.astype(np.float64).copy()
         for i, (rmin, rmax, span, offset) in enumerate(self._joint_rad_limits):
             if i < action.shape[-1]:
                 out[..., i] = (action[..., i] - offset) / span * (rmax - rmin) + rmin

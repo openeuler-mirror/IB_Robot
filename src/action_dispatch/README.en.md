@@ -179,6 +179,7 @@ ros2 run action_dispatch action_dispatcher_node
 | `inference_action_server` | string | `/act_inference_node/DispatchInfer` | Inference service Action name |
 | `contract_path` | string | `''` | Contract file path |
 | `joint_state_topic` | string | `/joint_states` | Joint state topic |
+| `navigation_mode` | bool | false | Navigation mode (stopped at startup, waiting for external trigger) |
 | `temporal_smoothing_enabled` | bool | false | Enable cross-frame smoothing |
 | `temporal_ensemble_coeff` | double | 0.01 | Smoothing coefficient |
 | `chunk_size` | int | 100 | Action chunk size |
@@ -340,6 +341,78 @@ ros2 service call /action_dispatcher/toggle_smoothing std_srvs/srv/Empty
 ros2 service call /action_dispatcher/reset std_srvs/srv/Empty
 ```
 
+## Navigation Mode
+
+When `navigation_mode=true`, the system starts in a stopped state and waits for an external trigger to begin execution. This mode is used when nav2 reaches the destination, then triggers the ACT model to execute grasping tasks.
+
+### Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Navigation Mode Workflow                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. System Startup                                                           │
+│     ┌─────────────┐                                                          │
+│     │ Dispatcher  │  At startup: _is_running = False                        │
+│     │ [NAV] Mode  │  System ready, waiting for trigger                       │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  2. Nav2 Navigation                                                          │
+│     ┌─────────────┐                                                          │
+│     │   Nav2      │  Navigate to target position                             │
+│     │ Navigating  │  Dispatcher does not execute actions                     │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  3. Arrival at Destination                                                   │
+│     ┌─────────────┐                                                          │
+│     │  Nav2 Done  │  Call /action_dispatcher/start_evaluate                  │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  4. ACT Execution                                                            │
+│     ┌─────────────┐                                                          │
+│     │ Dispatcher  │  _is_running = True                                      │
+│     │ Executing   │  Trigger inference, execute ACT action sequence          │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  5. Task Complete                                                            │
+│     ┌─────────────┐                                                          │
+│     │    Call     │  Call /action_dispatcher/stop_evaluate                   │
+│     │stop_evaluate│  Stop execution, set base velocity to zero               │
+│     └─────────────┘                                                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Usage
+
+```bash
+# Launch system (when navigation_mode=true)
+ros2 launch robot_config robot.launch.py robot_config:=lekiwi_navi control_mode:=navi
+
+# After Nav2 reaches destination, start execution
+ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger
+
+# After task completion, stop execution
+ros2 service call /action_dispatcher/stop_evaluate std_srvs/srv/Trigger
+
+# Query current status
+ros2 service call /action_dispatcher/get_status std_srvs/srv/Trigger
+```
+
+### Configuration Example
+
+Enable in robot configuration YAML:
+
+```yaml
+control_modes:
+  navi:
+    executor:
+      navigation_mode: true    # Enable navigation mode
+      watermark_threshold: 20
+      control_frequency: 30.0
+```
+
 ## Topics and Services
 
 ### Communication with Inference Service
@@ -368,6 +441,9 @@ ros2 service call /action_dispatcher/reset std_srvs/srv/Empty
 |---------|------|-------------|
 | `~/reset` | `std_srvs/Empty` | Reset queue and state |
 | `~/toggle_smoothing` | `std_srvs/Empty` | Toggle smoothing on/off |
+| `~/start_evaluate` | `std_srvs/Trigger` | Start execution (only when navigation_mode=true) |
+| `~/stop_evaluate` | `std_srvs/Trigger` | Stop execution and stop base (only when navigation_mode=true) |
+| `~/get_status` | `std_srvs/Trigger` | Get running status (running/stopped) |
 
 ### Communication with ros2_control
 

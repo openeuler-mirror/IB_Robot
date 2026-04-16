@@ -1,0 +1,318 @@
+# LeKiwi Mobile Manipulator - Evaluation Configuration
+# Single Source of Truth for LeKiwi robot used in lekiwi_navi.
+#
+# This config enables lekiwi_navi to load robot configuration from YAML
+# instead of hardcoding LeKiwiClientConfig(remote_ip=..., id=...).
+# Actions are dispatched via ROS topics to ros2_control controllers.
+
+robot:
+  name: lekiwi_navi
+  type: lekiwi
+  robot_type: lekiwi  # For LeRobot dataset metadata
+
+  # ============================================
+  # Model Library
+  # ============================================
+  models:
+    lekiwi_act:
+      path: ./model/act/pretrained_model
+      policy_type: act
+      lerobot_norm_mode: range_m100_100
+
+  # ============================================
+  # Unified joint definitions (Single Source of Truth)
+  # ============================================
+  joints:
+    arm:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+    gripper:
+      - "6"
+    all: ["1", "2", "3", "4", "5", "6"]
+
+  # Control mode management
+  default_control_mode: "model_inference"
+
+  control_modes:
+    teleop:
+      description: "Human teleoperation mode (leader arm + keyboard base)"
+      description_cn: "人工遥操作模式（leader arm + 键盘底盘）"
+      controllers:
+        - joint_state_broadcaster
+        - arm_position_controller
+        - gripper_position_controller
+        - base_velocity_controller
+      inference:
+        enabled: false
+        force_disable: true
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+    model_inference:
+      description: "LeKiwi end-to-end control mode (ACT policy)"
+      controllers:
+        - joint_state_broadcaster
+        - arm_position_controller
+        - gripper_position_controller
+        - base_velocity_controller
+      inference:
+        enabled: true
+        execution_mode: "distributed"
+        model: lekiwi_act
+        action_server: /inference/dispatch
+      # ============================================
+      # Executor configuration
+      # ============================================
+      executor:
+        type: topic  # topic | action
+        mode: model_inference
+        queue_size: 100
+        watermark_threshold: 0
+        control_frequency: 30.0
+
+    navi:
+      description: "Navigation evaluation mode (lekiwi_navi + ACT policy)"
+      description_cn: "导航评估模式（lekiwi_navi + ACT 策略）"
+      controllers:
+        - joint_state_broadcaster
+        - arm_position_controller
+        - gripper_position_controller
+        - base_velocity_controller
+      inference:
+        enabled: true
+        execution_mode: "distributed"
+        model: lekiwi_act
+        action_server: /inference/dispatch
+      executor:
+        type: topic
+        mode: navi
+        dispatcher: action_dispatch    # unified action dispatcher
+        navigation_mode: true          # enable navigation mode (explicit start/stop + base control)
+        watermark_threshold: 20
+        control_frequency: 30.0
+
+  # ============================================
+  # ros2_control
+  # ============================================
+  ros2_control:
+    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
+    port: /dev/ttyACM0
+    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+    joint_names: ["1", "2", "3", "4", "5", "6"]
+    velocity_joints: ["7", "8", "9"]
+    # Max base velocity in physical units (rad/s).
+    # Equivalent to the former base_vel_max_raw=3000 (≈4.602 rad/s).
+    # ros2_control velocity controller commands are in rad/s;
+    # lekiwi_hardware converts rad/s → raw steps/s for the STS3215 motors.
+    base_vel_max_rad: 4.602
+    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+    controllers_config: $(find lekiwi_hardware)/config/lekiwi_controllers.yaml
+
+  # ============================================
+  # Peripheral devices
+  # ============================================
+  peripherals:
+    - type: camera
+      name: front
+      driver: opencv
+      index: 4
+      width: 640
+      height: 480
+      fps: 30
+      fovy: 60
+      pixel_format: mjpeg2rgb
+      frame_id: camera_front_frame
+      optical_frame_id: camera_front_optical_frame
+      brightness: -1
+      contrast: -1
+      saturation: -1
+      autoexposure: true
+      exposure: -1
+      auto_white_balance: true
+      white_balance: -1
+      transform:
+        parent_frame: base_link
+        x: 0.1
+        y: 0.2
+        z: 0.0
+        roll: -1.5708
+        pitch: 0.0
+        yaw: 0.0
+
+    - type: camera
+      name: wrist
+      driver: opencv
+      index: 6
+      width: 640
+      height: 480
+      fps: 30
+      fovy: 60
+      pixel_format: mjpeg2rgb
+      frame_id: camera_wrist_frame
+      optical_frame_id: camera_wrist_optical_frame
+      brightness: -1
+      contrast: -1
+      saturation: -1
+      autoexposure: true
+      exposure: -1
+      auto_white_balance: true
+      white_balance: -1
+      transform:
+        parent_frame: gripper
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+
+  # ============================================
+  # Contract - I/O mapping for policy inference
+  # ============================================
+  contract:
+    rate_hz: 30
+    max_duration_s: 600.0
+
+    observations:
+      # Front camera image
+      - key: observation.images.front
+        topic: /camera/front/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: front
+        image:
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+
+      # Wrist camera image
+      - key: observation.images.wrist
+        topic: /camera/wrist/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: wrist
+        image:
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+
+      # Joint state: 6 arm/gripper positions + 3 base velocities
+      # Published by ros2_control joint_state_broadcaster
+      # dot_get format: "<ros_field>.<joint_name>" where ros_field = position | velocity
+      - key: observation.state
+        topic: /joint_states
+        type: sensor_msgs/msg/JointState
+        selector:
+          names:
+            - "position.1"
+            - "position.2"
+            - "position.3"
+            - "position.4"
+            - "position.5"
+            - "position.6"
+            - "velocity.7"
+            - "velocity.8"
+            - "velocity.9"
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+
+    actions:
+      # Arm joints (5) via ros2_control position controller
+      - key: action
+        selector:
+          names:
+            - "action.0"
+            - "action.1"
+            - "action.2"
+            - "action.3"
+            - "action.4"
+        publish:
+          topic: /arm_position_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+        safety_behavior: hold
+
+      # Gripper (1) via ros2_control position controller
+      - key: action
+        selector:
+          names:
+            - "action.5"
+        publish:
+          topic: /gripper_position_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+        safety_behavior: hold
+
+      # Base wheel velocities (3) via ros2_control velocity controller
+      - key: action
+        selector:
+          names:
+            - "action.6"
+            - "action.7"
+            - "action.8"
+        publish:
+          topic: /base_velocity_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+        safety_behavior: zeros
+
+  # ============================================
+  # Teleoperation Configuration (leader arm + keyboard base)
+  # ============================================
+  teleoperation:
+    enabled: true
+    active_device: "so101_leader"
+    devices:
+      - name: "so101_leader"
+        type: "leader_arm"
+        port: "/dev/ttyACM1"
+        calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
+    safety:
+      joint_limits:
+        "1": {"min": -3.14159, "max": 3.14159}
+        "2": {"min": -3.14159, "max": 3.14159}
+        "3": {"min": -3.14159, "max": 3.14159}
+        "4": {"min": -3.14159, "max": 3.14159}
+        "5": {"min": -3.14159, "max": 3.14159}
+        "6": {"min": 0.0, "max": 1.0}
+
+  # ============================================
+  # Recording Configuration
+  # ============================================
+  recording:
+    bag_base_dir: "~/rosbag/episodes"
+    storage: mcap

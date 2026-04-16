@@ -1,0 +1,275 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="lekiwi">
+
+  <!--
+    Assembled URDF: simplified chassis + SO101 arm.
+    Replaces CAD-exported lekiwi_car.urdf for real-robot hardware driving.
+    Joint names "1"-"9" match lekiwi_navi controllers.
+  -->
+
+  <!-- Arguments -->
+  <xacro:arg name="use_sim" default="false"/>
+  <xacro:arg name="port" default="/dev/ttyACM0"/>
+  <xacro:arg name="calib_file" default=""/>
+  <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
+  <xacro:arg name="mujoco_model" default=""/>
+
+  <!-- Chassis geometry/control properties (does not emit links/joints) -->
+  <xacro:include filename="$(find lekiwi_description)/urdf/base.common.xacro"/>
+  <xacro:include filename="$(find lekiwi_description)/urdf/base.control.xacro"/>
+
+  <!-- SO101 arm (joints "1"-"6", links: world->base->shoulder->...->jaw) -->
+  <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_base.xacro"/>
+
+  <!-- ============================================ -->
+  <!-- Materials                                    -->
+  <!-- ============================================ -->
+  <material name="light_grey">
+    <color rgba="${light_grey_rgba}"/>
+  </material>
+  <material name="charcoal">
+    <color rgba="${charcoal_rgba}"/>
+  </material>
+
+  <!-- ============================================ -->
+  <!-- Chassis Links                                -->
+  <!-- ============================================ -->
+
+  <!-- Base link (URDF root — EKF publishes odom → base_link) -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 ${base_offset_rz}"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/lekiwi_base.stl"/>
+      </geometry>
+      <material name="light_grey"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 ${base_offset_rz}"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/lekiwi_base.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="2.0"/>
+      <inertia ixx="0.01" ixy="0.0" ixz="0.0" iyy="0.01" iyz="0.0" izz="0.02"/>
+    </inertial>
+  </link>
+
+  <!-- Left wheel link -->
+  <link name="left_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+      </geometry>
+      <material name="charcoal"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- Back wheel link -->
+  <link name="back_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+      </geometry>
+      <material name="charcoal"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- Right wheel link -->
+  <link name="right_wheel_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+      </geometry>
+      <material name="charcoal"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
+    </inertial>
+  </link>
+
+  <!-- ============================================ -->
+  <!-- Chassis Joints                               -->
+  <!-- ============================================ -->
+
+  <!-- Left wheel: 60 deg anti-clockwise from +X -->
+  <joint name="7" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel_link"/>
+    <origin xyz="${wheel_base_radius * cos(offset)} ${wheel_base_radius * sin(offset)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset}"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
+  </joint>
+
+  <!-- Back wheel: 180 deg anti-clockwise from +X -->
+  <joint name="8" type="continuous">
+    <parent link="base_link"/>
+    <child link="back_wheel_link"/>
+    <origin xyz="${wheel_base_radius * cos(offset + theta)} ${wheel_base_radius * sin(offset + theta)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset + theta}"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
+  </joint>
+
+  <!-- Right wheel: 300 deg anti-clockwise from +X -->
+  <joint name="9" type="continuous">
+    <parent link="base_link"/>
+    <child link="right_wheel_link"/>
+    <origin xyz="${wheel_base_radius * cos(offset - theta)} ${wheel_base_radius * sin(offset - theta)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset - theta}"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
+  </joint>
+
+  <!-- ============================================ -->
+  <!-- Arm Mounting: base_link -> world (arm base)  -->
+  <!-- ============================================ -->
+  <!--
+    Transform from base_link to arm servo base.
+    Original was relative to base_plate_layer1-v5 (CAD root):
+      xyz=(0.01025, 0.034348, 0.0848), rpy=(π/2, 0, 0)
+    base_link and base_plate_layer1-v5 differ by R_x(-π/2).
+    Composing: R_x(-π/2)*R_x(π/2)=identity, translation rotated by R_x(-π/2).
+  -->
+  <joint name="base_to_arm" type="fixed">
+    <parent link="base_link"/>
+    <child link="world"/>
+    <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
+  </joint>
+
+  <!-- ============================================ -->
+  <!-- ros2_control                                 -->
+  <!-- ============================================ -->
+  <ros2_control name="RobotSystem" type="system">
+    <xacro:if value="$(arg use_sim)">
+      <hardware>
+        <plugin>$(arg sim_plugin)</plugin>
+        <xacro:if value="${'$(arg mujoco_model)' != ''}">
+          <param name="mujoco_model">$(arg mujoco_model)</param>
+        </xacro:if>
+      </hardware>
+    </xacro:if>
+
+    <xacro:unless value="$(arg use_sim)">
+      <hardware>
+        <plugin>lekiwi_hardware/LeKiwiSystemHardware</plugin>
+        <param name="port">$(arg port)</param>
+        <param name="calib_file">$(arg calib_file)</param>
+      </hardware>
+    </xacro:unless>
+
+    <!-- ===== Arm joints 1-6: position control ===== -->
+    <joint name="1">
+      <command_interface name="position">
+        <param name="min">-3.14159</param>
+        <param name="max">3.14159</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">1</param>
+    </joint>
+
+    <joint name="2">
+      <command_interface name="position">
+        <param name="min">-3.14159</param>
+        <param name="max">3.14159</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">2</param>
+    </joint>
+
+    <joint name="3">
+      <command_interface name="position">
+        <param name="min">-3.14159</param>
+        <param name="max">3.14159</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">3</param>
+    </joint>
+
+    <joint name="4">
+      <command_interface name="position">
+        <param name="min">-3.14159</param>
+        <param name="max">3.14159</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">4</param>
+    </joint>
+
+    <joint name="5">
+      <command_interface name="position">
+        <param name="min">-3.14159</param>
+        <param name="max">3.14159</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">5</param>
+    </joint>
+
+    <joint name="6">
+      <command_interface name="position">
+        <param name="min">0.0</param>
+        <param name="max">1.0</param>
+      </command_interface>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">6</param>
+    </joint>
+
+    <!-- ===== Base joints 7-9: velocity control ===== -->
+    <joint name="7">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">7</param>
+    </joint>
+
+    <joint name="8">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">8</param>
+    </joint>
+
+    <joint name="9">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+      <param name="id">9</param>
+    </joint>
+
+  </ros2_control>
+
+</robot>

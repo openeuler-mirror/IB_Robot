@@ -11,17 +11,17 @@ Execution Modes:
 - distributed: Edge preprocessing → Cloud inference → Edge postprocessing
 """
 
-import os
 from launch_ros.actions import Node
-from robot_config.logger_utils import get_colored_logger
 
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, prepare_lerobot_env
 
 logger = get_colored_logger("robot_config.execution")
 
+INFERENCE_NODE_NAME = "act_inference_node"
 
-def generate_inference_node(robot_config, control_mode, use_sim=False,
-                            cloud_local=False):
+
+def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_local=False):
     """Generate inference service node with auto-synthesized contract.
 
     This function:
@@ -41,8 +41,6 @@ def generate_inference_node(robot_config, control_mode, use_sim=False,
     Raises:
         ContractSynthesisError: If configuration is architecturally invalid
     """
-    is_sim = parse_bool(use_sim, default=False)
-
     control_modes = robot_config.get("control_modes", {})
     if control_mode not in control_modes:
         logger.info(f"WARNING: Control mode '{control_mode}' not found")
@@ -58,8 +56,7 @@ def generate_inference_node(robot_config, control_mode, use_sim=False,
     execution_mode = inference_config.get("execution_mode", "monolithic")
 
     if execution_mode == "distributed":
-        return generate_distributed_inference_nodes(
-            robot_config, control_mode, use_sim, cloud_local=cloud_local)
+        return generate_distributed_inference_nodes(robot_config, control_mode, use_sim, cloud_local=cloud_local)
 
     return generate_monolithic_inference_node(robot_config, control_mode, use_sim)
 
@@ -81,11 +78,9 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     logger.info(f"Control mode: {control_mode}")
     logger.info(f"Execution mode: {execution_mode}")
 
-    robot_config_path = robot_config.get('_config_path', '')
+    robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError(
-            "robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly."
-        )
+        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
 
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
@@ -111,7 +106,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
         "passive_mode": True,
         "device": "auto",
         "use_sim_time": is_sim,
-        "node_name": "act_inference_node",
+        "node_name": INFERENCE_NODE_NAME,
         "execution_mode": execution_mode,
         "request_timeout": request_timeout,
         "cloud_inference_topic": cloud_inference_topic,
@@ -121,18 +116,17 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     inference_node = Node(
         package="inference_service",
         executable="lerobot_policy_node",
-        name="act_inference_node",
+        name=INFERENCE_NODE_NAME,
         env=env,
         parameters=[node_params],
         output="screen",
     )
 
-    logger.info(f"✓ Monolithic inference node configured")
+    logger.info("✓ Monolithic inference node configured")
     return inference_node
 
 
-def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=False,
-                                         cloud_local=False):
+def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=False, cloud_local=False):
     """Generate distributed inference nodes.
 
     By default only the edge proxy node is generated here. The cloud
@@ -163,14 +157,12 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
 
     logger.info("========== Generating Inference Nodes (Distributed) ==========")
     logger.info(f"Control mode: {control_mode}")
-    logger.info(f"Architecture: Edge Proxy + Cloud Inference")
+    logger.info("Architecture: Edge Proxy + Cloud Inference")
     logger.info(f"Cloud co-located: {cloud_local}")
 
-    robot_config_path = robot_config.get('_config_path', '')
+    robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError(
-            "robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly."
-        )
+        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
 
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
@@ -198,7 +190,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         "passive_mode": True,
         "device": "auto",
         "use_sim_time": is_sim,
-        "node_name": "act_inference_node",
+        "node_name": INFERENCE_NODE_NAME,
         "execution_mode": "distributed",
         "request_timeout": request_timeout,
         "cloud_inference_topic": cloud_inference_topic,
@@ -208,15 +200,13 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     edge_node = Node(
         package="inference_service",
         executable="lerobot_policy_node",
-        name="act_inference_node",
+        name=INFERENCE_NODE_NAME,
         env=env,
         parameters=[edge_node_params],
         output="screen",
     )
     nodes.append(edge_node)
-    logger.info(
-        f"  Edge Node (lerobot_policy_node): Action Server + Pre/Post processing"
-    )
+    logger.info("  Edge Node (lerobot_policy_node): Action Server + Pre/Post processing")
     logger.info(f"    Publishing to: {cloud_inference_topic}")
     logger.info(f"    Subscribed to: {cloud_result_topic}")
 
@@ -265,11 +255,9 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
     """
     is_sim = parse_bool(use_sim, default=False)
 
-    robot_config_path = robot_config.get('_config_path', '')
+    robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError(
-            "robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly."
-        )
+        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
 
     control_modes = robot_config.get("control_modes", {})
     mode_config = control_modes.get(control_mode, {})
@@ -282,15 +270,13 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
     executor_type = executor_config.get("type", "topic")
     executor_mode = executor_config.get("mode", control_mode)
 
-    logger.info(f"========== Generating Action Dispatcher ==========")
+    logger.info("========== Generating Action Dispatcher ==========")
     logger.info(f"Robot: {robot_name}")
     logger.info(f"Control mode: {control_mode}")
     logger.info(f"Executor type: {executor_type}")
     logger.info(f"Use sim time: {is_sim}")
 
-    inference_config = mode_config.get("inference", {})
-
-    action_server = "/act_inference_node/DispatchInfer"
+    action_server = f"/{INFERENCE_NODE_NAME}/DispatchInfer"
 
     action_dispatcher_node = Node(
         package="action_dispatch",
@@ -322,18 +308,73 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
                 "robot_config_path": str(robot_config_path),
                 "inference_action_server": action_server,
                 "inference_prompt": "",
+                "navigation_mode": executor_config.get("navigation_mode", False),
                 "use_sim_time": is_sim,
             }
         ],
         output="screen",
     )
 
-    logger.info(f"✓ Action dispatcher configured")
+    logger.info("✓ Action dispatcher configured")
     return action_dispatcher_node
 
 
-def generate_execution_nodes(robot_config, control_mode="model_inference",
-                             use_sim=False, cloud_local=False):
+def generate_robot_evaluate_node(robot_config, control_mode, use_sim=False):
+    """Generate robot_evaluate node with configuration binding.
+
+    .. deprecated::
+        Use generate_action_dispatcher_node with navigation_mode=True instead.
+        This function is kept for backward compatibility and will be removed.
+
+    Args:
+        robot_config: Robot configuration dict
+        control_mode: Active control mode
+        use_sim: Simulation mode flag
+
+    Returns:
+        Node action for robot_evaluate
+    """
+    is_sim = parse_bool(use_sim, default=False)
+
+    robot_config_path = robot_config.get("_config_path", "")
+    if not robot_config_path:
+        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
+
+    control_modes = robot_config.get("control_modes", {})
+    mode_config = control_modes.get(control_mode, {})
+    executor_config = mode_config.get("executor", {})
+
+    inference_action_server = f"/{INFERENCE_NODE_NAME}/DispatchInfer"
+    watermark_threshold = executor_config.get("watermark_threshold", 20)
+    enable_stable_mode = executor_config.get("enable_stable_mode", False)
+
+    logger.info("========== Generating Robot Evaluate Node ==========")
+    logger.info(f"Control mode: {control_mode}")
+    logger.info(f"Inference action server: {inference_action_server}")
+    logger.info(f"Watermark threshold: {watermark_threshold}")
+    logger.info(f"Robot config path: {robot_config_path}")
+
+    robot_evaluate_node = Node(
+        package="robot_evaluate",
+        executable="robot_evaluate_node",
+        name="robot_evaluate",
+        parameters=[
+            {
+                "robot_config_path": str(robot_config_path),
+                "inference_action_server": inference_action_server,
+                "watermark_threshold": watermark_threshold,
+                "enable_stable_mode": enable_stable_mode,
+                "use_sim_time": is_sim,
+            }
+        ],
+        output="screen",
+    )
+
+    logger.info("✓ Robot evaluate node configured")
+    return robot_evaluate_node
+
+
+def generate_execution_nodes(robot_config, control_mode="model_inference", use_sim=False, cloud_local=False):
     """Generate all execution nodes (inference + dispatcher).
 
     This is the main entry point for execution system generation.
@@ -355,8 +396,7 @@ def generate_execution_nodes(robot_config, control_mode="model_inference",
         control_mode = robot_config.get("default_control_mode", "model_inference")
 
     try:
-        inference_result = generate_inference_node(
-            robot_config, control_mode, use_sim, cloud_local=cloud_local)
+        inference_result = generate_inference_node(robot_config, control_mode, use_sim, cloud_local=cloud_local)
         if inference_result:
             if isinstance(inference_result, list):
                 nodes.extend(inference_result)
@@ -366,12 +406,11 @@ def generate_execution_nodes(robot_config, control_mode="model_inference",
         logger.error(f"generating inference node: {e}")
 
     try:
-        dispatcher_node = generate_action_dispatcher_node(
-            robot_config, control_mode, use_sim
-        )
+        # Use unified action dispatcher (navigation_mode is set via executor config).
+        dispatcher_node = generate_action_dispatcher_node(robot_config, control_mode, use_sim)
         nodes.append(dispatcher_node)
     except Exception as e:
-        logger.error(f"generating action dispatcher: {e}")
+        logger.error(f"generating dispatcher node: {e}")
         raise
 
     return nodes

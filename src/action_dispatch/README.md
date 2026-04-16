@@ -178,6 +178,7 @@ ros2 run action_dispatch action_dispatcher_node
 | `inference_action_server` | string | `/act_inference_node/DispatchInfer` | 推理服务 Action 名称 |
 | `contract_path` | string | `''` | Contract 文件路径 |
 | `joint_state_topic` | string | `/joint_states` | 关节状态话题 |
+| `navigation_mode` | bool | false | 导航模式（启动时停止，等待外部触发） |
 | `temporal_smoothing_enabled` | bool | false | 是否启用跨帧平滑 |
 | `temporal_ensemble_coeff` | double | 0.01 | 平滑系数 |
 | `chunk_size` | int | 100 | Action Chunk 大小 |
@@ -333,6 +334,78 @@ ros2 service call /action_dispatcher/toggle_smoothing std_srvs/srv/Empty
 ros2 service call /action_dispatcher/reset std_srvs/srv/Empty
 ```
 
+## 导航模式 (Navigation Mode)
+
+当 `navigation_mode=true` 时，系统启动后处于停止状态，等待外部触发开始执行。此模式用于 nav2 导航到达目的地后，触发 ACT 模型执行抓取任务。
+
+### 工作流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Navigation Mode 工作流程                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  1. 系统启动                                                                  │
+│     ┌─────────────┐                                                          │
+│     │ Dispatcher  │  启动时 _is_running = False                              │
+│     │ [NAV] 模式  │  系统就绪，等待触发                                        │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  2. Nav2 导航                                                                 │
+│     ┌─────────────┐                                                          │
+│     │   Nav2      │  导航到目标位置                                            │
+│     │  导航中...  │  Dispatcher 不执行动作                                     │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  3. 到达目的地                                                                │
+│     ┌─────────────┐                                                          │
+│     │  Nav2 完成  │  调用 /action_dispatcher/start_evaluate                  │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  4. ACT 执行                                                                  │
+│     ┌─────────────┐                                                          │
+│     │ Dispatcher  │  _is_running = True                                      │
+│     │ 开始执行    │  触发推理，执行 ACT 动作序列                                │
+│     └─────────────┘                                                          │
+│                                                                              │
+│  5. 任务完成                                                                  │
+│     ┌─────────────┐                                                          │
+│     │  调用       │  调用 /action_dispatcher/stop_evaluate                   │
+│     │ stop_evaluate│  停止执行，底盘速度置零                                   │
+│     └─────────────┘                                                          │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 使用方法
+
+```bash
+# 启动系统（navigation_mode=true 时）
+ros2 launch robot_config robot.launch.py robot_config:=lekiwi_navi control_mode:=navi
+
+# Nav2 到达目的地后，开始执行
+ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger
+
+# 任务完成后，停止执行
+ros2 service call /action_dispatcher/stop_evaluate std_srvs/srv/Trigger
+
+# 查询当前状态
+ros2 service call /action_dispatcher/get_status std_srvs/srv/Trigger
+```
+
+### 配置示例
+
+在机器人配置 YAML 中启用：
+
+```yaml
+control_modes:
+  navi:
+    executor:
+      navigation_mode: true    # 启用导航模式
+      watermark_threshold: 20
+      control_frequency: 30.0
+```
+
 ## 话题和服务
 
 ### 与 Inference Service 通信
@@ -361,6 +434,9 @@ ros2 service call /action_dispatcher/reset std_srvs/srv/Empty
 |------|------|------|
 | `~/reset` | `std_srvs/Empty` | 重置队列和状态 |
 | `~/toggle_smoothing` | `std_srvs/Empty` | 切换平滑开关 |
+| `~/start_evaluate` | `std_srvs/Trigger` | 开始执行（仅 navigation_mode=true 时有效） |
+| `~/stop_evaluate` | `std_srvs/Trigger` | 停止执行并停止底盘（仅 navigation_mode=true 时有效） |
+| `~/get_status` | `std_srvs/Trigger` | 获取运行状态（running/stopped） |
 
 ### 与 ros2_control 通信
 

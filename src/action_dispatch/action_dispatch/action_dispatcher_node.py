@@ -25,7 +25,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Int32
-from std_srvs.srv import Empty
+from std_srvs.srv import Empty, Trigger
 
 from ibrobot_msgs.action import DispatchInfer
 from robot_config.contract_utils import iter_specs
@@ -62,6 +62,7 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("inference_action_server", "/act_inference_node/DispatchInfer")
         self.declare_parameter("robot_config_path", "")
         self.declare_parameter("joint_state_topic", "/joint_states")
+        self.declare_parameter("navigation_mode", False)
 
         # Temporal smoothing parameters
         self.declare_parameter("temporal_smoothing_enabled", False)
@@ -83,10 +84,12 @@ class ActionDispatcherNode(Node):
             smoothing_device = None
 
         # 2. State & Queue
+        self._navigation_mode = self.get_parameter("navigation_mode").value
         self._queue = collections.deque(maxlen=self._queue_limit)
         self._last_action: np.ndarray | None = None
         self._inference_in_progress = False
-        self._is_running = True
+        # In navigation mode, start in stopped state; otherwise run immediately.
+        self._is_running = not self._navigation_mode
 
         # Track actions executed during inference for temporal alignment
         self._plan_length_at_inference_start: int = 0
@@ -122,6 +125,18 @@ class ActionDispatcherNode(Node):
         else:
             self.get_logger().warn("No robot_config_path provided! TopicExecutor will use defaults.")
 
+        # 4b. Detect base action spec for navigation mode stop command.
+        # Base spec: 3 names with first index >= 6 (e.g. action.6, action.7, action.8).
+        self._base_act_spec = None
+        for sv in self._action_specs:
+            if sv.names and len(sv.names) == 3:
+                first_idx = int(sv.names[0].split(".")[-1])
+                if first_idx >= 6:
+                    self._base_act_spec = sv
+                    break
+        if self._base_act_spec:
+            self.get_logger().info(f"Detected base action spec: {[n for n in self._base_act_spec.names]}")
+
         # 5. Executor (Topic-based)
         self._executor = TopicExecutor(self, {"action_specs": self._action_specs})
         if not self._executor.initialize():
@@ -151,8 +166,15 @@ class ActionDispatcherNode(Node):
         self._reset_srv = self.create_service(Empty, "~/reset", self._reset_cb)
         self._toggle_smoothing_srv = self.create_service(Empty, "~/toggle_smoothing", self._toggle_smoothing_cb)
 
+        # Navigation mode services (only useful when navigation_mode=True)
+        self._start_nav_srv = self.create_service(Trigger, "~/start_evaluate", self._start_nav_cb)
+        self._stop_nav_srv = self.create_service(Trigger, "~/stop_evaluate", self._stop_nav_cb)
+        self._get_status_srv = self.create_service(Trigger, "~/get_status", self._get_status_cb)
+
+        mode_label = "NAV" if self._navigation_mode else "NORMAL"
         self.get_logger().info(
-            f"Dispatcher ready. Hz: {self._control_hz}, Watermark: {self._watermark}, "
+            f"Dispatcher ready [{mode_label}]. Hz: {self._control_hz}, "
+            f"Watermark: {self._watermark}, "
             f"Smoothing: {'ON' if self._smoothing_enabled else 'OFF'}"
         )
         self.get_logger().info(f"Waiting for inference server: {self._server_name}")
@@ -432,6 +454,68 @@ class ActionDispatcherNode(Node):
         self._smoother._smoother.config.enabled = self._smoothing_enabled
 
         self.get_logger().info(f"Temporal smoothing {'ENABLED' if self._smoothing_enabled else 'DISABLED'}")
+        return response
+
+    def _stop_base(self):
+        """Send zero-velocity command to base controller via TopicExecutor."""
+        if self._base_act_spec is None:
+            self.get_logger().warn("No base action spec found, cannot stop base")
+            return
+
+        from std_msgs.msg import Float64MultiArray
+
+        for topic, info in self._executor._publishers.items():
+            if info["spec"] is self._base_act_spec:
+                msg = Float64MultiArray()
+                msg.data = [0.0, 0.0, 0.0]
+                info["pub"].publish(msg)
+                self.get_logger().info(f"Published zero base command to {topic}")
+                break
+
+    def _start_nav_cb(self, request, response):
+        """Start evaluate service callback."""
+        if not self._navigation_mode:
+            response.success = False
+            response.message = "Navigation mode is not enabled"
+            return response
+
+        if self._is_running:
+            response.success = False
+            response.message = "Evaluate is already running"
+            return response
+
+        self._is_running = True
+        self.get_logger().info("Evaluate started")
+        response.success = True
+        response.message = "Evaluate started"
+        return response
+
+    def _stop_nav_cb(self, request, response):
+        """Stop evaluate service callback."""
+        if not self._navigation_mode:
+            response.success = False
+            response.message = "Navigation mode is not enabled"
+            return response
+
+        if not self._is_running:
+            response.success = False
+            response.message = "Evaluate is already stopped"
+            return response
+
+        self._is_running = False
+        self._stop_base()
+        self.get_logger().info("Evaluate stopped")
+        response.success = True
+        response.message = "Evaluate stopped"
+        return response
+
+    def _get_status_cb(self, request, response):
+        """Get status service callback."""
+        if self._is_running:
+            response.message = "running"
+        else:
+            response.message = "stopped"
+        response.success = True
         return response
 
 

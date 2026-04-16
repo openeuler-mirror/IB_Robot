@@ -1,0 +1,10 @@
+<library path="lekiwi_hardware_interface">
+  <class name="lekiwi_hardware/LeKiwiSystemHardware"
+         type="lekiwi_hardware::LeKiwiSystemHardware"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      Native C++ ros2_control hardware interface for LeKiwi mobile manipulator
+      with 6 arm position servos and 3 base velocity servos via Feetech STS protocol
+    </description>
+  </class>
+</library>
