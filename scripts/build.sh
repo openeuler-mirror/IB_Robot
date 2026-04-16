@@ -135,17 +135,58 @@ setup_venv() {
         "/home/ros/colcon_venv/venv"
         "${VIRTUAL_ENV:-}"
     )
-
+    
     for venv in "${venv_paths[@]}"; do
         if [[ -n "${venv}" && -f "${venv}/bin/activate" ]]; then
             source "${venv}/bin/activate"
             export PATH="${venv}/bin:$PATH"
-            export COLCON_PYTHON_EXECUTABLE="${venv}/bin/python3"
-            export PYTHONNOUSERSITE=1
             return 0
         fi
     done
     return 1
+}
+
+ensure_python_deps() {
+    [[ -z "${VIRTUAL_ENV:-}" ]] && return 0
+    
+    local deps=("typing_extensions:typing-extensions" "serial:pyserial" "feetech_servo_sdk:feetech-servo-sdk" "sherpa_onnx:sherpa-onnx" "soundfile:soundfile" "sounddevice:sounddevice")
+    for dep in "${deps[@]}"; do
+        local module="${dep%%:*}"
+        local package="${dep##*:}"
+        if ! python3 -c "import ${module}" 2>/dev/null; then
+            echo "Installing ${package} in venv..."
+            python3 -m pip install --quiet "${package}"
+        fi
+    done
+}
+
+check_lerobot_python_compat() {
+    local pyproject="${WORKSPACE}/libs/lerobot/pyproject.toml"
+    [[ ! -f "${pyproject}" ]] && return 0
+
+    local min_python
+    min_python="$(grep -E '^requires-python = ">=[0-9]+\.[0-9]+"' "${pyproject}" | sed -E 's/.*">=([0-9]+\.[0-9]+)".*/\1/' | head -n1)"
+    [[ -z "${min_python}" ]] && return 0
+
+    if ! python3 - "${min_python}" <<'PY'
+import re
+import sys
+
+required = sys.argv[1]
+match = re.fullmatch(r"(\d+)\.(\d+)", required)
+if not match:
+    raise SystemExit(0)
+
+major, minor = map(int, match.groups())
+raise SystemExit(0 if sys.version_info >= (major, minor) else 1)
+PY
+    then
+            local current_py
+            current_py="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
+            log_error "libs/lerobot requires Python >= ${min_python}, but the active interpreter is ${current_py}."
+            log_error "The current ROS 2 Humble workspace venv is not new enough for LeRobot v0.5.1."
+            exit 1
+    fi
 }
 
 require_setup_environment() {
@@ -172,6 +213,8 @@ require_setup_environment() {
         log_error "Or re-run ./scripts/setup.sh which now installs colcon into venv automatically."
         exit 1
     fi
+
+    check_lerobot_python_compat
 
     if ! python3 -c "import lerobot" 2>/dev/null; then
         log_warning "lerobot is not importable in the current venv."
@@ -230,7 +273,7 @@ echo "════════════════════════�
 EVENT_HANDLERS="status- summary-"
 ${VERBOSE} && EVENT_HANDLERS="console_cohesion+"
 
-python3 -m colcon build \
+colcon build \
     --continue-on-error \
     --parallel-workers "$(nproc)" \
     --merge-install \

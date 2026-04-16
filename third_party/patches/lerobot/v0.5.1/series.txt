@@ -1,0 +1,2 @@
+0001-python-compat-syntax-and-metadata.patch
+0002-python-compat-min-version-3.10.patch

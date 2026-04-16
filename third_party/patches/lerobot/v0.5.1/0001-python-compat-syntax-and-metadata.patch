@@ -1,0 +1,140 @@
+From 5f568b8c9df481c485f02fd49f0242bff177453d Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Wed, 15 Apr 2026 22:51:00 +0800
+Subject: [PATCH 1/2] Patch Python 3.11 compatibility
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ pyproject.toml                            | 5 +++--
+ src/lerobot/datasets/streaming_dataset.py | 5 ++++-
+ src/lerobot/motors/motors_bus.py          | 4 ++--
+ src/lerobot/processor/pipeline.py         | 4 ++--
+ src/lerobot/utils/io_utils.py             | 4 +++-
+ 5 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index c299199c..eff6d67b 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -29,7 +29,7 @@ version = "0.5.1"
+ description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
+ dynamic = ["readme"]
+ license = { text = "Apache-2.0" }
+-requires-python = ">=3.12"
++requires-python = ">=3.11"
+ authors = [
+     { name = "Rémi Cadène", email = "re.cadene@gmail.com" },
+     { name = "Simon Alibert", email = "alibert.sim@gmail.com" },
+@@ -50,6 +50,7 @@ classifiers = [
+     "Intended Audience :: Education",
+     "Intended Audience :: Science/Research",
+     "License :: OSI Approved :: Apache Software License",
++    "Programming Language :: Python :: 3.11",
+     "Programming Language :: Python :: 3.12",
+     "Programming Language :: Python :: 3.13",
+     "Topic :: Software Development :: Build Tools",
+@@ -329,7 +330,7 @@ default.extend-ignore-identifiers-re = [
+ # Uncomment [tool.mypy] first, then uncomment individual module overrides as they get proper type annotations
+ 
+ [tool.mypy]
+-python_version = "3.12"
++python_version = "3.11"
+ ignore_missing_imports = true
+ follow_imports = "skip"
+ # warn_return_any = true
+diff --git a/src/lerobot/datasets/streaming_dataset.py b/src/lerobot/datasets/streaming_dataset.py
+index 1767cc79..a4fcdda0 100644
+--- a/src/lerobot/datasets/streaming_dataset.py
++++ b/src/lerobot/datasets/streaming_dataset.py
+@@ -16,6 +16,7 @@
+ from collections import deque
+ from collections.abc import Callable, Generator, Iterable, Iterator
+ from pathlib import Path
++from typing import Generic, TypeVar
+ 
+ import datasets
+ import numpy as np
+@@ -37,6 +38,8 @@ from lerobot.datasets.video_utils import (
+ )
+ from lerobot.utils.constants import HF_LEROBOT_HOME, LOOKAHEAD_BACKTRACKTABLE, LOOKBACK_BACKTRACKTABLE
+ 
++T = TypeVar("T")
++
+ 
+ class LookBackError(Exception):
+     """
+@@ -54,7 +57,7 @@ class LookAheadError(Exception):
+     pass
+ 
+ 
+-class Backtrackable[T]:
++class Backtrackable(Generic[T]):
+     """
+     Wrap any iterator/iterable so you can step back up to `history` items
+     and look ahead up to `lookahead` items.
+diff --git a/src/lerobot/motors/motors_bus.py b/src/lerobot/motors/motors_bus.py
+index 509f5e95..52cd2830 100644
+--- a/src/lerobot/motors/motors_bus.py
++++ b/src/lerobot/motors/motors_bus.py
+@@ -38,8 +38,8 @@ from tqdm import tqdm
+ from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+ from lerobot.utils.utils import enter_pressed, move_cursor_up
+ 
+-type NameOrID = str | int
+-type Value = int | float
++NameOrID = str | int
++Value = int | float
+ 
+ logger = logging.getLogger(__name__)
+ 
+diff --git a/src/lerobot/processor/pipeline.py b/src/lerobot/processor/pipeline.py
+index abfb3142..31c9895a 100644
+--- a/src/lerobot/processor/pipeline.py
++++ b/src/lerobot/processor/pipeline.py
+@@ -39,7 +39,7 @@ from collections.abc import Callable, Iterable, Sequence
+ from copy import deepcopy
+ from dataclasses import dataclass, field
+ from pathlib import Path
+-from typing import Any, TypedDict, TypeVar, cast
++from typing import Any, Generic, TypedDict, TypeVar, cast
+ 
+ import torch
+ from huggingface_hub import hf_hub_download
+@@ -251,7 +251,7 @@ class ProcessorMigrationError(Exception):
+ 
+ 
+ @dataclass
+-class DataProcessorPipeline[TInput, TOutput](HubMixin):
++class DataProcessorPipeline(HubMixin, Generic[TInput, TOutput]):
+     """A sequential pipeline for processing data, integrated with the Hugging Face Hub.
+ 
+     This class chains together multiple `ProcessorStep` instances to form a complete
+diff --git a/src/lerobot/utils/io_utils.py b/src/lerobot/utils/io_utils.py
+index d70ea8b6..de055e1d 100644
+--- a/src/lerobot/utils/io_utils.py
++++ b/src/lerobot/utils/io_utils.py
+@@ -16,10 +16,12 @@
+ import json
+ import warnings
+ from pathlib import Path
++from typing import TypeVar
+ 
+ import imageio
+ 
+ JsonLike = str | int | float | bool | None | list["JsonLike"] | dict[str, "JsonLike"] | tuple["JsonLike", ...]
++TJson = TypeVar("TJson", bound=JsonLike)
+ 
+ 
+ def write_video(video_path, stacked_frames, fps):
+@@ -31,7 +33,7 @@ def write_video(video_path, stacked_frames, fps):
+         imageio.mimsave(video_path, stacked_frames, fps=fps)
+ 
+ 
+-def deserialize_json_into_object[T: JsonLike](fpath: Path, obj: T) -> T:
++def deserialize_json_into_object(fpath: Path, obj: TJson) -> TJson:
+     """
+     Loads the JSON data from `fpath` and recursively fills `obj` with the
+     corresponding values (strictly matching structure and types).
+-- 
+2.34.1
+

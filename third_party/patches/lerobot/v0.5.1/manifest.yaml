@@ -1,0 +1,33 @@
+upstream:
+  repo: https://gitcode.com/openharmony-robot/lerobot.git
+  tag: v0.5.1
+  commit: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
+
+patch_stack:
+  generated_from_submodule_branch: compat/python310
+  reference_submodule_commit: b455fd50b13714f80e25097eaf71a95ae29cc9ad
+  local_branch_name: ibrobot/lerobot-v0.5.1-patched
+  application_method: git-am
+
+patches:
+  - file: 0001-python-compat-syntax-and-metadata.patch
+    purpose:
+      - Replace Python 3.12-only generic syntax with Python 3.10-compatible typing constructs.
+      - Lower project metadata from Python 3.12 to Python 3.11 as the first step in the compatibility stack.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [core, ros, hardware, dev]
+  - file: 0002-python-compat-min-version-3.10.patch
+    purpose:
+      - Lower project metadata from Python 3.11 to Python 3.10.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [core, ros, hardware, dev]
+
+notes:
+  - This stack intentionally targets the broadest common Python baseline used by IB_Robot.
+  - NumPy >= 2 requirements from upstream lerobot v0.5.1 are not solved by these patches.
+  - Platform-specific patches for musl/OpenHarmony should be added as new numbered patches instead of forking this stack.
+  - The reference_submodule_commit records the current local development result, but repeated git-am application will produce different commit hashes unless committer identity and dates are reproduced exactly.

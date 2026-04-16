@@ -1,7 +1,6 @@
 [submodule "libs/lerobot"]
     path = libs/lerobot
-    url = https://gitcode.com/openeuler/lerobot_ros2.git
-    branch = master
+    url = https://gitcode.com/openharmony-robot/lerobot.git
     ignore = dirty
 [submodule "src/pymoveit2"]
 	path = src/pymoveit2
