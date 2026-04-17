@@ -35,18 +35,31 @@ class LossUtils:
         start_time = time.perf_counter()
         preds = self.forward(batches)
         end_time = time.perf_counter()
-        print(end_time - start_time)
+        print(f"inference time: {end_time - start_time:.3f}s")
 
         if len(targets) != len(preds):
             raise ValueError(f"Length mismatch: targets {len(targets)} vs preds {len(preds)}")
 
-        arr_loss = []
+        arr_l1 = []
+        arr_cos = []
         for i in range(len(targets)):
-            loss = torch.nn.functional.l1_loss(preds[i], targets[i], reduction="mean")
-            print(f"loss[{i}]: {loss.mean()}")
-            arr_loss.append(loss.item())
-        avg_loss = sum(arr_loss) / len(arr_loss)
-        print(f"avg loss: {avg_loss}")
+            l1 = torch.nn.functional.l1_loss(preds[i], targets[i], reduction="mean").item()
+            cos = torch.nn.functional.cosine_similarity(
+                preds[i].flatten().unsqueeze(0),
+                targets[i].flatten().unsqueeze(0),
+            ).item()
+            arr_l1.append(l1)
+            arr_cos.append(cos)
+
+        # Print summary table
+        print(f"\n{'Batch':>6} {'L1 Loss':>12} {'Cosine Sim':>12}")
+        print("-" * 32)
+        for i in range(len(arr_l1)):
+            print(f"{i:>6} {arr_l1[i]:>12.6f} {arr_cos[i]:>12.6f}")
+        print("-" * 32)
+        avg_l1 = sum(arr_l1) / len(arr_l1)
+        avg_cos = sum(arr_cos) / len(arr_cos)
+        print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
 
     def prepare_policy(self):
         if self.args.policy_type == "act":
