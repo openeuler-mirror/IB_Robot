@@ -706,6 +706,8 @@ setup_python_venv() {
     fi
 
     local venv_path="${WORKSPACE}/venv"
+    local lerobot_dir="${WORKSPACE}/libs/lerobot"
+    local lerobot_submodule_status=""
     
     # 1. Ensure system-level venv tools are installed
     log_info "Checking for Python venv and pip..."
@@ -724,14 +726,33 @@ setup_python_venv() {
         log_info "Virtual environment already exists at ${venv_path}."
     fi
 
+    lerobot_submodule_status="$(git submodule status -- libs/lerobot 2>/dev/null || true)"
+    if [[ "${lerobot_submodule_status}" == -* ]]; then
+        log_error "LeRobot submodule is not initialized at ${lerobot_dir}."
+        log_error "This usually happens when submodule initialization was skipped."
+        log_error "Run: git submodule update --init --recursive libs/lerobot"
+        exit 1
+    fi
+
+    if [[ ! -d "${lerobot_dir}" ]]; then
+        log_error "LeRobot dependency directory not found at ${lerobot_dir}."
+        log_error "Initialize the submodule with: git submodule update --init --recursive libs/lerobot"
+        exit 1
+    fi
+
+    if [[ ! -f "${lerobot_dir}/pyproject.toml" || ! -d "${lerobot_dir}/src/lerobot" ]]; then
+        log_error "LeRobot submodule at ${lerobot_dir} appears empty or uninitialized."
+        log_error "This usually happens when submodule initialization was skipped."
+        log_error "Run: git submodule update --init --recursive libs/lerobot"
+        exit 1
+    fi
+
     # 3. 激活虚拟环境并安装依赖
     if [[ "${DRY_RUN}" == true ]]; then
         log_info "Skipping venv activation in dry-run mode."
         run_cmd python3 -m pip install --upgrade pip --quiet
         run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
-        if [[ -d "${WORKSPACE}/libs/lerobot" ]]; then
-            run_cmd python3 -m pip install -e "${WORKSPACE}/libs/lerobot"
-        fi
+        run_cmd python3 -m pip install -e "${lerobot_dir}"
         run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
         run_cmd python3 -m pip install scipy --quiet
         run_cmd python3 -m pip install gitlint --quiet
@@ -751,10 +772,8 @@ setup_python_venv() {
     run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
 
     # 以可编辑模式安装 LeRobot
-    if [[ -d "${WORKSPACE}/libs/lerobot" ]]; then
-        log_info "Installing LeRobot in editable mode..."
-        run_cmd python3 -m pip install -e "${WORKSPACE}/libs/lerobot"
-    fi
+    log_info "Installing LeRobot in editable mode..."
+    run_cmd python3 -m pip install -e "${lerobot_dir}"
 
     # 安装原有的硬件依赖
     log_info "Installing hardware dependencies (pyserial, feetech)..."
@@ -792,11 +811,19 @@ setup_python_venv() {
     # 必须放在最后，防止 lerobot/scipy 等依赖将 numpy 升级到 2.x
     log_info "Pinning NumPy to 1.26.4 for ROS 2 compatibility..."
     run_cmd python3 -m pip install "numpy==1.26.4" --quiet
-    log_info "Installing gitlint pre-commit hook..."
-    if [[ "${DRY_RUN}" == true ]]; then
-        run_cmd gitlint install-hook
+    local commit_msg_hook
+    commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg)"
+    if [[ -e "${commit_msg_hook}" ]]; then
+        log_warn "gitlint commit-msg hook already exists at ${commit_msg_hook}; keeping it."
+        log_done "gitlint commit-msg hook already exists"
     else
-        yes | gitlint install-hook
+        log_info "Installing gitlint commit-msg hook..."
+        if [[ "${DRY_RUN}" == true ]]; then
+            run_cmd gitlint install-hook
+        else
+            printf 'y\n' | gitlint install-hook
+        fi
+        log_done "gitlint commit-msg hook installed"
     fi
 
     log_done "Python environment configured"
@@ -828,7 +855,8 @@ verify_setup() {
         exit 1
     fi
 
-    if ! (source /opt/ros/humble/setup.sh && "${venv_python}" -c "import rclpy" >/dev/null 2>&1); then
+    # ROS 2's setup.sh reads AMENT_TRACE_SETUP_FILES directly and is not nounset-safe.
+    if ! (set +u; source /opt/ros/humble/setup.sh && set -u && "${venv_python}" -c "import rclpy" >/dev/null 2>&1); then
         log_error "Verification failed: rclpy is not accessible from the virtual environment."
         exit 1
     fi
@@ -862,7 +890,7 @@ print_next_steps() {
     echo "  source venv/bin/activate"
     echo "  source /opt/ros/humble/setup.sh"
     echo "  ./scripts/build.sh"
-    echo "  # After the first build, also source: source install/setup.sh"
+    echo "  # After the first build, also execute: source install/setup.sh"
 }
 
 # ============================================================================
