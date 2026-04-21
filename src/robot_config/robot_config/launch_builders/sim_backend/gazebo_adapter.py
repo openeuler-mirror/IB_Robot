@@ -18,9 +18,10 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from robot_config.logger_utils import get_colored_logger
 
-from robot_config.utils import resolve_ros_path, parse_bool
+from robot_config.logger_utils import get_colored_logger
+from robot_config.utils import parse_bool, resolve_ros_path
+
 from .base_adapter import SimBackendAdapter
 
 logger = get_colored_logger("robot_config.sim_backend.gazebo")
@@ -34,9 +35,7 @@ def _start_actions_on_success(start_actions, success_message: str, failure_reaso
             logger.info(success_message)
             return start_actions
 
-        logger.error(
-            f"{failure_reason} (returncode={event.returncode})"
-        )
+        logger.error(f"{failure_reason} (returncode={event.returncode})")
         return [EmitEvent(event=Shutdown(reason=failure_reason))]
 
     return _handler
@@ -65,24 +64,30 @@ class GazeboAdapter(SimBackendAdapter):
             (actions, create_entity_node) for ``OnProcessExit``-triggered spawners.
         """
         actions = []
-        ros2_control_config = robot_config.get("ros2_control")
 
         # ---- Environment variable setup ----
         gazebo_resource_paths = []
         gazebo_model_paths = []
 
         try:
-            install_share = os.path.dirname(
-                FindPackageShare("robot_description").find("robot_description")
-            )
+            install_share = os.path.dirname(FindPackageShare("robot_description").find("robot_description"))
             gazebo_resource_paths.append(install_share)
             gazebo_model_paths.append(install_share)
             logger.info(f"Added install share path for Gazebo: {install_share}")
 
-            robot_desc_share = FindPackageShare('robot_description').find('robot_description')
-            mesh_path = os.path.join(robot_desc_share, 'meshes', 'lerobot', 'so101')
+            # Add lekiwi_description for chassis mesh resolution
+            try:
+                lekiwi_share = os.path.dirname(FindPackageShare("lekiwi_description").find("lekiwi_description"))
+                gazebo_resource_paths.append(lekiwi_share)
+                gazebo_model_paths.append(lekiwi_share)
+                logger.info(f"Added lekiwi_description share path for Gazebo: {lekiwi_share}")
+            except Exception:
+                pass  # lekiwi_description not installed, skip silently
+
+            robot_desc_share = FindPackageShare("robot_description").find("robot_description")
+            mesh_path = os.path.join(robot_desc_share, "meshes", "lerobot", "so101")
             if Path(mesh_path).exists():
-                mesh_files = list(Path(mesh_path).glob('*.stl'))
+                mesh_files = list(Path(mesh_path).glob("*.stl"))
                 logger.info(f"Verified {len(mesh_files)} mesh files at {mesh_path}")
             else:
                 logger.info(f"WARNING: Mesh directory not found at {mesh_path}")
@@ -90,14 +95,14 @@ class GazeboAdapter(SimBackendAdapter):
             logger.info(f"WARNING: Could not find robot_description package: {e}")
 
         if gazebo_resource_paths:
-            combined_resource = ':'.join(gazebo_resource_paths)
-            actions.append(SetEnvironmentVariable('GZ_SIM_RESOURCE_PATH', combined_resource))
-            actions.append(SetEnvironmentVariable('IGN_GAZEBO_RESOURCE_PATH', combined_resource))
+            combined_resource = ":".join(gazebo_resource_paths)
+            actions.append(SetEnvironmentVariable("GZ_SIM_RESOURCE_PATH", combined_resource))
+            actions.append(SetEnvironmentVariable("IGN_GAZEBO_RESOURCE_PATH", combined_resource))
 
         if gazebo_model_paths:
-            combined_model = ':'.join(gazebo_model_paths)
-            actions.append(SetEnvironmentVariable('GAZEBO_MODEL_PATH', combined_model))
-            actions.append(SetEnvironmentVariable('GZ_SIM_MODEL_PATH', combined_model))
+            combined_model = ":".join(gazebo_model_paths)
+            actions.append(SetEnvironmentVariable("GAZEBO_MODEL_PATH", combined_model))
+            actions.append(SetEnvironmentVariable("GZ_SIM_MODEL_PATH", combined_model))
 
         # ---- Optional GUI / EGL workarounds ----
         # Symptom: gray/empty 3D view while physics and ROS topics work; log may show
@@ -133,6 +138,7 @@ class GazeboAdapter(SimBackendAdapter):
         if _scene_name:
             try:
                 from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
+
                 world_path = str(get_gazebo_world_path(_scene_name))
                 logger.info(f"sim_models scene '{_scene_name}' → {world_path}")
                 layout = get_scene_layout(_scene_name)
@@ -145,10 +151,7 @@ class GazeboAdapter(SimBackendAdapter):
             except ImportError:
                 logger.warning("sim_models not installed; ignoring simulation.scene")
             except Exception as e:
-                logger.warning(
-                    f"scene '{_scene_name}' load failed: {e}; "
-                    "falling back to default world"
-                )
+                logger.warning(f"scene '{_scene_name}' load failed: {e}; falling back to default world")
 
         if not Path(world_path).exists():
             logger.info(f"WARNING: World file not found at {world_path}")
@@ -163,38 +166,44 @@ class GazeboAdapter(SimBackendAdapter):
         # gflags names use underscores (see `ros2 run ros_gz_sim create --help`):
         #   -allow_renaming   NOT -allow-renaming (latter is not a valid flag).
         create_args = [
-            '-world', gazebo_world_name,
-            '-name', robot_config.get("name", "so101"),
-            '-allow_renaming=true',
-            '-topic', '/robot_description',
-            '-x', str(robot_config.get("initial_pose_x", 0.0)),
-            '-y', str(robot_config.get("initial_pose_y", 0.0)),
-            '-z', str(robot_config.get("initial_pose_z", 0.0)),
+            "-world",
+            gazebo_world_name,
+            "-name",
+            robot_config.get("name", "so101"),
+            "-allow_renaming=true",
+            "-topic",
+            "/robot_description",
+            "-x",
+            str(robot_config.get("initial_pose_x", 0.0)),
+            "-y",
+            str(robot_config.get("initial_pose_y", 0.0)),
+            "-z",
+            str(robot_config.get("initial_pose_z", 0.0)),
         ]
         create_entity = Node(
-            package='ros_gz_sim',
-            executable='create',
+            package="ros_gz_sim",
+            executable="create",
             arguments=create_args,
-            output='screen',
+            output="screen",
         )
 
         # ---- Clock bridge ----
         clock_bridge = Node(
-            package='ros_gz_bridge',
-            executable='parameter_bridge',
-            arguments=['/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock'],
-            output='screen',
+            package="ros_gz_bridge",
+            executable="parameter_bridge",
+            arguments=["/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
+            output="screen",
         )
 
         # ---- Joint state bridge ----
         joint_state_bridge = Node(
-            package='ros_gz_bridge',
-            executable='parameter_bridge',
+            package="ros_gz_bridge",
+            executable="parameter_bridge",
             arguments=[
-                f'/world/{gazebo_world_name}/model/{robot_config.get("name", "so101")}'
-                f'/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model'
+                f"/world/{gazebo_world_name}/model/{robot_config.get('name', 'so101')}"
+                f"/joint_state@sensor_msgs/msg/JointState[gz.msgs.Model"
             ],
-            output='screen',
+            output="screen",
         )
 
         # ---- Gazebo server + GUI (must be listed before spawn; see below) ----
@@ -206,13 +215,15 @@ class GazeboAdapter(SimBackendAdapter):
 
         gazebo_launch = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('ros_gz_sim'),
-                    'launch',
-                    'gz_sim.launch.py',
-                ])
+                PathJoinSubstitution(
+                    [
+                        FindPackageShare("ros_gz_sim"),
+                        "launch",
+                        "gz_sim.launch.py",
+                    ]
+                )
             ),
-            launch_arguments={'gz_args': gz_args}.items(),
+            launch_arguments={"gz_args": gz_args}.items(),
         )
 
         clock_ready_waiter = Node(
@@ -227,27 +238,27 @@ class GazeboAdapter(SimBackendAdapter):
             ],
             output="screen",
         )
-        logger.info(
-            "Gazebo spawn: waiting for /clock before creating robot entity"
-        )
+        logger.info("Gazebo spawn: waiting for /clock before creating robot entity")
         logger.info(f"ros_gz_sim create argv: {create_args}")
 
-        actions.extend([
-            gazebo_launch,
-            clock_bridge,
-            joint_state_bridge,
-            clock_ready_waiter,
-            RegisterEventHandler(
-                event_handler=OnProcessExit(
-                    target_action=clock_ready_waiter,
-                    on_exit=_start_actions_on_success(
-                        [create_entity],
-                        success_message="Gazebo clock detected; creating robot entity.",
-                        failure_reason="Gazebo clock probe failed before robot spawn.",
-                    ),
-                )
-            ),
-        ])
+        actions.extend(
+            [
+                gazebo_launch,
+                clock_bridge,
+                joint_state_bridge,
+                clock_ready_waiter,
+                RegisterEventHandler(
+                    event_handler=OnProcessExit(
+                        target_action=clock_ready_waiter,
+                        on_exit=_start_actions_on_success(
+                            [create_entity],
+                            success_message="Gazebo clock detected; creating robot entity.",
+                            failure_reason="Gazebo clock probe failed before robot spawn.",
+                        ),
+                    )
+                ),
+            ]
+        )
 
         # Store model name for use by spawn_peripheral_bridges()
         self._model_name = robot_config.get("name", "so101")
@@ -257,7 +268,7 @@ class GazeboAdapter(SimBackendAdapter):
 
     def load_scene(self, scene_file_path: str) -> list:
         """Stub: scene loading for Gazebo (T5 implementation)."""
-        logger.info(f"GazeboAdapter.load_scene: not implemented yet (T5)")
+        logger.info("GazeboAdapter.load_scene: not implemented yet (T5)")
         return []
 
     def ensure_controller_manager(self, robot_config: dict) -> list:
@@ -284,12 +295,10 @@ class GazeboAdapter(SimBackendAdapter):
         from robot_config.launch_builders.sim_peripheral_bridge import (
             generate_peripheral_sim_bridges,
         )
+
         model_name = getattr(self, "_model_name", "so101")
         world_name = getattr(self, "_gazebo_world_name", "demo")
-        logger.info(
-            f"Gazebo: spawning peripheral bridges "
-            f"(world: {world_name}, model: {model_name})"
-        )
+        logger.info(f"Gazebo: spawning peripheral bridges (world: {world_name}, model: {model_name})")
         return generate_peripheral_sim_bridges(peripherals, model_name, world_name)
 
     def update_object_pose(self, object_name: str, pose) -> None:

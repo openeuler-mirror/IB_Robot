@@ -153,13 +153,6 @@
   <!-- ============================================ -->
   <!-- Arm Mounting: base_link -> world (arm base)  -->
   <!-- ============================================ -->
-  <!--
-    Transform from base_link to arm servo base.
-    Original was relative to base_plate_layer1-v5 (CAD root):
-      xyz=(0.01025, 0.034348, 0.0848), rpy=(π/2, 0, 0)
-    base_link and base_plate_layer1-v5 differ by R_x(-π/2).
-    Composing: R_x(-π/2)*R_x(π/2)=identity, translation rotated by R_x(-π/2).
-  -->
   <joint name="base_to_arm" type="fixed">
     <parent link="base_link"/>
     <child link="world"/>

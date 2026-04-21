@@ -1,0 +1,46 @@
+{
+  "keywords": {
+    "捡.*蓝色方块|拿.*蓝色方块|蓝色方块": {
+      "type": "action",
+      "info": {
+        "task_description": "Pick up the blue square"
+      }
+    },
+    "捡.*黑色方块|拿.*黑色方块|黑色方块": {
+      "type": "action",
+      "info": {
+        "task_description": "Pick up the black square"
+      }
+    },
+    "捡.*香蕉|拿.*香蕉|香蕉": {
+      "type": "action",
+      "info": {
+        "task_description": "Pick up the banana"
+      }
+    },
+    "去.*a点|到.*a点|a点": {
+      "type": "destination",
+      "info": {
+        "destination": "point_a"
+      }
+    },
+    "去.*b点|到.*b点|b点": {
+      "type": "destination",
+      "info": {
+        "destination": "point_b"
+      }
+    },
+    "回.*起点|到.*起点|起点": {
+      "type": "destination",
+      "info": {
+        "destination": "origin"
+      }
+    },
+    "停止|停下": {
+      "type": "stop",
+      "info": {
+        "task_description": "Stop current action"
+      }
+    }
+  }
+}

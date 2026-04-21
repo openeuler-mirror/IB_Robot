@@ -7,9 +7,9 @@ This module handles:
 - Virtual camera relays
 """
 
-from robot_config.logger_utils import get_colored_logger
 from launch_ros.actions import Node
 
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 
 logger = get_colored_logger("robot_config.perception")
@@ -33,10 +33,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
     nodes = []
 
     peripherals = robot_config.get("peripherals", [])
-    logger.info(
-        f"Generating nodes for {len(peripherals)} peripherals (use_sim={is_sim})"
-    )
-
+    logger.info(f"Generating nodes for {len(peripherals)} peripherals (use_sim={is_sim})")
     for periph in peripherals:
         periph_type = periph.get("type")
 
@@ -157,14 +154,8 @@ def generate_camera_nodes(robot_config, use_sim=False):
                     name=f"{name}_camera",
                     parameters=[params],
                     remappings=[
-                        (
-                            f"/camera/{name}/color/image_raw",
-                            f"/camera/{name}/image_raw",
-                        ),
-                        (
-                            f"/camera/{name}/color/camera_info",
-                            f"/camera/{name}/camera_info",
-                        ),
+                        (f"/camera/{name}/color/image_raw", f"/camera/{name}/image_raw"),
+                        (f"/camera/{name}/color/camera_info", f"/camera/{name}/camera_info"),
                     ],
                     output="screen",
                 )
@@ -182,9 +173,7 @@ def generate_lidar_nodes(robot_config, use_sim=False):
 
     nodes = []
     peripherals = robot_config.get("peripherals", [])
-    print(
-        f"[robot_config] Generating lidar nodes from {len(peripherals)} peripherals (use_sim={is_sim})"
-    )
+    print(f"[robot_config] Generating lidar nodes from {len(peripherals)} peripherals (use_sim={is_sim})")
 
     for periph in peripherals:
         if periph.get("type") != "lidar":
@@ -325,8 +314,13 @@ def generate_tf_nodes(robot_config, use_sim=False):
             )
         )
 
-        if periph.get("type") == "camera" and optical_frame_id:
-            # Optical frame TF (standard rotation for camera sensors)
+        # Optical frame TF (standard rotation for camera sensors)
+        # Skip for RealSense: driver publishes its own optical frame TF internally
+        if periph.get("driver") == "realsense":
+            logger.info(
+                f"  Skipping optical frame TF for RealSense (driver publishes {frame_id} -> {optical_frame_id})"
+            )
+        elif periph.get("type") == "camera" and optical_frame_id:
             nodes.append(
                 Node(
                     package="tf2_ros",
