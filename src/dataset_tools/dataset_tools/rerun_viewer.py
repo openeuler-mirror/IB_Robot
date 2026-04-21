@@ -25,6 +25,12 @@ rerun_addr : str, default "rerun+http://127.0.0.1:9090/proxy"
     gRPC address when ``rerun_mode`` is ``connect``.
 rerun_save_path : str, default "/tmp/ib_recording.rrd"
     Output path when ``rerun_mode`` is ``save``.
+image_max_fps : float, default 5.0
+    Per-image-stream logging cap inside the sidecar. This reduces viewer memory
+    growth without affecting rosbag recording.
+image_max_long_edge : int, default 320
+    Downscale large images before logging when their longest edge exceeds this
+    value. Set to ``0`` to disable downscaling.
 
 Usage
 -----
@@ -37,6 +43,7 @@ main launch file, or manually::
 
 from __future__ import annotations
 
+import os
 import signal
 import threading
 from contextlib import suppress
@@ -59,6 +66,8 @@ from robot_config.contract_utils import (
 from tensormsg import TensorMsgConverter
 
 DEFAULT_QOS_DEPTH = 10
+DEFAULT_IMAGE_MAX_FPS = 5.0
+DEFAULT_IMAGE_MAX_LONG_EDGE = 320
 
 # --------------- Color palette for joint/action curves ---------------
 _COLORS = [
@@ -79,12 +88,73 @@ def _color_for(idx: int) -> tuple[int, int, int, int]:
     return _COLORS[idx % len(_COLORS)]
 
 
-def _decode_image_for_rerun(msg: Any, spec: Any = None) -> np.ndarray | None:
-    """Decode images via tensormsg, then adapt them to viewer-friendly uint8."""
-    try:
-        arr = np.asarray(TensorMsgConverter.decode(msg, spec=spec))
-    except (ValueError, TypeError):
+def _default_rerun_memory_limit() -> str:
+    """Match LeRobot's default viewer memory cap and allow env override."""
+    return str(os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%") or "10%")
+
+
+def _image_msg_to_numpy(msg: Any) -> np.ndarray | None:
+    """Decode common ``sensor_msgs/Image`` encodings into numpy arrays."""
+    encoding = str(getattr(msg, "encoding", "") or "").lower()
+    width = int(getattr(msg, "width", 0) or 0)
+    height = int(getattr(msg, "height", 0) or 0)
+    step = int(getattr(msg, "step", 0) or 0)
+    data = getattr(msg, "data", None)
+
+    if width <= 0 or height <= 0 or step <= 0 or data is None:
         return None
+
+    encoding_spec: dict[str, tuple[type[np.generic], int, str | None]] = {
+        "rgb8": (np.uint8, 3, None),
+        "bgr8": (np.uint8, 3, "bgr"),
+        "rgba8": (np.uint8, 4, None),
+        "bgra8": (np.uint8, 4, "bgra"),
+        "mono8": (np.uint8, 1, None),
+        "8uc1": (np.uint8, 1, None),
+        "16uc1": (np.uint16, 1, None),
+        "mono16": (np.uint16, 1, None),
+        "32fc1": (np.float32, 1, None),
+    }
+    spec = encoding_spec.get(encoding)
+    if spec is None:
+        return None
+
+    dtype, channels, reorder = spec
+    bytes_per_channel = np.dtype(dtype).itemsize
+    expected_row_bytes = width * channels * bytes_per_channel
+    if step < expected_row_bytes:
+        return None
+
+    raw = memoryview(data)
+    expected_total_bytes = step * height
+    if len(raw) < expected_total_bytes:
+        return None
+
+    rows = np.frombuffer(raw[:expected_total_bytes], dtype=np.uint8).reshape(height, step)
+    pixel_bytes = rows[:, :expected_row_bytes]
+    arr = pixel_bytes.view(dtype)
+
+    if channels == 1:
+        arr = arr.reshape(height, width)
+    else:
+        arr = arr.reshape(height, width, channels)
+
+    if reorder == "bgr":
+        arr = arr[..., ::-1]
+    elif reorder == "bgra":
+        arr = arr[..., [2, 1, 0, 3]]
+
+    return np.ascontiguousarray(arr)
+
+
+def _decode_image_for_rerun(msg: Any, spec: Any = None) -> np.ndarray | None:
+    """Decode images via fast-path raw decoding, then tensormsg as fallback."""
+    arr = _image_msg_to_numpy(msg)
+    if arr is None:
+        try:
+            arr = np.asarray(TensorMsgConverter.decode(msg, spec=spec))
+        except (ValueError, TypeError):
+            return None
 
     if arr.size == 0:
         return None
@@ -99,6 +169,37 @@ def _decode_image_for_rerun(msg: Any, spec: Any = None) -> np.ndarray | None:
         arr = arr.astype(np.uint8)
 
     return np.ascontiguousarray(arr)
+
+
+def _downscale_image_for_rerun(arr: np.ndarray, max_long_edge: int) -> np.ndarray:
+    """Downscale large images before shipping them to Rerun."""
+    if max_long_edge <= 0 or arr.ndim < 2:
+        return arr
+
+    height, width = arr.shape[:2]
+    long_edge = max(height, width)
+    if long_edge <= max_long_edge:
+        return arr
+
+    scale = max_long_edge / float(long_edge)
+    new_height = max(1, int(round(height * scale)))
+    new_width = max(1, int(round(width * scale)))
+    y_idx = np.linspace(0, height - 1, new_height, dtype=np.int32)
+    x_idx = np.linspace(0, width - 1, new_width, dtype=np.int32)
+    reduced = np.take(arr, y_idx, axis=0)
+    reduced = np.take(reduced, x_idx, axis=1)
+    return np.ascontiguousarray(reduced)
+
+
+def _should_log_sample(
+    last_timestamp_s: float | None,
+    current_timestamp_s: float,
+    min_interval_s: float,
+) -> bool:
+    """Return whether a timestamp is outside the current throttle window."""
+    if min_interval_s <= 0.0 or last_timestamp_s is None:
+        return True
+    return current_timestamp_s >= (last_timestamp_s + min_interval_s)
 
 
 # --------------- Main Node ---------------
@@ -137,6 +238,9 @@ class RerunViewer(Node):
         self.declare_parameter("rerun_mode", "spawn")
         self.declare_parameter("rerun_addr", "rerun+http://127.0.0.1:9090/proxy")
         self.declare_parameter("rerun_save_path", "/tmp/ib_recording.rrd")
+        self.declare_parameter("rerun_memory_limit", _default_rerun_memory_limit())
+        self.declare_parameter("image_max_fps", DEFAULT_IMAGE_MAX_FPS)
+        self.declare_parameter("image_max_long_edge", DEFAULT_IMAGE_MAX_LONG_EDGE)
 
         robot_config_path = self.get_parameter("robot_config_path").get_parameter_value().string_value
         if not robot_config_path:
@@ -165,8 +269,12 @@ class RerunViewer(Node):
             rr.save(save_path)
             self.get_logger().info(f"Rerun: saving to {save_path}")
         else:
-            rr.spawn(detach_process=False)
-            self.get_logger().info("Rerun: spawning local viewer")
+            memory_limit = (
+                self.get_parameter("rerun_memory_limit").get_parameter_value().string_value.strip()
+                or _default_rerun_memory_limit()
+            )
+            rr.spawn(memory_limit=memory_limit, detach_process=False)
+            self.get_logger().info(f"Rerun: spawning local viewer (memory_limit={memory_limit})")
 
         # ---- Set up static SeriesLines style for scalar panels ----
         self._setup_series_styles()
@@ -176,7 +284,14 @@ class RerunViewer(Node):
         self._subs: list[Any] = []
         self._lock = threading.Lock()
         self._image_decode_warned: set[str] = set()
+        self._last_image_log_time_s: dict[str, float] = {}
         self._joint_state_name_warned = False
+        configured_image_max_fps = self.get_parameter("image_max_fps").get_parameter_value().double_value
+        self._image_min_interval_s = 0.0 if configured_image_max_fps <= 0.0 else 1.0 / configured_image_max_fps
+        self._image_max_long_edge = max(
+            0,
+            int(self.get_parameter("image_max_long_edge").get_parameter_value().integer_value),
+        )
 
         self._setup_observation_subs()
         self._setup_action_subs()
@@ -184,6 +299,11 @@ class RerunViewer(Node):
 
         self.get_logger().info(
             f"Rerun viewer ready — contract '{self._contract.name}' | {len(self._subs)} subscriptions"
+        )
+        self.get_logger().info(
+            "Rerun image safeguards enabled: "
+            f"max_fps={'unlimited' if self._image_min_interval_s <= 0.0 else f'{configured_image_max_fps:.2f}'} "
+            f"| max_long_edge={self._image_max_long_edge or 'disabled'}"
         )
 
     def _shutdown_rerun(self) -> None:
@@ -380,7 +500,7 @@ class RerunViewer(Node):
     #  Logging callbacks
     # ================================================================
 
-    def _set_ros_time(self, msg: Any) -> None:
+    def _set_ros_time(self, msg: Any) -> float:
         """Set the rerun timeline to the message's ROS timestamp."""
         rr = self._rr
         try:
@@ -389,11 +509,25 @@ class RerunViewer(Node):
         except AttributeError:
             t = float(self.get_clock().now().nanoseconds) * 1e-9
         rr.set_time("ros_time", duration=t)
+        return t
 
     def _log_image(self, msg: Any, entity_path: str) -> None:
         """Convert a ROS Image message and log to rerun."""
         rr = self._rr
-        self._set_ros_time(msg)
+        timestamp_s = self._set_ros_time(msg)
+
+        with self._lock:
+            last_timestamp_s = self._last_image_log_time_s.get(entity_path)
+            should_log = _should_log_sample(
+                last_timestamp_s=last_timestamp_s,
+                current_timestamp_s=timestamp_s,
+                min_interval_s=self._image_min_interval_s,
+            )
+            if should_log:
+                self._last_image_log_time_s[entity_path] = timestamp_s
+
+        if not should_log:
+            return
 
         arr = _decode_image_for_rerun(msg, spec=None)
         if arr is None:
@@ -408,6 +542,8 @@ class RerunViewer(Node):
                     f"step={getattr(msg, 'step', '?')})"
                 )
             return
+
+        arr = _downscale_image_for_rerun(arr, self._image_max_long_edge)
 
         # Determine color model
         if arr.ndim == 2 or (arr.ndim == 3 and arr.shape[2] == 1):
