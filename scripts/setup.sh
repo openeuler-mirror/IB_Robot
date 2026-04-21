@@ -778,6 +778,9 @@ setup_python_venv() {
         run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
         run_cmd python3 -m pip install -e "${lerobot_dir}"
         run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
+        if [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
+            run_cmd python3 -m pip install aiortc --quiet
+        fi
         run_cmd python3 -m pip install scipy --quiet
         run_cmd python3 -m pip install gitlint --quiet
         run_cmd python3 -m pip install "numpy==1.26.4" --quiet
@@ -802,6 +805,11 @@ setup_python_venv() {
     # 安装原有的硬件依赖
     log_info "Installing hardware dependencies (pyserial, feetech)..."
     run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
+
+    if [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
+        log_info "Installing openEuler fallback dependency (aiortc) into the workspace venv..."
+        run_cmd python3 -m pip install aiortc --quiet
+    fi
 
     # 安装 scipy 用于数学计算 (四元数/旋转矩阵转换)
     log_info "Installing scipy for mathematical computations..."
