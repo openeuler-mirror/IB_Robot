@@ -96,6 +96,15 @@ ros2 launch inference_service cloud_inference.launch.py \
     device:=cuda
 ```
 
+如果 Cloud 节点运行在端侧开发板（openEuler / OpenHarmony）上的 Ascend NPU，可直接切换为：
+
+```bash
+export ROS_DOMAIN_ID=42
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/models/pretrained_model \
+    device:=npu
+```
+
 #### 场景二：单机调试（开发测试用）
 
 在一台机器上同时运行 Edge + Cloud 节点，添加 `cloud_local:=true`：

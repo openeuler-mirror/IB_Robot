@@ -34,7 +34,7 @@ src/robot_config/config/robots/so101_single_arm.yaml
 
 用于控制 episode 录制的命令行工具。
 
-**启动录制服务**（在另一个终端）：
+**启动录制服务**（Ubuntu 录制服务器）：
 ```bash
 ros2 launch robot_config robot.launch.py \
     robot_config:=so101_single_arm \
@@ -44,7 +44,18 @@ ros2 launch robot_config robot.launch.py \
     use_sim:=false
 ```
 
-**启动录制客户端**：
+**如需启用 Rerun 可视化**：
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=teleop \
+    record:=true \
+    record_mode:=episodic \
+    record_visualizer:=rerun \
+    use_sim:=false
+```
+
+**启动录制客户端**（同机或另一台设置了相同 `ROS_DOMAIN_ID` 的机器）：
 ```bash
 ros2 run dataset_tools record_cli
 ```
@@ -82,25 +93,21 @@ Prompt > get        # 输入任务描述开始录制
 Prompt > q          # 退出
 ```
 
+录制完成后，推荐直接把整个 dataset 根目录转换成 LeRobot v3 数据集：
+
+```bash
+ros2 run dataset_tools bag_to_lerobot \
+    --bags-dir ~/rosbag/episodes/so101_single_arm \
+    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
+    --out /path/to/output_dataset
+```
+
 ### 2. bag_to_lerobot - Bag 转 LeRobot 数据集
 
-将 ROS 2 bag 转换为 LeRobot v3 数据集格式。
+将 ROS 2 episodic dataset 根目录转换为 LeRobot v3 数据集格式。
 
 **基本用法**：
 ```bash
-# 单个 bag
-ros2 run dataset_tools bag_to_lerobot \
-    --bag /path/to/bag \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
-    --out /path/to/output_dataset
-
-# 多个 bags
-ros2 run dataset_tools bag_to_lerobot \
-    --bags /path/to/epi1 /path/to/epi2 \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
-    --out /path/to/output_dataset
-
-# 直接转换一个 dataset 根目录（推荐）
 ros2 run dataset_tools bag_to_lerobot \
     --bags-dir ~/rosbag/episodes/so101_single_arm \
     --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
@@ -111,9 +118,7 @@ ros2 run dataset_tools bag_to_lerobot \
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--bag` | 单个 bag 目录路径 | 必需（与 --bags 二选一） |
-| `--bags` | 多个 bag 目录路径 | 必需（与 --bag 二选一） |
-| `--bags-dir` | episode 目录或 dataset 根目录，自动发现多个 bag | 必需（与 --bag 二选一） |
+| `--bags-dir` | dataset 根目录或 episodes 目录，自动发现多个 episode bag | 必需 |
 | `--robot-config` | robot_config.yaml 路径 | 必需 |
 | `--out` | 输出数据集目录 | 必需 |
 | `--repo-id` | 数据集 repo_id | `rosbag_v30` |

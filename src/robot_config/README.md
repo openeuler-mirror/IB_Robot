@@ -129,8 +129,31 @@ robot:
 
 **启动命令：**
 ```bash
-# 遥操作模式（带自动录制）
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=teleop record:=true
+# 遥操作模式（episodic 录制）
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=teleop \
+  record:=true \
+  record_mode:=episodic \
+  use_sim:=false
+
+# 遥操作模式（episodic + Rerun）
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=teleop \
+  record:=true \
+  record_mode:=episodic \
+  record_visualizer:=rerun \
+  use_sim:=false
+
+# 另一个终端启动录制客户端
+ros2 run dataset_tools record_cli
+
+# 录制完成后转换为 LeRobot 数据集
+ros2 run dataset_tools bag_to_lerobot \
+  --bags-dir ~/rosbag/episodes/so101_single_arm \
+  --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
+  --out /path/to/output_dataset
 ```
 
 #### 2. model_inference 模式（高频位置控制）
@@ -361,6 +384,8 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true
 # 算力机器（需设置相同 ROS_DOMAIN_ID）：
 # ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=cuda
+# 端侧开发板 Ascend NPU：
+# ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=npu
 ```
 
 ### 验证配置

@@ -97,7 +97,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 
 ### 0. 系统要求
 
-- **操作系统**: Ubuntu 或 openEuler Embedded
+- **操作系统**: Ubuntu 主机负责仿真、录制服务或云侧推理；端侧开发板可运行 openEuler Embedded 或 OpenHarmony
 - **ROS 版本**: ROS 2 Humble
 - **Python**: 系统原生 Python 3.11。**严禁在 Conda 激活的环境中执行，否则会导致动态库冲突。**
 - **加速器**: 支持 NVIDIA GPU、Ascend 310B、Ascend 310P，若未检测到则按 CPU-only 路径运行。
@@ -201,58 +201,257 @@ export ATOMGIT_TOKEN="your_token_here" `~\.zshrc` 或者 `~\.bashrc`中
 
 ## 运行指南
 
-所有操作均通过 `robot_config` 包的统一入口 `robot.launch.py` 触发。
+所有运行入口都以 `robot_config` 包的统一入口 `robot.launch.py` 为主。下文中的“端侧开发板”统一指可运行 **openEuler Embedded** 或 **OpenHarmony** 的板端设备。
 
-### 基础仿真（自动启动模型推理控制）
-
-```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
-```
-
-### 基础仿真（无模型推理，仅控制器）
+开始任一场景前，请先完成环境加载并设置唯一的 `ROS_DOMAIN_ID`。跨机器运行时，参与的所有机器必须使用**相同的 `ROS_DOMAIN_ID`**。
 
 ```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true with_inference:=false
+source .shrc_local
+export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 ```
 
-### MoveIt 规划模式（自动检测，带 RViz）
+更详细的子模块说明可参考下表：
+
+| 文档 | 简短说明 |
+| :--- | :--- |
+| [`src/inference_service/README.md`](src/inference_service/README.md) | 推理服务架构、单机/分布式部署与 NPU/GPU Cloud 节点启动方式 |
+| [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt Planning 控制、`/cmd_pose` 用法与 headless 启动方式 |
+| [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
+
+### 一、Ubuntu 仿真与控制场景
+
+#### 1. Ubuntu 启动仿真环境（仅仿真与控制器）
+
+适合验证 Gazebo、相机、控制器和基础 ROS 2 拓扑，不启动模型推理。
 
 ```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    use_sim:=true \
+    with_inference:=false
 ```
 
-### MoveIt 无 RViz（headless）
+#### 2. Ubuntu 启动仿真并用模型推理控制仿真机械臂
+
+显式切到 `model_inference` 模式，使用本机推理链路控制仿真机械臂。
 
 ```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true moveit_display:=false
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    use_sim:=true
 ```
 
-### 真实硬件
+#### 3. Ubuntu 启动 MoveIt Planning 控制（仿真）
+
+该场景默认会启动 MoveIt 与 RViz，并暴露 `/cmd_pose` 接口用于发送目标位姿。
 
 ```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=false
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true
 ```
 
-### 手动覆盖自动检测
+如需在板端或无图形界面的环境中运行，可关闭 RViz：
 
 ```bash
-ros2 launch robot_config robot.launch.py control_mode:=model_inference with_inference:=true use_sim:=true
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true \
+    moveit_display:=false
 ```
+
+发送位姿命令控制机械臂移动：
+
+```bash
+ros2 topic pub /cmd_pose geometry_msgs/Pose "{
+  position: {x: 0.15, y: 0.0, z: 0.25},
+  orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}
+}" --once
+```
+
+查看末端位姿反馈：
+
+```bash
+ros2 topic echo /robot_status/ee_pose
+```
+
+#### 4. 端侧开发板启动 MoveIt Planning 控制（真机）
+
+这部分与 Ubuntu 上的 MoveIt 用法保持一致，只是 `use_sim` 不再开启，适合真实机械臂控制。
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning
+```
+
+控制接口仍然是同一套话题：
+
+```bash
+ros2 topic pub /cmd_pose geometry_msgs/Pose "{
+  position: {x: 0.15, y: 0.0, z: 0.25},
+  orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}
+}" --once
+```
+
+### 二、分布式推理部署场景
+
+以下说明采用当前分布式部署模式：机器人侧只启动 Edge 代理节点，算力侧单独启动 `cloud_inference.launch.py`。
+
+#### 1. Ubuntu 单机调试分布式推理（Edge + Cloud 同机）
+
+适合开发和联调，在一台 Ubuntu 机器上同时运行分布式架构中的两侧节点。
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    execution_mode:=distributed \
+    use_sim:=true \
+    cloud_local:=true
+```
+
+#### 2. Ubuntu 启动仿真环境，端侧开发板启动 NPU 推理
+
+Ubuntu 主机负责仿真与 Edge 侧预处理/后处理；端侧开发板负责云侧纯推理。两台机器必须位于同一局域网，并设置相同的 `ROS_DOMAIN_ID`。
+
+**Ubuntu 主机（仿真 + Edge）**
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    execution_mode:=distributed \
+    use_sim:=true
+```
+
+**端侧开发板（NPU Cloud 节点）**
+
+```bash
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/model \
+    device:=npu
+```
+
+如需改为 GPU 服务器，只需将 `device:=npu` 替换为 `device:=cuda`。
+
+快速验证分布式链路是否打通：
+
+```bash
+ros2 node list | grep -E 'act_inference|pure_inference'
+ros2 topic list | grep -E 'preprocessed|inference/action'
+ros2 topic hz /inference/action
+```
+
+### 三、数据集录制场景
+
+episodic 录制始终由两部分组成：
+
+1. `robot.launch.py` 启动 `episode_recorder` 录制服务端
+2. `ros2 run dataset_tools record_cli` 启动交互式录制客户端
+
+`record_visualizer:=rerun` 只会额外拉起 Rerun 可视化 sidecar，不会替代 `record_cli`。
+
+#### 1. Ubuntu 启动录制服务器 + Ubuntu 启动录制客户端
+
+**不启用 Rerun**
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=teleop \
+    record:=true \
+    record_mode:=episodic \
+    use_sim:=false
+```
+
+**启用 Rerun**
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=teleop \
+    record:=true \
+    record_mode:=episodic \
+    record_visualizer:=rerun \
+    use_sim:=false
+```
+
+**客户端（同机另一个终端）**
+
+```bash
+ros2 run dataset_tools record_cli
+```
+
+启动 `record_cli` 后输入任务描述即可开始录制，按回车可提前结束当前 episode。
+
+#### 2. Ubuntu 启动录制服务器，端侧开发板启动录制客户端
+
+该模式适合把机器人控制与录制操作分离。Ubuntu 主机负责录制服务端，端侧开发板只负责运行 `record_cli`。两端仍需保持相同的 `ROS_DOMAIN_ID`。
+
+**Ubuntu 录制服务器（可选启用 Rerun）**
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=teleop \
+    record:=true \
+    record_mode:=episodic \
+    use_sim:=false
+```
+
+如需开启可视化，在服务端命令中增加：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=teleop \
+    record:=true \
+    record_mode:=episodic \
+    record_visualizer:=rerun \
+    use_sim:=false
+```
+
+**端侧开发板录制客户端**
+
+```bash
+ros2 run dataset_tools record_cli
+```
+
+录制完成后，可将整个 episodic dataset 根目录转换为 LeRobot 数据集格式：
+
+```bash
+ros2 run dataset_tools bag_to_lerobot \
+    --bags-dir ~/rosbag/episodes/so101_single_arm \
+    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
+    --out /path/to/output_dataset
+```
+
+bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/dataset_tools/README.md`。
 
 ***
 
 ## 参数说明
 
-| 参数名                      | 说明                                                          | 默认值                |
-| :----------------------- | :---------------------------------------------------------- | :----------------- |
-| `robot_config`           | 机器人配置名称 (对应 `config/robots/` 下的 YAML)                       | `so101_single_arm` |
-| `config_path`            | 配置文件绝对路径 (可选，覆盖 `robot_config`)                             | 空                  |
-| `use_sim`                | 是否使用 Gazebo 仿真模式                                            | `false`            |
-| `control_mode`           | 覆盖默认控制模式 (`model_inference` / `moveit_planning` / `teleop`) | 从 YAML 读取          |
-| `with_inference`         | 强制启用/禁用推理服务 (空则自动检测)                                        | 空                  |
-| `with_moveit`            | 强制启用/禁用 MoveIt 核心 (空则自动检测)                                  | 空                  |
-| `moveit_display`         | 是否启动 MoveIt RViz 可视化界面                                      | `true`             |
-| `auto_start_controllers` | 是否在启动后自动激活控制器                                               | `true`             |
+| 参数名 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `robot_config` | 机器人配置名称（对应 `config/robots/` 下的 YAML） | `so101_single_arm` |
+| `config_path` | 配置文件绝对路径（可选，覆盖 `robot_config`） | 空 |
+| `use_sim` | 是否启用仿真模式 | `false` |
+| `control_mode` | 覆盖默认控制模式（`model_inference` / `moveit_planning` / `teleop`） | 从 YAML 读取 |
+| `with_inference` | 强制启用/禁用推理服务（空则自动检测） | 空 |
+| `execution_mode` | 推理执行模式（`monolithic` / `distributed`） | `monolithic` |
+| `cloud_local` | 在分布式模式下是否同时在本机启动 Cloud 节点 | `false` |
+| `with_moveit` | 强制启用/禁用 MoveIt 核心（空则自动检测） | 空 |
+| `moveit_display` | 是否启动 MoveIt RViz 可视化界面 | `true` |
+| `record` | 是否启用录制流水线 | `false` |
+| `record_mode` | 录制模式（`continuous` / `episodic`） | `continuous` |
+| `record_visualizer` | 录制可视化器（`none` / `rerun`） | `none` |
+| `auto_start_controllers` | 是否在启动后自动激活控制器 | `true` |
 
 ***
 

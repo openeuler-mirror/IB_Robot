@@ -4,6 +4,39 @@
 
 `moveit_gateway` 是 IB-Robot 项目中的核心运动控制节点，充当高层控制接口与底层 MoveIt2 运动规划框架之间的网关。该节点专门针对 SO101 5自由度机械臂设计，解决了 5DOF 机械臂在逆运动学（IK）求解中的特殊约束问题。
 
+## 推荐启动场景
+
+### Ubuntu 启动 MoveIt Planning 控制（仿真）
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true
+```
+
+如需在板端或无图形界面的环境中运行，可关闭 RViz：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true \
+    moveit_display:=false
+```
+
+### 端侧开发板启动 MoveIt Planning 控制（真机）
+
+端侧开发板可运行 openEuler Embedded 或 OpenHarmony，真机场景下与 Ubuntu 的控制接口保持一致，只需关闭仿真模式：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning
+```
+
+两种场景都通过 `/cmd_pose` 发送位姿命令，通过 `/robot_status/ee_pose` 观察末端位姿反馈。
+
 ## 主要功能
 
 ### 1. 位姿控制 (Pose Control)
