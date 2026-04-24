@@ -868,17 +868,23 @@ setup_python_venv() {
     # 3. 激活虚拟环境并安装依赖
     if [[ "${DRY_RUN}" == true ]]; then
         log_info "Skipping venv activation in dry-run mode."
-        run_cmd python3 -m pip install --upgrade pip --quiet
-        run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
-        run_cmd python3 -m pip install -e "${lerobot_dir}"
-        run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
+        log_info "NOTE: dry-run only prints planned commands; no packages are installed into system Python."
+        run_cmd "${venv_path}/bin/python" -m pip install --upgrade pip --quiet
+        run_cmd "${venv_path}/bin/python" -m pip install "setuptools<80" "setuptools>=71" --quiet
+        run_cmd "${venv_path}/bin/python" -m pip install -e "${lerobot_dir}"
+        run_cmd "${venv_path}/bin/python" -m pip install pyserial feetech-servo-sdk --quiet
         if [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
-            run_cmd python3 -m pip install aiortc --quiet
+            run_cmd "${venv_path}/bin/python" -m pip install aiortc --quiet
         fi
-        run_cmd python3 -m pip install scipy --quiet
-        run_cmd python3 -m pip install gitlint --quiet
-        run_cmd python3 -m pip install colcon-common-extensions colcon-mixin --quiet
-        run_cmd python3 -m pip install rosdepc --quiet
+        run_cmd "${venv_path}/bin/python" -m pip install scipy --quiet
+        if [[ "${AUTO_YES}" == true ]]; then
+            run_cmd "${venv_path}/bin/python" -m pip install hebi teleop --quiet
+        else
+            log_info "Phone teleoperation backends (hebi/teleop) skipped in dry-run. Re-run without --dry-run to select."
+        fi
+        run_cmd "${venv_path}/bin/python" -m pip install gitlint --quiet
+        run_cmd "${venv_path}/bin/python" -m pip install colcon-common-extensions colcon-mixin --quiet
+        run_cmd "${venv_path}/bin/python" -m pip install rosdepc --quiet
         run_cmd gitlint install-hook
         log_done "Python dependencies planned for venv"
         return 0
@@ -922,6 +928,49 @@ setup_python_venv() {
     # 安装 scipy 用于数学计算 (四元数/旋转矩阵转换)
     log_info "Installing scipy for mathematical computations..."
     run_cmd "${pip_install[@]}" scipy --quiet
+
+    # 安装手机遥操可选依赖（iOS: hebi, Android: teleop）
+    log_info "Installing optional phone teleoperation dependencies..."
+    if [[ "${AUTO_YES}" == true ]]; then
+        log_info "Auto-yes mode: installing both phone backends (hebi + teleop)..."
+        run_cmd "${pip_install[@]}" hebi teleop --quiet
+        log_done "Phone teleoperation dependencies installed (hebi + teleop)"
+    else
+        echo ""
+        echo "  Phone teleoperation backends (optional):"
+        echo "    1) iOS only  — hebi  (HEBI Mobile I/O + ARKit)"
+        echo "    2) Android only — teleop  (WebXR WebSocket)"
+        echo "    3) Both (iOS + Android)"
+        echo "    0) Skip phone backends"
+        echo ""
+        while true; do
+            read -r -p "  Enter your choice [0-3]: " PHONE_CHOICE
+            case "${PHONE_CHOICE}" in
+                1)
+                    run_cmd "${pip_install[@]}" hebi --quiet
+                    log_done "Phone dependencies installed: hebi (iOS)"
+                    break
+                    ;;
+                2)
+                    run_cmd "${pip_install[@]}" teleop --quiet
+                    log_done "Phone dependencies installed: teleop (Android)"
+                    break
+                    ;;
+                3)
+                    run_cmd "${pip_install[@]}" hebi teleop --quiet
+                    log_done "Phone dependencies installed: hebi + teleop (iOS + Android)"
+                    break
+                    ;;
+                0)
+                    log_info "Skipping phone teleoperation dependencies."
+                    break
+                    ;;
+                *)
+                    echo "  Invalid choice. Please enter 0-3."
+                    ;;
+            esac
+        done
+    fi
 
     # 安装训练可视化依赖
     log_info "Installing training visualization dependencies (tensorboard)..."

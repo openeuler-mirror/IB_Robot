@@ -24,7 +24,7 @@ class PhoneConfig:
     Attributes:
         phone_os: The operating system of the phone (iOS or Android)
         camera_offset: Offset from camera to phone physical center [x, y, z] in meters
-        end_effector_step_sizes: Step sizes for end-effector movement scaling
+        linear_scale: Linear displacement amplification factor
         end_effector_bounds: Workspace bounds for end-effector position
         max_ee_step_m: Maximum allowed end-effector step in meters
         max_angular_step_rad: Maximum allowed angular step per control cycle in radians
@@ -33,9 +33,7 @@ class PhoneConfig:
     """
     phone_os: PhoneOS = PhoneOS.IOS
     camera_offset: np.ndarray = field(default_factory=lambda: np.array([0.0, -0.02, 0.04]))
-    end_effector_step_sizes: Dict[str, float] = field(
-        default_factory=lambda: {"x": 0.5, "y": 0.5, "z": 0.5}
-    )
+    linear_scale: float = 2.0
     end_effector_bounds: Dict[str, list] = field(
         default_factory=lambda: {"min": [-0.5, -0.5, 0.0], "max": [0.5, 0.5, 0.5]}
     )
@@ -49,7 +47,7 @@ class PhoneConfig:
         return {
             "phone_os": self.phone_os.value,
             "camera_offset": self.camera_offset.tolist(),
-            "end_effector_step_sizes": self.end_effector_step_sizes,
+            "linear_scale": self.linear_scale,
             "end_effector_bounds": self.end_effector_bounds,
             "max_ee_step_m": self.max_ee_step_m,
             "max_angular_step_rad": self.max_angular_step_rad,
@@ -63,9 +61,7 @@ class PhoneConfig:
         return cls(
             phone_os=PhoneOS(data.get("phone_os", "ios")),
             camera_offset=np.array(data.get("camera_offset", [0.0, -0.02, 0.04])),
-            end_effector_step_sizes=data.get(
-                "end_effector_step_sizes", {"x": 0.5, "y": 0.5, "z": 0.5}
-            ),
+            linear_scale=data.get("linear_scale", 2.0),
             end_effector_bounds=data.get(
                 "end_effector_bounds", {"min": [-0.5, -0.5, 0.0], "max": [0.5, 0.5, 0.5]}
             ),

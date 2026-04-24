@@ -389,7 +389,8 @@ class PhoneDevice(BaseTeleopDevice):
         self._joint_state_sub = None
         self._current_joint_states: Dict[str, float] = {}
         self._first_state_received = False
-        self._going_home = True   # Auto-home on first connect; Servo enabled after arm reaches home
+        self._going_home = False
+        self._servo_enabled = False
         self._home_start_time: Optional[float] = None
 
         # Injected by teleop.py launch builder
@@ -427,7 +428,7 @@ class PhoneDevice(BaseTeleopDevice):
                 JointState, '/joint_states', self._joint_state_callback, 10)
 
             self._is_connected = True
-            self._home_start_time = self._node.get_clock().now().nanoseconds * 1e-9
+            self.logger.info("Phone device connected. Servo will be enabled on first control cycle.")
             return True
 
         except Exception as e:
@@ -448,16 +449,26 @@ class PhoneDevice(BaseTeleopDevice):
             home_start_time = self._home_start_time
             first_state_rcvd = self._first_state_received
             current_joints = dict(self._current_joint_states)
+            servo_enabled = self._servo_enabled
 
         if going_home:
             return self._compute_home_targets(
                 current_joints, first_state_rcvd, home_start_time)
 
-        if self.servo_client and not self.servo_client.is_enabled:
-            return {}
-
         cmd = self._get_cmd_internal()
         if cmd is None:
+            return {}
+
+        if not servo_enabled:
+            if first_state_rcvd and not cmd.go_home:
+                with self._state_lock:
+                    self._servo_enabled = True
+                self.servo_client.enable()
+                self.logger.info("Servo enabled: joint_states ready and phone control active.")
+            else:
+                return {}
+
+        if self.servo_client and not self.servo_client.is_enabled:
             return {}
 
         if cmd.go_home:
@@ -499,6 +510,7 @@ class PhoneDevice(BaseTeleopDevice):
                     with self._state_lock:
                         self._going_home = False
                         self._home_start_time = None
+                        self._servo_enabled = True
                     self.servo_client.enable()       # ROS call, outside lock
         return targets
 
@@ -532,7 +544,6 @@ class PhoneDevice(BaseTeleopDevice):
         if pos is None or rot is None:
             return None
 
-        # Gripper: integrate velocity signal
         if self.phone_config.phone_os == PhoneOS.IOS:
             gripper_vel = float(raw_inputs.get("a3", 0.0))
             go_home = bool(raw_inputs.get("b2", 0))
@@ -545,14 +556,7 @@ class PhoneDevice(BaseTeleopDevice):
                 and bool(raw_inputs.get("reservedButtonB", 0))
             )
 
-        self._last_gripper_pos = float(np.clip(
-            self._last_gripper_pos + gripper_vel * self.phone_config.gripper_speed_factor,
-            self.phone_config.gripper_range[0],
-            self.phone_config.gripper_range[1],
-        ))
-
         if not enabled:
-            # Reset previous state so next enable starts with zero delta
             self._prev_pos = None
             self._prev_rot = None
             return _CartesianCommand(
@@ -561,6 +565,12 @@ class PhoneDevice(BaseTeleopDevice):
                 gripper_pos=self._last_gripper_pos,
                 go_home=go_home,
             )
+
+        self._last_gripper_pos = float(np.clip(
+            self._last_gripper_pos + gripper_vel * self.phone_config.gripper_speed_factor,
+            self.phone_config.gripper_range[0],
+            self.phone_config.gripper_range[1],
+        ))
 
         # First frame after enable: record baseline, output zero
         if self._prev_pos is None or self._prev_rot is None:
@@ -580,13 +590,7 @@ class PhoneDevice(BaseTeleopDevice):
         self._prev_pos = pos.copy()
         self._prev_rot = rot
 
-        # Scale position delta → EE displacement per step
-        step_sizes = self.phone_config.end_effector_step_sizes
-        linear = np.array([
-            delta_pos[0] * step_sizes.get("x", 1),
-            delta_pos[1] * step_sizes.get("y", 1),
-            delta_pos[2] * step_sizes.get("z", 1),
-        ], dtype=float)
+        linear = delta_pos.astype(float) * self.phone_config.linear_scale
 
         # Clamp to max single-step magnitude
         norm = float(np.linalg.norm(linear))
@@ -614,6 +618,9 @@ class PhoneDevice(BaseTeleopDevice):
         """Disconnect from phone device and disable Servo."""
         if self.servo_client and self.servo_client.is_enabled:
             self.servo_client.disable()
+        with self._state_lock:
+            self._servo_enabled = False
+            self._going_home = False
         if self._phone_impl is not None:
             self._phone_impl.disconnect()
             self._phone_impl = None
