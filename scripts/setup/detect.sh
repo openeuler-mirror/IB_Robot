@@ -56,7 +56,7 @@ detect_gpu_summary() {
 }
 
 detect_ram_summary() {
-    if [[ -r /proc/meminfo ]]; then
+    if [[ -e /proc/meminfo ]]; then
         local total_kib
         total_kib="$(awk '/MemTotal/{print $2; exit}' /proc/meminfo)"
         format_kib_as_gb "${total_kib}"
@@ -119,7 +119,7 @@ detect_host_metadata() {
     SETUP_OS_PRETTY_NAME="unknown"
     SETUP_PACKAGE_MANAGER="unknown"
 
-    if [[ -r /etc/os-release ]]; then
+    if [[ -e /etc/os-release ]]; then
         SETUP_OS_ID="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release)"
         SETUP_OS_VERSION="$(awk -F= '$1=="VERSION_ID"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release)"
         SETUP_OS_PRETTY_NAME="$(awk -F= '$1=="PRETTY_NAME"{gsub(/"/,"",$2); print $2}' /etc/os-release)"

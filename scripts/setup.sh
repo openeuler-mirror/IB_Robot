@@ -63,6 +63,9 @@ SKIP_VERIFY=false
 CURRENT_STAGE="initializing"
 SYSTEM_DEPS_STATUS="pending"
 PYTHON_ENV_STATUS="pending"
+SETUP_ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/rosdistro/index-v4.yaml}"
+SETUP_ROSDEP_DEFAULT_SOURCES_URL="${SETUP_ROSDEP_DEFAULT_SOURCES_URL:-https://mirrors.tuna.tsinghua.edu.cn/github-raw/ros/rosdistro/master/rosdep/sources.list.d/20-default.list}"
+SETUP_ROSDEP_DEFAULT_SOURCES_FILE="${SETUP_ROSDEP_DEFAULT_SOURCES_FILE:-/etc/ros/rosdep/sources.list.d/20-default.list}"
 
 # Mirror build.sh / .shrc_local: ignore ~/.local site-packages so that the
 # install-time view of Python packages matches what the build/runtime sees.
@@ -112,6 +115,46 @@ run_cmd() {
     fi
     [[ "${VERBOSE}" == true ]] && { echo -n "[CMD] "; print_cmd "$@"; }
     "$@"
+}
+
+rosdep_sources_list_needs_refresh() {
+    local target_file="${SETUP_ROSDEP_DEFAULT_SOURCES_FILE}"
+
+    if [[ ! -f "${target_file}" ]]; then
+        return 0
+    fi
+
+    grep -q "https://raw.githubusercontent.com/ros/rosdistro/master/rosdep/" "${target_file}"
+}
+
+write_rosdep_sources_list() {
+    local target_file="${SETUP_ROSDEP_DEFAULT_SOURCES_FILE}"
+    local target_dir
+    local tmpfile
+    target_dir="$(dirname "${target_file}")"
+    tmpfile="$(mktemp /tmp/ibrobot-rosdep.XXXXXX)"
+
+    if ! "${VENV_PYTHON}" -c 'from pathlib import Path; import sys; from rosdep2.sources_list import download_default_sources_list; Path(sys.argv[2]).write_text(download_default_sources_list(sys.argv[1]), encoding="utf-8")' "${SETUP_ROSDEP_DEFAULT_SOURCES_URL}" "${tmpfile}"; then
+        rm -f "${tmpfile}"
+        return 1
+    fi
+
+    if ! run_sudo mkdir -p "${target_dir}"; then
+        rm -f "${tmpfile}"
+        return 1
+    fi
+
+    if [[ -f "${target_file}" ]] && ! run_sudo cp "${target_file}" "${target_file}.bak"; then
+        rm -f "${tmpfile}"
+        return 1
+    fi
+
+    if ! run_sudo cp "${tmpfile}" "${target_file}"; then
+        rm -f "${tmpfile}"
+        return 1
+    fi
+
+    rm -f "${tmpfile}"
 }
 
 resolve_venv_python() {
@@ -743,17 +786,23 @@ platform_install_python_bootstrap() {
 
 platform_install_rosdeps() {
     local rosdepc_cmd="${ROSDEPC_BIN:-rosdepc}"
+    local rosdep_install_extra_args=()
+
+    if [[ "${USE_SUDO}" != true ]]; then
+        rosdep_install_extra_args+=(--as-root apt:false --as-root dnf:false --as-root pip:false)
+    fi
 
     if command -v apt-get &>/dev/null; then
         run_privileged_with_live_output "Updating apt package lists..." apt-get update
 
-        if ! run_with_progress "Updating rosdepc database..." "${rosdepc_cmd}" update --rosdistro=humble; then
+        if ! run_with_progress "Updating rosdepc database..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
-        if ! run_with_progress "Installing ROS dependencies via apt..." "${rosdepc_cmd}" install \
+        if ! run_with_progress "Installing ROS dependencies via apt..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" install \
+            "${rosdep_install_extra_args[@]}" \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -777,13 +826,14 @@ platform_install_rosdeps() {
     fi
 
     if command -v dnf &>/dev/null; then
-        if ! run_with_progress "Updating rosdepc database..." "${rosdepc_cmd}" update --rosdistro=humble; then
+        if ! run_with_progress "Updating rosdepc database..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
-        if ! run_with_progress "Installing ROS dependencies via dnf..." "${rosdepc_cmd}" install \
+        if ! run_with_progress "Installing ROS dependencies via dnf..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" install \
+            "${rosdep_install_extra_args[@]}" \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -1080,9 +1130,8 @@ ensure_rosdepc() {
     fi
     log_info "Using venv rosdepc: ${ROSDEPC_BIN}"
 
-    # Init if sources list doesn't exist yet
-    if [[ ! -d /etc/ros/rosdep/sources.list.d ]]; then
-        log_info "Initializing rosdepc..."
+    if rosdep_sources_list_needs_refresh; then
+        log_info "Configuring rosdep sources list..."
         # Pre-authenticate sudo so password prompt is visible
         if [[ "${USE_SUDO}" == true ]]; then
             sudo -v
@@ -1090,16 +1139,16 @@ ensure_rosdepc() {
 
         local init_output=""
         local init_exit=0
-        init_output=$(run_sudo env PATH="${PATH}" "${ROSDEPC_BIN}" init 2>&1) || init_exit=$?
+        init_output=$(write_rosdep_sources_list 2>&1) || init_exit=$?
 
         # Check both exit code and output for SSL/network errors
         if [[ ${init_exit} -ne 0 ]] || echo "${init_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
             if echo "${init_output}" | grep -qi "certificate\|ssl\|urlopen"; then
-                log_warn "SSL certificate error detected during rosdepc init:"
+                log_warn "SSL certificate error detected while preparing rosdep sources:"
                 echo "${init_output}"
                 log_warn "Attempting to fix SSL certificates..."
             else
-                log_warn "rosdepc init failed, attempting SSL certificate fix..."
+                log_warn "rosdep sources setup failed, attempting SSL certificate fix..."
                 echo "${init_output}"
             fi
 
@@ -1156,20 +1205,22 @@ ensure_rosdepc() {
                 run_sudo cp "${ca_bundle}" "${ssl_pem}"
                 log_done "SSL certificate fix applied"
 
-                # Retry init, capture output again
+                # Retry writing sources list, capture output again
                 local retry_output
-                if ! retry_output=$(run_sudo "${ROSDEPC_BIN}" init 2>&1) || echo "${retry_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
-                    log_error "rosdepc init failed even after SSL fix."
+                if ! retry_output=$(write_rosdep_sources_list 2>&1) || echo "${retry_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
+                    log_error "rosdep sources setup failed even after SSL fix."
                     echo "${retry_output}"
-                    log_error "Try running manually: sudo ${ROSDEPC_BIN} init"
+                    log_error "Please check network and certificate configuration, then re-run ./scripts/setup.sh."
                     exit 1
                 fi
             else
                 log_warn "Skipped SSL fix. Please manually check your network or certificate configuration."
-                log_warn "You can also try running: sudo ${ROSDEPC_BIN} init"
+                log_warn "Then re-run ./scripts/setup.sh with root or sudo access."
                 exit 1
             fi
         fi
+
+        log_done "rosdep sources list configured"
     fi
 }
 
