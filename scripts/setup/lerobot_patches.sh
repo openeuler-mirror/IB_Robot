@@ -6,8 +6,8 @@
 # This module resolves the active lerobot patch tag through
 # third_party/patches/lerobot/INDEX.yaml (single source of truth for
 # multi-tag support) and applies only the subset of patches that match
-# the current host's Python version and active profile list.
-# Filtering is delegated to scripts/setup/lerobot_filter_series.py
+# the current host's Python version and active profile
+# list. Filtering is delegated to scripts/setup/lerobot_filter_series.py
 # and tag resolution to scripts/setup/lerobot_resolve_active.py; both run
 # under ${VENV_PYTHON} so PyYAML is guaranteed available.
 #
@@ -107,6 +107,39 @@ _lerobot_resolve_active() {
     return 0
 }
 
+# Validate libs/lerobot HEAD against the resolved manifest's commit range.
+# Mirrors lerobot_filter_series.py::_validate_head_commit so the binding is
+# enforced even when IBR_LEROBOT_FORCE_UNFILTERED=1 short-circuits the
+# python filter. HEAD must equal LEROBOT_BASE_COMMIT_MIN (clean upstream)
+# or LEROBOT_BASE_COMMIT_MAX (patched tip already at the recorded SHA).
+# Empty head_commit is treated as a soft-skip (rev-parse failed; downstream
+# branch-existence checks still gate the rebuild path).
+_lerobot_validate_head_commit() {
+    local head_commit="$1"
+
+    if [[ -z "${head_commit}" ]]; then
+        log_warn "Skipping libs/lerobot HEAD/tag binding check (rev-parse returned empty)."
+        return 0
+    fi
+
+    if [[ -z "${LEROBOT_BASE_COMMIT_MIN:-}" || -z "${LEROBOT_BASE_COMMIT_MAX:-}" ]]; then
+        log_error "Manifest for tag ${LEROBOT_TAG:-?} is missing lerobot_commit_range; cannot validate HEAD ${head_commit}."
+        log_error "Hint: add lerobot_commit_range.{min,max} to ${LEROBOT_MANIFEST:-manifest.yaml}."
+        return 1
+    fi
+
+    if [[ "${head_commit}" != "${LEROBOT_BASE_COMMIT_MIN}" && \
+          "${head_commit}" != "${LEROBOT_BASE_COMMIT_MAX}" ]]; then
+        log_error "libs/lerobot HEAD ${head_commit} is not in the manifest"
+        log_error "  commit_range [${LEROBOT_BASE_COMMIT_MIN}..${LEROBOT_BASE_COMMIT_MAX}]."
+        log_error "Either checkout the recorded upstream commit, or update the"
+        log_error "manifest's lerobot_commit_range to include the new SHA."
+        log_error "(This check runs unconditionally; IBR_LEROBOT_FORCE_UNFILTERED does not bypass it.)"
+        return 1
+    fi
+    return 0
+}
+
 # Compute the filtered patch series and write one filename per line to
 # the path given by $2. Audit output (KEEP/SKIP reasons) is mirrored to
 # the user via log_info. Returns 0 on success, 1 on filter failure
@@ -115,11 +148,18 @@ lerobot_compute_filtered_series() {
     local manifest="$1"
     local raw_series="$2"
     local out_file="$3"
-    local head_commit="${4:-}"
+    # head_commit was previously consumed by lerobot_filter_series.py for
+    # commit-range validation. The check was moved to the shell-level
+    # _lerobot_validate_head_commit so it runs at the right moment
+    # (immediately before apply/rebuild, not on every steady-state setup).
 
     local filter_script="${WORKSPACE}/scripts/setup/lerobot_filter_series.py"
 
     if [[ "${IBR_LEROBOT_FORCE_UNFILTERED:-0}" == "1" ]]; then
+        # NOTE: HEAD/tag binding is validated separately by
+        # _lerobot_validate_head_commit (called by the caller before us);
+        # FORCE_UNFILTERED only bypasses the platform-specific patch
+        # filtering, not the upstream-commit pinning contract.
         log_warn "IBR_LEROBOT_FORCE_UNFILTERED=1 set; bypassing platform filter and applying full series.txt verbatim."
         # Drop blank lines so downstream count is consistent with filtered path.
         grep -v '^[[:space:]]*$' "${raw_series}" > "${out_file}"
@@ -144,7 +184,6 @@ lerobot_compute_filtered_series() {
     if ! "${py_bin}" "${filter_script}" \
             --manifest "${manifest}" \
             --series "${raw_series}" \
-            --lerobot-head-commit "${head_commit}" \
             >"${out_file}" 2>"${audit_file}"; then
         local rc=$?
         log_error "lerobot_filter_series.py failed with exit ${rc}."
@@ -238,8 +277,11 @@ ensure_lerobot_patch_stack_applied() {
     # against manifest.lerobot_commit_range. Empty string when rev-parse
     # fails (e.g. detached without HEAD); the filter treats empty as
     # "skip the predicate" rather than fail-closed.
-    local head_commit=""
-    head_commit="$(git -C "${submodule_dir}" rev-parse HEAD 2>/dev/null || true)"
+    # NOTE: HEAD/tag binding is validated by _lerobot_validate_head_commit
+    # only at the points where we are about to checkout / apply / rebuild
+    # (i.e. when libs/lerobot must be on the upstream clean commit). On
+    # steady-state runs HEAD is the patched-branch tip — not in
+    # commit_range — so a top-of-function check would false-positive.
 
     # Compute the platform-filtered series into a temp file. All downstream
     # logic (count comparisons, am, rebuild) consumes this filtered file
@@ -250,7 +292,7 @@ ensure_lerobot_patch_stack_applied() {
     # shellcheck disable=SC2064
     trap "rm -f '${series_file}' '${series_file}.audit'" RETURN
 
-    if ! lerobot_compute_filtered_series "${manifest_file}" "${raw_series}" "${series_file}" "${head_commit}"; then
+    if ! lerobot_compute_filtered_series "${manifest_file}" "${raw_series}" "${series_file}"; then
         log_error "Cannot compute filtered lerobot patch series; aborting setup."
         exit 1
     fi
@@ -293,6 +335,13 @@ ensure_lerobot_patch_stack_applied() {
 
         if [[ "${applied_patch_count}" -gt "${expected_patch_count}" ]] || [[ "${IBR_LEROBOT_FORCE_REBUILD:-0}" == "1" ]]; then
             log_warn "Existing patched branch contains ${applied_patch_count} commits after ${base_commit}, expected ${expected_patch_count}."
+            # Rebuild discards the current branch and re-applies from
+            # base_commit; the submodule will be reset to base_commit
+            # which MUST live in the manifest commit_range.
+            if ! _lerobot_validate_head_commit "${base_commit}"; then
+                log_error "Refusing to rebuild lerobot patch branch from out-of-range base ${base_commit}."
+                exit 1
+            fi
             lerobot_rebuild_patch_branch "${submodule_dir}" "${patch_dir}" "${series_file}" "${base_commit}" "${branch_name}"
             return 0
         fi
@@ -308,8 +357,39 @@ ensure_lerobot_patch_stack_applied() {
     fi
 
     if [[ "$(git -C "${submodule_dir}" rev-parse HEAD)" != "${base_commit}" ]]; then
-        log_warn "libs/lerobot is not at the expected upstream base commit ${base_commit}; skipping automatic patch application."
-        return 0
+        # Fail-closed: per tag-binding contract, libs/lerobot HEAD prior
+        # to patch application MUST live inside manifest.lerobot_commit_range.
+        # A common cause for landing here is "submodule was bumped but
+        # nobody added a matching tag directory under
+        # third_party/patches/lerobot/" — that drift used to be a silent
+        # warn+return, which violated the SSOT contract. We now hard-stop.
+        local current_head
+        current_head="$(git -C "${submodule_dir}" rev-parse HEAD)"
+        if ! _lerobot_validate_head_commit "${current_head}"; then
+            log_error "libs/lerobot HEAD is outside manifest.lerobot_commit_range for tag ${LEROBOT_TAG}."
+            log_error "Hint: add a new tag directory under third_party/patches/lerobot/ and bump INDEX.yaml.active_tag,"
+            log_error "      or reset the submodule to the recorded upstream commit before re-running setup."
+            exit 1
+        fi
+        # HEAD lies in commit_range but is not the resolver-selected
+        # base_commit (i.e. HEAD == MAX while base_commit == MIN, which
+        # only happens once manifests widen the range). The current
+        # applier does not yet know how to pick an alternate fast-forward
+        # start; treat this as an explicit error rather than silent skip
+        # so the gap is visible in CI when the manifest schema evolves.
+        log_error "libs/lerobot HEAD ${current_head} is in commit_range but != base_commit ${base_commit}."
+        log_error "Multi-commit ranges are not yet supported by the applier; checkout ${base_commit} and retry."
+        exit 1
+    fi
+
+    # Fresh apply: HEAD == base_commit by construction; validation here is
+    # a defence-in-depth assertion that base_commit itself sits inside the
+    # manifest commit_range (catches a malformed resolver / manifest pair).
+    # This also enforces tag binding when IBR_LEROBOT_FORCE_UNFILTERED=1
+    # is set (which previously short-circuited the python-side validation).
+    if ! _lerobot_validate_head_commit "$(git -C "${submodule_dir}" rev-parse HEAD)"; then
+        log_error "Refusing to apply lerobot patches on out-of-range upstream HEAD."
+        exit 1
     fi
 
     if ! git -C "${submodule_dir}" diff --quiet || ! git -C "${submodule_dir}" diff --cached --quiet; then

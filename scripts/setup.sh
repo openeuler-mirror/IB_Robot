@@ -1329,6 +1329,30 @@ setup_python_venv() {
     # 解决 setuptools 版本冲突 (兼容 LeRobot 和 colcon)
     run_cmd "${venv_python}" -m pip install "setuptools<80" "setuptools>=71" --quiet
 
+    # ------------------------------------------------------------------
+    # LeRobot patch stack — MUST run before install_lerobot_editable.
+    # The platform-aware filter (lerobot_filter_series.py) requires
+    # PyYAML; install it explicitly first because --system-site-packages
+    # cannot be relied on across stripped openEuler/OpenHarmony images.
+    #
+    # Why here (not after setup_python_venv): install_lerobot_editable
+    # invokes check_lerobot_python_compat which reads
+    # libs/lerobot/pyproject.toml. On a fresh clone with py3.10/py3.11
+    # hosts, pyproject.toml still carries upstream's
+    # `requires-python>=3.12` until patches 0001/0002 lower it. Running
+    # the patch stack first ensures the compat gate reads the patched
+    # pyproject.toml. (See PR #98 review comment 169589247.)
+    # ------------------------------------------------------------------
+    log_info "Installing PyYAML for the lerobot patch dispatcher..."
+    run_cmd "${venv_python}" -m pip install pyyaml --quiet
+    # Export VENV_PYTHON so lerobot_patches.sh::_lerobot_filter_python
+    # picks up *this* venv (ensure_workspace_venv may have set a stale
+    # value if the venv was recreated since then).
+    export VENV_PYTHON="${venv_python}"
+    if [[ -d "${lerobot_dir}" ]]; then
+        ensure_lerobot_patch_stack_applied
+    fi
+
     # 以可编辑模式安装 LeRobot
     # 注意: 不传 -c numpy==1.26.4 约束。lerobot 依赖图(rerun-sdk/opencv/
     # datasets/...)在 numpy>=2 下解析，硬约束会让 pip 进入 resolution-too-deep。
@@ -1637,10 +1661,13 @@ main() {
         log_done "Python virtual environment configured"
     fi
 
-    # LeRobot patch stack must run AFTER the venv exists so the
-    # platform-aware filter (lerobot_filter_series.py) can run under
-    # ${VENV_PYTHON} where PyYAML is guaranteed installed.
-    set_stage "applying lerobot patches"
+    # LeRobot patch stack is normally applied inline by setup_python_venv
+    # (before install_lerobot_editable so check_lerobot_python_compat sees
+    # the patched pyproject.toml). The call below is an idempotent safety
+    # net for code paths that bypass setup_python_venv (e.g. --skip-python
+    # on a workspace whose patched branch was lost). It is a no-op when
+    # the patch stack is already applied.
+    set_stage "verifying lerobot patch stack"
     ensure_lerobot_patch_stack_applied
 
     echo ""

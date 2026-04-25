@@ -283,6 +283,88 @@ EOF
 run_resolver_fail "resolver / INDEX vs manifest commit mismatch rejected" \
     "${TMP_INDEX_DIR}/INDEX.yaml"
 
+# ---------------------------------------------------------------------------
+# Shell applier fixtures (_lerobot_validate_head_commit)
+# ---------------------------------------------------------------------------
+#
+# The Python filter's --lerobot-head-commit covers the in-process binding,
+# but the real applier (scripts/setup/lerobot_patches.sh) calls a shell-level
+# helper that the Python filter never reaches when IBR_LEROBOT_FORCE_UNFILTERED=1
+# bypasses the predicate. We exercise that helper directly here so a
+# regression in the shell binding is caught even when the Python path is
+# muted.
+
+LEROBOT_PATCHES_LIB="${REPO_ROOT}/scripts/setup/lerobot_patches.sh"
+
+# Minimal logging stubs — lerobot_patches.sh is normally sourced into
+# scripts/setup.sh which defines log_info / log_warn / log_error / log_done.
+# In the harness we inline single-line stubs so the helper can be exercised
+# in isolation. Single-line form avoids newline/`;` interleaving issues
+# when the stubs are interpolated into `bash -c "..."`.
+LOG_STUBS='log_info() { printf "[INFO] %s\n" "$*" >&2; } ; log_warn() { printf "[WARN] %s\n" "$*" >&2; } ; log_error() { printf "[ERROR] %s\n" "$*" >&2; } ; log_done() { printf "[DONE] %s\n" "$*" >&2; }'
+
+run_validator() {
+    # run_validator <name> <expected-exit> <head-sha>
+    local name="$1"
+    local expected_exit="$2"
+    local head_sha="$3"
+
+    local actual_exit=0
+    env -i PATH="${PATH}" HOME="${HOME}" \
+        LEROBOT_TAG="v0.5.1" \
+        LEROBOT_MANIFEST="${MANIFEST}" \
+        LEROBOT_BASE_COMMIT_MIN="${EXPECTED_BASE_COMMIT}" \
+        LEROBOT_BASE_COMMIT_MAX="${EXPECTED_BASE_COMMIT}" \
+        bash -c "set -euo pipefail; ${LOG_STUBS}; source '${LEROBOT_PATCHES_LIB}'; _lerobot_validate_head_commit '${head_sha}'" \
+        >/dev/null 2>&1 || actual_exit=$?
+
+    if [[ "${actual_exit}" -eq "${expected_exit}" ]]; then
+        printf '  PASS  %s (exit %d)\n' "${name}" "${actual_exit}"
+        PASS=$((PASS + 1))
+    else
+        printf '  FAIL  %s\n' "${name}" >&2
+        printf '    expected exit: %d\n' "${expected_exit}" >&2
+        printf '    actual exit:   %d\n' "${actual_exit}" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# HEAD equal to commit_range.min must pass.
+run_validator "shell-validator / HEAD == range.min passes" 0 "${EXPECTED_BASE_COMMIT}"
+
+# HEAD equal to commit_range.max must pass (covers future widening).
+run_validator "shell-validator / HEAD == range.max passes" 0 "${EXPECTED_BASE_COMMIT}"
+
+# HEAD outside commit_range must fail-closed (exit 1) — this is the path
+# the reviewer flagged: previously the applier silently warned + return 0
+# when patched branch was missing AND HEAD drifted.
+run_validator "shell-validator / HEAD out of range fails closed" 1 \
+    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+# Empty HEAD (rev-parse failed) is intentionally a soft-skip — branch
+# existence checks elsewhere gate the rebuild path.
+run_validator "shell-validator / empty HEAD soft-skips" 0 ""
+
+# Missing commit_range env vars must fail-closed (catches malformed
+# manifest / resolver pairs).
+run_validator_missing_range() {
+    local name="$1"
+    local actual_exit=0
+    env -i PATH="${PATH}" HOME="${HOME}" \
+        LEROBOT_TAG="v0.5.1" \
+        LEROBOT_MANIFEST="${MANIFEST}" \
+        bash -c "set -euo pipefail; ${LOG_STUBS}; source '${LEROBOT_PATCHES_LIB}'; _lerobot_validate_head_commit '${EXPECTED_BASE_COMMIT}'" \
+        >/dev/null 2>&1 || actual_exit=$?
+    if [[ "${actual_exit}" -eq 1 ]]; then
+        printf '  PASS  %s (exit 1)\n' "${name}"
+        PASS=$((PASS + 1))
+    else
+        printf '  FAIL  %s (exit %d, expected 1)\n' "${name}" "${actual_exit}" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+run_validator_missing_range "shell-validator / missing commit_range env fails closed"
+
 echo
 echo "== summary: ${PASS} passed, ${FAIL} failed =="
 [[ ${FAIL} -eq 0 ]]

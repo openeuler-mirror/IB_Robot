@@ -19,7 +19,9 @@ repos:
         pass_filenames: false
         files: |
           (?x)^(
-            third_party/patches/lerobot/v0\.5\.1/(manifest\.yaml|series\.txt) |
+            third_party/patches/lerobot/INDEX\.yaml |
+            third_party/patches/lerobot/[^/]+/(manifest\.yaml|series\.txt) |
             scripts/setup/lerobot_filter_series\.py |
+            scripts/setup/lerobot_resolve_active\.py |
             scripts/setup/tests/test_lerobot_filter\.sh
           )$
