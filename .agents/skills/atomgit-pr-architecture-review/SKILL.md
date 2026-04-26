@@ -80,6 +80,13 @@ python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_ar
      - 验证包之间的依赖是否符合分层设计，严禁职责越界。
      - 识别“职责蔓延”：如果一个简单的驱动包开始处理复杂的业务逻辑，必须提出警告。
 
+5. **README Documentation Consistency**
+   - **核心原则**: 每个包的 `README.md` 是该包对外暴露的本地架构契约，必须与代码行为、职责边界、启动方式、配置入口、数据流和限制保持同步。
+   - **关键检查**:
+     - 如果 PR 修改了某个包的核心职责、公开接口、launch 参数、配置项、数据流、依赖边界或使用方式，必须检查该包 README 是否同步更新。
+     - 如果 README 在 PR 中被修改，必须反向检查 README 描述是否真实反映代码实现，避免文档夸大、过时或描述未实现能力。
+     - 如果代码变更使 README 关键说明失效、缺失或误导使用者，应作为架构问题提出，而不是当作普通文档风格问题忽略。
+
 ## 架构审查协议 (Mandatory Protocol)
 
 在分析代码前，你 **必须** 遵循以下协议以确保对各包职责有准确认知：
@@ -91,7 +98,12 @@ python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_ar
 3. **依赖审计**: 检查是否引入了不符合分层原则的跨包依赖。
 4. **SSOT 验证**: 检查配置是否统一来自 `robot_config`，严禁硬编码。
 5. **职责合规性判断**: 根据步骤 1 获取的契约，判断当前改动是否导致了“职责蔓延”或“架构违越”。
-6. **输出审查结果**: 生成符合 JSON 格式的 `arch_issues.json`。
+6. **README 一致性审计 (Mandatory)**:
+   - 对 PR 涉及的每个包，必须读取最近的包级 `README.md`（通常为 `src/<package>/README.md`）。
+   - 对比 README 与本次代码改动，判断 README 是否仍准确描述包职责、关键 API/CLI/launch/config、数据流、依赖边界和已知限制。
+   - 若代码变更影响用户使用或架构契约但 README 未同步，必须输出 `pillar: "docs"` 的架构问题。
+   - 若 README 被修改但与代码实现不一致，也必须输出 `pillar: "docs"` 的架构问题。
+7. **输出审查结果**: 生成符合 JSON 格式的 `arch_issues.json`。
 
 ## API 说明
 
@@ -145,7 +157,7 @@ JSON 文件必须是一个**数组**，直接包含问题对象：
 | `title` | string | 问题标题（简洁明了） |
 | `description` | string | 问题描述（可包含 `\n` 换行） |
 | `severity` | string | 严重性：`critical` / `error` / `warning` / `suggestion` |
-| `pillar` | string | 架构支柱：`python` / `ros` / `ml` 等 |
+| `pillar` | string | 架构支柱：`ssot` / `contract` / `control_mode` / `tensormsg` / `ros2` / `python` / `docs` 等 |
 
 ### 可选字段
 

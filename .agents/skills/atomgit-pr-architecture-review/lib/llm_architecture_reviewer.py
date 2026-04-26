@@ -3,10 +3,8 @@ LLM Architecture Reviewer
 使用 LLM 进行架构合规性审查
 """
 
-import os
-import re
 import json
-from typing import List, Dict, Optional
+import re
 from dataclasses import dataclass
 
 
@@ -20,8 +18,8 @@ class ArchitectureIssue:
     description: str
     severity: str
     pillar: str
-    fix: Optional[str] = None
-    context_code: Optional[str] = None
+    fix: str | None = None
+    context_code: str | None = None
 
 
 class LLMArchitectureReviewer:
@@ -52,10 +50,16 @@ IB_Robot 架构四大支柱：
 
 5. **Package-Specific Architecture Compliance**
    - **包职责隔离**: 每个 ROS 包必须遵循其在架构中定义的职责边界。
-   - **严禁职责越界**: 
+   - **严禁职责越界**:
      - 例如 `robot_teleop` 应仅负责传感器数据映射，严禁引入 IK (Inverse Kinematics) 或运动规划逻辑。
      - 如果驱动包开始持有 ROS Node 句柄并调用其他重型服务，必须提出警告。
      - 检查改动是否使包演变成了“重型节点”，违背了关注点分离原则。
+
+6. **README Documentation Consistency**
+   - 每个包的 README.md 是该包的本地架构契约。
+   - 如果代码改动影响职责边界、公开 API/CLI、launch/config、数据流、依赖边界或使用方式，README 必须同步。
+   - 如果 README 被修改，必须检查 README 是否真实反映代码实现，避免描述未实现能力或保留过时用法。
+   - README 与代码不一致时，应输出 pillar="docs" 的架构问题。
 """
 
     def __init__(
@@ -71,15 +75,27 @@ IB_Robot 架构四大支柱：
         self.llm_model = llm_model
 
     def review_file(
-        self, file_path: str, file_content: str, diff: str
-    ) -> List[ArchitectureIssue]:
+        self,
+        file_path: str,
+        file_content: str,
+        diff: str,
+        readme_context: dict | None = None,
+    ) -> list[ArchitectureIssue]:
         """审查单个文件的架构合规性"""
-        prompt = self._build_review_prompt(file_path, file_content, diff)
+        prompt = self._build_review_prompt(file_path, file_content, diff, readme_context)
         response = self._call_llm(prompt)
         return self._parse_issues(response, file_path)
 
-    def _build_review_prompt(self, file_path: str, file_content: str, diff: str) -> str:
+    def _build_review_prompt(
+        self,
+        file_path: str,
+        file_content: str,
+        diff: str,
+        readme_context: dict | None = None,
+    ) -> str:
         """构建架构审查提示词"""
+        readme_path = (readme_context or {}).get("path") or "(未找到包级 README.md)"
+        readme_content = (readme_context or {}).get("content") or "(无 README 内容)"
         return f"""你是一个机器人软件架构审查专家。请审查以下代码是否遵循 IB_Robot 架构规范。
 
 {self.ARCHITECTURE_PILLARS}
@@ -96,7 +112,16 @@ IB_Robot 架构四大支柱：
 {file_content}
 ```
 
-请检查代码是否违反以上四大架构支柱，并按照以下JSON格式输出发现的问题：
+**包级 README 上下文**: {readme_path}
+```
+{readme_content}
+```
+
+请检查代码是否违反以上架构支柱，并特别审查 README 是否与本次代码变更保持一致。
+如果代码改动影响职责、接口、launch/config、数据流或使用方式但 README 未同步，请输出 pillar="docs" 的问题。
+如果当前文件就是 README，请反向检查 README 描述是否与代码实际能力一致。
+
+请按照以下JSON格式输出发现的问题：
 
 ```json
 [
@@ -105,7 +130,7 @@ IB_Robot 架构四大支柱：
     "title": "简短的问题标题",
     "description": "详细的问题描述",
     "severity": "error|warning|suggestion|info",
-    "pillar": "ssot|tensormsg|ros2|python",
+    "pillar": "ssot|tensormsg|ros2|python|docs",
     "fix": "修复建议",
     "context_code": "相关代码片段"
   }}
@@ -115,7 +140,7 @@ IB_Robot 架构四大支柱：
 **重要**：
 - 只输出JSON数组，不要包含其他文字
 - 如果没有问题，输出 `[]`
-- pillar 应该是以下之一：ssot, tensormsg, ros2, python
+- pillar 应该是以下之一：ssot, tensormsg, ros2, python, docs
 - severity: error（必须修复）, warning（应该修复）, suggestion（建议）, info（信息）"""
 
     def _call_llm(self, prompt: str) -> str:
@@ -143,7 +168,7 @@ IB_Robot 架构四大支柱：
 
         return response.content[0].text
 
-    def _parse_issues(self, response: str, file_path: str) -> List[ArchitectureIssue]:
+    def _parse_issues(self, response: str, file_path: str) -> list[ArchitectureIssue]:
         """解析 LLM 响应中的问题"""
         issues = []
 

@@ -99,6 +99,21 @@ src/
 | `robot_moveit` | Motion planning integration |
 | `so101_hardware` | Hardware drivers (ros2_control plugin) |
 
+### README as Local Architecture Contract
+
+Each package-level `README.md` is treated as the package's local architecture contract. It should describe the package's responsibilities, public entry points, launch/configuration usage, data flow, dependency boundaries, and known constraints.
+
+When code changes alter any of the following, the package README must be checked and updated if needed:
+
+1. Package responsibilities or prohibited responsibilities
+2. Public APIs, CLIs, launch arguments, topics, services, or actions
+3. Configuration keys, defaults, or SSOT sources
+4. Data flow, tensor/ROS message contracts, or control mode behavior
+5. Cross-package dependencies or layer boundaries
+6. Operational limitations, required hardware, or setup steps
+
+Architecture reviews should flag README drift as an architecture issue when code behavior and documentation diverge. A stale README is not a minor documentation style problem; it invalidates the package contract and makes future architecture reviews unreliable.
+
 ## Data Flow Architecture
 
 ### Observation Flow (Sensors → Inference)

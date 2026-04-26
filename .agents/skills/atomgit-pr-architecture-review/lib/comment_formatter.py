@@ -3,9 +3,7 @@
 负责将架构问题格式化为 AtomGit PR 评论
 """
 
-from typing import Dict, List, Optional
 from atomgit_sdk import ArchitectureIssue
-
 
 # IB-Robot 架构参考资料
 ARCHITECTURE_REFERENCES = {
@@ -69,6 +67,12 @@ ARCHITECTURE_REFERENCES = {
             "url": "https://docs.python.org/3/tutorial/index.html",
         }
     ],
+    "docs": [
+        {
+            "title": "IB-Robot Architecture",
+            "url": "https://deepwiki.com/wuxiaoqiang12/IB_Robot/4-system-architecture",
+        }
+    ],
 }
 
 
@@ -101,6 +105,7 @@ class CommentFormatter:
             "action_dispatch": "动作执行 (Action Dispatch)",
             "ros2": "ROS 2 原生性",
             "python": "Python 规范",
+            "docs": "README 架构契约一致性",
         }
         return names.get(pillar, pillar)
 
@@ -117,9 +122,7 @@ class CommentFormatter:
 
         return body
 
-    def format_issue(
-        self, issue: ArchitectureIssue, position: Optional[int] = None
-    ) -> dict:
+    def format_issue(self, issue: ArchitectureIssue, position: int | None = None) -> dict:
         """格式化单个问题为行内评论"""
         body = ""
 
@@ -158,9 +161,9 @@ class CommentFormatter:
 
     def format_issues(
         self,
-        issues: List[ArchitectureIssue],
-        positions: Dict[str, Dict[int, int]] = None,
-    ) -> List[dict]:
+        issues: list[ArchitectureIssue],
+        positions: dict[str, dict[int, int]] = None,
+    ) -> list[dict]:
         """格式化问题列表"""
         if positions is None:
             positions = {}
@@ -191,20 +194,17 @@ class CommentFormatter:
         body += self.ai_signature
         return body
 
-    def format_pr_level_issues(self, issues: List[ArchitectureIssue]) -> str:
+    def format_pr_level_issues(self, issues: list[ArchitectureIssue]) -> str:
         """格式化多个问题为一条 PR 级评论"""
         parts = []
         for issue in issues:
             parts.append(self.format_pr_level_issue(issue))
         return "\n\n---\n\n".join(parts)
 
-    def format_summary(self, issues: List[ArchitectureIssue]) -> str:
+    def format_summary(self, issues: list[ArchitectureIssue]) -> str:
         """格式化架构审查总结"""
         if not issues:
-            return (
-                "## 架构审查完成\n\n✅ 未发现架构违背问题。代码变更符合 IB_Robot 架构原则。"
-                + self.ai_signature
-            )
+            return "## 架构审查完成\n\n✅ 未发现架构违背问题。代码变更符合 IB_Robot 架构原则。" + self.ai_signature
 
         # 按支柱分组
         by_pillar = {}

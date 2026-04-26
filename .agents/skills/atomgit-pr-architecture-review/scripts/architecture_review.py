@@ -7,17 +7,15 @@ AtomGit Architecture Review Workflow
 3. --auto: 自动审查（调用LLM）- CI 使用，需要配置 LLM
 """
 
-import os
-import sys
-import json
 import argparse
-from pathlib import Path
-from typing import List, Dict, Optional
+import json
+import sys
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
-from atomgit_sdk import AtomGitClient, AtomGitConfig, ArchitectureIssue
-from atomgit_sdk.utils import calculate_diff_position, add_line_numbers
+from atomgit_sdk import ArchitectureIssue, AtomGitClient, AtomGitConfig
+from atomgit_sdk.utils import add_line_numbers
 from comment_formatter import CommentFormatter
 from llm_architecture_reviewer import LLMArchitectureReviewer
 
@@ -29,6 +27,41 @@ class ArchitectureReviewer:
         self.client = client
         self.formatter = formatter
 
+    def _candidate_readme_paths(self, file_path: str) -> list[str]:
+        """Return nearest README candidates for a repository path."""
+        path = PurePosixPath(file_path)
+        candidates = []
+        for parent in path.parents:
+            parent_text = str(parent)
+            if parent_text in (".", ""):
+                continue
+            candidate = f"{parent_text}/README.md"
+            if candidate not in candidates:
+                candidates.append(candidate)
+        return candidates
+
+    def get_readme_context(self, file_path: str, ref: str) -> dict:
+        """Fetch nearest package README context for a changed file."""
+        candidates = self._candidate_readme_paths(file_path)
+        errors = []
+        for candidate in candidates:
+            try:
+                content = self.client.get_file_content(candidate, ref)
+                return {
+                    "path": candidate,
+                    "content": add_line_numbers(content),
+                    "candidates": candidates,
+                }
+            except Exception as e:
+                errors.append(f"{candidate}: {e}")
+
+        return {
+            "path": None,
+            "content": "",
+            "candidates": candidates,
+            "errors": errors,
+        }
+
     def extract_pr_info(self, pr_number: int) -> dict:
         """提取 PR 信息"""
         pr = self.client.get_pull_request(pr_number)
@@ -37,9 +70,11 @@ class ArchitectureReviewer:
 
         changed_files = []
         for f in files:
-            if f.get("status") != "removed" and f.get("filename").endswith(".py"):
+            filename = f.get("filename") or ""
+            is_arch_relevant = filename.endswith(".py") or filename.endswith("README.md")
+            if f.get("status") != "removed" and is_arch_relevant:
                 file_data = {
-                    "filename": f.get("filename"),
+                    "filename": filename,
                     "status": f.get("status"),
                     "additions": f.get("additions", 0),
                     "deletions": f.get("deletions", 0),
@@ -48,11 +83,12 @@ class ArchitectureReviewer:
 
                 # 获取文件内容（使用 PR 的 head SHA）
                 try:
-                    content = self.client.get_file_content(f.get("filename"), head_sha)
+                    content = self.client.get_file_content(filename, head_sha)
                     file_data["content"] = add_line_numbers(content)
                 except Exception as e:
                     file_data["content"] = f"# Error fetching content: {e}"
 
+                file_data["readme_context"] = self.get_readme_context(filename, head_sha)
                 changed_files.append(file_data)
 
         return {
@@ -66,9 +102,9 @@ class ArchitectureReviewer:
             }
         }
 
-    def load_issues_from_json(self, json_path: str) -> List[ArchitectureIssue]:
+    def load_issues_from_json(self, json_path: str) -> list[ArchitectureIssue]:
         """从 JSON 文件加载问题"""
-        with open(json_path, "r", encoding="utf-8") as f:
+        with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
 
         issues = []
@@ -87,7 +123,7 @@ class ArchitectureReviewer:
 
         return issues
 
-    def submit_review(self, pr_number: int, issues: List[ArchitectureIssue]) -> None:
+    def submit_review(self, pr_number: int, issues: list[ArchitectureIssue]) -> None:
         """提交审查结果"""
         if not issues:
             summary = self.formatter.format_summary(issues)
@@ -111,9 +147,7 @@ class ArchitectureReviewer:
             results = self.client.submit_batch_comments(pr_number, comments)
 
             success_count = sum(1 for r in results if r["success"])
-            print(
-                f"✅ 提交 {success_count}/{len(results)} 条行内评论到 PR #{pr_number}"
-            )
+            print(f"✅ 提交 {success_count}/{len(results)} 条行内评论到 PR #{pr_number}")
 
             for result in results:
                 if not result["success"]:
@@ -123,9 +157,7 @@ class ArchitectureReviewer:
             body = self.formatter.format_pr_level_issues(pr_level_issues)
             try:
                 self.client.submit_pr_comment(pr_number, body)
-                print(
-                    f"✅ 提交 {len(pr_level_issues)} 条 PR 评论到 PR #{pr_number}（非变更文件，降级为 PR 级评论）"
-                )
+                print(f"✅ 提交 {len(pr_level_issues)} 条 PR 评论到 PR #{pr_number}（非变更文件，降级为 PR 级评论）")
             except Exception as e:
                 print(f"  ❌ PR 评论提交失败: {e}")
 
@@ -148,19 +180,20 @@ def mode_extract_info(args, reviewer: ArchitectureReviewer):
         json.dump(pr_info, f, indent=2, ensure_ascii=False)
 
     print(f"\n✅ 已保存到: {output_file}")
-    print(f"\n📊 变更摘要:")
+    print("\n📊 变更摘要:")
     print(f"   标题: {pr_info['pr']['title']}")
     print(f"   作者: {pr_info['pr']['author']}")
     print(f"   分支: {pr_info['pr']['branch']}")
-    print(f"   Python文件: {len(pr_info['pr']['changed_files'])} 个")
+    print(f"   架构相关文件: {len(pr_info['pr']['changed_files'])} 个")
 
     print("\n💡 下一步:")
     print("  AI Agent 应该:")
     print("  1. 读取此文件并进行架构审查")
     print("  2. 检查是否符合 IB_Robot 架构四大支柱")
-    print("  3. 生成 arch-issues.json（包含所有架构问题和建议）")
-    print("  4. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
-    print("  5. 用户确认后，运行提交命令")
+    print("  3. 对比每个 changed_files[].readme_context，检查 README 是否与代码同步")
+    print("  4. 生成 arch-issues.json（包含所有架构问题和建议）")
+    print("  5. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
+    print("  6. 用户确认后，运行提交命令")
     print(
         f"\n     python3 architecture_review.py --pr {args.pr} --submit-review arch-issues.json --ai-model <your-model-name>"
     )
@@ -186,17 +219,15 @@ def mode_submit_review(args, reviewer: ArchitectureReviewer):
 
     reviewer.submit_review(args.pr, issues)
 
-    print(f"\n" + "=" * 60)
+    print("\n" + "=" * 60)
     print("✅ 审查完成")
     print("=" * 60 + "\n")
-    print(f"📊 统计:")
+    print("📊 统计:")
     print(f"   总问题数: {len(issues)}")
     print(f"\n🔗 PR 链接: {reviewer.client.get_pr_url(args.pr)}\n")
 
 
-def mode_auto(
-    args, client: AtomGitClient, reviewer: ArchitectureReviewer, config: dict
-):
+def mode_auto(args, client: AtomGitClient, reviewer: ArchitectureReviewer, config: dict):
     """模式3: 自动审查（CI 使用，需要 LLM 配置）"""
     print("\n" + "=" * 60)
     print("🤖 模式: 自动审查（LLM驱动）")
@@ -227,7 +258,7 @@ def mode_auto(
     pr_info = client.get_pull_request(args.pr)
     head_sha = pr_info.get("head", {}).get("sha", "HEAD")
 
-    print(f"\n📝 获取 PR 文件变更...")
+    print("\n📝 获取 PR 文件变更...")
     files = client.get_pr_files(args.pr)
 
     all_issues = []
@@ -235,16 +266,19 @@ def mode_auto(
     for i, file_info in enumerate(files, 1):
         file_path = file_info["filename"]
 
-        # 只审查 Python 文件
-        if not file_path.endswith(".py"):
+        is_readme = file_path.endswith("README.md")
+        is_python = file_path.endswith(".py")
+
+        # 只审查 Python 文件和 README
+        if not (is_python or is_readme):
             continue
 
         # 跳过测试文件
-        if "test" in file_path.lower():
+        if is_python and "test" in file_path.lower():
             continue
 
         # 跳过 __init__.py
-        if file_path.endswith("__init__.py"):
+        if is_python and file_path.endswith("__init__.py"):
             continue
 
         print(f"\n[{i}/{len(files)}] 审查 {file_path}")
@@ -253,22 +287,28 @@ def mode_auto(
             # 获取文件内容（使用 head_sha）
             content = client.get_file_content(file_path, head_sha)
             diff = file_info.get("patch", "")
+            readme_context = reviewer.get_readme_context(file_path, head_sha)
 
             # 调用 LLM 审查
             print("  ⏳ 调用 LLM 进行架构审查...")
-            issues = llm_reviewer.review_file(file_path, content, diff)
+            issues = llm_reviewer.review_file(
+                file_path,
+                content,
+                diff,
+                readme_context=readme_context,
+            )
 
             if issues:
                 print(f"  ✓ 发现 {len(issues)} 个架构问题")
                 all_issues.extend(issues)
             else:
-                print(f"  ✓ 未发现架构问题")
+                print("  ✓ 未发现架构问题")
 
         except Exception as e:
             print(f"  ✗ 审查失败: {e}")
 
     if args.dry_run:
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print("⚠️  Dry run 模式，未提交评论")
         print("=" * 60)
         print(f"\n发现 {len(all_issues)} 个架构问题：")
@@ -281,20 +321,20 @@ def mode_auto(
         print(f"\n📦 提交 {len(all_issues)} 个架构审查结果...")
         reviewer.submit_review(args.pr, all_issues)
 
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print("✅ 审查完成")
         print("=" * 60)
-        print(f"\n📊 统计:")
+        print("\n📊 统计:")
         print(
             f"   审查文件: {len([f for f in files if f['filename'].endswith('.py') and 'test' not in f['filename'].lower()])} 个"
         )
         print(f"   发现问题: {len(all_issues)} 个")
     else:
         # 提交通过评论
-        print(f"\n📦 提交架构审查通过评论...")
+        print("\n📦 提交架构审查通过评论...")
         reviewer.submit_review(args.pr, [])
 
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print("✅ 审查完成 - 未发现架构问题")
         print("=" * 60)
 
@@ -323,17 +363,11 @@ def main():
         metavar="JSON_FILE",
         help="模式2: 提交审查结果（AI Agent 使用）",
     )
-    mode_group.add_argument(
-        "--auto", action="store_true", help="模式3: 自动审查（CI 使用，需要 LLM 配置）"
-    )
+    mode_group.add_argument("--auto", action="store_true", help="模式3: 自动审查（CI 使用，需要 LLM 配置）")
 
     # 通用参数
-    parser.add_argument(
-        "--config", type=str, default="config.json", help="配置文件路径"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)"
-    )
+    parser.add_argument("--config", type=str, default="config.json", help="配置文件路径")
+    parser.add_argument("--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)")
     parser.add_argument(
         "--ai-model",
         type=str,
@@ -373,7 +407,7 @@ def main():
 
     # 加载配置
     try:
-        with open(args.config, "r", encoding="utf-8") as f:
+        with open(args.config, encoding="utf-8") as f:
             config = json.load(f)
     except FileNotFoundError:
         print(f"\n❌ 配置文件不存在: {args.config}")
