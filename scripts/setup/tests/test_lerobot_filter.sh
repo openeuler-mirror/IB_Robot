@@ -107,10 +107,12 @@ run_fixture "ubuntu-22.04 / py3.10 / desktop profile" \
     IBR_LEROBOT_PROFILES=core,ros,hardware,dev \
     --
 
-# openEuler Embedded 24.03 / Python 3.11 — must drop 0001-0003 (down-grade
-# patches) but keep the Ascend-side compat patches.
+# openEuler Embedded 24.03 / Python 3.11 — must keep 0001 (replaces py3.12-only
+# generic syntax and lowers metadata to py>=3.11) plus the Ascend-side compat
+# patches. 0002/0003 stay gated to py<3.11 since typing.Unpack is native on 3.11
+# and the metadata after 0001 already accepts 3.11.
 run_fixture "openeuler-embedded-24.03 / py3.11" \
-    "0005-compat-add-npu-device-detection.patch,0006-compat-add-ascend-om-config-fields.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0005-compat-add-npu-device-detection.patch,0006-compat-add-ascend-om-config-fields.patch" \
     IBR_HOST_PYTHON_VERSION=3.11 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
     --

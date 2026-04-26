@@ -71,7 +71,7 @@ patches:
       - Replace Python 3.12-only generic syntax with Python 3.10-compatible typing constructs.
       - Lower project metadata from Python 3.12 to Python 3.11 as the first step in the compatibility stack.
     applies_to:
-      python_max: "<3.11"
+      python_max: "<3.12"
       profiles: [core, ros, hardware, dev, openeuler]
   - file: 0002-python-compat-min-version-3.10.patch
     purpose:
