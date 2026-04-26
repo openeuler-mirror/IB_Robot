@@ -128,6 +128,7 @@ python3 pr_review.py --pr 123
 - **不需要** `git fetch` 或 `git diff`
 - **不需要** 切换分支或修改本地代码
 - 直接读取 JSON 文件中的 `changed_files`、`commits` 和 `comments` 进行审查即可
+- 如果需要“回复某一条已有 review 意见”而不是提交新的审查结果，请切换到 `atomgit-review-resolution`，使用 `--reply-comment <comment_id>`；不要在本 skill 中伪造普通 PR 级评论。
 
 ### 提交审查结果
 

@@ -58,6 +58,31 @@ python3 repair_pr.py --url https://atomgit.com/some-org/some-repo/pull/123
 python3 review_resolution.py --pr 123 --apply-fixes ./tmp/ib_robot_pr_123_fix_results.json --ai-model claude-sonnet-4
 ```
 
+### 回复某一条 review 意见
+
+当用户明确要求“只回复某条评论 / 针对 comment_id 回复 / 这条意见单独回一下”时，不需要生成 fixes.json，直接使用单评论回复模式：
+
+```bash
+python3 review_resolution.py --pr 123 --reply-comment 456 --reply-body "已确认，这里按建议补充边界检查。" --ai-model gpt-5.5
+
+# 回复内容较长时，从文件读取，避免 shell 转义导致 Markdown 损坏
+python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/reply_456.md --ai-model gpt-5.5
+```
+
+脚本会先调用 SDK 获取 `comment_id=456` 的原始评论，解析 `discussion_id`，再使用官方文档中的 `POST /api/v5/repos/:owner/:repo/pulls/:number/discussions/:discussion_id/comments` 接口进行嵌套回复。
+
+### 修改某条 review discussion 的解决状态
+
+```bash
+# 按评论 ID 自动查找 discussion_id 并标记已解决
+python3 review_resolution.py --pr 123 --resolve-comment 456 --resolved true --ai-model gpt-5.5
+
+# 已知 discussion_id 时直接操作
+python3 review_resolution.py --pr 123 --resolve-discussion abcdef --resolved false --ai-model gpt-5.5
+```
+
+脚本使用官方文档中的 `PUT /api/v5/repos/:owner/:repo/pulls/:number/comments/:discussion_id` 接口修改解决状态。
+
 **重要**: 
 - 在步骤3，你必须将修复方案展示给人类确认后再提交
 - **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `claude-sonnet-4`、`gpt-4`、`gemini-pro`）
@@ -108,3 +133,17 @@ python3 review_resolution.py --pr 123 --apply-fixes ./tmp/ib_robot_pr_123_fix_re
 - `--owner`: 目标仓库 owner（可选，覆盖 `config.json`）
 - `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
 - `--url`: PR 链接（可选，自动解析 `owner/repo/pr_number`）
+- `--reply-comment`: 回复指定 PR review 评论 ID
+- `--reply-body`: 直接传入回复正文
+- `--reply-file`: 从文件读取回复正文
+- `--resolve-comment`: 按评论 ID 修改其 discussion 解决状态
+- `--resolve-discussion`: 按 discussion ID 修改解决状态
+- `--resolved`: 解决状态，`true` 或 `false`，默认 `true`
+
+## SDK / API 设计决策
+
+保留 `libs/atomgit_sdk` 作为唯一 AtomGit API 抽象层；skill 脚本只做工作流编排，不直接散落 HTTP 请求。原因：
+
+1. 单条 review 回复、解决状态、评论编辑/删除等能力会被多个 skill 复用，放在 SDK 中更稳定。
+2. 官方 API 文档目前主要提供 endpoint 标题、HTTP 方法和路径；SDK 已沉淀为 `APICatalog`，常用协作 API 提供 typed wrapper，长尾 API 可通过 `client.call_api(...)` 或 `APICatalog.from_docs()` 使用。
+3. 这样比每个 skill 脚本各自拼 curl 更简洁，也能统一认证、错误处理、重试和 URL 解析。
