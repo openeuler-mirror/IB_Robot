@@ -212,11 +212,16 @@ lerobot_apply_patch_series() {
     local submodule_dir="$1"
     local patch_dir="$2"
     local series_file="$3"
+    local git_user_name="${IBR_LEROBOT_GIT_USER_NAME:-IB Robot Setup}"
+    local git_user_email="${IBR_LEROBOT_GIT_USER_EMAIL:-ibrobot@example.invalid}"
 
     while IFS= read -r patch_file; do
         [[ -z "${patch_file}" ]] && continue
         log_info "Applying ${patch_file}..."
-        git -C "${submodule_dir}" am "${patch_dir}/${patch_file}" >/dev/null
+        git -C "${submodule_dir}" \
+            -c "user.name=${git_user_name}" \
+            -c "user.email=${git_user_email}" \
+            am "${patch_dir}/${patch_file}" >/dev/null
     done < "${series_file}"
 }
 
@@ -405,11 +410,11 @@ ensure_lerobot_patch_stack_applied() {
         fi
 
         log_info "Applying $((expected_patch_count - applied_patch_count)) new LeRobot compatibility patch(es) on ${branch_name}..."
-        tail -n +"$((applied_patch_count + 1))" "${series_file}" | while IFS= read -r patch_file; do
-            [[ -z "${patch_file}" ]] && continue
-            log_info "Applying ${patch_file}..."
-            git -C "${submodule_dir}" am "${patch_dir}/${patch_file}" >/dev/null
-        done
+        local remaining_series
+        remaining_series="$(mktemp -t lerobot-remaining-series-XXXXXX.txt)"
+        tail -n +"$((applied_patch_count + 1))" "${series_file}" > "${remaining_series}"
+        lerobot_apply_patch_series "${submodule_dir}" "${patch_dir}" "${remaining_series}"
+        rm -f "${remaining_series}"
         log_done "LeRobot patch stack updated"
         return 0
     fi

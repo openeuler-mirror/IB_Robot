@@ -320,6 +320,34 @@ run_privileged_with_live_output() {
     fi
 }
 
+openeuler_base_repo_configured() {
+    dnf repolist --enabled | awk '
+        $1 == "OS" || $1 ~ /^openEuler-24\.03-LTS/ { found = 1 }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+ensure_openeuler_base_repo() {
+    openeuler_base_repo_configured && {
+        log_info "openEuler repo already configured, skipping add-repo."
+        return 0
+    }
+
+    local arch
+    arch=$(uname -m)
+    log_info "Adding openEuler repo for ${arch}..."
+    run_sudo bash -c "cat > /etc/yum.repos.d/openEuler-24.03-LTS.repo" <<EOF
+[openEuler-24.03-LTS]
+name=openEuler-24.03-LTS
+baseurl=https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}/
+enabled=1
+gpgcheck=0
+EOF
+
+    run_sudo dnf clean all
+    run_sudo dnf makecache
+}
+
 ui_prompt_input() {
     local prompt="$1"
     local placeholder="${2:-}"
@@ -401,7 +429,7 @@ install_gitlint_hook() {
 
 print_banner() {
     local cols banner
-    cols=$(stty size </dev/tty 2>/dev/null | awk '{print $2}') \
+    cols=$(stty size 2>/dev/null </dev/tty | awk '{print $2}') \
         || cols=$(tput cols 2>/dev/null) \
         || cols=80
 
@@ -750,15 +778,7 @@ platform_prepare_host() {
         log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
         export ROS_OS_OVERRIDE=rhel:8
 
-        if ! dnf repolist | grep -qi "openEuler-24.03-LTS"; then
-            local arch
-            arch=$(uname -m)
-            run_privileged_with_live_output "Adding openEuler repo for ${arch}..." dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
-            run_privileged_with_live_output "Refreshing dnf metadata..." dnf clean all
-            run_privileged_with_live_output "Building dnf cache..." dnf makecache
-        else
-            log_info "openEuler repo already configured, skipping add-repo."
-        fi
+        ensure_openeuler_base_repo
 
         run_privileged_with_live_output "Installing openEuler host packages required by the workspace..." dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel
         return 0
@@ -1113,19 +1133,9 @@ check_openeuler() {
         log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
         export ROS_OS_OVERRIDE=rhel:8
 
-        if ! dnf repolist | grep -qi "openEuler-24.03-LTS"; then
-            local arch
-            arch=$(uname -m)
-            log_info "Adding openEuler repo for ${arch}..."
-            run_sudo dnf install -y dnf-plugins-core
-            run_sudo dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
-            run_sudo dnf clean all
-            run_sudo dnf makecache
-        else
-            log_info "openEuler repo already configured, skipping add-repo."
-        fi
+        ensure_openeuler_base_repo
 
-        log_info "Installing gcc-c++, vim-enhanced, ffmpeg-devel, libvpx, libvpx-devel, and nlohmann-json-devel..."
+        log_info "Installing openEuler host packages required by the workspace..."
         run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel
     fi
 }

@@ -43,16 +43,7 @@ platform_prepare_host() {
     log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
     export ROS_OS_OVERRIDE=rhel:8
 
-    if ! dnf repolist | grep -qi "openEuler-24.03-LTS"; then
-        local arch
-        arch=$(uname -m)
-        log_info "Adding openEuler repo for ${arch}..."
-        run_sudo dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
-        run_sudo dnf clean all
-        run_sudo dnf makecache
-    else
-        log_info "openEuler repo already configured, skipping add-repo."
-    fi
+    ensure_openeuler_base_repo
 
     log_info "Installing openEuler host packages required by the workspace..."
     run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel
