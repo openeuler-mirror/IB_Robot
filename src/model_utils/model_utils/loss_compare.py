@@ -226,6 +226,15 @@ class LossUtils:
             model_dtype = torch.float32
         outputs = []
         for i in tqdm(range(len(batches)), desc="forwarding"):
+            # IMPORTANT: loss_compare treats each JSON batch as an independent
+            # sample, but PI05Policy.select_action() keeps an internal
+            # ``_action_queue`` across calls to serve multi-step chunks. If we
+            # don't reset that queue here, batch i may consume leftover actions
+            # produced from batch i-1's observation, which contaminates the
+            # comparison and can make later batches look progressively worse.
+            if hasattr(self.policy, "_action_queue"):
+                self.policy._action_queue.clear()
+
             # Fix random seed per batch so that diffusion/flow-matching noise is
             # deterministic across runs.  Without this, PI05's sample_noise()
             # generates different Gaussian noise each time → different actions.
