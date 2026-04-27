@@ -75,6 +75,30 @@ class LossUtils:
         else:
             raise NotImplementedError(f"Policy type {self.args.policy_type} not implemented")
 
+        # Optional dtype cast — defaults to whatever the checkpoint provides
+        # (BF16 for PI05).  Use ``--model_dtype fp16`` to match the OM/ORT
+        # deployment dtype and isolate BF16↔FP16 conversion error from any
+        # real ONNX-export error.
+        model_dtype = getattr(self.args, "model_dtype", "native")
+        if model_dtype == "fp16":
+            policy.model = policy.model.half()
+            print("  Cast policy.model to float16")
+        elif model_dtype == "bf16":
+            policy.model = policy.model.bfloat16()
+            print("  Cast policy.model to bfloat16")
+        elif model_dtype == "fp32":
+            policy.model = policy.model.float()
+            print("  Cast policy.model to float32")
+        elif model_dtype != "native":
+            raise ValueError(f"unknown --model_dtype: {model_dtype}")
+
+        # Log actual running dtype for clarity.
+        try:
+            sample_param = next(policy.model.parameters())
+            print(f"  Running PT policy in dtype={sample_param.dtype}")
+        except (StopIteration, AttributeError):
+            pass
+
         print(f"model loaded: {policy_path}")
         return policy
 
@@ -101,6 +125,13 @@ class LossUtils:
             policy_cfg=self.policy, pretrained_path=self.args.policy_path
         )
         device = get_safe_torch_device(self.policy.config.device)
+        # Resolve model dtype once — noise has to match the action_expert
+        # weight dtype, otherwise action_in_proj fails with
+        # ``mat1 and mat2 must have the same dtype``.
+        try:
+            model_dtype = next(self.policy.model.parameters()).dtype
+        except (StopIteration, AttributeError):
+            model_dtype = torch.float32
         outputs = []
         for i in tqdm(range(len(batches)), desc="forwarding"):
             # Fix random seed per batch so that diffusion/flow-matching noise is
@@ -124,7 +155,10 @@ class LossUtils:
                     np.save(noise_path, noise.numpy())
                 else:
                     noise = torch.from_numpy(np.load(noise_path)).float()
-                self.policy._external_noise = noise.to(device)
+                # Cast noise to model dtype so action_in_proj matmul matches
+                # (noise files stay fp32 on disk for portability across runs
+                # with different model dtypes).
+                self.policy._external_noise = noise.to(device=device, dtype=model_dtype)
 
             output = predict_action(
                 observation=batches[i],
@@ -166,6 +200,14 @@ def parse_args():
     )
     parser.add_argument(
         "--policy_type", type=str, default="act", help="Type of policy model (e.g. act, diffuser, ddpg)"
+    )
+    parser.add_argument(
+        "--model_dtype", type=str, default="native",
+        choices=["native", "fp16", "bf16", "fp32"],
+        help="Cast PT model to this dtype before forward. "
+             "'native' (default) keeps the checkpoint dtype "
+             "(BF16 for PI05). Use 'fp16' for apples-to-apples "
+             "comparison with OM/ORT deployment.",
     )
     parser.add_argument(
         "--generate-target", action="store_true", help="Reading batches and generating target json file"
