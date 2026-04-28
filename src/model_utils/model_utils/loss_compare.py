@@ -3,12 +3,14 @@ import contextlib
 import json
 import os
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from lerobot.policies.factory import make_pre_post_processors
+from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
 
@@ -61,7 +63,13 @@ class LossUtils:
         print("-" * 32)
         avg_l1 = sum(arr_l1) / len(arr_l1)
         avg_cos = sum(arr_cos) / len(arr_cos)
-        print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
+        if self.args.policy_type == "pi05":
+            # PI05's flow-matching ODE is chaotic; per-sample cosine is
+            # not a meaningful aggregate. See pi05_dist_metrics.py for the
+            # replacement (Wasserstein + first-frame cosine).
+            print(f"{'Avg':>6} {avg_l1:>12.6f} {'(see dist eval)':>15}")
+        else:
+            print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
 
         # ------------------------------------------------------------------
         # Independent sanity check: compare in *normalized* (pre-postprocessor)
@@ -104,8 +112,12 @@ class LossUtils:
                     for i in range(len(arr_raw_l1)):
                         print(f"{i:>6} {arr_raw_l1[i]:>12.6f} {arr_raw_cos[i]:>12.6f}")
                     print("-" * 32)
-                    print(f"{'Avg':>6} {sum(arr_raw_l1)/len(arr_raw_l1):>12.6f} "
-                          f"{sum(arr_raw_cos)/len(arr_raw_cos):>12.6f}")
+                    if self.args.policy_type == "pi05":
+                        print(f"{'Avg':>6} {sum(arr_raw_l1)/len(arr_raw_l1):>12.6f} "
+                              f"{'(see dist eval)':>15}")
+                    else:
+                        print(f"{'Avg':>6} {sum(arr_raw_l1)/len(arr_raw_l1):>12.6f} "
+                              f"{sum(arr_raw_cos)/len(arr_raw_cos):>12.6f}")
         elif raw_preds is not None and raw_targets_path:
             print(f"\nNOTE: raw target file not found at {raw_targets_path}; "
                   f"run --generate-target with --raw-target-path to create it.")
@@ -128,11 +140,34 @@ class LossUtils:
                 reduce_dims = tuple(range(diff.ndim - 1))
                 per_dim_l1 = diff.mean(dim=reduce_dims)
                 per_dim_max = diff.amax(dim=reduce_dims)
+                _old_np_opts = np.get_printoptions()
                 np.set_printoptions(precision=4, suppress=True, linewidth=160)
                 print(f"  per-dim L1   : {per_dim_l1.cpu().numpy()}")
                 print(f"  per-dim Linf : {per_dim_max.cpu().numpy()}")
+                np.set_printoptions(**_old_np_opts)
             print(f"  pred   first row: {p.flatten()[:p.shape[-1]].cpu().numpy()}")
             print(f"  target first row: {t.flatten()[:t.shape[-1]].cpu().numpy()}")
+
+        # ------------------------------------------------------------------
+        # PI05 only: replace the meaningless per-sample cosine summary with
+        # chaos-robust distributional metrics (see pi05_dist_metrics.py).
+        # ------------------------------------------------------------------
+        if self.args.policy_type == "pi05":
+            import sys
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from pi05_dist_metrics import evaluate_pi05  # type: ignore[import-not-found]
+
+            raw_preds_list = getattr(self, "_raw_preds", None)
+            raw_targets_list = None
+            if raw_preds_list is not None and raw_targets_path and os.path.exists(raw_targets_path):
+                with open(raw_targets_path, encoding="utf-8") as f:
+                    raw_targets_list = [torch.tensor(t) for t in json.load(f)]
+            evaluate_pi05(
+                preds=preds,
+                targets=targets,
+                raw_preds=raw_preds_list,
+                raw_targets=raw_targets_list,
+            )
 
     def prepare_policy(self):
         if self.args.policy_type == "act":
@@ -234,7 +269,6 @@ class LossUtils:
             # comparison and can make later batches look progressively worse.
             if hasattr(self.policy, "_action_queue"):
                 self.policy._action_queue.clear()
-
             # Fix random seed per batch so that diffusion/flow-matching noise is
             # deterministic across runs.  Without this, PI05's sample_noise()
             # generates different Gaussian noise each time → different actions.
@@ -261,14 +295,39 @@ class LossUtils:
                 # with different model dtypes).
                 self.policy._external_noise = noise.to(device=device, dtype=model_dtype)
 
-            output = predict_action(
-                observation=batches[i],
-                policy=self.policy,
-                device=device,
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=self.policy.config.use_amp,
-            )
+            if self.args.policy_type == "pi05":
+                # --- PI05: bypass action queue and grab the *full* chunk ---
+                # ``predict_action`` returns only the first frame of the chunk
+                # (queue.popleft()).  For distributional evaluation we want
+                # the entire (1, T, D) chunk so Method A (Wasserstein) has
+                # N*T samples per dim and Method C can pick chunk[:, 0, :]
+                # explicitly.  We call the same low-level steps as
+                # ``predict_action`` but invoke ``predict_action_chunk``
+                # instead of ``select_action``.
+                use_amp = self.policy.config.use_amp
+                with (
+                    torch.inference_mode(),
+                    torch.autocast(device_type=device.type)
+                        if device.type == "cuda" and use_amp else nullcontext(),
+                ):
+                    obs = prepare_observation_for_inference(
+                        dict(batches[i]), device, None, None
+                    )
+                    obs = preprocessor(obs)
+                    chunk = self.policy.predict_action_chunk(obs)  # (1, T, D)
+                    output = postprocessor(chunk)                  # (1, T, D)
+                # Strip leading batch dim (== 1) for storage symmetry with
+                # the act path which returns (D,) after predict_action.
+                output = output.squeeze(0).detach().cpu()           # (T, D)
+            else:
+                output = predict_action(
+                    observation=batches[i],
+                    policy=self.policy,
+                    device=device,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=self.policy.config.use_amp,
+                )
             outputs.append(output)
 
         # Stash raw preds for compute_loss / generate_target to use.
