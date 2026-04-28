@@ -1,0 +1,505 @@
+From 96f4393cd075fcc79718d1c13b64c444bb8372f0 Mon Sep 17 00:00:00 2001
+From: Copilot <223556219+Copilot@users.noreply.github.com>
+Date: Fri, 24 Apr 2026 16:49:41 +0800
+Subject: [PATCH] openharmony: lazy-load inference-time policy imports
+
+---
+ src/lerobot/optim/optimizers.py    |  39 +++++++--
+ src/lerobot/optim/schedulers.py    |  10 ++-
+ src/lerobot/policies/__init__.py   |  40 ++++++---
+ src/lerobot/policies/factory.py    | 133 ++++++++++++++---------------
+ src/lerobot/policies/pretrained.py |   3 +-
+ src/lerobot/policies/utils.py      |   3 +-
+ 6 files changed, 136 insertions(+), 92 deletions(-)
+
+diff --git a/src/lerobot/optim/optimizers.py b/src/lerobot/optim/optimizers.py
+index e2e3d893..ac2ce171 100644
+--- a/src/lerobot/optim/optimizers.py
++++ b/src/lerobot/optim/optimizers.py
+@@ -14,6 +14,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ import abc
++import json
+ from collections.abc import Iterable
+ from dataclasses import asdict, dataclass, field
+ from pathlib import Path
+@@ -23,14 +24,42 @@ import draccus
+ import torch
+ from safetensors.torch import load_file, save_file
+
+-from lerobot.datasets.io_utils import write_json
+-from lerobot.datasets.utils import flatten_dict, unflatten_dict
+ from lerobot.utils.constants import (
+     OPTIMIZER_PARAM_GROUPS,
+     OPTIMIZER_STATE,
+ )
+ from lerobot.utils.io_utils import deserialize_json_into_object
+
++
++def _flatten_dict(d: dict, parent_key: str = "", sep: str = "/") -> dict:
++    items = []
++    for k, v in d.items():
++        new_key = f"{parent_key}{sep}{k}" if parent_key else k
++        if isinstance(v, dict):
++            items.extend(_flatten_dict(v, new_key, sep=sep).items())
++        else:
++            items.append((new_key, v))
++    return dict(items)
++
++
++def _unflatten_dict(d: dict, sep: str = "/") -> dict:
++    outdict = {}
++    for key, value in d.items():
++        parts = key.split(sep)
++        nested = outdict
++        for part in parts[:-1]:
++            if part not in nested:
++                nested[part] = {}
++            nested = nested[part]
++        nested[parts[-1]] = value
++    return outdict
++
++
++def _write_json(data: dict, fpath: Path) -> None:
++    fpath.parent.mkdir(exist_ok=True, parents=True)
++    with open(fpath, "w", encoding="utf-8") as f:
++        json.dump(data, f, indent=4, ensure_ascii=False)
++
+ # Type alias for parameters accepted by optimizer build() methods.
+ # This matches PyTorch's optimizer signature while also supporting:
+ # - dict[str, Parameter]: Named parameters for differential LR by name (e.g., XVLA)
+@@ -305,9 +334,9 @@ def _save_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
+     """Save a single optimizer's state to disk."""
+     state = optimizer.state_dict()
+     param_groups = state.pop("param_groups")
+-    flat_state = flatten_dict(state)
++    flat_state = _flatten_dict(state)
+     save_file(flat_state, save_dir / OPTIMIZER_STATE)
+-    write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
++    _write_json(param_groups, save_dir / OPTIMIZER_PARAM_GROUPS)
+
+
+ def load_optimizer_state(
+@@ -341,7 +370,7 @@ def _load_single_optimizer_state(optimizer: torch.optim.Optimizer, save_dir: Pat
+     """Load a single optimizer's state from disk."""
+     current_state_dict = optimizer.state_dict()
+     flat_state = load_file(save_dir / OPTIMIZER_STATE)
+-    state = unflatten_dict(flat_state)
++    state = _unflatten_dict(flat_state)
+
+     # Handle case where 'state' key might not exist (for newly created optimizers)
+     if "state" in state:
+diff --git a/src/lerobot/optim/schedulers.py b/src/lerobot/optim/schedulers.py
+index 19c3fd7b..59e70473 100644
+--- a/src/lerobot/optim/schedulers.py
++++ b/src/lerobot/optim/schedulers.py
+@@ -14,6 +14,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ import abc
++import json
+ import logging
+ import math
+ from dataclasses import asdict, dataclass
+@@ -23,11 +24,16 @@ import draccus
+ from torch.optim import Optimizer
+ from torch.optim.lr_scheduler import LambdaLR, LRScheduler
+
+-from lerobot.datasets.io_utils import write_json
+ from lerobot.utils.constants import SCHEDULER_STATE
+ from lerobot.utils.io_utils import deserialize_json_into_object
+
+
++def _write_json(data: dict, fpath: Path) -> None:
++    fpath.parent.mkdir(exist_ok=True, parents=True)
++    with open(fpath, "w", encoding="utf-8") as f:
++        json.dump(data, f, indent=4, ensure_ascii=False)
++
++
+ @dataclass
+ class LRSchedulerConfig(draccus.ChoiceRegistry, abc.ABC):
+     num_warmup_steps: int | None
+@@ -134,7 +140,7 @@ class CosineDecayWithWarmupSchedulerConfig(LRSchedulerConfig):
+
+ def save_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> None:
+     state_dict = scheduler.state_dict()
+-    write_json(state_dict, save_dir / SCHEDULER_STATE)
++    _write_json(state_dict, save_dir / SCHEDULER_STATE)
+
+
+ def load_scheduler_state(scheduler: LRScheduler, save_dir: Path) -> LRScheduler:
+diff --git a/src/lerobot/policies/__init__.py b/src/lerobot/policies/__init__.py
+index 55ce09cf..177d6df5 100644
+--- a/src/lerobot/policies/__init__.py
++++ b/src/lerobot/policies/__init__.py
+@@ -12,19 +12,24 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+
+-from .act.configuration_act import ACTConfig as ACTConfig
+-from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
+-from .groot.configuration_groot import GrootConfig as GrootConfig
+-from .multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig as MultiTaskDiTConfig
+-from .pi0.configuration_pi0 import PI0Config as PI0Config
+-from .pi0_fast.configuration_pi0_fast import PI0FastConfig as PI0FastConfig
+-from .pi05.configuration_pi05 import PI05Config as PI05Config
+-from .smolvla.configuration_smolvla import SmolVLAConfig as SmolVLAConfig
+-from .smolvla.processor_smolvla import SmolVLANewLineProcessor
+-from .tdmpc.configuration_tdmpc import TDMPCConfig as TDMPCConfig
+-from .vqbet.configuration_vqbet import VQBeTConfig as VQBeTConfig
+-from .wall_x.configuration_wall_x import WallXConfig as WallXConfig
+-from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
++from importlib import import_module
++
++_LAZY_EXPORTS = {
++    "ACTConfig": (".act.configuration_act", "ACTConfig"),
++    "DiffusionConfig": (".diffusion.configuration_diffusion", "DiffusionConfig"),
++    "GrootConfig": (".groot.configuration_groot", "GrootConfig"),
++    "MultiTaskDiTConfig": (".multi_task_dit.configuration_multi_task_dit", "MultiTaskDiTConfig"),
++    "PI0Config": (".pi0.configuration_pi0", "PI0Config"),
++    "PI0FastConfig": (".pi0_fast.configuration_pi0_fast", "PI0FastConfig"),
++    "PI05Config": (".pi05.configuration_pi05", "PI05Config"),
++    "SARMConfig": (".sarm.configuration_sarm", "SARMConfig"),
++    "SmolVLAConfig": (".smolvla.configuration_smolvla", "SmolVLAConfig"),
++    "SmolVLANewLineProcessor": (".smolvla.processor_smolvla", "SmolVLANewLineProcessor"),
++    "TDMPCConfig": (".tdmpc.configuration_tdmpc", "TDMPCConfig"),
++    "VQBeTConfig": (".vqbet.configuration_vqbet", "VQBeTConfig"),
++    "WallXConfig": (".wall_x.configuration_wall_x", "WallXConfig"),
++    "XVLAConfig": (".xvla.configuration_xvla", "XVLAConfig"),
++}
+
+ __all__ = [
+     "ACTConfig",
+@@ -41,3 +46,12 @@ __all__ = [
+     "XVLAConfig",
+     "WallXConfig",
+ ]
++
++
++def __getattr__(name: str):
++    if name not in _LAZY_EXPORTS:
++        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
++    module_name, attr_name = _LAZY_EXPORTS[name]
++    value = getattr(import_module(module_name, __name__), attr_name)
++    globals()[name] = value
++    return value
+diff --git a/src/lerobot/policies/factory.py b/src/lerobot/policies/factory.py
+index 501dd7af..c564c2f7 100644
+--- a/src/lerobot/policies/factory.py
++++ b/src/lerobot/policies/factory.py
+@@ -24,40 +24,43 @@ import torch
+
+ from lerobot.configs.policies import PreTrainedConfig
+ from lerobot.configs.types import FeatureType
+-from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+-from lerobot.datasets.feature_utils import dataset_to_policy_features
+-from lerobot.envs.configs import EnvConfig
+-from lerobot.envs.utils import env_to_policy_features
+-from lerobot.policies.act.configuration_act import ACTConfig
+-from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+-from lerobot.policies.groot.configuration_groot import GrootConfig
+-from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
+-from lerobot.policies.pi0.configuration_pi0 import PI0Config
+-from lerobot.policies.pi05.configuration_pi05 import PI05Config
+-from lerobot.policies.pretrained import PreTrainedPolicy
+-from lerobot.policies.sac.configuration_sac import SACConfig
+-from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
+-from lerobot.policies.sarm.configuration_sarm import SARMConfig
+-from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
+-from lerobot.policies.tdmpc.configuration_tdmpc import TDMPCConfig
+-from lerobot.policies.utils import validate_visual_features_consistency
+-from lerobot.policies.vqbet.configuration_vqbet import VQBeTConfig
+-from lerobot.policies.wall_x.configuration_wall_x import WallXConfig
+-from lerobot.policies.xvla.configuration_xvla import XVLAConfig
+-from lerobot.processor import PolicyProcessorPipeline
+-from lerobot.processor.converters import (
+-    batch_to_transition,
+-    policy_action_to_transition,
+-    transition_to_batch,
+-    transition_to_policy_action,
+-)
+-from lerobot.types import PolicyAction
+ from lerobot.utils.constants import (
+     ACTION,
+     POLICY_POSTPROCESSOR_DEFAULT_NAME,
+     POLICY_PREPROCESSOR_DEFAULT_NAME,
+ )
+
++_BUILTIN_POLICY_CONFIGS = {
++    "act": ("lerobot.policies.act.configuration_act", "ACTConfig"),
++    "diffusion": ("lerobot.policies.diffusion.configuration_diffusion", "DiffusionConfig"),
++    "groot": ("lerobot.policies.groot.configuration_groot", "GrootConfig"),
++    "multi_task_dit": ("lerobot.policies.multi_task_dit.configuration_multi_task_dit", "MultiTaskDiTConfig"),
++    "pi0": ("lerobot.policies.pi0.configuration_pi0", "PI0Config"),
++    "pi05": ("lerobot.policies.pi05.configuration_pi05", "PI05Config"),
++    "reward_classifier": (
++        "lerobot.policies.sac.reward_model.configuration_classifier",
++        "RewardClassifierConfig",
++    ),
++    "sac": ("lerobot.policies.sac.configuration_sac", "SACConfig"),
++    "sarm": ("lerobot.policies.sarm.configuration_sarm", "SARMConfig"),
++    "smolvla": ("lerobot.policies.smolvla.configuration_smolvla", "SmolVLAConfig"),
++    "tdmpc": ("lerobot.policies.tdmpc.configuration_tdmpc", "TDMPCConfig"),
++    "vqbet": ("lerobot.policies.vqbet.configuration_vqbet", "VQBeTConfig"),
++    "wall_x": ("lerobot.policies.wall_x.configuration_wall_x", "WallXConfig"),
++    "xvla": ("lerobot.policies.xvla.configuration_xvla", "XVLAConfig"),
++}
++
++
++def _get_builtin_policy_config_class(policy_type: str) -> type[PreTrainedConfig]:
++    if policy_type not in _BUILTIN_POLICY_CONFIGS:
++        raise KeyError(policy_type)
++    module_path, class_name = _BUILTIN_POLICY_CONFIGS[policy_type]
++    module = importlib.import_module(module_path)
++    config_cls = getattr(module, class_name)
++    if not issubclass(config_cls, PreTrainedConfig):
++        raise TypeError(f"Expected {class_name} to inherit from PreTrainedConfig")
++    return config_cls
++
+
+ def _reconnect_relative_absolute_steps(
+     preprocessor: PolicyProcessorPipeline, postprocessor: PolicyProcessorPipeline
+@@ -184,33 +187,10 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
+     Raises:
+         ValueError: If the `policy_type` is not recognized.
+     """
+-    if policy_type == "tdmpc":
+-        return TDMPCConfig(**kwargs)
+-    elif policy_type == "diffusion":
+-        return DiffusionConfig(**kwargs)
+-    elif policy_type == "act":
+-        return ACTConfig(**kwargs)
+-    elif policy_type == "multi_task_dit":
+-        return MultiTaskDiTConfig(**kwargs)
+-    elif policy_type == "vqbet":
+-        return VQBeTConfig(**kwargs)
+-    elif policy_type == "pi0":
+-        return PI0Config(**kwargs)
+-    elif policy_type == "pi05":
+-        return PI05Config(**kwargs)
+-    elif policy_type == "sac":
+-        return SACConfig(**kwargs)
+-    elif policy_type == "smolvla":
+-        return SmolVLAConfig(**kwargs)
+-    elif policy_type == "reward_classifier":
+-        return RewardClassifierConfig(**kwargs)
+-    elif policy_type == "groot":
+-        return GrootConfig(**kwargs)
+-    elif policy_type == "xvla":
+-        return XVLAConfig(**kwargs)
+-    elif policy_type == "wall_x":
+-        return WallXConfig(**kwargs)
+-    else:
++    try:
++        config_cls = _get_builtin_policy_config_class(policy_type)
++        return config_cls(**kwargs)
++    except KeyError:
+         try:
+             config_cls = PreTrainedConfig.get_choice_class(policy_type)
+             return config_cls(**kwargs)
+@@ -271,8 +251,16 @@ def make_pre_post_processors(
+             policy configuration type.
+     """
+     if pretrained_path:
++        from lerobot.processor import PolicyProcessorPipeline
++        from lerobot.processor.converters import (
++            batch_to_transition,
++            policy_action_to_transition,
++            transition_to_batch,
++            transition_to_policy_action,
++        )
++
+         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
+-        if isinstance(policy_cfg, GrootConfig):
++        if policy_cfg.type == "groot":
+             # GROOT handles normalization in groot_pack_inputs_v3 step
+             # Need to override both stats AND normalize_min_max since saved config might be empty
+             preprocessor_overrides = {}
+@@ -314,7 +302,7 @@ def make_pre_post_processors(
+         return preprocessor, postprocessor
+
+     # Create a new processor based on policy type
+-    if isinstance(policy_cfg, TDMPCConfig):
++    if policy_cfg.type == "tdmpc":
+         from lerobot.policies.tdmpc.processor_tdmpc import make_tdmpc_pre_post_processors
+
+         processors = make_tdmpc_pre_post_processors(
+@@ -322,7 +310,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, DiffusionConfig):
++    elif policy_cfg.type == "diffusion":
+         from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
+
+         processors = make_diffusion_pre_post_processors(
+@@ -330,7 +318,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, ACTConfig):
++    elif policy_cfg.type == "act":
+         from lerobot.policies.act.processor_act import make_act_pre_post_processors
+
+         processors = make_act_pre_post_processors(
+@@ -338,7 +326,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, MultiTaskDiTConfig):
++    elif policy_cfg.type == "multi_task_dit":
+         from lerobot.policies.multi_task_dit.processor_multi_task_dit import (
+             make_multi_task_dit_pre_post_processors,
+         )
+@@ -348,7 +336,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, VQBeTConfig):
++    elif policy_cfg.type == "vqbet":
+         from lerobot.policies.vqbet.processor_vqbet import make_vqbet_pre_post_processors
+
+         processors = make_vqbet_pre_post_processors(
+@@ -356,7 +344,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, PI0Config):
++    elif policy_cfg.type == "pi0":
+         from lerobot.policies.pi0.processor_pi0 import make_pi0_pre_post_processors
+
+         processors = make_pi0_pre_post_processors(
+@@ -364,7 +352,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, PI05Config):
++    elif policy_cfg.type == "pi05":
+         from lerobot.policies.pi05.processor_pi05 import make_pi05_pre_post_processors
+
+         processors = make_pi05_pre_post_processors(
+@@ -372,7 +360,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, SACConfig):
++    elif policy_cfg.type == "sac":
+         from lerobot.policies.sac.processor_sac import make_sac_pre_post_processors
+
+         processors = make_sac_pre_post_processors(
+@@ -380,7 +368,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, RewardClassifierConfig):
++    elif policy_cfg.type == "reward_classifier":
+         from lerobot.policies.sac.reward_model.processor_classifier import make_classifier_processor
+
+         processors = make_classifier_processor(
+@@ -388,7 +376,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, SmolVLAConfig):
++    elif policy_cfg.type == "smolvla":
+         from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+
+         processors = make_smolvla_pre_post_processors(
+@@ -396,7 +384,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, SARMConfig):
++    elif policy_cfg.type == "sarm":
+         from lerobot.policies.sarm.processor_sarm import make_sarm_pre_post_processors
+
+         processors = make_sarm_pre_post_processors(
+@@ -404,7 +392,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+             dataset_meta=kwargs.get("dataset_meta"),
+         )
+-    elif isinstance(policy_cfg, GrootConfig):
++    elif policy_cfg.type == "groot":
+         from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+
+         processors = make_groot_pre_post_processors(
+@@ -412,7 +400,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, XVLAConfig):
++    elif policy_cfg.type == "xvla":
+         from lerobot.policies.xvla.processor_xvla import (
+             make_xvla_pre_post_processors,
+         )
+@@ -422,7 +410,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+
+-    elif isinstance(policy_cfg, WallXConfig):
++    elif policy_cfg.type == "wall_x":
+         from lerobot.policies.wall_x.processor_wall_x import make_wall_x_pre_post_processors
+
+         processors = make_wall_x_pre_post_processors(
+@@ -491,11 +479,16 @@ def make_policy(
+         )
+
+     policy_cls = get_policy_class(cfg.type)
++    from lerobot.policies.utils import validate_visual_features_consistency
+
+     kwargs = {}
+     if ds_meta is not None:
++        from lerobot.datasets.feature_utils import dataset_to_policy_features
++
+         features = dataset_to_policy_features(ds_meta.features)
+     else:
++        from lerobot.envs.utils import env_to_policy_features
++
+         if not cfg.pretrained_path:
+             logging.warning(
+                 "You are instantiating a policy from scratch and its features are parsed from an environment "
+diff --git a/src/lerobot/policies/pretrained.py b/src/lerobot/policies/pretrained.py
+index 70efeba6..5ac48711 100644
+--- a/src/lerobot/policies/pretrained.py
++++ b/src/lerobot/policies/pretrained.py
+@@ -11,6 +11,8 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++from __future__ import annotations
++
+ import abc
+ import builtins
+ import dataclasses
+@@ -30,7 +32,6 @@ from safetensors.torch import load_model as load_model_as_safetensor, save_model
+ from torch import Tensor, nn
+
+ from lerobot.configs.policies import PreTrainedConfig
+-from lerobot.configs.train import TrainPipelineConfig
+ from lerobot.policies.utils import log_model_loading_keys
+ from lerobot.utils.hub import HubMixin
+
+diff --git a/src/lerobot/policies/utils.py b/src/lerobot/policies/utils.py
+index 82ab5100..635286c4 100644
+--- a/src/lerobot/policies/utils.py
++++ b/src/lerobot/policies/utils.py
+@@ -23,7 +23,6 @@ from torch import nn
+
+ from lerobot.configs.policies import PreTrainedConfig
+ from lerobot.configs.types import FeatureType, PolicyFeature
+-from lerobot.datasets.feature_utils import build_dataset_frame
+ from lerobot.types import PolicyAction, RobotAction, RobotObservation
+ from lerobot.utils.constants import ACTION, OBS_STR
+
+@@ -163,6 +162,8 @@ def build_inference_frame(
+     Returns:
+         A dictionary of preprocessed tensors ready for model inference.
+     """
++    from lerobot.datasets.feature_utils import build_dataset_frame
++
+     # Extracts the correct keys from the incoming raw observation
+     observation = build_dataset_frame(ds_features, observation, prefix=OBS_STR)
+
+--
+2.34.1

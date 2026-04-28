@@ -213,8 +213,11 @@ detect_python_runtimes() {
         ubuntu-22.04)
             candidates=(/usr/bin/python3.10 /usr/bin/python3 python3.10 python3)
             ;;
-        openeuler-embedded-24.03|openharmony-5.1.0-musl)
+        openeuler-embedded-24.03)
             candidates=(/usr/bin/python3.11 /usr/bin/python3 python3.11 python3)
+            ;;
+        openharmony-5.1.0-musl)
+            candidates=(/data/out/bin/python3.12 /usr/bin/python3.12 /usr/bin/python3 python3.12 python3)
             ;;
         *)
             candidates=(/usr/bin/python3 /usr/local/bin/python3 python3)

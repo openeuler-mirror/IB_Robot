@@ -117,10 +117,10 @@ run_fixture "openeuler-embedded-24.03 / py3.11" \
     IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
     --
 
-# OpenHarmony 5.1.0 / Python 3.12 — must drop both the down-grade and
-# the Ascend compat patches (no profile overlap).
+# OpenHarmony 5.1.0 / Python 3.12 — must drop the down-grade and Ascend compat
+# patches, then keep only the board runtime lazy-import patch.
 run_fixture "openharmony-5.1.0 / py3.12" \
-    "" \
+    "0004-openharmony-lazy-import-policy-stack.patch" \
     IBR_HOST_PYTHON_VERSION=3.12 \
     IBR_LEROBOT_PROFILES=core,openharmony \
     --

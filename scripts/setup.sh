@@ -738,6 +738,8 @@ install_lerobot_editable() {
 platform_ros_setup_path() {
     if [[ -n "${ROS_HUMBLE_SETUP_PATH:-}" ]]; then
         echo "${ROS_HUMBLE_SETUP_PATH}"
+    elif [[ "${SETUP_PLATFORM_ID}" == "openharmony-5.1.0-musl" && -f /data/ros2ohos.env ]]; then
+        echo "/data/ros2ohos.env"
     elif [[ -f /opt/ros/humble/setup.sh ]]; then
         echo "/opt/ros/humble/setup.sh"
     elif [[ -f /opt/ros/humble/setup.bash ]]; then
@@ -750,7 +752,8 @@ platform_ros_setup_path() {
 platform_handle_missing_ros() {
     if [[ "${SETUP_PLATFORM_ID}" == "openharmony-5.1.0-musl" ]]; then
         log_error "ROS 2 Humble setup script is not configured for OpenHarmony."
-        log_error "Set ROS_HUMBLE_SETUP_PATH to your Python 3.11 ROS Humble environment before running setup."
+        log_error "If you are on the board, source /data/ros2ohos.env in the current shell before running setup."
+        log_error "Otherwise set ROS_HUMBLE_SETUP_PATH to an OpenHarmony ROS environment that exposes Python 3.12."
         exit 1
     fi
 
@@ -789,6 +792,10 @@ platform_prepare_host() {
         log_warn "System dependency bootstrap is not yet fully automated for this platform."
         log_warn "Proceeding with shared setup steps only; platform-specific package installation must be supplied separately."
     fi
+}
+
+platform_supports_local_workspace_build() {
+    return 0
 }
 
 platform_install_colcon() {
@@ -1304,11 +1311,20 @@ install_system_deps() {
     fi
 
     # Check for ROS 2 installation first
-    ensure_sudo_session
     check_ros_installation
-    ensure_colcon
 
     platform_prepare_host
+
+    if ! platform_supports_local_workspace_build; then
+        log_info "Skipping local workspace build prerequisites on ${SETUP_PLATFORM_ID}."
+        log_info "This platform consumes a prebuilt ROS runtime and host cross-built deployables."
+        SYSTEM_DEPS_STATUS="skipped"
+        log_skipped "Local workspace build prerequisites"
+        return 0
+    fi
+
+    ensure_sudo_session
+    ensure_colcon
     ensure_rosdepc
     platform_install_rosdeps
     SYSTEM_DEPS_STATUS="done"
@@ -1320,6 +1336,15 @@ setup_python_venv() {
         log_info "Skipping Python virtual environment setup (--skip-python)."
         log_skipped "Python virtual environment"
         PYTHON_ENV_STATUS="skipped"
+        return 0
+    fi
+
+    if ! platform_supports_local_workspace_build; then
+        log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
+        log_info "Use the board ROS runtime directly after sourcing $(platform_ros_setup_path)."
+        log_info "Cross-build IB_Robot artifacts on the host with scripts/openharmony/build_ibrobot_oh_custom.sh."
+        PYTHON_ENV_STATUS="skipped"
+        log_skipped "Workspace Python virtual environment"
         return 0
     fi
 
@@ -1645,6 +1670,20 @@ verify_setup() {
         return 0
     fi
 
+    if ! platform_supports_local_workspace_build; then
+        log_info "Verifying OpenHarmony ROS runtime..."
+        if platform_verify_ros_python_bridge >/dev/null 2>&1; then
+            PYTHON_ENV_STATUS="done"
+            log_done "Verified OpenHarmony ROS runtime"
+            return 0
+        fi
+
+        log_error "Verification failed: could not import rclpy from the OpenHarmony runtime."
+        log_error "Source /data/ros2ohos.env and ensure /data/out/bin/python3.12 is available."
+        PYTHON_ENV_STATUS="failed"
+        exit 1
+    fi
+
     log_info "Verifying ROS 2 connection..."
     ros_setup="$(platform_ros_setup_path)"
     python_bin="$(command -v python3 || true)"
@@ -1780,14 +1819,21 @@ main() {
         log_done "Python virtual environment configured"
     fi
 
-    # LeRobot patch stack is normally applied inline by setup_python_venv
-    # (before install_lerobot_editable so check_lerobot_python_compat sees
-    # the patched pyproject.toml). The call below is an idempotent safety
-    # net for code paths that bypass setup_python_venv (e.g. --skip-python
-    # on a workspace whose patched branch was lost). It is a no-op when
-    # the patch stack is already applied.
-    set_stage "verifying lerobot patch stack"
-    ensure_lerobot_patch_stack_applied
+    if platform_supports_local_workspace_build; then
+        # LeRobot patch stack is normally applied inline by setup_python_venv
+        # (before install_lerobot_editable so check_lerobot_python_compat sees
+        # the patched pyproject.toml). The call below is an idempotent safety
+        # net for code paths that bypass setup_python_venv (e.g. --skip-python
+        # on a workspace whose patched branch was lost). It is a no-op when
+        # the patch stack is already applied.
+        set_stage "verifying lerobot patch stack"
+        ensure_lerobot_patch_stack_applied
+    else
+        log_info "Skipping LeRobot patch stack checks on runtime-only platform ${SETUP_PLATFORM_ID}."
+    fi
+
+    set_stage "verifying environment"
+    verify_setup
 
     echo ""
     echo -e "${YELLOW}============================================================${NC}"
@@ -1797,10 +1843,14 @@ main() {
         echo -e "  ${entry}"
     done
     echo ""
+    local completion_message="Setup complete! Run ./scripts/build.sh to build the workspace."
+    if ! platform_supports_local_workspace_build; then
+        completion_message="Setup complete! OpenHarmony runtime verified; cross-build deployables on the host."
+    fi
     if [[ "${USE_GUM}" == true ]]; then
-        "${GUM_BIN}" style --foreground 42 --bold "[INFO] Setup complete! Run ./scripts/build.sh to build the workspace."
+        "${GUM_BIN}" style --foreground 42 --bold "[INFO] ${completion_message}"
     else
-        echo -e "\033[1;32m[INFO] Setup complete! Run ./scripts/build.sh to build the workspace.${NC}"
+        echo -e "\033[1;32m[INFO] ${completion_message}${NC}"
     fi
 }
 

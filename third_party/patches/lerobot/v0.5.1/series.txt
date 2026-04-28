@@ -1,5 +1,6 @@
 0001-python-compat-syntax-and-metadata.patch
 0002-python-compat-min-version-3.10.patch
 0003-python-compat-typing-unpack.patch
+0004-openharmony-lazy-import-policy-stack.patch
 0005-compat-add-npu-device-detection.patch
 0006-compat-add-ascend-om-config-fields.patch

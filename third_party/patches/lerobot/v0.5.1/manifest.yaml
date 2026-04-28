@@ -59,6 +59,13 @@ patch_profiles:
         lerobot_ros2 history.
       - Keep these master-parity candidates outside the default series until
         each feature is validated on the current upstream v0.5.1 base.
+  - name: openharmony-5.1.0-musl
+    branch_name: ibrobot/lerobot-v0.5.1-openharmony-5.1.0-musl
+    series_file: series.openharmony-5.1.0-musl.txt
+    purpose:
+      - Keep upstream Python 3.12 support intact on the OpenHarmony board
+        runtime.
+      - Document the board-validated lazy-import subset needed for inference.
 
 # Per-patch applicability bounds. Schema v2 contract:
 #   * applies_to.python_min / python_max are PEP 440 specifiers (e.g. ">=3.10",
@@ -86,6 +93,15 @@ patches:
     applies_to:
       python_max: "<3.11"
       profiles: [core, ros, hardware, dev, openeuler]
+  - file: 0004-openharmony-lazy-import-policy-stack.patch
+    purpose:
+      - Defer policy, dataset, env, and processor imports that are not required
+        for inference-time policy loading.
+      - Keep the OpenHarmony board on upstream Python 3.12 while trimming
+        board-side dependency pressure.
+    applies_to:
+      python_min: ">=3.12"
+      profiles: [openharmony]
   - file: 0005-compat-add-npu-device-detection.patch
     purpose:
       - Add torch NPU device recognition to the current upstream device utilities.
@@ -145,6 +161,9 @@ notes:
   - Platform-specific patches for OpenHarmony should be added as new numbered
     patches with explicit `profiles` predicates (e.g. `[openharmony]`) instead
     of forking this stack.
+  - OpenHarmony 5.1.0 musl uses the `core,openharmony` profile set so the board
+    keeps upstream Python 3.12 syntax while applying only the lazy-import fixes
+    needed for runtime inference.
   - Patches 0007-0012 are feature-scoped migration candidates extracted from
     lerobot_ros2 for master-parity work. They are intentionally tracked outside
     the default series until each feature is revalidated on the current
