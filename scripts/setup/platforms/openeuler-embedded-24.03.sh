@@ -88,11 +88,31 @@ platform_install_rosdeps() {
         --skip-keys=numpy_lessthan_2 \
         --skip-keys=ament_python \
         --skip-keys=feetech-servo-sdk \
+        --skip-keys=lttng-tools \
+        --skip-keys=nlohmann-json-dev \
+        --skip-keys=python3-opencv \
+        --skip-keys=python3-aiortc \
+        --skip-keys=gz_ros2_control \
+        --skip-keys=ros_gz_sim \
+        --skip-keys=ros_gz_bridge \
+        --skip-keys=mujoco_ros2_control \
         --skip-keys=pyserial; then
         log_error "rosdepc install failed."
         log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
         exit 1
     fi
+
+    # On openEuler, babeltrace/python3-babeltrace/lttng-ust still need explicit
+    # dnf installation. lttng-tools remains skipped above because the current
+    # repositories do not provide it.
+    log_info "Installing remaining tracing tools without rosdep rules..."
+    run_sudo dnf install -y --nogpgcheck \
+        babeltrace \
+        python3-babeltrace \
+        lttng-ust
+
+    log_warn "python3-lttngust is not currently available in the tested openEuler repos."
+    log_warn "ROS trace CLI works, but Python-domain ib_trace.* logging remains unavailable for now."
 }
 
 platform_verify_ros_python_bridge() {

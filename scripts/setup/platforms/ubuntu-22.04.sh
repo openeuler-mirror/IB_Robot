@@ -84,6 +84,17 @@ platform_install_rosdeps() {
         log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
         exit 1
     fi
+
+    # rosdepc resolves the ros2_tracing and tracetools_analysis packages from
+    # robot_config/package.xml on Ubuntu, but python3-lttngust and babeltrace2
+    # still need explicit system packages in the normal setup flow.
+    log_info "Installing remaining tracing tools without rosdep rules..."
+    run_sudo apt-get install -y --no-install-recommends python3-lttngust babeltrace2 -qq
+
+    if ! groups | grep -q '\btracing\b'; then
+        run_sudo usermod -aG tracing "$(whoami)" 2>/dev/null || true
+        log_warn "Added $(whoami) to the 'tracing' group; re-login may be required before using LTTng."
+    fi
 }
 
 platform_verify_ros_python_bridge() {

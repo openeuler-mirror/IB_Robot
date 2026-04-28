@@ -24,18 +24,10 @@ echo "--- Installing ros2_tracing ---"
 sudo apt-get install -y --no-install-recommends \
     "ros-${ROS_DISTRO}-ros2trace" \
     "ros-${ROS_DISTRO}-tracetools" \
+    "ros-${ROS_DISTRO}-tracetools-analysis" \
     "ros-${ROS_DISTRO}-tracetools-launch" \
     "ros-${ROS_DISTRO}-tracetools-read" \
     "ros-${ROS_DISTRO}-tracetools-trace"
-
-echo "--- Installing tracetools_analysis ---"
-if [[ -x "${WORKSPACE}/venv/bin/python3" ]]; then
-    "${WORKSPACE}/venv/bin/python3" -m pip install --quiet tracetools-analysis 2>/dev/null || \
-        echo "Note: tracetools_analysis pip install skipped (install manually if needed)"
-else
-    pip3 install --quiet tracetools-analysis 2>/dev/null || \
-        echo "Note: tracetools_analysis pip install skipped (install manually if needed)"
-fi
 
 echo ""
 echo "--- Verification ---"

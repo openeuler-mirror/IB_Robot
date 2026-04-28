@@ -39,6 +39,7 @@
 
   <!-- Tracing -->
   <exec_depend>tracetools</exec_depend>
+  <exec_depend>tracetools_analysis</exec_depend>
   <exec_depend>ros2trace</exec_depend>
   <exec_depend>lttng-tools</exec_depend>
 
