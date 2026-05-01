@@ -2,5 +2,4 @@
 0010-weighted-training.patch
 0011-knowledge-distillation.patch
 0012-mt-act-model.patch
-0013-attention-visualization-tools.patch
 0014-training-logs.patch

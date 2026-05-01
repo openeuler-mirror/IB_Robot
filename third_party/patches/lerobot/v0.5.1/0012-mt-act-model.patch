@@ -1,4 +1,4 @@
-From 95e1368ad46dc2b4d81b7dac86c5db66b62ec051 Mon Sep 17 00:00:00 2001
+From 122d1a2093774d4dcdc134511bc2a2548fcf3ab7 Mon Sep 17 00:00:00 2001
 From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
 Date: Fri, 24 Apr 2026 22:41:22 +0800
 Subject: [PATCH] feature: add mt_act model
@@ -8,9 +8,9 @@ Subject: [PATCH] feature: add mt_act model
  .../policies/mt_act/configuration_mt_act.py   | 167 ++++
  src/lerobot/policies/mt_act/constants.py      |  19 +
  .../policies/mt_act/language_embedding.py     |  21 +
- .../policies/mt_act/modeling_mt_act.py        | 836 ++++++++++++++++++
- src/lerobot/policies/mt_act/resnet_film.py    | 519 +++++++++++
- 6 files changed, 1570 insertions(+), 1 deletion(-)
+ .../policies/mt_act/modeling_mt_act.py        | 736 ++++++++++++++++++
+ src/lerobot/policies/mt_act/resnet_film.py    | 519 ++++++++++++
+ 6 files changed, 1470 insertions(+), 1 deletion(-)
  create mode 100644 src/lerobot/policies/mt_act/configuration_mt_act.py
  create mode 100644 src/lerobot/policies/mt_act/constants.py
  create mode 100644 src/lerobot/policies/mt_act/language_embedding.py
@@ -18,21 +18,21 @@ Subject: [PATCH] feature: add mt_act model
  create mode 100644 src/lerobot/policies/mt_act/resnet_film.py
 
 diff --git a/src/lerobot/policies/factory.py b/src/lerobot/policies/factory.py
-index eb626675..bc084c10 100644
+index 501dd7af..534f7b26 100644
 --- a/src/lerobot/policies/factory.py
 +++ b/src/lerobot/policies/factory.py
-@@ -31,6 +31,7 @@ from lerobot.envs.utils import env_to_policy_features
- from lerobot.policies.act.configuration_act import ACTConfig
+@@ -32,6 +32,7 @@ from lerobot.policies.act.configuration_act import ACTConfig
  from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
  from lerobot.policies.groot.configuration_groot import GrootConfig
+ from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
 +from lerobot.policies.mt_act.configuration_mt_act import MTACTConfig
  from lerobot.policies.pi0.configuration_pi0 import PI0Config
  from lerobot.policies.pi05.configuration_pi05 import PI05Config
  from lerobot.policies.pretrained import PreTrainedPolicy
-@@ -79,6 +80,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
-         from lerobot.policies.act.modeling_act import ACTPolicy
+@@ -114,6 +115,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
+         from lerobot.policies.multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
  
-         return ACTPolicy
+         return MultiTaskDiTPolicy
 +    elif name == "mt_act":
 +        from lerobot.policies.mt_act.modeling_mt_act import MTACTPolicy
 +
@@ -40,16 +40,16 @@ index eb626675..bc084c10 100644
      elif name == "vqbet":
          from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
  
-@@ -136,6 +141,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
-         return DiffusionConfig(**kwargs)
-     elif policy_type == "act":
+@@ -192,6 +197,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
          return ACTConfig(**kwargs)
+     elif policy_type == "multi_task_dit":
+         return MultiTaskDiTConfig(**kwargs)
 +    elif policy_type == "mt_act":
 +        return MTACTConfig(**kwargs)
      elif policy_type == "vqbet":
          return VQBeTConfig(**kwargs)
      elif policy_type == "pi0":
-@@ -266,7 +273,7 @@ def make_pre_post_processors(
+@@ -330,7 +337,7 @@ def make_pre_post_processors(
              dataset_stats=kwargs.get("dataset_stats"),
          )
  
@@ -285,17 +285,16 @@ index 00000000..82c2659c
 +print(embeddings_df.head())  # 显示前几行
 diff --git a/src/lerobot/policies/mt_act/modeling_mt_act.py b/src/lerobot/policies/mt_act/modeling_mt_act.py
 new file mode 100644
-index 00000000..1c4406ea
+index 00000000..52348a14
 --- /dev/null
 +++ b/src/lerobot/policies/mt_act/modeling_mt_act.py
-@@ -0,0 +1,836 @@
+@@ -0,0 +1,736 @@
 +#!/usr/bin/env python
 +
 +# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 +# Licensed under the Apache License, Version 2.0 (the "License")
 +
 +import math
-+import os
 +from collections import deque
 +from collections.abc import Callable
 +from itertools import chain
@@ -316,9 +315,7 @@ index 00000000..1c4406ea
 +from lerobot.policies.mt_act.resnet_film import ResNetFilmBackbone
 +from lerobot.policies.pretrained import PreTrainedPolicy
 +from lerobot.processor.converters import batch_to_transition
-+from lerobot.utils.attention_masking import create_interactive_masks, process_pixel_mask_to_feature_mask
 +from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-+from lerobot.utils.visualization import RealTimeVisualizer
 +
 +
 +class MTACTPolicy(PreTrainedPolicy):
@@ -341,42 +338,11 @@ index 00000000..1c4406ea
 +        # 2. 标准动作队列
 +        self._action_queue = deque([], maxlen=self.config.n_action_steps)
 +
-+        # 3. 可视化与交互状态
-+        self.inference_step_counter = 0
-+        self.enable_visualization = False
-+        self.visualization_frequency = 10
-+        self.visualization_dir = "inference_visualizations"
-+        self.action_queries_to_visualize = list(range(0, config.chunk_size, max(1, config.chunk_size // 5)))
-+        self.last_attn_weights = None
-+
-+        self.enable_interactive_masking = False
-+        self.user_attention_masks = {}
-+        self._is_first_action_of_episode = True
-+        self.gui_save_dir = "gui_interactions"
-+
-+        # 4. 实时可视化器初始化 (可选)
-+        self.visualizer = None
-+        if os.environ.get("VIZ_MODE", "file").lower() == "interactive" and self.config.image_features:
-+            self.visualizer = RealTimeVisualizer(
-+                camera_keys=list(self.config.image_features.keys()),
-+                queries_to_visualize=self.action_queries_to_visualize,
-+                layer_idx=-1,
-+                batch_idx=0,
-+                average_heads=True,
-+                blend_alpha=0.4,
-+            )
-+
 +        self.reset()
 +
 +    def reset(self):
 +        """环境重置时调用"""
 +        self._action_queue.clear()
-+        self.inference_step_counter = 0
-+        self.last_attn_weights = None
-+        self.user_attention_masks.clear()
-+        self._is_first_action_of_episode = True
-+        if self.visualizer:
-+            self.visualizer.close()
 +
 +    def get_optim_params(self) -> list[dict]:
 +        return [
@@ -417,10 +383,6 @@ index 00000000..1c4406ea
 +        # C. 从队列弹出一个动作
 +        action = self._action_queue.popleft()
 +
-+        # D. 可视化
-+        self.inference_step_counter += 1
-+        self._visualize_if_enabled(batch)
-+
 +        if action.ndim == 2:
 +            action = action.squeeze(0)
 +
@@ -438,70 +400,8 @@ index 00000000..1c4406ea
 +        if self.config.use_language and "task" in batch and "language_features" not in batch:
 +            batch["language_features"] = self.model.encode_text(batch["task"]).to(batch[OBS_STATE].device)
 +
-+        # 交互式掩码处理
-+        if self._is_first_action_of_episode and self.enable_interactive_masking:
-+            self._handle_gui_masks(batch)
-+            self._is_first_action_of_episode = False
-+
-+        enc_mask, dec_mask = self._build_transformer_masks(batch)
-+
-+        # 前向传播
-+        actions, _, attn_weights, _ = self.model(
-+            batch, attention_mask=dec_mask, encoder_key_padding_mask=enc_mask
-+        )
-+
-+        self.last_attn_weights = attn_weights
++        actions, _, _, _ = self.model(batch)
 +        return actions
-+
-+    def _handle_gui_masks(self, batch):
-+        pixel_masks = create_interactive_masks(batch, self.gui_save_dir)
-+        if pixel_masks:
-+            for cam_key, mask_gray in pixel_masks.items():
-+                f_mask = process_pixel_mask_to_feature_mask(
-+                    mask_image=mask_gray, feature_map_size=self.model.get_feature_map_size()
-+                )
-+                if f_mask is not None:
-+                    self.user_attention_masks[cam_key] = f_mask
-+
-+    def _build_transformer_masks(self, batch) -> tuple[Tensor | None, Tensor | None]:
-+        if not self.user_attention_masks:
-+            return None, None
-+
-+        device = batch[OBS_STATE].device
-+        f_size = self.model.get_feature_map_size()
-+        f_area = f_size[0] * f_size[1]
-+
-+        all_cam_masks = []
-+        for cam_key in self.config.image_features:
-+            if cam_key in self.user_attention_masks:
-+                all_cam_masks.append(self.user_attention_masks[cam_key].to(device))
-+            else:
-+                all_cam_masks.append(torch.zeros(f_area, dtype=torch.bool, device=device))
-+
-+        visual_mask = torch.cat(all_cam_masks)
-+        num_1d = (
-+            1
-+            + (1 if self.config.robot_state_feature else 0)
-+            + (1 if self.config.env_state_feature else 0)
-+            + (1 if self.config.use_language else 0)
-+        )
-+
-+        one_d_mask = torch.zeros(num_1d, dtype=torch.bool, device=device)
-+        full_mask = torch.cat([one_d_mask, visual_mask])
-+
-+        enc_key_mask = full_mask.unsqueeze(0).expand(batch[OBS_STATE].shape[0], -1)
-+        dec_attn_mask = full_mask.unsqueeze(0).expand(self.config.chunk_size, -1)
-+        return enc_key_mask, dec_attn_mask
-+
-+    def _visualize_if_enabled(self, batch):
-+        if not self.enable_visualization or self.last_attn_weights is None:
-+            return
-+        if self.inference_step_counter % self.visualization_frequency != 0:
-+            return
-+
-+        f_size = self.model.get_feature_map_size()
-+        if self.visualizer:
-+            self.visualizer.update(self.last_attn_weights, batch, f_size)
 +
 +    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
 +        """训练前向逻辑"""
@@ -1651,5 +1551,5 @@ index 00000000..87170c4e
 +    def dim_model(self):  # 将原来的embed_dim属性改为dim_model
 +        return self._dim_model
 -- 
-2.34.1
+2.43.0
 

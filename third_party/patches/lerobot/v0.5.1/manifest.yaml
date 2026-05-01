@@ -40,7 +40,6 @@ profiles:
   distillation: Hosts that perform knowledge distillation across policies.
   models: Hosts that need extra model families beyond the upstream set.
   mt-act: Multi-task ACT policy variant.
-  visualization: Attention-visualization and tooling stack.
   tooling: Auxiliary tooling shared by the model patches.
   master-parity-candidates: Migration patches tracked outside the default series.
 
@@ -130,11 +129,6 @@ patches:
       - Restore the mt_act policy family as a dedicated model patch.
     applies_to:
       profiles: [master-parity-candidates, models, mt-act]
-  - file: 0013-attention-visualization-tools.patch
-    purpose:
-      - Restore the attention-masking and visualization utility stack used by the legacy model patches.
-    applies_to:
-      profiles: [master-parity-candidates, visualization, tooling]
   - file: 0014-training-logs.patch
     purpose:
       - Add TensorBoard training and evaluation scalar logs for KD-capable training runs.
@@ -163,10 +157,10 @@ notes:
   - OpenHarmony 5.1.0 musl uses the `core,openharmony` profile set so the board
     keeps upstream Python 3.12 syntax while applying only the lazy-import fixes
     needed for runtime inference.
-  - Patches 0010 and 0012-0013 are feature-scoped migration candidates extracted from
-    lerobot_ros2 for master-parity work. They are intentionally tracked outside
-    the default series until each feature is revalidated on the current
-    upstream lerobot v0.5.1 base.
+  - Patches 0010 and 0012 are feature-scoped migration candidates extracted
+    from lerobot_ros2 for master-parity work. They are intentionally tracked
+    outside the default series until each feature is revalidated on the
+    current upstream lerobot v0.5.1 base.
   - Patch 0009 is part of the default series because patch 0011 is rebased on
     top of its training-loop changes. Its adaptive weighting behavior remains
     confined to the training pipeline.
