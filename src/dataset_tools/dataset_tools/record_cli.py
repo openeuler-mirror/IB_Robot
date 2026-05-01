@@ -11,7 +11,7 @@ import threading
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from std_srvs.srv import Trigger
+from std_srvs.srv import Empty, Trigger
 
 # Import the global interface
 from ibrobot_msgs.action import RecordEpisode
@@ -20,21 +20,39 @@ from ibrobot_msgs.action import RecordEpisode
 class RecordCLI(Node):
     def __init__(self):
         super().__init__('record_cli')
+
+        self.declare_parameter('dispatcher_reset_service', '/action_dispatcher/reset')
+        self.declare_parameter('policy_reset_service', '/act_inference_node/reset_policy_state')
+        self.declare_parameter('reset_timeout_sec', 2.0)
+        self.declare_parameter('control_mode', 'teleop')
+        self.declare_parameter('reset_before_episode', 'auto')
+        self._reset_timeout_s = float(self.get_parameter('reset_timeout_sec').value)
         self._episode_finished_evt = threading.Event()
-        
+
         # Action client to start recording
         self._action_client = ActionClient(self, RecordEpisode, 'record_episode')
-        
+
         # Service client to stop recording early
         self._cancel_client = self.create_client(Trigger, 'record_episode/cancel')
+        self._dispatcher_reset_client = self.create_client(
+            Empty,
+            self.get_parameter('dispatcher_reset_service').value,
+        )
+        self._policy_reset_client = self.create_client(
+            Trigger,
+            self.get_parameter('policy_reset_service').value,
+        )
         # Service client to get dataset info
         self._info_client = self.create_client(Trigger, 'record_episode/get_info')
-        
+
         self.get_logger().info("Record CLI started. Waiting for Action Server...")
         self._action_client.wait_for_server()
         self.get_logger().info("Connected to Episode Recorder Server!")
 
     def send_goal(self, prompt_text: str):
+        if self._should_reset_before_episode():
+            self.prepare_new_episode()
+
         goal_msg = RecordEpisode.Goal()
         goal_msg.prompt = prompt_text
 
@@ -97,10 +115,106 @@ class RecordCLI(Node):
         except Exception as e:
             self.get_logger().error(f"Cancel service call failed: {e}")
 
+    def prepare_new_episode(self):
+        """Best-effort reset so a new episode reuses clean policy/dispatcher state."""
+        # Prefer dispatcher reset because it clears queued action chunks and then
+        # asks inference_service to clear policy-local caches. The direct policy
+        # reset remains a fallback for deployments that start record_cli without
+        # action_dispatch.
+        if self._reset_dispatcher_state():
+            return
+        self._reset_policy_state()
+
+    def _should_reset_before_episode(self) -> bool:
+        override = str(self.get_parameter('reset_before_episode').value).strip().lower()
+        if override in {'true', '1', 'yes', 'on'}:
+            return True
+        if override in {'false', '0', 'no', 'off'}:
+            return False
+        return str(self.get_parameter('control_mode').value).strip() == 'model_inference'
+
+    def _reset_dispatcher_state(self) -> bool:
+        service_name = self.get_parameter('dispatcher_reset_service').value
+        if not service_name:
+            return False
+        if not self._dispatcher_reset_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warning(
+                f"Dispatcher reset service unavailable: {service_name}"
+            )
+            return False
+
+        try:
+            future = self._dispatcher_reset_client.call_async(Empty.Request())
+        except Exception as e:
+            self.get_logger().warning(f"Dispatcher reset call failed: {e}")
+            return False
+
+        if not self._wait_for_future(future, timeout_sec=self._reset_timeout_s):
+            self.get_logger().warning("Dispatcher reset call timed out.")
+            return False
+
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().warning(f"Dispatcher reset call failed: {e}")
+            return False
+
+        if response is not None:
+            self.get_logger().info("Dispatcher state reset for new episode.")
+            return True
+
+        self.get_logger().warning("Dispatcher reset call failed.")
+        return False
+
+    def _reset_policy_state(self) -> bool:
+        service_name = self.get_parameter('policy_reset_service').value
+        if not service_name:
+            return False
+        if not self._policy_reset_client.wait_for_service(timeout_sec=0.5):
+            self.get_logger().warning(
+                f"Policy reset service unavailable: {service_name}"
+            )
+            return False
+
+        try:
+            future = self._policy_reset_client.call_async(Trigger.Request())
+        except Exception as e:
+            self.get_logger().warning(f"Policy reset call failed: {e}")
+            return False
+
+        if not self._wait_for_future(future, timeout_sec=self._reset_timeout_s):
+            self.get_logger().warning("Policy reset call timed out.")
+            return False
+
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().warning(f"Policy reset call failed: {e}")
+            return False
+
+        if response is not None and response.success:
+            self.get_logger().info("Policy runtime state reset for new episode.")
+            return True
+
+        message = response.message if response is not None else ""
+        self.get_logger().warning(f"Policy reset call failed. {message}")
+        return False
+
+    @staticmethod
+    def _wait_for_future(future, timeout_sec: float) -> bool:
+        """Wait for a future while the node is already spun by the executor thread."""
+        if future.done():
+            return True
+        done_event = threading.Event()
+        future.add_done_callback(lambda _future: done_event.set())
+        if future.done():
+            return True
+        return done_event.wait(timeout=timeout_sec)
+
 
 def cli_loop(node):
     """Run the interactive prompt in a separate thread."""
-    
+
     print("\nFetching dataset configuration from server...")
     if node._info_client.wait_for_service(timeout_sec=3.0):
         future = node._info_client.call_async(Trigger.Request())
@@ -113,7 +227,7 @@ def cli_loop(node):
                 info = json.loads(future.result().message)
                 path = info.get("path", "Unknown")
                 count = info.get("episodes", 0)
-                
+
                 print(f"\n========================================")
                 print(f"📊 DATASET TARGET INFO")
                 print(f"========================================")
@@ -127,7 +241,7 @@ def cli_loop(node):
                 print(f"💡 Tip: To change the dataset name, restart the launch server with:")
                 print(f"   ros2 launch ... dataset_name:=<new_name> bag_base_dir:=<custom_dir>")
                 print(f"========================================")
-                
+
                 ans = input("\nPress Enter to CONFIRM and continue, or 'q' to quit > ")
                 if ans.strip().lower() in ['q', 'quit']:
                     rclpy.shutdown()
@@ -138,10 +252,10 @@ def cli_loop(node):
         print("⚠️  Warning: Could not fetch dataset info from server (timeout).")
 
     last_prompt = "default_task"
-    
+
     while rclpy.ok():
         node._episode_finished_evt.clear()
-        
+
         print("\n========================================")
         print("Dataset Collection CLI")
         print(f"Enter prompt text to start recording. (Press Enter to reuse: '{last_prompt}')")
@@ -162,10 +276,10 @@ def cli_loop(node):
                 
             # Send the start command
             node.send_goal(prompt)
-            
+
             # Wait for user to press Enter to stop
-            input() 
-            
+            input()
+
             # Send cancel command
             node.cancel_recording()
             
@@ -176,7 +290,7 @@ def cli_loop(node):
                     "Timed out waiting for recorder to finish. "
                     "The recording server may have crashed — check its logs."
                 )
-            
+
         except EOFError:
             break
         except Exception as e:

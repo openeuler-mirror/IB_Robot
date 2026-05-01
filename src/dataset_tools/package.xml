@@ -10,6 +10,7 @@
   <depend>rclpy</depend>
   <depend>rosbag2_py</depend>
   <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>tensormsg</depend>
   <depend>robot_config</depend>

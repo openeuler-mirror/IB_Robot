@@ -453,6 +453,7 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
     logger.info(f"Use sim time: {is_sim}")
 
     action_server = f"/{INFERENCE_NODE_NAME}/DispatchInfer"
+    inference_reset_service = f"/{INFERENCE_NODE_NAME}/reset_policy_state"
     action_dispatcher_node = Node(
         package="action_dispatch",
         executable="action_dispatcher_node",
@@ -482,6 +483,10 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
                 "dispatch_action_topic": "/action_dispatch/dispatch_action",
                 "robot_config_path": str(robot_config_path),
                 "inference_action_server": action_server,
+                "inference_reset_service": inference_reset_service,
+                "policy_reset_timeout_sec": executor_config.get(
+                    "policy_reset_timeout_sec", 2.0
+                ),
                 "inference_prompt": "",
                 "navigation_mode": executor_config.get("navigation_mode", False),
                 "use_sim_time": is_sim,

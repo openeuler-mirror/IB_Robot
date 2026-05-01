@@ -59,7 +59,13 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("queue_size", 100)
         self.declare_parameter("watermark_threshold", 20)
         self.declare_parameter("control_frequency", 100.0)
-        self.declare_parameter("inference_action_server", "/act_inference_node/DispatchInfer")
+        self.declare_parameter(
+            "inference_action_server", "/act_inference_node/DispatchInfer"
+        )
+        self.declare_parameter(
+            "inference_reset_service", "/act_inference_node/reset_policy_state"
+        )
+        self.declare_parameter("policy_reset_timeout_sec", 2.0)
         self.declare_parameter("robot_config_path", "")
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("navigation_mode", False)
@@ -88,6 +94,13 @@ class ActionDispatcherNode(Node):
         self._queue = collections.deque(maxlen=self._queue_limit)
         self._last_action: np.ndarray | None = None
         self._inference_in_progress = False
+        self._inflight_request_id = ""
+        self._policy_reset_in_progress = False
+        self._policy_reset_started_at = 0.0
+        self._policy_reset_timeout_s = float(
+            self.get_parameter("policy_reset_timeout_sec").value
+        )
+        self._request_generation = 0
         # In navigation mode, start in stopped state; otherwise run immediately.
         self._is_running = not self._navigation_mode
 
@@ -143,7 +156,13 @@ class ActionDispatcherNode(Node):
             raise RuntimeError("Failed to initialize TopicExecutor")
 
         # 6. Communication
-        self._infer_client = rclpy.action.ActionClient(self, DispatchInfer, self._server_name)
+        self._infer_client = rclpy.action.ActionClient(
+            self, DispatchInfer, self._server_name
+        )
+        self._policy_reset_client = self.create_client(
+            Trigger,
+            self.get_parameter("inference_reset_service").value,
+        )
 
         # Subscriptions
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -205,12 +224,18 @@ class ActionDispatcherNode(Node):
         if not self._is_running:
             return
 
+        self._expire_policy_reset_if_needed()
+
         q_size = self._get_plan_length()
         self._queue_size_pub.publish(Int32(data=q_size))
         self._smoothing_enabled_pub.publish(Bool(data=self._smoothing_enabled))
 
         # A. Trigger Inference if queue is low
-        if q_size <= self._watermark and not self._inference_in_progress:
+        if (
+            q_size <= self._watermark
+            and not self._inference_in_progress
+            and not self._policy_reset_in_progress
+        ):
             self._request_inference()
 
         # B. Get Action
@@ -296,6 +321,7 @@ class ActionDispatcherNode(Node):
         self._inference_in_progress = True
         self._plan_length_at_inference_start = self._get_plan_length()
         self._current_request_id = uuid.uuid4().hex[:8]
+        self._inflight_request_id = self._current_request_id
 
         goal = DispatchInfer.Goal()
         goal.obs_timestamp = self.get_clock().now().to_msg()
@@ -313,22 +339,41 @@ class ActionDispatcherNode(Node):
         )
 
         send_goal_future = self._infer_client.send_goal_async(goal)
-        send_goal_future.add_done_callback(self._goal_response_cb)
+        request_generation = self._request_generation
+        send_goal_future.add_done_callback(
+            lambda future, req_id=self._current_request_id, gen=request_generation:
+                self._goal_response_cb(future, req_id, gen)
+        )
 
-    def _goal_response_cb(self, future):
+    def _goal_response_cb(self, future, request_id: str, request_generation: int):
+        if request_generation != self._request_generation:
+            self._complete_inflight_request(request_id)
+            self.get_logger().debug(
+                f"Ignoring stale inference goal response: {request_id}"
+            )
+            return
         goal_handle = future.result()
         if not goal_handle.accepted:
             self.get_logger().warn("Inference goal REJECTED")
-            self._inference_in_progress = False
+            self._complete_inflight_request(request_id)
             return
 
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._result_cb)
+        result_future.add_done_callback(
+            lambda future, req_id=request_id, gen=request_generation:
+                self._result_cb(future, req_id, gen)
+        )
 
-    def _result_cb(self, future):
-        self._inference_in_progress = False
+    def _result_cb(self, future, request_id: str, request_generation: int):
+        if request_generation != self._request_generation:
+            self._complete_inflight_request(request_id)
+            self.get_logger().debug(
+                f"Ignoring stale inference result: {request_id}"
+            )
+            return
+        self._complete_inflight_request(request_id)
         result = future.result().result
-        req_id = getattr(self, "_current_request_id", "")
+        req_id = request_id
         if not result.success:
             self._consecutive_failures += 1
             _trace.info(
@@ -434,7 +479,10 @@ class ActionDispatcherNode(Node):
         self._queue.clear()
         if self._smoother is not None:
             self._smoother.reset()
+        self._request_generation += 1
         self._inference_in_progress = False
+        self._inflight_request_id = ""
+        self._request_policy_reset()
         self._plan_length_at_inference_start = 0
         self._last_action = None
         self._active_request_id = ""
@@ -442,6 +490,68 @@ class ActionDispatcherNode(Node):
         self._last_queue_refill_monotonic_ns = 0
         self._current_request_id = ""
         return response
+
+    def _complete_inflight_request(self, request_id: str):
+        if request_id != self._inflight_request_id:
+            return
+        self._inference_in_progress = False
+        self._inflight_request_id = ""
+
+    def _expire_policy_reset_if_needed(self):
+        if not self._policy_reset_in_progress:
+            return
+        if self._policy_reset_started_at <= 0.0:
+            return
+        if time.monotonic() - self._policy_reset_started_at <= self._policy_reset_timeout_s:
+            return
+        self._policy_reset_in_progress = False
+        self._policy_reset_started_at = 0.0
+        self.get_logger().warn(
+            "Policy reset timed out; continuing with dispatcher reset complete"
+        )
+
+    def _request_policy_reset(self):
+        """Reset policy-local runtime state for a new episode boundary."""
+        service_name = self.get_parameter("inference_reset_service").value
+        if not service_name:
+            self._policy_reset_in_progress = False
+            self._policy_reset_started_at = 0.0
+            return
+
+        if not self._policy_reset_client.wait_for_service(timeout_sec=0.2):
+            self.get_logger().warn(
+                f"Policy reset service unavailable: {service_name}"
+            )
+            self._policy_reset_in_progress = False
+            self._policy_reset_started_at = 0.0
+            return
+
+        self._policy_reset_in_progress = True
+        self._policy_reset_started_at = time.monotonic()
+        try:
+            future = self._policy_reset_client.call_async(Trigger.Request())
+            future.add_done_callback(self._policy_reset_done_cb)
+        except Exception as e:
+            self._policy_reset_in_progress = False
+            self._policy_reset_started_at = 0.0
+            self.get_logger().warn(f"Policy reset request failed: {e}")
+
+    def _policy_reset_done_cb(self, future):
+        self._policy_reset_in_progress = False
+        self._policy_reset_started_at = 0.0
+        try:
+            result = future.result()
+            if result is None:
+                self.get_logger().warn("Policy reset returned no response")
+                return
+            if not result.success:
+                self.get_logger().warn(
+                    f"Policy reset failed: {result.message}"
+                )
+                return
+            self.get_logger().info("Policy runtime state reset")
+        except Exception as e:
+            self.get_logger().warn(f"Policy reset request failed: {e}")
 
     def _toggle_smoothing_cb(self, request, response):
         """Toggle smoothing on/off at runtime (requires smoother to be initialized)."""

@@ -176,6 +176,8 @@ ros2 run action_dispatch action_dispatcher_node
 | `watermark_threshold` | int | 20 | 触发推理的水位线阈值 |
 | `control_frequency` | double | 100.0 | 控制频率 (Hz) |
 | `inference_action_server` | string | `/act_inference_node/DispatchInfer` | 推理服务 Action 名称 |
+| `inference_reset_service` | string | `/act_inference_node/reset_policy_state` | 推理侧 policy 重置服务名；reset 时 best-effort 调用 |
+| `policy_reset_timeout_sec` | double | 2.0 | 等待推理侧 policy 重置完成的最长时间 |
 | `contract_path` | string | `''` | Contract 文件路径 |
 | `joint_state_topic` | string | `/joint_states` | 关节状态话题 |
 | `navigation_mode` | bool | false | 导航模式（启动时停止，等待外部触发） |
@@ -331,7 +333,7 @@ blended[i] = (old[i] * cumsum[count[i]-1] + new[i] * weight[count[i]]) / cumsum[
 ros2 service call /action_dispatcher/toggle_smoothing std_srvs/srv/Empty
 
 # 重置状态
-ros2 service call /action_dispatcher/reset std_srvs/srv/Empty
+ros2 service call /action_dispatcher/reset std_srvs/srv/Empty "{}"
 ```
 
 ## 导航模式 (Navigation Mode)
@@ -432,7 +434,7 @@ control_modes:
 
 | 服务 | 类型 | 说明 |
 |------|------|------|
-| `~/reset` | `std_srvs/Empty` | 重置队列和状态 |
+| `~/reset` | `std_srvs/Empty` | 重置队列和状态；同时 best-effort 调用 `inference_reset_service` 重置推理侧 policy 状态 |
 | `~/toggle_smoothing` | `std_srvs/Empty` | 切换平滑开关 |
 | `~/start_evaluate` | `std_srvs/Trigger` | 开始执行（仅 navigation_mode=true 时有效） |
 | `~/stop_evaluate` | `std_srvs/Trigger` | 停止执行并停止底盘（仅 navigation_mode=true 时有效） |

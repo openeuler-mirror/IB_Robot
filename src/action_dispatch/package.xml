@@ -14,6 +14,7 @@
   <depend>trajectory_msgs</depend>
   <depend>diagnostic_msgs</depend>
   <depend>builtin_interfaces</depend>
+  <depend>std_srvs</depend>
 
   <depend>ibrobot_msgs</depend>
   <depend>tensormsg</depend>
