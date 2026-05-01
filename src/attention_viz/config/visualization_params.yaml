@@ -1,0 +1,13 @@
+/**:
+  ros__parameters:
+    visualization_mode: 'file'        # 'file', 'realtime', or 'interactive'
+    attention_topic: '/attention/weights'
+    save_dir: 'attention_visualizations'
+    heatmap_topic_prefix: '/visualization/heatmap'
+    queries_to_visualize: [0, 20, 40, 60, 80]
+    layer_idx: -1
+    batch_idx: 0
+    average_heads: true
+    blend_alpha: 0.4
+    update_frequency: 10.0   # Hz
+    headless: false
