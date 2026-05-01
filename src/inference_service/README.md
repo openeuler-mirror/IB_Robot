@@ -69,6 +69,54 @@ control_modes:
       model: so101_act
 ```
 
+### 注意力可视化
+
+推理节点支持节点化注意力可视化：
+
+| 方式 | 适用模式 | 说明 | 详细文档 |
+|------|---------|------|---------|
+| 节点化可视化（推荐） | Monolithic | 通过 ROS 话题发布注意力权重，由独立 `attention_viz` 节点渲染热力图 | [attention_viz 文档](../attention_viz/README.md) |
+
+#### 节点化可视化参数
+
+```yaml
+control_modes:
+  model_inference:
+    inference:
+      attention_viz_topic: /attention/weights
+      attention_viz:
+        enabled: true
+        mode: file
+        save_dir: /tmp/attention_viz
+        interactive_masking: false
+        mask_save_dir: /tmp/attention_masks
+```
+
+`attention_viz.enabled` 会自动启用 `publish_attention` 并拉起独立可视化节点。`attention_viz.interactive_masking` 会在首个 action chunk 前弹出 mask 绘制窗口，将用户标记区域转换为 ACT transformer mask。可视化和交互式 mask 只在 `execution_mode: monolithic` 下生效；分布式模式下会在启动时输出警告。
+
+### 重置推理运行时状态
+
+推理节点提供显式状态重置服务，用于在 episode 切换时清理 policy 内部状态和 attention hook 缓存：
+
+```bash
+ros2 service call /act_inference_node/reset_policy_state std_srvs/srv/Trigger "{}"
+```
+
+重置范围：
+
+| 组件 | 重置内容 |
+|------|---------|
+| Policy | 内部 queue、action chunk 和 episode 状态 |
+| Attention Hook | 已缓存的注意力权重和交互式 attention mask |
+
+`action_dispatcher` 在收到 reset 请求时会触发推理侧重置；`record_cli` 仅在 `control_mode:=model_inference` 或显式 `reset_before_episode:=true` 时调用该 reset 链路：
+
+```text
+record_cli (model_inference) -> /action_dispatcher/reset -> /act_inference_node/reset_policy_state
+```
+
+其中，`action_dispatcher` 的 reset 服务会先清理自身动作队列，再 best-effort 调用推理侧 reset 服务。若推理节点不在线，dispatcher reset 仍会完成自身状态清理。
+
 ### 启动命令
 
 #### 场景一：跨机器分布式部署（推荐生产用法）

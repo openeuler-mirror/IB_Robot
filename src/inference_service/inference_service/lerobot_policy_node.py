@@ -29,11 +29,13 @@ ROS Interface Compatibility (MUST NOT CHANGE):
 - Parameters: name, node_name, model_type, repo_id, checkpoint,
               contract_path, device, frequency, use_header_time,
               execution_mode, request_timeout, cloud_inference_topic,
-              cloud_result_topic
+              cloud_result_topic, publish_attention, attention_viz_topic,
+              attention_interactive_masking, attention_mask_save_dir
 """
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 import traceback
@@ -51,9 +53,10 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallb
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
+from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import DispatchInfer
-from ibrobot_msgs.msg import VariantsList
+from ibrobot_msgs.msg import AttentionWeights, VariantsList
 from inference_service.core import (
     CoordinatorResult,
     InferenceCoordinator,
@@ -95,6 +98,20 @@ def _trace_shape(value: Any) -> str:
     return "scalar"
 
 
+# Attention visualization support (optional)
+try:
+    from attention_viz.attention_hook import StackedAttentionHook
+    from attention_viz.attention_masking import (
+        build_transformer_attention_masks,
+        create_feature_masks_from_pixel_masks,
+        create_interactive_masks,
+    )
+    from attention_viz.utils import attention_data_to_msg
+    _HAS_ATTENTION_VIZ = True
+except ImportError:
+    _HAS_ATTENTION_VIZ = False
+
+
 @dataclass
 class _SubState:
     """Subscription state for a single observation stream."""
@@ -121,6 +138,10 @@ class _NodeConfig:
     request_timeout: float = 5.0
     cloud_inference_topic: str = "/preprocessed/batch"
     cloud_result_topic: str = "/inference/action"
+    publish_attention: bool = False
+    attention_viz_topic: str = "/attention/weights"
+    attention_interactive_masking: bool = False
+    attention_mask_save_dir: str = "gui_interactions"
 
 
 class LeRobotPolicyNode(Node):
@@ -149,7 +170,11 @@ class LeRobotPolicyNode(Node):
     def __init__(self, model_config: dict):
         super().__init__(model_config.get("node_name", "lerobot_policy_node"))
 
-        self._config = _NodeConfig(**{k: v for k, v in model_config.items() if k in _NodeConfig.__dataclass_fields__})
+        self._config = _NodeConfig(**{
+            k: v
+            for k, v in model_config.items()
+            if k in _NodeConfig.__dataclass_fields__
+        })
 
         self.get_logger().info(f"Initializing {self._config.name} node")
         self.get_logger().info(f"Execution mode: {self._config.execution_mode}")
@@ -173,7 +198,8 @@ class LeRobotPolicyNode(Node):
         self._required_inputs: set = set()  # Input features required by model
         self._joint_rad_limits: list = []  # populated in _load_contract()
         self._default_task: str = ""  # static task string, set in _load_contract()
-
+        self._camera_topics_by_key: dict[str, str] = {}
+        self._attn_feature_map_size: tuple[int, int] | None = None
         # Load model config first to get required inputs
         self._load_policy_config()
 
@@ -188,11 +214,35 @@ class LeRobotPolicyNode(Node):
 
         self._setup_publishers()
 
+        # Attention visualization hook (optional)
+        self._attn_hook = None
+        self._attn_pub = None
+        self._attention_mask_prompted = False
+        needs_attention_tools = (
+            self._config.publish_attention
+            or self._config.attention_interactive_masking
+        )
+        if self._config.execution_mode == "monolithic" and needs_attention_tools:
+            if _HAS_ATTENTION_VIZ:
+                self._setup_attention_publishing()
+            else:
+                self.get_logger().warn(
+                    "attention tools are enabled but attention_viz is unavailable"
+                )
         self._setup_action_server()
 
         self._health_timer = self.create_timer(1.0, self._health_callback)
+        self._policy_reset_srv = None
+        if self._config.execution_mode == "monolithic":
+            self._setup_policy_reset_service()
+        else:
+            self._warn_unsupported_attention_publishing()
 
-        mode_str = "distributed (edge proxy)" if self._config.execution_mode == "distributed" else "monolithic"
+        mode_str = (
+            "distributed (edge proxy)"
+            if self._config.execution_mode == "distributed"
+            else "monolithic"
+        )
         self.get_logger().info(
             f"{self._config.name} node ready ({mode_str}): "
             f"policy_type={self._policy_type}, "
@@ -294,7 +344,11 @@ class LeRobotPolicyNode(Node):
             self._obs_specs = all_obs_specs
 
         self._state_specs = [s for s in self._obs_specs if s.key == "observation.state"]
-
+        self._camera_topics_by_key = {
+            s.key: s.topic
+            for s in self._obs_specs
+            if s.key.startswith("observation.images.")
+        }
         self._topic_to_qos = {}
         for obs in self._contract.observations or []:
             self._topic_to_qos[obs.topic] = obs.qos
@@ -427,6 +481,102 @@ class LeRobotPolicyNode(Node):
             f"/{self._config.node_name}/health",
             10,
         )
+
+    def _setup_attention_publishing(self):
+        """Install attention hook and optional publisher (monolithic only)."""
+        try:
+            if self._config.publish_attention:
+                self._attn_pub = self.create_publisher(
+                    AttentionWeights,
+                    self._config.attention_viz_topic,
+                    10,
+                )
+
+            if self._coordinator is not None:
+                raw_policy = self._coordinator.raw_policy
+                if raw_policy is not None:
+                    self._attn_hook = StackedAttentionHook()
+                    if self._attn_hook.install(raw_policy):
+                        self.get_logger().info(
+                            "Attention visualization hook installed"
+                        )
+                        if self._config.publish_attention:
+                            self.get_logger().info(
+                                f"Publishing attention to "
+                                f"{self._config.attention_viz_topic}"
+                            )
+                        if self._config.attention_interactive_masking:
+                            self.get_logger().info(
+                                "Interactive attention masking enabled"
+                            )
+                    else:
+                        self.get_logger().warn("Failed to install attention hook")
+                        self._attn_hook = None
+                else:
+                    self.get_logger().warn(
+                        "raw_policy is None, cannot install attention hook"
+                    )
+        except Exception as e:
+            self.get_logger().warn(f"Attention visualization setup failed: {e}")
+            self._attn_hook = None
+            self._attn_pub = None
+
+    def _reset_policy_runtime_state(self, raw_policy=None):
+        """Reset policy-local state and the optional attention hook cache."""
+        if raw_policy is None and self._coordinator is not None:
+            raw_policy = self._coordinator.raw_policy
+        if raw_policy is None:
+            return
+
+        if hasattr(raw_policy, "reset"):
+            raw_policy.reset()
+        if hasattr(raw_policy, "last_attn_weights"):
+            raw_policy.last_attn_weights = None
+        self._attn_feature_map_size = None
+        self._attention_mask_prompted = False
+        if self._attn_hook is not None and hasattr(
+            self._attn_hook, "reset_for_new_inference"
+        ):
+            self._attn_hook.reset_for_new_inference()
+        if self._attn_hook is not None and hasattr(
+            self._attn_hook, "clear_attention_masks"
+        ):
+            self._attn_hook.clear_attention_masks()
+
+    def _setup_policy_reset_service(self):
+        """Expose an explicit reset hook for policy-local debug state."""
+        self._policy_reset_srv = self.create_service(
+            Trigger,
+            "~/reset_policy_state",
+            self._reset_policy_state_cb,
+            callback_group=ReentrantCallbackGroup(),
+        )
+
+    def _reset_policy_state_cb(self, _request, response):
+        raw_policy = (
+            self._coordinator.raw_policy
+            if self._coordinator is not None
+            else None
+        )
+        if raw_policy is None:
+            response.success = False
+            response.message = "Policy runtime reset unavailable in current execution mode"
+            return response
+
+        self._reset_policy_runtime_state(raw_policy)
+        response.success = True
+        response.message = "Policy runtime state reset"
+        return response
+
+    def _warn_unsupported_attention_publishing(self):
+        if self._config.publish_attention:
+            self.get_logger().warn(
+                "Attention publishing is only supported in monolithic mode"
+            )
+        if self._config.attention_interactive_masking:
+            self.get_logger().warn(
+                "Interactive attention masking is only supported in monolithic mode"
+            )
 
     def _setup_action_server(self):
         """Setup DispatchInfer Action Server."""
@@ -624,6 +774,8 @@ class LeRobotPolicyNode(Node):
                 _trace_shape(action_rad),
             )
 
+            # Publish attention weights (if enabled)
+            self._publish_attention_weights()
             response = DispatchInfer.Result()
             response.action_chunk = action_msg
             response.chunk_size = result.chunk_size
@@ -717,7 +869,47 @@ class LeRobotPolicyNode(Node):
             self._config.device,
             self._device,
         )
-        result = self._coordinator(obs_frame)
+
+        total_start = time.perf_counter()
+        attention_tools_active = self._attn_hook is not None and (
+            self._config.publish_attention
+            or self._config.attention_interactive_masking
+        )
+        if not attention_tools_active:
+            result = self._coordinator(obs_frame)
+            _trace.info(
+                "[inference_end] request_id=%s latency_ms=%.2f shape=%s",
+                request_id,
+                result.total_latency_ms,
+                list(result.action.shape),
+            )
+            return result
+
+        preprocess_start = time.perf_counter()
+        batch = self._coordinator.preprocess_only(obs_frame)
+        preprocess_latency = (time.perf_counter() - preprocess_start) * 1000.0
+
+        self._prepare_attention_capture(batch)
+        self._prepare_interactive_attention_mask(batch, obs_frame)
+
+        inference_result = self._coordinator.infer_only(batch)
+        inference_latency = inference_result.latency_ms
+
+        postprocess_start = time.perf_counter()
+        action = self._coordinator.postprocess_only(inference_result.action)
+        postprocess_latency = (time.perf_counter() - postprocess_start) * 1000.0
+
+        total_latency = (time.perf_counter() - total_start) * 1000.0
+
+        result = CoordinatorResult(
+            action=action,
+            chunk_size=self._chunk_size,
+            total_latency_ms=total_latency,
+            preprocess_latency_ms=preprocess_latency,
+            inference_latency_ms=inference_latency,
+            postprocess_latency_ms=postprocess_latency,
+            policy_type=self._policy_type,
+        )
         _trace.info(
             "[inference_end] request_id=%s latency_ms=%.2f shape=%s",
             request_id,
@@ -827,12 +1019,219 @@ class LeRobotPolicyNode(Node):
                 req = self._pending_requests[request_id]
                 req[1] = batch
                 req[0].set()
-                self.get_logger().debug(f"Cloud result received for request_id={request_id}")
+                self.get_logger().debug(
+                    f"Cloud result received for request_id={request_id}"
+                )
             else:
-                self.get_logger().warn(f"No pending request found for request_id={request_id}")
+                self.get_logger().warn(
+                    f"No pending request found for request_id={request_id}"
+                )
 
         except Exception as e:
             self.get_logger().error(f"Error processing cloud result: {e}")
+
+    def _prepare_attention_capture(self, batch: dict[str, torch.Tensor]) -> None:
+        """在单机推理前刷新 hook 元数据并清空上一轮残留状态。"""
+        if not self._attn_hook or self._coordinator is None:
+            return
+
+        if hasattr(self._attn_hook, "reset_for_new_inference"):
+            self._attn_hook.reset_for_new_inference()
+
+        raw_policy = self._coordinator.raw_policy
+        if raw_policy is None:
+            return
+
+        policy_config = getattr(raw_policy, "config", None)
+        image_features = getattr(policy_config, "image_features", None) or {}
+        camera_keys = list(image_features.keys())
+        if camera_keys:
+            self._attn_hook.set_camera_keys(camera_keys)
+
+        self._attn_hook.set_num_non_image_tokens(
+            self._count_non_image_tokens(policy_config, batch)
+        )
+
+        if self._attn_feature_map_size is not None:
+            self._attn_hook.set_feature_map_size(self._attn_feature_map_size)
+            return
+
+        if not camera_keys:
+            return
+
+        first_cam_key = camera_keys[0]
+        if first_cam_key not in batch:
+            return
+
+        model = getattr(raw_policy, "model", None)
+        backbone = getattr(model, "backbone", None)
+        if backbone is None:
+            return
+
+        try:
+            with torch.no_grad():
+                feature_map = backbone(batch[first_cam_key][:1])["feature_map"]
+            self._attn_feature_map_size = tuple(
+                int(v) for v in feature_map.shape[-2:]
+            )
+            self._attn_hook.set_feature_map_size(self._attn_feature_map_size)
+        except Exception as e:
+            self.get_logger().debug(
+                f"Failed to compute attention feature map size: {e}"
+            )
+            self._refresh_attention_feature_map_size_from_model(model)
+
+    def _prepare_interactive_attention_mask(
+        self,
+        batch: dict[str, torch.Tensor],
+        initial_observation: dict[str, Any],
+    ) -> None:
+        """Prompt once per episode and install user-drawn ACT token masks."""
+        if not self._config.attention_interactive_masking:
+            return
+        if self._attention_mask_prompted:
+            return
+
+        if self._attn_hook is None:
+            return
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            self._attention_mask_prompted = True
+            self.get_logger().warn(
+                "Interactive attention masking requested but no graphical "
+                "display is available"
+            )
+            return
+        if self._attn_feature_map_size is None:
+            self.get_logger().warn(
+                "Interactive attention masking skipped because feature map "
+                "size is unavailable"
+            )
+            return
+
+        raw_policy = self._coordinator.raw_policy if self._coordinator else None
+        if raw_policy is None:
+            return
+
+        policy_config = getattr(raw_policy, "config", None)
+        image_features = getattr(policy_config, "image_features", None) or {}
+        camera_keys = list(image_features.keys())
+        if not camera_keys:
+            return
+
+        self._attention_mask_prompted = True
+        try:
+            pixel_masks = create_interactive_masks(
+                initial_observation,
+                camera_keys=camera_keys,
+                gui_save_dir=self._config.attention_mask_save_dir,
+            )
+            feature_masks = create_feature_masks_from_pixel_masks(
+                pixel_masks,
+                self._attn_feature_map_size,
+            )
+            if not feature_masks:
+                self.get_logger().info(
+                    "Interactive attention masking finished without masks"
+                )
+                return
+
+            chunk_size = int(getattr(policy_config, "chunk_size", self._chunk_size))
+            batch_size = int(batch[camera_keys[0]].shape[0])
+            decoder_mask, encoder_mask = build_transformer_attention_masks(
+                feature_masks,
+                camera_keys=camera_keys,
+                feature_map_size=self._attn_feature_map_size,
+                num_non_image_tokens=self._count_non_image_tokens(
+                    policy_config,
+                    batch,
+                ),
+                chunk_size=chunk_size,
+                batch_size=batch_size,
+                device=self._device,
+            )
+            self._attn_hook.set_attention_masks(decoder_mask, encoder_mask)
+            masked_tokens = sum(
+                int(mask.sum().item())
+                for mask in feature_masks.values()
+            )
+            self.get_logger().info(
+                f"Interactive attention mask installed: {masked_tokens} "
+                f"visual tokens masked"
+            )
+        except Exception as e:
+            self.get_logger().warn(f"Interactive attention masking failed: {e}")
+
+    @staticmethod
+    def _count_non_image_tokens(
+        policy_config,
+        batch: dict[str, Any] | None = None,
+    ) -> int:
+        num_tokens = 1
+        if getattr(policy_config, "robot_state_feature", None):
+            num_tokens += 1
+        if getattr(policy_config, "env_state_feature", None):
+            num_tokens += 1
+        # MT-ACT adds the language token only when runtime text or precomputed
+        # language features are present in the batch. The offset must match the
+        # actual encoder token layout or visual-token heatmaps/masks shift.
+        if (
+            getattr(policy_config, "use_language", False)
+            and batch is not None
+            and ("task" in batch or "language_features" in batch)
+        ):
+            num_tokens += 1
+        return num_tokens
+
+    def _refresh_attention_feature_map_size_from_model(self, model) -> bool:
+        """Refresh feature-map size from models that expose runtime metadata."""
+        getter = getattr(model, "get_feature_map_size", None)
+        if not callable(getter):
+            return False
+        try:
+            feature_map_size = getter()
+        except Exception as e:
+            self.get_logger().debug(
+                f"Failed to read attention feature map size from model: {e}"
+            )
+            return False
+        if not feature_map_size:
+            return False
+        self._attn_feature_map_size = tuple(int(v) for v in feature_map_size)
+        if self._attn_hook is not None:
+            self._attn_hook.set_feature_map_size(self._attn_feature_map_size)
+        return True
+
+    def _publish_attention_weights(self):
+        """Extract and publish attention weights (if enabled)."""
+        if not self._attn_hook or not self._attn_pub:
+            return
+
+        try:
+            if self._coordinator is not None:
+                raw_policy = self._coordinator.raw_policy
+                model = getattr(raw_policy, "model", None)
+                if model is not None:
+                    self._refresh_attention_feature_map_size_from_model(model)
+
+            attn_data = self._attn_hook.get_latest()
+            if attn_data is None:
+                return
+            attn_payload = dict(attn_data)
+            camera_keys = attn_payload.get("camera_keys", [])
+            attn_payload["camera_topics"] = [
+                self._camera_topics_by_key.get(key, "")
+                for key in camera_keys
+            ]
+            stamp = self.get_clock().now().to_msg()
+
+            msg = attention_data_to_msg(
+                attn_payload,
+                stamp_sec=stamp.sec,
+                stamp_nanosec=stamp.nanosec,
+            )
+            self._attn_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().debug(f"Attention publish failed: {e}")
 
     def _create_action_msg(self, action: torch.Tensor) -> VariantsList:
         """Create VariantsList message from action tensor."""
@@ -909,6 +1308,10 @@ def main() -> None:
             "request_timeout",
             "cloud_inference_topic",
             "cloud_result_topic",
+            "publish_attention",
+            "attention_viz_topic",
+            "attention_interactive_masking",
+            "attention_mask_save_dir",
         ]:
             if p == "execution_mode":
                 default = "monolithic"
@@ -918,6 +1321,14 @@ def main() -> None:
                 default = "/preprocessed/batch"
             elif p == "cloud_result_topic":
                 default = "/inference/action"
+            elif p == "publish_attention":
+                default = False
+            elif p == "attention_viz_topic":
+                default = "/attention/weights"
+            elif p == "attention_interactive_masking":
+                default = False
+            elif p == "attention_mask_save_dir":
+                default = "gui_interactions"
             elif p in ["repo_id", "checkpoint", "robot_config_path"]:
                 default = ""
             elif p == "lerobot_norm_mode":
@@ -953,6 +1364,14 @@ def main() -> None:
         config["request_timeout"] = temp_node.get_parameter("request_timeout").value
         config["cloud_inference_topic"] = temp_node.get_parameter("cloud_inference_topic").value
         config["cloud_result_topic"] = temp_node.get_parameter("cloud_result_topic").value
+        config["publish_attention"] = temp_node.get_parameter("publish_attention").value
+        config["attention_viz_topic"] = temp_node.get_parameter("attention_viz_topic").value
+        config["attention_interactive_masking"] = temp_node.get_parameter(
+            "attention_interactive_masking"
+        ).value
+        config["attention_mask_save_dir"] = temp_node.get_parameter(
+            "attention_mask_save_dir"
+        ).value
         temp_node.destroy_node()
 
         node = LeRobotPolicyNode(config)
@@ -965,7 +1384,11 @@ def main() -> None:
         except KeyboardInterrupt:
             pass
         finally:
-            node.destroy_node()
+            try:
+                if getattr(node, "_attn_hook", None) is not None:
+                    node._attn_hook.uninstall()
+            finally:
+                node.destroy_node()
     finally:
         if rclpy.ok():
             rclpy.shutdown()

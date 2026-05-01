@@ -13,7 +13,10 @@ from robot_config.launch_builders.control import (
     generate_controller_spawners,
     generate_ros2_control_nodes,
 )
-from robot_config.launch_builders.execution import generate_inference_node
+from robot_config.launch_builders.execution import (
+    _attention_viz_request,
+    generate_inference_node,
+)
 from robot_config.launch_builders.navigation import generate_navigation_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
@@ -301,6 +304,15 @@ def test_generate_inference_node_uses_policy_path_only_for_rknn(monkeypatch, tmp
     assert str(model_dir) in params["checkpoint"]
     assert node.env is not None
     assert all(_text(key) != "RKNN_MODEL_PATH" for key, _value in node.env)
+
+
+def test_attention_viz_request_uses_robot_config_only():
+    enabled, mode, _viz_config = _attention_viz_request(
+        {"attention_viz": {"enabled": False, "mode": "file"}}
+    )
+
+    assert enabled is False
+    assert mode == "file"
 
 
 def test_generate_joy_teleop_nodes_for_mobile_base():

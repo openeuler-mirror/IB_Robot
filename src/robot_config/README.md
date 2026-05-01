@@ -194,6 +194,11 @@ robot:
         enabled: true
         execution_mode: "distributed" # 或 "monolithic" (单机零拷贝)
         model: so101_act
+        attention_viz:
+          enabled: false
+          mode: file
+          interactive_masking: false
+          mask_save_dir: gui_interactions
 ```
 
 **启动的控制器：**

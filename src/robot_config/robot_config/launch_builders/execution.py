@@ -61,6 +61,65 @@ def _resolve_inference_binding(model_config):
     return str(model_path), env
 
 
+def _attention_viz_request(inference_config):
+    """Return attention visualization request state from robot_config."""
+    viz_config = inference_config.get("attention_viz", {}) or {}
+    enabled = parse_bool(viz_config.get("enabled", False), default=False)
+    mode = str(viz_config.get("mode") or "file")
+    return enabled, mode, viz_config
+
+
+def _generate_attention_viz_node(inference_config, use_sim=False, env=None):
+    """Generate the optional attention visualization sidecar node."""
+    is_sim = parse_bool(use_sim, default=False)
+    enabled, mode, viz_config = _attention_viz_request(inference_config)
+    if not enabled:
+        return None
+
+    attention_topic = inference_config.get(
+        "attention_viz_topic",
+        "/attention/weights",
+    )
+    node_params = {
+        "attention_topic": attention_topic,
+        "visualization_mode": mode,
+        "save_dir": viz_config.get("save_dir", "attention_visualizations"),
+        "queries_to_visualize": viz_config.get(
+            "queries_to_visualize",
+            [0, 20, 40, 60, 80],
+        ),
+        "layer_idx": int(viz_config.get("layer_idx", -1)),
+        "batch_idx": int(viz_config.get("batch_idx", 0)),
+        "average_heads": parse_bool(
+            viz_config.get("average_heads", True),
+            default=True,
+        ),
+        "blend_alpha": float(viz_config.get("blend_alpha", 0.4)),
+        "update_frequency": float(viz_config.get("update_frequency", 10.0)),
+        "camera_topics": viz_config.get("camera_topics", [""]),
+        "headless": parse_bool(viz_config.get("headless", False), default=False),
+        "heatmap_topic_prefix": viz_config.get(
+            "heatmap_topic_prefix",
+            "/visualization/heatmap",
+        ),
+        "use_sim_time": is_sim,
+    }
+
+    logger.info("✓ Attention visualization sidecar configured")
+    logger.info(f"  Mode: {mode}")
+    logger.info(f"  Topic: {attention_topic}")
+    logger.info(f"  Save dir: {node_params['save_dir']}")
+
+    return Node(
+        package="attention_viz",
+        executable="attention_visualization_node",
+        name="attention_visualization",
+        env=env,
+        parameters=[node_params],
+        output="screen",
+    )
+
+
 def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_local=False):
     """Generate inference service node with auto-synthesized contract.
 
@@ -96,7 +155,12 @@ def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_loc
     execution_mode = inference_config.get("execution_mode", "monolithic")
 
     if execution_mode == "distributed":
-        return generate_distributed_inference_nodes(robot_config, control_mode, use_sim, cloud_local=cloud_local)
+        return generate_distributed_inference_nodes(
+            robot_config,
+            control_mode,
+            use_sim,
+            cloud_local=cloud_local,
+        )
 
     return generate_monolithic_inference_node(robot_config, control_mode, use_sim)
 
@@ -111,8 +175,14 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
 
     execution_mode = inference_config.get("execution_mode", "monolithic")
     request_timeout = inference_config.get("request_timeout", 5.0)
-    cloud_inference_topic = inference_config.get("cloud_inference_topic", "/preprocessed/batch")
-    cloud_result_topic = inference_config.get("cloud_result_topic", "/inference/action")
+    cloud_inference_topic = inference_config.get(
+        "cloud_inference_topic",
+        "/preprocessed/batch",
+    )
+    cloud_result_topic = inference_config.get(
+        "cloud_result_topic",
+        "/inference/action",
+    )
 
     logger.info("========== Generating Inference Node (Monolithic) ==========")
     logger.info(f"Control mode: {control_mode}")
@@ -120,7 +190,10 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
 
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
+        raise ValueError(
+            "robot_config dict is missing '_config_path'. "
+            "Ensure loader.py injects this correctly."
+        )
 
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
@@ -138,10 +211,39 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     checkpoint_path, env = _resolve_inference_binding(model_config)
     if env.get("PYTHONPATH"):
         logger.info(f"Injected PYTHONPATH: {env['PYTHONPATH']}")
+
+    attention_viz_node = _generate_attention_viz_node(
+        inference_config,
+        use_sim,
+        env=env,
+    )
+    publish_attention = parse_bool(
+        inference_config.get("publish_attention", False),
+        default=False,
+    ) or attention_viz_node is not None
+    viz_config = inference_config.get("attention_viz", {}) or {}
+    interactive_masking = parse_bool(
+        viz_config.get("interactive_masking", False),
+        default=False,
+    )
+
     node_params = {
         "checkpoint": checkpoint_path,
         "robot_config_path": str(robot_config_path),
-        "lerobot_norm_mode": model_config.get("lerobot_norm_mode", "range_m100_100"),
+        "lerobot_norm_mode": model_config.get(
+            "lerobot_norm_mode",
+            "range_m100_100",
+        ),
+        "publish_attention": publish_attention,
+        "attention_viz_topic": inference_config.get(
+            "attention_viz_topic",
+            "/attention/weights",
+        ),
+        "attention_interactive_masking": interactive_masking,
+        "attention_mask_save_dir": viz_config.get(
+            "mask_save_dir",
+            "gui_interactions",
+        ),
         "passive_mode": True,
         "device": model_config.get("device", "auto"),
         "use_sim_time": is_sim,
@@ -162,6 +264,8 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     )
 
     logger.info("✓ Monolithic inference node configured")
+    if attention_viz_node is not None:
+        return [inference_node, attention_viz_node]
     return inference_node
 
 
@@ -191,8 +295,24 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     inference_config = mode_config.get("inference", {})
 
     request_timeout = inference_config.get("request_timeout", 5.0)
-    cloud_inference_topic = inference_config.get("cloud_inference_topic", "/preprocessed/batch")
-    cloud_result_topic = inference_config.get("cloud_result_topic", "/inference/action")
+    cloud_inference_topic = inference_config.get(
+        "cloud_inference_topic",
+        "/preprocessed/batch",
+    )
+    cloud_result_topic = inference_config.get(
+        "cloud_result_topic",
+        "/inference/action",
+    )
+    attention_viz_requested, _, _ = _attention_viz_request(inference_config)
+    viz_config = inference_config.get("attention_viz", {}) or {}
+    if attention_viz_requested:
+        logger.warning(
+            "Attention visualization sidecar is only launched in monolithic mode."
+        )
+    if parse_bool(viz_config.get("interactive_masking", False), default=False):
+        logger.warning(
+            "Interactive attention masking is only supported in monolithic mode."
+        )
 
     logger.info("========== Generating Inference Nodes (Distributed) ==========")
     logger.info(f"Control mode: {control_mode}")
@@ -201,7 +321,10 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
 
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
+        raise ValueError(
+            "robot_config dict is missing '_config_path'. "
+            "Ensure loader.py injects this correctly."
+        )
 
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
@@ -223,7 +346,23 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     edge_node_params = {
         "checkpoint": policy_path,
         "robot_config_path": str(robot_config_path),
-        "lerobot_norm_mode": model_config.get("lerobot_norm_mode", "range_m100_100"),
+        "lerobot_norm_mode": model_config.get(
+            "lerobot_norm_mode",
+            "range_m100_100",
+        ),
+        "publish_attention": inference_config.get("publish_attention", False),
+        "attention_viz_topic": inference_config.get(
+            "attention_viz_topic",
+            "/attention/weights",
+        ),
+        "attention_interactive_masking": parse_bool(
+            viz_config.get("interactive_masking", False),
+            default=False,
+        ),
+        "attention_mask_save_dir": viz_config.get(
+            "mask_save_dir",
+            "gui_interactions",
+        ),
         "passive_mode": True,
         "device": model_config.get("device", "auto"),
         "use_sim_time": is_sim,
@@ -314,7 +453,6 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
     logger.info(f"Use sim time: {is_sim}")
 
     action_server = f"/{INFERENCE_NODE_NAME}/DispatchInfer"
-
     action_dispatcher_node = Node(
         package="action_dispatch",
         executable="action_dispatcher_node",

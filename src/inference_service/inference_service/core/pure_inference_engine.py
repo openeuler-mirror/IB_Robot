@@ -240,6 +240,11 @@ class LeRobotPolicyWrapper(PolicyWrapper):
         return self._chunk_size
 
     @property
+    def raw_policy(self):
+        """Access the underlying lerobot policy object."""
+        return self._policy
+
+    @property
     def policy_type(self) -> str:
         return self._policy_type
 
@@ -374,6 +379,11 @@ class PureInferenceEngine:
             result[key] = tensor.to(self._device)
 
         return result
+
+    @property
+    def raw_policy(self):
+        """Access the underlying policy object for hook attachment."""
+        return getattr(self._wrapper, "raw_policy", None)
 
     @property
     def device(self) -> torch.device:

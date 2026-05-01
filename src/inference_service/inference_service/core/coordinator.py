@@ -252,6 +252,11 @@ class InferenceCoordinator:
         return self._postprocessor(action)
     
     @property
+    def raw_policy(self):
+        """Access the underlying policy object for hook attachment."""
+        return self._engine.raw_policy
+
+    @property
     def device(self) -> torch.device:
         """Get the device used for inference."""
         return self._device

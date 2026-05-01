@@ -100,6 +100,16 @@ robot:
         # execution_mode: "distributed"
         model: so101_act_rknn
         action_server: /inference/dispatch
+        publish_attention: false
+        attention_viz_topic: /attention/weights
+        attention_viz:
+          enabled: false
+          mode: file
+          save_dir: attention_visualizations
+          update_frequency: 10.0
+          headless: false
+          interactive_masking: false
+          mask_save_dir: gui_interactions
       # ============================================
       # Executor configuration
       # ============================================
