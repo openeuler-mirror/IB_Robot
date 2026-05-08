@@ -12,6 +12,8 @@
 | [ibrobot-launch](./ibrobot-launch) | 操作 | 启动机器人系统、运行仿真、测试 ACT 推理或进行遥操作调试。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
 | [ibrobot-git-flow](./ibrobot-git-flow) | 工作流 | 提交代码、推送至个人仓库、确保符合 openEuler DCO/Commit 规范。 |
+| [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh。 |
+| [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。 |
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
 | [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、更新标题/描述、生成摘要。 |
 | [atomgit-issue](./atomgit-issue) | AtomGit | 管理 Issue 生命周期：创建、读取详情、更新内容、关闭/重开。 |
@@ -35,6 +37,8 @@
 - **系统启动 ([ibrobot-launch](./ibrobot-launch))**: 机器人系统的总入口，支持一键拉起复杂的节点拓扑。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。
 - **工程规范 ([ibrobot-git-flow](./ibrobot-git-flow))**: 自动化执行开源社区繁琐的提交规范校验。
+- **容器验证 ([ibrobot-docker-verify](./ibrobot-docker-verify))**: 在全新 Ubuntu 22.04 Docker 容器中运行 setup.sh 和 build.sh 的完整端到端验证，确保修改不会破坏首次安装体验。
+- **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器（qemu-user 模拟 chroot）中端到端验证 setup.sh + build.sh，以 root 用户模拟真实开发板操作环境。
 
 ### 🌐 AtomGit 自动化工具
 这些技能通过集成 AtomGit API，实现了 PR / Issue 生命周期和代码审查的自动化。
