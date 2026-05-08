@@ -19,6 +19,7 @@ import numpy as np
 
 _SILERO_VAD_V4_STATE_SHAPE = (2, 1, 64)
 _SILERO_VAD_V5_STATE_SHAPE = (2, 1, 128)
+_MIN_ENERGY_GATE = 1e-4
 
 
 class VADState(Enum):
@@ -62,6 +63,7 @@ class VADModule:
         self.config = config or VADConfig()
         self.state = VADState.SILENCE
         self._logger = None
+        self._sensitivity = 0.5
 
         self._model: Any | None = None
         self._model_loaded = False
@@ -127,8 +129,12 @@ class VADModule:
                 try:
                     import onnxruntime as ort
 
+                    session_options = ort.SessionOptions()
+                    session_options.intra_op_num_threads = 1
+                    session_options.inter_op_num_threads = 1
                     session = ort.InferenceSession(
                         onnx_model_path,
+                        sess_options=session_options,
                         providers=["CPUExecutionProvider"],
                     )
                     input_names = {inp.name for inp in session.get_inputs()}
@@ -243,10 +249,10 @@ class VADModule:
 
             frame = np.asarray(audio_frame, dtype=np.float32).reshape(1, -1)
 
-                    if self._model_backend == "onnx_v4":
-                        if self._onnx_state_h is None or self._onnx_state_c is None:
-                            self._onnx_state_h = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
-                            self._onnx_state_c = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
+            if self._model_backend == "onnx_v4":
+                if self._onnx_state_h is None or self._onnx_state_c is None:
+                    self._onnx_state_h = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
+                    self._onnx_state_c = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
                 prob, new_h, new_c = self._onnx_session.run(
                     None,
                     {"x": frame, "h": self._onnx_state_h, "c": self._onnx_state_c},
@@ -255,9 +261,9 @@ class VADModule:
                 self._onnx_state_c = new_c
                 return float(prob[0][0])
 
-                    if self._model_backend == "onnx_v5":
-                        if self._onnx_state is None:
-                            self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
+            if self._model_backend == "onnx_v5":
+                if self._onnx_state is None:
+                    self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
                 prob, new_state = self._onnx_session.run(
                     None,
                     {
@@ -312,9 +318,18 @@ class VADModule:
 
         return base_threshold
 
+    def _get_energy_gate(self) -> float:
+        static_gate = self.config.energy_threshold * max(0.5, 1.0 - self._sensitivity * 0.5)
+        if self._noise_floor <= 0:
+            return static_gate
+
+        noise_gate = max(_MIN_ENERGY_GATE, self._noise_floor * max(1.0, 2.5 - self._sensitivity))
+        return min(static_gate, noise_gate)
+
     def _update_state(self, confidence: float, energy: float, threshold: float) -> VADResult:
         """更新 VAD 状态"""
-        is_speech = confidence > threshold
+        energy_gate = self._get_energy_gate()
+        is_speech = confidence > threshold and energy >= energy_gate
 
         if self.state == VADState.SILENCE:
             if is_speech:
@@ -399,6 +414,7 @@ class VADModule:
         Returns:
             List of (start_sample, end_sample, audio_segment)
         """
+        self.reset()
         segments = []
         current_start = None
         current_audio = []
@@ -413,7 +429,7 @@ class VADModule:
 
             result = self.process(frame)
 
-            if result.state in (VADState.STARTING, VADState.SPEAKING):
+            if result.state in (VADState.STARTING, VADState.SPEAKING, VADState.ENDING):
                 if current_start is None:
                     current_start = start
                     pre_roll = self.get_pre_roll_audio()
@@ -452,6 +468,8 @@ class VADModule:
         self._post_roll_frames = 0
         self._pre_roll_buffer = []
         self._pre_roll_samples = 0
+        self._noise_floor = 0.0
+        self._noise_samples = 0
         if self._model_backend == "onnx_v4":
             self._onnx_state_h = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
             self._onnx_state_c = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
@@ -465,5 +483,7 @@ class VADModule:
         Args:
             sensitivity: 灵敏度 (0.0-1.0)，越高越灵敏
         """
+        sensitivity = max(0.0, min(1.0, sensitivity))
+        self._sensitivity = sensitivity
         self.config.speech_threshold = 0.7 - sensitivity * 0.4
         self.config.silence_threshold = self.config.speech_threshold - 0.1

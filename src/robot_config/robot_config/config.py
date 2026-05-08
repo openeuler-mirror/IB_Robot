@@ -1,7 +1,10 @@
 """Configuration dataclasses for unified robot configuration."""
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from robot_config.contract_utils import Contract
 
 
 @dataclass
@@ -108,15 +111,15 @@ class VoiceASRConfig:
 
     enabled: bool = False
     auto_download_model: bool = True
-    active_mode: str = "manual"
+    active_mode: str = "continuous"
     language: str = "zh"
     model_path: str = ""
     tokens_path: str = ""
     provider: str = "cpu"
     model_type: str = "auto"
     max_recording_duration: float = 10.0
-    vad_sensitivity: float = 0.5
-    realtime_pre_roll_seconds: float = 2.0
+    vad_sensitivity: float = 0.6
+    realtime_pre_roll_seconds: float = 0.5
     publish_partial: bool = True
     output_topic: str = "/voice_command"
     sample_rate: int = 16000

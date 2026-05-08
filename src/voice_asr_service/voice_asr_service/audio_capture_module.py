@@ -11,6 +11,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -112,6 +113,7 @@ class AudioCaptureModule:
         self._backend: Any | None = None
         self._backend_type: str | None = None
         self._stream: Any | None = None
+        self._stream_lock = threading.Lock()
 
         self._retry_count = 0
         self._max_retries = 5
@@ -217,9 +219,10 @@ class AudioCaptureModule:
             self.state = CaptureState.CAPTURING
             return True
 
-        if self.state != CaptureState.CLOSED or self._backend is None or self._backend_type is None:
-            if not self.initialize():
-                return False
+        if (
+            self.state != CaptureState.CLOSED or self._backend is None or self._backend_type is None
+        ) and not self.initialize():
+            return False
 
         self._stop_event.clear()
         self._pause_event.clear()
@@ -238,10 +241,13 @@ class AudioCaptureModule:
 
     def stop_capture(self):
         self._stop_event.set()
-        if self._capture_thread and self._capture_thread.is_alive():
-            self._capture_thread.join(timeout=2.0)
-
         self._close_stream()
+        if self._capture_thread and self._capture_thread.is_alive():
+            with suppress(KeyboardInterrupt):
+                self._capture_thread.join(timeout=0.5)
+        if self._capture_thread and not self._capture_thread.is_alive():
+            self._capture_thread = None
+
         self.state = CaptureState.CLOSED
 
     def pause(self):
@@ -285,6 +291,8 @@ class AudioCaptureModule:
                     self._capture_pyaudio()
 
             except Exception as e:
+                if self._stop_event.is_set():
+                    return
                 self._handle_error(f"Capture error: {e}")
                 if self._retry_count < self._max_retries:
                     self._retry_count += 1
@@ -307,10 +315,8 @@ class AudioCaptureModule:
             audio_data = indata[:, 0].astype(np.float32)
             self._ring_buffer.write(audio_data)
 
-            try:
+            with suppress(queue.Full):
                 self._audio_queue.put_nowait(audio_data)
-            except queue.Full:
-                pass
 
         try:
             with sd.InputStream(
@@ -320,7 +326,9 @@ class AudioCaptureModule:
                 blocksize=self.config.chunk_size,
                 device=self._device_index,
                 callback=callback,
-            ):
+            ) as stream:
+                with self._stream_lock:
+                    self._stream = stream
                 self.state = CaptureState.CAPTURING
                 self._retry_count = 0
 
@@ -333,9 +341,12 @@ class AudioCaptureModule:
 
         except Exception as e:
             raise e
+        finally:
+            with self._stream_lock:
+                self._stream = None
 
     def _capture_pyaudio(self):
-        self._stream = self._backend.open(
+        stream = self._backend.open(
             format=8,
             channels=self.config.channels,
             rate=self.config.sample_rate,
@@ -343,6 +354,8 @@ class AudioCaptureModule:
             frames_per_buffer=self.config.chunk_size,
             input_device_index=self._device_index,
         )
+        with self._stream_lock:
+            self._stream = stream
 
         self.state = CaptureState.CAPTURING
         self._retry_count = 0
@@ -354,27 +367,31 @@ class AudioCaptureModule:
                 continue
 
             try:
-                data = self._stream.read(self.config.chunk_size, exception_on_overflow=False)
+                data = stream.read(self.config.chunk_size, exception_on_overflow=False)
                 audio_data = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
                 self._ring_buffer.write(audio_data)
 
-                try:
+                with suppress(queue.Full):
                     self._audio_queue.put_nowait(audio_data)
-                except queue.Full:
-                    pass
 
             except Exception as e:
                 raise e
+        with self._stream_lock:
+            if self._stream is stream:
+                self._stream = None
 
     def _close_stream(self):
-        if self._stream:
-            try:
-                if self._backend_type == "pyaudio":
-                    self._stream.stop_stream()
-                    self._stream.close()
-            except:
-                pass
+        with self._stream_lock:
+            stream = self._stream
             self._stream = None
+
+        if stream is None:
+            return
+
+        if self._backend_type == "pyaudio":
+            with suppress(Exception):
+                stream.stop_stream()
+                stream.close()
 
     def _handle_error(self, message: str):
         self.state = CaptureState.ERROR
@@ -384,8 +401,6 @@ class AudioCaptureModule:
     def cleanup(self):
         self.stop_capture()
         if self._backend_type == "pyaudio" and self._backend:
-            try:
+            with suppress(Exception):
                 self._backend.terminate()
-            except:
-                pass
         self._backend = None

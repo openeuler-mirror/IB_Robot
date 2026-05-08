@@ -159,6 +159,32 @@ def load_robot_config(robot_config_name, config_path_override=None):
     return robot_config
 
 
+def _apply_voice_asr_cli_overrides(context, robot_config: dict) -> None:
+    """Apply optional voice ASR launch overrides onto the loaded robot config."""
+    voice_asr_config = dict(robot_config.get("voice_asr", {}))
+
+    enabled_override = context.launch_configurations.get("voice_asr_auto_start", "")
+    if enabled_override != "":
+        voice_asr_config["enabled"] = parse_bool(enabled_override, default=False)
+
+    device_index_override = context.launch_configurations.get("voice_asr_device_index", "")
+    if device_index_override != "":
+        voice_asr_config["device_index"] = int(device_index_override)
+
+    device_name_override = context.launch_configurations.get("voice_asr_device_name", "")
+    if device_name_override != "":
+        voice_asr_config["device_name"] = device_name_override
+
+    pre_roll_override = context.launch_configurations.get(
+        "voice_asr_realtime_pre_roll_seconds",
+        "",
+    )
+    if pre_roll_override != "":
+        voice_asr_config["realtime_pre_roll_seconds"] = float(pre_roll_override)
+
+    robot_config["voice_asr"] = voice_asr_config
+
+
 def _start_actions_on_success(start_actions, success_message: str, failure_reason: str):
     """Run launch actions only when the target process exits successfully."""
     frozen_actions = tuple(start_actions)
@@ -289,6 +315,15 @@ def launch_setup(context, *args, **kwargs):
 
     active_control_mode = robot_config.get("default_control_mode", "model_inference")
     logger.info(f"Active control mode: {active_control_mode}")
+
+    _apply_voice_asr_cli_overrides(context, robot_config)
+    voice_asr_config = robot_config.get("voice_asr", {})
+    logger.info(
+        "Voice ASR override state: "
+        f"enabled={voice_asr_config.get('enabled', False)}, "
+        f"device_index={voice_asr_config.get('device_index', -1)}, "
+        f"realtime_pre_roll_seconds={voice_asr_config.get('realtime_pre_roll_seconds', 0.5)}"
+    )
 
     # Determine with_inference flag globally
     with_inference_str = context.launch_configurations.get("with_inference", "")
@@ -648,6 +683,26 @@ def generate_launch_description():
                 "control_mode",
                 default_value="",
                 description="Override control mode from YAML (teleop, model_inference, or moveit_planning). If empty, uses default_control_mode from config file",
+            ),
+            DeclareLaunchArgument(
+                "voice_asr_auto_start",
+                default_value="",
+                description="Override robot.voice_asr.enabled. Set to true to force-launch the ASR node.",
+            ),
+            DeclareLaunchArgument(
+                "voice_asr_device_index",
+                default_value="",
+                description="Optional override for robot.voice_asr.device_index.",
+            ),
+            DeclareLaunchArgument(
+                "voice_asr_device_name",
+                default_value="",
+                description="Optional override for robot.voice_asr.device_name.",
+            ),
+            DeclareLaunchArgument(
+                "voice_asr_realtime_pre_roll_seconds",
+                default_value="",
+                description="Optional override for robot.voice_asr.realtime_pre_roll_seconds.",
             ),
             DeclareLaunchArgument(
                 "with_inference",

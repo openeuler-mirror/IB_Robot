@@ -24,11 +24,12 @@ from robot_config.loader import (
     load_voice_asr_config,
     validate_config,
 )
+from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
 from voice_asr_service.model_manager import (
     STREAMING_ZH_BUNDLE,
     infer_model_bundle_from_path_hint,
+    resolve_model_assets,
 )
-from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
 
 
 def test_load_single_arm_config():
@@ -48,9 +49,10 @@ def test_load_single_arm_config():
     assert config.voice_asr.enabled is False
     assert config.voice_asr.output_topic == "/voice_command"
     assert config.voice_asr.model_path.endswith("models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
-    assert config.voice_asr.realtime_pre_roll_seconds == 2.0
+    assert config.voice_asr.realtime_pre_roll_seconds == 0.5
     assert not Path(config.voice_asr.model_path).is_absolute()
     assert config.voice_asr.device_name == ""
+    assert config.voice_asr.device_index == 13
     assert config.voice_asr.exit_on_init_failure is True
 
     # Check cameras
@@ -453,6 +455,7 @@ def test_validate_voice_asr_requires_model_path_when_auto_download_is_disabled()
     )
     config.voice_asr.enabled = True
     config.voice_asr.auto_download_model = False
+    config.voice_asr.model_path = ""
 
     errors = validate_config(config)
     assert any("voice_asr.model_path" in error for error in errors)
@@ -480,6 +483,26 @@ def test_voice_asr_launch_builder_infers_shared_default_model_path():
 
     assert resolved.endswith("models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
     assert Path(resolved).is_absolute()
+
+
+def test_voice_asr_empty_model_path_auto_resolves_streaming_bundle(tmp_path):
+    """Test standalone ASR keeps generic defaults while resolving runtime assets."""
+    bundle_dir = tmp_path / STREAMING_ZH_BUNDLE.directory
+    bundle_dir.mkdir()
+    for file_name in ("tokens.txt", "encoder.onnx", "decoder.onnx", "joiner.onnx"):
+        (bundle_dir / file_name).write_text("placeholder")
+
+    resolved = resolve_model_assets(
+        model_path="",
+        model_type="auto",
+        active_mode="continuous",
+        model_root=tmp_path,
+        auto_download_model=True,
+    )
+
+    assert resolved.model_path == str(bundle_dir)
+    assert resolved.tokens_path == str(bundle_dir / "tokens.txt")
+    assert resolved.profile == STREAMING_ZH_BUNDLE.profile
 
 
 def test_resolve_voice_asr_path_uses_workspace_root_for_relative_paths():

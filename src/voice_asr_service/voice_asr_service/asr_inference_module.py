@@ -17,6 +17,8 @@ from typing import Any
 
 import numpy as np
 
+_MAX_FINAL_DECODE_STEPS = 200
+
 
 class ASRState(Enum):
     IDLE = "idle"
@@ -283,6 +285,15 @@ class ASRInferenceModule:
         text = getattr(result, "text", None)
         return text if isinstance(text, str) else ""
 
+    def _decode_online_stream_until_idle(self, stream: Any, max_steps: int | None = None) -> bool:
+        steps = 0
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_stream(stream)
+            steps += 1
+            if max_steps is not None and steps >= max_steps:
+                return not self._recognizer.is_ready(stream)
+        return True
+
     def start_streaming(self) -> bool:
         """开始流式识别"""
         with self._lock:
@@ -315,9 +326,7 @@ class ASRInferenceModule:
 
             self._active_stream.accept_waveform(self._sample_rate, audio_data)
 
-            if self._recognizer.is_ready(self._active_stream):
-                self._recognizer.decode_stream(self._active_stream)
-
+            self._decode_online_stream_until_idle(self._active_stream, max_steps=1)
             text = self._extract_streaming_text(self._active_stream)
             if text:
                 return ASRResult(text=text, is_final=False, confidence=1.0)
@@ -340,8 +349,10 @@ class ASRInferenceModule:
                 return ASRResult(text="", is_final=True)
 
             self._active_stream.input_finished()
-            while self._recognizer.is_ready(self._active_stream):
-                self._recognizer.decode_stream(self._active_stream)
+            self._decode_online_stream_until_idle(
+                self._active_stream,
+                max_steps=_MAX_FINAL_DECODE_STEPS,
+            )
             text = self._extract_streaming_text(self._active_stream)
 
             result = ASRResult(text=text, is_final=True, confidence=1.0)
@@ -511,7 +522,12 @@ class ASRInferenceModule:
         with self._lock:
             self._active_stream = None
             self._pending_stream = None
-            self.state = ASRState.READY
+            if self._recognizer is not None:
+                self.state = ASRState.READY
+            elif self._last_error:
+                self.state = ASRState.ERROR
+            else:
+                self.state = ASRState.IDLE
 
     def cleanup(self):
         """清理资源"""
@@ -519,7 +535,6 @@ class ASRInferenceModule:
             self._active_stream = None
             self._pending_stream = None
             self._recognizer = None
-            self._config = None
             self.state = ASRState.IDLE
 
     @property

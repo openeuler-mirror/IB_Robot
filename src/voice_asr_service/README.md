@@ -59,7 +59,8 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.
 这里的 `voice_asr_auto_start` 是 **launch 参数**，不是 YAML 字段。它会在启动时临时覆盖为：
 
 - `voice_asr.enabled=true`
-- `voice_asr.active_mode=continuous`
+
+`active_mode` 默认已经是 `continuous`，因此启用后会自动开始监听。
 
 ## 3. 运行时结构
 
@@ -114,8 +115,9 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.
 
 初始化流程如下：
 
-1. `resolve_model_assets()` 先检查 `model_path` 是否已经存在。
-2. 如果模型缺失且 `auto_download_model=true`，节点会按当前意图选择默认 bundle。
+1. `resolve_model_assets()` 先检查 `model_path` 是否为空或已存在。
+2. 如果 `model_path` 为空，或配置的模型缺失，且 `auto_download_model=true`，
+   节点会按当前意图选择默认 bundle。
 3. 下载后的 bundle 路径会回填到节点实际使用的运行参数里。
 4. `ASRInferenceModule.initialize()` 根据模型类型创建流式或离线 recognizer。
 
@@ -146,16 +148,15 @@ models/voice_asr/
 1. 从 `AudioCaptureModule` 读取一个音频块。
 2. 调用 `VADModule.process()` 判断当前音频状态。
 3. 检测到开始讲话后，创建一个流式 ASR 会话。
-4. 先补喂一小段 pre-roll，避免句首被截断；默认通过 `realtime_pre_roll_seconds=2.0` 回补 2 秒实时缓存。
+4. 先补喂一小段 pre-roll，避免句首被截断；默认通过 `realtime_pre_roll_seconds=0.5` 保留实时缓存，实际一次性喂给流式 ASR 的音频会被限制在最近 0.5 秒内，避免启动识别时阻塞控制循环。
 5. 在语音活动期间持续向 ASR 喂入音频块。
 6. 如果 `publish_partial=true`，就发布中间结果。
 7. 在静音或超时后结束识别，并发布最终结果。
 
 实时链路的几个细节：
 
-- 只有当 VAD 进入 `SPEAKING` 时，节点才会真正开启新的识别会话。
-- 仅处于 `STARTING` 不会触发新的 ASR 会话。
-- `realtime_pre_roll_seconds` 可以在保持现有 VAD 触发策略不变的情况下，补回 VAD 判定前的实时音频，减少句首丢失。
+- VAD 进入 `STARTING`、`SPEAKING` 或 `ENDING` 都会被视为语音活动并喂给 ASR，避免截断句首或句尾。
+- `realtime_pre_roll_seconds` 会保留 VAD 判定前的实时音频，减少句首丢失；当前帧会从 pre-roll 中裁掉，避免重复喂入。为保证实时性，流式 ASR 启动时最多一次性补喂最近 0.5 秒。
 - 如果检测到讲话时当前模型是离线模型，节点会停止采集并记录明确错误。
 
 ## 7. 文件识别流程
@@ -247,9 +248,9 @@ models/voice_asr/
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `active_mode` | `manual` | 节点激活模式 |
+| `active_mode` | `continuous` | 节点激活模式 |
 | `language` | `zh` | 传给 ASR 初始化的语言提示 |
-| `model_path` | `""` | 模型文件或目录路径 |
+| `model_path` | `""` | 模型文件或目录路径；具体机器人配置可在 `robot_config` YAML 中覆盖 |
 | `tokens_path` | `""` | 可选的显式 tokens 路径 |
 | `provider` | `cpu` | sherpa-onnx 推理 provider |
 | `model_type` | `auto` | `auto`、`streaming` 或 `offline` |
@@ -263,8 +264,8 @@ models/voice_asr/
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `vad_sensitivity` | `0.5` | VAD 灵敏度 |
-| `realtime_pre_roll_seconds` | `2.0` | 识别启动时补回的实时缓存时长，用于减少句首丢字 |
+| `vad_sensitivity` | `0.6` | VAD 灵敏度 |
+| `realtime_pre_roll_seconds` | `0.5` | 识别启动时补回的实时缓存时长，用于减少句首丢字 |
 | `sample_rate` | `16000` | 运行时音频采样率 |
 | `chunk_size` | `512` | 每个音频块的帧数 |
 | `buffer_seconds` | `5.0` | 音频环形缓冲区时长 |
@@ -322,7 +323,7 @@ src/robot_config/config/robots/so101_single_arm.yaml
 robot:
   voice_asr:
     enabled: false
-    active_mode: manual
+    active_mode: continuous
     language: zh
     model_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
     tokens_path: ""
@@ -330,8 +331,8 @@ robot:
     model_type: streaming
     auto_download_model: true
     max_recording_duration: 10.0
-    vad_sensitivity: 0.5
-    realtime_pre_roll_seconds: 2.0
+    vad_sensitivity: 0.6
+    realtime_pre_roll_seconds: 0.5
     publish_partial: true
     output_topic: /voice_command
     sample_rate: 16000

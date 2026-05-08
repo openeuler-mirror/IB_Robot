@@ -122,16 +122,16 @@ robot:
   voice_asr:
     enabled: false
     auto_download_model: true
-    # 可通过 launch 参数 `voice_asr_auto_start:=true` 临时覆盖为启用并切换到 continuous 监听模式。
-    active_mode: manual
+    # 默认使用 continuous 监听模式；可通过 launch 参数临时覆盖是否启用。
+    active_mode: continuous
     language: zh
     model_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
     tokens_path: ""
     provider: cpu
     model_type: streaming
     max_recording_duration: 10.0
-    vad_sensitivity: 0.5
-    realtime_pre_roll_seconds: 2.0
+    vad_sensitivity: 0.6
+    realtime_pre_roll_seconds: 0.5
     publish_partial: true
     sample_rate: 16000
     chunk_size: 512

@@ -205,6 +205,31 @@ ros2 topic pub /arm_position_controller/commands std_msgs/msg/Float64MultiArray 
 以及 shutdown 时的 stop/destroy 生命周期都由
 `robot_config/launch_builders/tracing.py` 统一管理。
 
+### Voice ASR（语音识别）
+
+`robot_config` 通过 `robot.voice_asr` 作为语音识别节点的机器人级单一配置来源，并由
+`robot_config/launch_builders/voice_asr.py` 注入到 `voice_asr_service` 节点。
+
+常用启动覆盖参数：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_single_arm \
+  voice_asr_auto_start:=true \
+  voice_asr_device_name:=Blackwire \
+  voice_asr_realtime_pre_roll_seconds:=0.5
+```
+
+| Launch 参数 | 作用 |
+| --- | --- |
+| `voice_asr_auto_start` | 临时覆盖 `robot.voice_asr.enabled`，设为 `true` 时强制启动 ASR 节点 |
+| `voice_asr_device_index` | 临时覆盖 `robot.voice_asr.device_index` |
+| `voice_asr_device_name` | 临时覆盖 `robot.voice_asr.device_name`，优先按设备名匹配 |
+| `voice_asr_realtime_pre_roll_seconds` | 临时覆盖实时识别 pre-roll 时长 |
+
+`voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
+具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
+
 #### 2. moveit_planning 模式（轨迹规划控制）
 
 **适用于：** 基于规划的模型（VoxPoser、VLM、目标条件化）
