@@ -286,6 +286,7 @@ def run_stage_gain(
         gain_after_step_a=step_a.new_gain,
         snr_result=snr,
         brightness_caps=bri_caps,
+        gain_caps=gain_caps,
     )
     _trace("gain", 2, f"stepB Y_mean_after={post_stats.y_mean_excl_clip:.1f} "
            f"snr_db={snr.snr_db} -> gain={step_b.final_gain} "

@@ -195,7 +195,7 @@ _DIRECT_KEYS: tuple[str, ...] = (
 
 def apply_params(device: str,
                  resolved: dict[str, CtrlInfo],
-                 params: dict) -> tuple[bool, str]:
+                 params: dict) -> tuple[bool, str, set[str]]:
     """Best-effort: write *params* directly via v4l2-ctl.
 
     Bypasses the usb_cam ROS parameter callback entirely so it never has a
@@ -203,11 +203,17 @@ def apply_params(device: str,
     spams 'unknown control' and stalls the set_parameters service for
     seconds, causing Auto / Reset timeouts).
 
-    Returns (all_ok, summary). Skips bool keys (auto_white_balance /
-    autoexposure) silently — those have to be handled separately via
-    :func:`force_manual_modes`.
+    Returns ``(all_ok, summary, handled_keys)``:
+
+    * ``all_ok``       -- True iff every attempted write succeeded.
+    * ``summary``      -- human-readable failure list, or ``"ok"``.
+    * ``handled_keys`` -- the set of input keys we actually attempted via
+      v4l2-ctl (succeeded **or** failed). Anything in ``params`` but not
+      in this set was skipped (bool-typed, non-numeric, or unknown to
+      this layer) and the caller must still route it via ROS.
     """
     failures: list[str] = []
+    handled: set[str] = set()
     for k, v in params.items():
         if isinstance(v, bool):
             continue  # handled by force_manual_modes
@@ -216,18 +222,21 @@ def apply_params(device: str,
         except (TypeError, ValueError):
             continue
         if k in _SLIDER_TO_LOGICAL:
+            handled.add(k)
             ok, msg = set_ctrl(device, _SLIDER_TO_LOGICAL[k], iv, resolved)
             if not ok:
                 failures.append(f"{k}: {msg}")
             continue
         if k in _DIRECT_KEYS:
+            handled.add(k)
             rc, _out, err = _run([
                 "v4l2-ctl", "--device", device, "-c", f"{k}={iv}",
             ])
             if rc != 0:
                 failures.append(f"{k}: {err.strip() or rc}")
             continue
-        # Unknown key — leave it to the ROS path.
+        # Unknown key — leave it to the ROS path (caller sees it absent
+        # from ``handled`` and re-routes).
     if failures:
-        return False, "; ".join(failures)[:200]
-    return True, "ok"
+        return False, "; ".join(failures)[:200], handled
+    return True, "ok", handled

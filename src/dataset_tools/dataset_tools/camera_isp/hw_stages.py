@@ -543,6 +543,7 @@ def evaluate_gain_step_b(
     gain_after_step_a: int,
     snr_result: SnrResult,
     brightness_caps: CtrlCaps,
+    gain_caps: CtrlCaps,
     *,
     snr_floor_db: float = SNR_FLOOR_DB,
 ) -> GainStepBResult:
@@ -593,8 +594,7 @@ def evaluate_gain_step_b(
 
     # SNR too low → halve gain back toward Step A's starting point.
     halved = (gain_before_step_a + gain_after_step_a) // 2
-    halved = max(brightness_caps.minimum, halved)  # gain_caps would be ideal but we
-    # don't have them here — Step A already clipped to gain_caps so halve stays valid.
+    halved = max(gain_caps.minimum, min(gain_caps.maximum, halved))
 
     deficit = y_mean_target - y_mean_after_step_a   # may be negative if already bright.
     proposed_bri = brightness_caps.default + int(round(deficit))

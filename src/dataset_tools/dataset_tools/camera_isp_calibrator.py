@@ -2379,14 +2379,20 @@ class CalibratorWindow:
         v4l2_ok = True
         v4l2_msg = ""
         if device and resolved and _v4l2.have_v4l2_ctl() and v4l2_payload:
-            v4l2_ok, v4l2_msg = _v4l2.apply_params(device, resolved, v4l2_payload)
+            v4l2_ok, v4l2_msg, handled = _v4l2.apply_params(
+                device, resolved, v4l2_payload
+            )
             # [WriteTrace] commented out — fires on every V4L2 write, too noisy.
             # tag = "OK" if v4l2_ok else f"FAIL:{v4l2_msg}"
             # print(f"[WriteTrace] v4l2 mode={self._mode} payload={v4l2_payload} {tag}",
             #       flush=True)
             if v4l2_ok:
-                # Don't re-send via ROS — driver already has them.
-                v4l2_payload = {}
+                # Drop only the keys the V4L2 layer actually wrote; keys it
+                # didn't recognise (e.g. ``focus``) must still fall through
+                # to ROS instead of being silently dropped.
+                v4l2_payload = {
+                    k: v for k, v in v4l2_payload.items() if k not in handled
+                }
         # Anything still in v4l2_payload (failure or v4l2-ctl unavailable) +
         # the bool keys go through ROS as fallback.
         ros_payload.update(v4l2_payload)
@@ -3942,8 +3948,24 @@ class CalibratorWindow:
                     signal.signal(signal.SIGTSTP, prev_sigtstp)
                 except (ValueError, OSError):
                     pass
+            self._join_auto_thread()
             self._destroy_all_windows()
         return 0
+
+    def _join_auto_thread(self) -> None:
+        """Best-effort wait for AUTO/search worker before tearing down GUI.
+
+        The worker is daemon, so process exit will reap it regardless,
+        but joining briefly here prevents it from writing one last
+        parameter set after the user already closed the window.
+        """
+        thread = self._auto_thread
+        if thread is None or not thread.is_alive():
+            return
+        try:
+            thread.join(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _destroy_all_windows(self) -> None:
         cv = self._opencv
@@ -3958,6 +3980,21 @@ class CalibratorWindow:
                 pass
 
     def _main_window_closed(self) -> bool:
+        """True only when the main window has been outright destroyed.
+
+        OpenCV+GTK exposes three states via ``WND_PROP_VISIBLE``:
+
+        * ``>= 1.0`` -- window is mapped and visible;
+        * ``== 0.0`` -- minimized / temporarily hidden by the WM;
+        * ``< 0.0``  -- window no longer exists (user clicked X, or it
+          was never registered).
+
+        Treating ``0.0`` as "closed" caused false positives whenever the
+        user minimised the calibrator or the WM briefly unmapped it,
+        making the process self-exit. We only react to a true destroy
+        (``< 0.0``) here; the X-click signal is also covered by
+        :meth:`_trackbar_panel_closed`, which is more reliable on GTK.
+        """
         cv = self._opencv
         try:
             visible = cv.getWindowProperty(
@@ -3969,7 +4006,10 @@ class CalibratorWindow:
         if visible >= 1.0:
             self._main_window_seen = True
             return False
-        return self._main_window_seen
+        if visible < 0.0:
+            return self._main_window_seen
+        # 0.0: minimized / transiently unmapped — not a close.
+        return False
 
     def _trackbar_panel_closed(self) -> bool:
         if not self._trackbars_ready:
