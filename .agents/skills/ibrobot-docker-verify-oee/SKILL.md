@@ -5,7 +5,7 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 s
 
 # IB-Robot openEuler Embedded Docker Verification Skill
 
-在 openEuler Embedded aarch64 Docker 容器中完整验证 `setup.sh` 和 `build.sh`。
+在全新 openEuler Embedded aarch64 Docker 容器中完整验证 `setup.sh` 和 `build.sh`。
 
 > **⚠️ 与 Ubuntu 验证的两个核心差异：**
 > 1. **以 root 用户操作**（openEuler Embedded 开发板默认 root，无需 sudo/testuser）
@@ -118,14 +118,20 @@ docker exec verify-oee bash -c 'chroot /root/rootfs /bin/bash -c "
 容器镜像应包含：git、python3、dnf + 两个 openEuler ROS repo 配置。
 ROS 2 安装由 setup.sh 通过 `install_ros.sh` 自动完成，无需手动干预。
 
-### Phase 3 — Copy Workspace into chroot rootfs
+### Phase 3 — Prepare a Standalone Workspace Copy
+
+> **重要：不要直接把 linked worktree 拷进容器。**
+> 如果后续要运行 `setup.sh` 且不使用 `--skip-submodules`，请先在宿主机准备一个
+> 普通 clone（非 linked worktree），并完成 `git submodule update --init --recursive`。
+> 这样容器内的 `.git` / submodule 状态才是自洽的。
 
 ```bash
-# 3.1 Reset lerobot submodule state (avoid dirty state)
-git -C <project_root> checkout -- libs/lerobot
+# 3.1 Create a standalone clone for verification
+git clone --branch <branch> --single-branch <project_root> /tmp/oee-verify
+git -C /tmp/oee-verify submodule update --init --recursive
 
-# 3.2 Copy workspace into rootfs
-docker cp <project_root> verify-oee:/root/rootfs/root/IB_Robot
+# 3.2 Copy the standalone workspace into rootfs
+docker cp /tmp/oee-verify verify-oee:/root/rootfs/root/IB_Robot
 
 # 3.3 Remove stale artifacts (host paths are wrong in container)
 docker exec verify-oee bash -c \
@@ -136,7 +142,7 @@ docker exec verify-oee bash -c \
 
 ```bash
 docker exec -d verify-oee bash -c \
-  'chroot /root/rootfs /bin/bash -c "cd /root/IB_Robot && IBR_LEROBOT_FORCE_REBUILD=1 bash scripts/setup.sh --yes --skip-submodules --no-sudo > /tmp/setup.log 2>&1"'
+  'chroot /root/rootfs /bin/bash -c "cd /root/IB_Robot && IBR_LEROBOT_FORCE_REBUILD=1 bash scripts/setup.sh --yes --no-sudo > /tmp/setup.log 2>&1"'
 ```
 
 Monitor progress (qemu-user 模拟下 pip 安装很慢，全流程约 20-40 min):
@@ -203,7 +209,7 @@ docker cp scripts/setup/lerobot_patches.sh \
 docker exec verify-oee bash -c \
   'chroot /root/rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
 docker exec -d verify-oee bash -c \
-  'chroot /root/rootfs /bin/bash -c "cd /root/IB_Robot && IBR_LEROBOT_FORCE_REBUILD=1 bash scripts/setup.sh --yes --skip-submodules --no-sudo > /tmp/setup.log 2>&1"'
+  'chroot /root/rootfs /bin/bash -c "cd /root/IB_Robot && IBR_LEROBOT_FORCE_REBUILD=1 bash scripts/setup.sh --yes --no-sudo > /tmp/setup.log 2>&1"'
 ```
 
 ## Key Differences from Ubuntu Verification
@@ -229,6 +235,7 @@ docker exec -d verify-oee bash -c \
 | `dubious ownership in repository` | UID mismatch after `docker cp` | Phase 1.6 adds `safe.directory` |
 | `gpg.errors.GPGMEError` during `rosdep install` | qemu-aarch64 emulation bug with Python `gpg` | Phase 1.7 disables `gpgcheck=1` globally in `/etc/dnf/dnf.conf` |
 | `git-lfs was not found` post-checkout hook | No git-lfs in rootfs | `lerobot_patches.sh` auto-removes hook when git-lfs missing |
+| `ERROR: file:///root/IB_Robot/libs/lerobot does not appear to be a Python project` | Copied a linked worktree or an uninitialized submodule tree into the container, then ran setup without `--skip-submodules` | Use a standalone clone and run `git submodule update --init --recursive` before `docker cp` |
 | `pip3 not found, cannot install colcon` | `platform_install_python_bootstrap` not called before `ensure_colcon` | `install_system_deps` calls bootstrap first |
 | `python%{python3_pkgversion}-scipy` not found | `ROS_OS_OVERRIDE=rhel:8` uses RHEL naming; openEuler dnf can't match macro | Platform script skips `python3-scipy` in rosdep, installs via explicit `dnf install` |
 | `rosdep install failed` for missing packages | Some ROS packages not in openEuler repos (e.g. `robot_localization`) | Platform script uses non-fatal rosdep + skip-keys |
