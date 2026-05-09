@@ -1,4 +1,5 @@
 #include "lekiwi_hardware/lekiwi_system_hardware.hpp"
+#include "lekiwi_hardware/lekiwi_conversions.hpp"
 #include "hardware_interface/types/hardware_interface_type_values.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "SMS_STS.h"
@@ -8,8 +9,6 @@
 
 namespace lekiwi_hardware
 {
-
-static constexpr double TICKS_PER_RAD = 4096.0 / (2.0 * M_PI);
 
 hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
   const hardware_interface::HardwareInfo & info)
@@ -174,9 +173,7 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
     usleep(2000);
 
     int offset = homing_offsets_[id];
-    u16 encoded_offset = (offset < 0)
-      ? (static_cast<u16>(std::abs(offset)) | (1 << 11))
-      : static_cast<u16>(offset);
+    u16 encoded_offset = encode_homing_offset(offset);
     sms_sts_.writeWord(id, 31, encoded_offset);
     sms_sts_.writeWord(id, 9, range_mins_[id]);
     sms_sts_.writeWord(id, 11, range_maxes_[id]);
@@ -217,9 +214,8 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
     for (size_t i = 0; i < motor_ids_.size(); i++) {
       u8 data[2];
       if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
-        s16 pos = (data[1] << 8) | data[0];
-        if (pos & (1 << 15)) pos = -(pos & 0x7FFF);  // sign bit
-        double rad = (static_cast<double>(pos) - 2048.0) / TICKS_PER_RAD;
+        s16 pos = decode_motor_register(data[0], data[1]);
+        double rad = ticks_to_radians(pos);
         hw_positions_[i] = rad;
         if (i < NUM_ARM_JOINTS) {
           hw_commands_[i] = rad;  // hold current position
@@ -274,12 +270,11 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
   for (size_t i = 0; i < motor_ids_.size(); i++) {
     u8 data[2];
     if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
-      s16 pos = (data[1] << 8) | data[0];
-      if (pos & (1 << 15)) pos = -(pos & 0x7FFF);
+      s16 pos = decode_motor_register(data[0], data[1]);
 
       if (i < NUM_ARM_JOINTS) {
         // Arm: convert ticks to radians
-        hw_positions_[i] = (static_cast<double>(pos) - 2048.0) / TICKS_PER_RAD;
+        hw_positions_[i] = ticks_to_radians(pos);
       } else {
         // Base: store raw position tick (accumulated rotation in wheel mode)
         hw_positions_[i] = static_cast<double>(pos);
@@ -294,15 +289,14 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
     for (size_t i = 0; i < motor_ids_.size(); i++) {
       u8 data[2];
       if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
-        s16 speed = (data[1] << 8) | data[0];
-        if (speed & (1 << 15)) speed = -(speed & 0x7FFF);
+        s16 speed = decode_motor_register(data[0], data[1]);
 
         if (i < NUM_ARM_JOINTS) {
-          // Arm velocity in raw steps/s → convert to rad/s
-          hw_velocities_[i] = static_cast<double>(speed) / TICKS_PER_RAD;
+          // Arm velocity in raw steps/s -> convert to rad/s
+          hw_velocities_[i] = steps_to_rad_s(speed);
         } else {
-          // Base velocity: convert raw steps/s → rad/s for ros2_control state interface
-          hw_velocities_[i] = static_cast<double>(speed) / TICKS_PER_RAD;
+          // Base velocity: convert raw steps/s -> rad/s for ros2_control state interface
+          hw_velocities_[i] = steps_to_rad_s(speed);
         }
       }
     }
@@ -318,11 +312,7 @@ hardware_interface::return_type LeKiwiSystemHardware::write(
 
   // ---- Arm motors: position control (SyncWritePosEx) ----
   for (size_t i = 0; i < NUM_ARM_JOINTS; i++) {
-    double target_raw = hw_commands_[i] * TICKS_PER_RAD + 2048.0;
-    // Safety clamp
-    if (target_raw < 0) target_raw = 0;
-    if (target_raw > 4095) target_raw = 4095;
-    arm_target_positions_[i] = static_cast<s16>(target_raw);
+    arm_target_positions_[i] = radians_to_ticks(hw_commands_[i]);
     arm_target_speeds_[i] = 2400;
     arm_target_accs_[i] = 50;
   }
@@ -340,11 +330,7 @@ hardware_interface::return_type LeKiwiSystemHardware::write(
     for (size_t i = 0; i < NUM_BASE_JOINTS; i++) {
       // hw_commands_[NUM_ARM_JOINTS + i] is velocity in rad/s (ros2_control convention).
       // Convert to raw steps/s for the STS3215 speed register.
-      double raw = hw_commands_[NUM_ARM_JOINTS + i] * TICKS_PER_RAD;
-      // Clamp to safe s16 range
-      if (raw > 32767) raw = 32767;
-      if (raw < -32768) raw = -32768;
-      base_speeds[i] = static_cast<s16>(raw);
+      base_speeds[i] = rad_s_to_steps(hw_commands_[NUM_ARM_JOINTS + i]);
       base_accs[i] = 50;
     }
     sms_sts_.SyncWriteSpe(

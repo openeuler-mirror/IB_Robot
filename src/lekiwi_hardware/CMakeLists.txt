@@ -74,6 +74,14 @@ install(TARGETS scan_motors DESTINATION lib/${PROJECT_NAME})
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_lekiwi_conversions test/test_lekiwi_conversions.cpp)
+  if(TARGET test_lekiwi_conversions)
+    target_include_directories(test_lekiwi_conversions PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    )
+  endif()
 endif()
 
 # ===== Install =====

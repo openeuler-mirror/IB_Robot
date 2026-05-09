@@ -15,7 +15,7 @@ robot:
   # ============================================
   models:
     lekiwi_act:
-      path: ~/workspace/model/act/pretrained_model
+      path: models/act/pretrained_model
       policy_type: act
       lerobot_norm_mode: range_m100_100
 
@@ -98,6 +98,20 @@ robot:
         control_frequency: 30.0
 
   # ============================================
+  # Voice ASR Configuration
+  # ============================================
+  voice_asr:
+    enabled: true
+    active_mode: continuous
+    language: zh
+    model_path: models/voice_asr/sherpa-onnx-streaming-paraformer-zh
+    model_type: streaming
+    auto_download_model: true
+    publish_partial: true
+    output_topic: /voice_command
+    device_index: 9
+
+  # ============================================
   # Navigation Configuration
   # ============================================
   navigation:
@@ -163,12 +177,6 @@ robot:
           x: 0.0
           y: 0.0
           theta: 0.0
-
-    funasr:
-      host: "127.0.0.1"
-      port: "10095"
-      mode: "2pass"
-      hotword_msg: ""
 
     rviz:
       enabled: true

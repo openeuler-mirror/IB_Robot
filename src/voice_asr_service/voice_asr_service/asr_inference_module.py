@@ -200,10 +200,12 @@ class ASRInferenceModule:
                 provider=provider,
             )
 
-        paraformer = list(model_dir.glob("*.onnx"))
-        if paraformer:
+        encoder = list(model_dir.glob("encoder*.onnx"))
+        decoder = list(model_dir.glob("decoder*.onnx"))
+        if encoder and decoder:
             return sherpa_onnx.OnlineRecognizer.from_paraformer(
-                model=str(paraformer[0]),
+                encoder=str(encoder[0]),
+                decoder=str(decoder[0]),
                 tokens=tokens_path,
                 num_threads=4,
                 provider=provider,

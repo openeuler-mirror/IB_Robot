@@ -11,6 +11,7 @@
 - JSON 标定文件支持：homing offset、关节限位
 - 内置 `scan_motors` 诊断工具
 - 控制频率 100 Hz
+- 55 个 gtest 单元测试覆盖核心转换逻辑
 
 ## 架构
 
@@ -49,9 +50,12 @@ lekiwi_hardware/
 ├── config/
 │   └── lekiwi_controllers.yaml          # 控制器配置
 ├── include/lekiwi_hardware/
+│   ├── lekiwi_conversions.hpp           # 坐标转换纯函数（header-only）
 │   └── lekiwi_system_hardware.hpp       # 硬件接口头文件
 ├── src/
 │   └── lekiwi_system_hardware.cpp       # 硬件接口实现
+├── test/
+│   └── test_lekiwi_conversions.cpp      # 转换函数 gtest 单元测试
 └── tools/
     └── scan_motors.cpp                  # 电机扫描诊断工具
 ```
@@ -65,6 +69,17 @@ cd ~/workspace/IB_Robot
 colcon build --packages-select lekiwi_hardware
 source install/setup.bash
 ```
+
+> 构建时会自动通过 CMake FetchContent 从 GitHub 拉取 [Feetech SDK](https://github.com/ftservo/FTServo_Linux.git)。
+
+### 2. 运行单元测试
+
+```bash
+colcon test --packages-select lekiwi_hardware
+colcon test-result --verbose
+```
+
+包含 55 个 gtest 用例，覆盖坐标转换、符号位解码、回零偏移编码及往返一致性（见 `test/test_lekiwi_conversions.cpp`）。
 
 > 构建时会自动通过 CMake FetchContent 从 GitHub 拉取 [Feetech SDK](https://github.com/ftservo/FTServo_Linux.git)。
 
@@ -171,6 +186,18 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_nav
 
 ### 坐标转换
 
+所有转换逻辑集中在 `lekiwi_conversions.hpp`（header-only），提供 6 个纯函数，无硬件依赖，方便单元测试：
+
+| 函数 | 用途 |
+|------|------|
+| `ticks_to_radians(raw_ticks)` | 手臂位置：raw ticks → 弧度 |
+| `radians_to_ticks(radians)` | 手臂位置：弧度 → ticks（钳位 [0, 4095]） |
+| `steps_to_rad_s(raw_speed)` | 速度：raw steps/s → rad/s |
+| `rad_s_to_steps(rad_per_sec)` | 速度：rad/s → steps/s（钳位 [-32768, 32767]） |
+| `decode_motor_register(low, high)` | 解码 2 字节寄存器（bit 15 符号位） |
+| `encode_homing_offset(offset)` | 编码回零偏移（bit 11 符号位） |
+
+转换公式：
 - **手臂位置**：4096 ticks = 2π rad，中心点 2048 ticks
   - ticks → rad: `(ticks - 2048) / (4096 / 2π)`
   - rad → ticks: `rad × (4096 / 2π) + 2048`

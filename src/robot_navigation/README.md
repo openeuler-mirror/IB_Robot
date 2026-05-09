@@ -4,7 +4,7 @@
 
 ## 功能特性
 
-- **语音识别**: 基于 FunASR 的实时语音识别和正则关键词匹配
+- **语音控制**: 基于 `voice_asr_service` (sherpa-onnx 本地 ASR) + `voice_control` 关键词匹配的语音导航
 - **导航控制**: Nav2 导航 Goal 客户端，支持语音触发导航，到达后自动触发机械臂推理
 - **底盘桥接**: `cmd_vel_bridge_node` 通过 IK/FK 将标准 `/cmd_vel` 桥接到 ros2_control 全向轮速度指令 (rad/s)，并发布里程计
 - **定位融合**: EKF (robot_localization) 融合底盘里程计速度，RTAB-Map 视觉 SLAM 提供全局定位修正
@@ -13,20 +13,26 @@
 ## 系统架构
 
 ```text
-  用户语音 ──► funasr_client_node ──► /voice_asr/keyword_matched
-                    │                         │
-                    │                         ▼
-                    │               nav2_goal_client
-                    │                         │
-                    │                         ▼
-                    │               Nav2 NavigateToPose Action
-                    │                         │
-                    │                         ▼
-                    │              Nav2 规划 + 发布 /cmd_vel
-                    │                         │
-                    │                         ▼
-                    │              到达目标 ──► /action_dispatcher/start_evaluate
-                    │
+  用户语音 ──► voice_asr_node (sherpa-onnx) ──► /voice_command
+                                                     │
+                                                     ▼
+                                              voice_control (关键词匹配)
+                                                     │
+                                                     ▼
+                                         /voice_asr/keyword_matched (JSON)
+                                                     │
+                                                     ▼
+                                            nav2_goal_client
+                                                     │
+                                                     ▼
+                                         Nav2 NavigateToPose Action
+                                                     │
+                                                     ▼
+                                        Nav2 规划 + 发布 /cmd_vel
+                                                     │
+                                                     ▼
+                                        到达目标 ──► /action_dispatcher/start_evaluate
+
   /cmd_vel ─────► cmd_vel_bridge_node (IK) ──► /base_velocity_controller/commands (rad/s)
                     │  (FK)
                     └──► /odom (nav_msgs/Odometry)
@@ -55,7 +61,7 @@ AMCL 的 `tf_broadcast` 设为 `false`，避免与 RTAB-Map 的 `map → odom` T
 
 | 节点 | 功能 | 入口点 |
 |------|------|--------|
-| `funasr_client_node` | FunASR 语音识别 + 关键词匹配 | `robot_navigation.funasr_client_node` |
+| `voice_control` | 语音关键词匹配 + 导航桥接 (sherpa-onnx 本地 ASR) | `robot_navigation.voice_control` |
 | `nav2_goal_client` | Nav2 导航 Goal 客户端 + 评估触发 | `robot_navigation.nav2_goal_client` |
 | `cmd_vel_bridge_node` | cmd_vel → ros2_control 桥接 + 里程计发布 | `robot_navigation.cmd_vel_bridge_node` |
 
@@ -69,17 +75,7 @@ colcon build --packages-select robot_navigation robot_config
 source install/setup.bash
 ```
 
-### 2. 启动 FunASR 服务器（语音控制需要）
-
-```bash
-# 一键安装（首次）
-bash scripts/install.sh ${deploy_path}
-
-# 启动服务（默认端口 10086）
-bash scripts/start_service.sh ${deploy_path}
-```
-
-### 3. 通过 robot_config 启动（推荐）
+### 2. 通过 robot_config 启动（推荐）
 
 `robot_config` 集成了导航功能，通过 YAML 配置文件统一管理所有参数。以 `lekiwi_navi` 机器人为例：
 
@@ -120,9 +116,6 @@ navigation:
     destinations:
       point_a: {x: 0.0, y: 0.2, theta: 1.5708}  # rad (90 deg)
       point_b: {x: 0.2, y: 0.0, theta: 0.0}
-  funasr:
-    host: "127.0.0.1"
-    port: "10095"
   rviz:
     enabled: true
 ```
@@ -132,7 +125,7 @@ navigation:
 - 自动启动相关组件（控制器、相机、TF、定位等）
 - 支持 `control_mode` 切换不同运行模式
 
-### 4. 直接启动（备选方案）
+### 3. 直接启动（备选方案）
 
 如果不使用 `robot_config`，可以直接启动 `robot_navigation` 的 launch 文件：
 
@@ -143,51 +136,44 @@ ros2 launch robot_navigation nav2_bringup.launch.py
 # 指定地图
 ros2 launch robot_navigation nav2_bringup.launch.py map:=/path/to/rtabmap.yaml
 
-# 仅语音识别
-ros2 launch robot_navigation funasr_client.launch.py
+# 仅语音控制
+ros2 run robot_navigation voice_control
 
 # EKF + RTAB-Map + RealSense
 ros2 launch robot_navigation ekf_rtabmap_launch.py
 ```
 
-### 5. 单独运行节点
+### 4. 单独运行节点
 
 ```bash
-ros2 run robot_navigation funasr_client_node
+ros2 run robot_navigation voice_control
 ros2 run robot_navigation nav2_goal_client
 ros2 run robot_navigation cmd_vel_bridge_node
 ```
 
 ## ROS 接口
 
-### funasr_client_node
+### voice_control
 
 | 类型 | 话题/服务 | 类型 | 方向 | 说明 |
 |------|-----------|------|------|------|
+| 订阅 | `/voice_command` | `std_msgs/String` | 输入 | voice_asr_node 输出的识别文本 |
 | 订阅 | `/voice_asr/keywords` | `std_msgs/String` | 输入 | 动态更新关键词 (JSON) |
-| 发布 | `/voice_asr/text` | `std_msgs/String` | 输出 | ASR 原始识别文本 |
-| 发布 | `/voice_asr/status` | `std_msgs/String` | 输出 | 连接状态 (connecting/connected/error/disconnected) |
 | 发布 | `/voice_asr/keyword_matched` | `std_msgs/String` | 输出 | 匹配的关键词 (JSON) |
 | 发布 | `/voice_asr/nav_stop` | `std_msgs/String` | 输出 | 停止导航命令 |
-| 服务 | `~/start` | `std_srvs/Trigger` | 调用 | 启动语音识别 |
-| 服务 | `~/stop` | `std_srvs/Trigger` | 调用 | 停止语音识别 |
 | 服务客户端 | `/action_dispatcher/stop_evaluate` | `std_srvs/Trigger` | 调用 | 匹配 "停止" 时调用 |
+| 服务客户端 | `/voice_asr_node/set_hotwords` | `ibrobot_msgs/srv/SetHotwords` | 调用 | 启动时注册热词 |
 
 **参数**:
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `host` | `127.0.0.1` | FunASR 服务器地址 |
-| `port` | `10095` | FunASR 服务器端口 |
-| `use_itn` | `true` | 逆文本规范化 |
-| `mode` | `2pass` | 识别模式 |
-| `chunk_size` | `[5, 10, 5]` | 音频分块大小 |
-| `chunk_interval` | `10` | 分块间隔 |
-| `hotword_msg` | `""` | 热词 |
-| `keywords_file` | `""` | 关键词 JSON 文件路径 |
+| `topic_text` | `/voice_command` | voice_asr_node 输出话题 |
+| `topic_keyword_matched` | `/voice_asr/keyword_matched` | 匹配结果输出话题 |
+| `topic_nav_stop` | `/voice_asr/nav_stop` | 导航停止话题 |
 | `keywords_json` | `{}` | 关键词 JSON（从 launch 传入） |
+| `keywords_file` | `""` | 关键词 JSON 文件路径 |
 | `destinations_json` | `{}` | 目的地名称 → 坐标映射 |
-| `auto_start` | `true` | 是否自动启动 |
 
 ### nav2_goal_client
 
@@ -321,58 +307,27 @@ RTAB-Map 以定位模式运行（`localization: true`），通过视觉 SLAM 发
 ## 完整工作流程
 
 ```text
-1. 用户说："去a点"
-2. funasr_client_node 通过 WebSocket 将音频流发送给 FunASR 服务器
-3. FunASR 返回 2pass-offline 最终识别文本 "去a点"
-4. funasr_client_node 用正则匹配关键词，从 destinations_json 解析 point_a 的坐标
-5. 发布 JSON 到 /voice_asr/keyword_matched
-6. nav2_goal_client 收到消息，发送 NavigateToPose Action 给 Nav2
-7. Nav2 进行全局/局部规划，通过 controller_server 发布 /cmd_vel
-8. cmd_vel_bridge_node 将 /cmd_vel 通过 IK 转换为全向轮角速度 (rad/s)
-9. 发布到 /base_velocity_controller/commands，经由 ros2_control → lekiwi_hardware 驱动电机
-10. cmd_vel_bridge_node 同时通过 FK 计算里程计，发布 /odom
-11. EKF 融合 /odom 速度数据，发布 odom → base_link TF
-12. RTAB-Map 通过视觉 SLAM 发布 map → odom TF 进行全局修正
-13. 到达目标后，nav2_goal_client 检查是否有缓存的 task_description
-14. 如果有，调用 /action_dispatcher/start_evaluate 触发机械臂推理
-15. 如果用户说"停止"，funasr_client_node 调用 /action_dispatcher/stop_evaluate 并取消导航
+ 1. 用户说："去a点"
+ 2. voice_asr_node (sherpa-onnx) 本地语音识别，输出 "去a点" 到 /voice_command
+ 3. voice_control 订阅 /voice_command，用正则匹配关键词，从 destinations_json 解析 point_a 的坐标
+ 4. 发布 JSON 到 /voice_asr/keyword_matched
+ 5. nav2_goal_client 收到消息，发送 NavigateToPose Action 给 Nav2
+ 6. Nav2 进行全局/局部规划，通过 controller_server 发布 /cmd_vel
+ 7. cmd_vel_bridge_node 将 /cmd_vel 通过 IK 转换为全向轮角速度 (rad/s)
+ 8. 发布到 /base_velocity_controller/commands，经由 ros2_control → lekiwi_hardware 驱动电机
+ 9. cmd_vel_bridge_node 同时通过 FK 计算里程计，发布 /odom
+10. EKF 融合 /odom 速度数据，发布 odom → base_link TF
+11. RTAB-Map 通过视觉 SLAM 发布 map → odom TF 进行全局修正
+12. 到达目标后，nav2_goal_client 检查是否有缓存的 task_description
+13. 如果有，调用 /action_dispatcher/start_evaluate 触发机械臂推理
+14. 如果用户说"停止"，voice_control 调用 /action_dispatcher/stop_evaluate 并取消导航
 ```
-
-## FunASR 语音服务部署
-
-`scripts/` 目录提供 FunASR 服务器的一键安装和启动脚本。
-
-### 系统依赖
-
-- `libopenblas-dev`
-- `libssl-dev`
-- `portaudio19-dev` (Ubuntu) / `portaudio-devel` (CentOS)
-
-### 安装
-
-```bash
-bash scripts/install.sh ${deploy_path}
-```
-
-自动完成：
-- pip 安装 `funasr`、`humanfriendly`
-- 下载 onnxruntime 和 ffmpeg（自动识别 x86_64 / aarch64）
-- 克隆 FunASR 仓库并编译 WebSocket 服务端
-
-### 启动服务
-
-```bash
-bash scripts/start_service.sh ${deploy_path}
-```
-
-启动 FunASR 2pass 语音识别 WebSocket 服务，默认端口 `10086`（客户端连接端口通过 `port` 参数配置，默认 `10095`）。
 
 ## 启动文件
 
 | 文件 | 启动内容 |
 |------|---------|
 | `nav2_bringup.launch.py` | Nav2 栈 + robot_state_publisher + nav2_goal_client + RViz2 |
-| `funasr_client.launch.py` | 仅 funasr_client_node（读取 keywords.json 和 robot_config destinations） |
 | `ekf_rtabmap_launch.py` | RTAB-Map + EKF 融合（RealSense 由 peripherals 启动） |
 
 ## 目录结构
@@ -386,15 +341,15 @@ robot_navigation/
 │   └── nav2_params.yaml           # Nav2 完整参数栈
 ├── launch/
 │   ├── nav2_bringup.launch.py     # Nav2 + 状态发布 + GoalClient + RViz
-│   ├── funasr_client.launch.py    # 语音识别独立启动
 │   └── ekf_rtabmap_launch.py      # EKF + RTAB-Map
 ├── robot_navigation/
-│   ├── funasr_client_node.py      # 语音识别 + 关键词匹配 (~460 行)
-│   ├── nav2_goal_client.py        # Nav2 Action 客户端 + 评估触发 (~330 行)
-│   └── cmd_vel_bridge_node.py     # cmd_vel 桥接 + IK/FK + 里程计 (~350 行)
-├── scripts/
-│   ├── install.sh                 # FunASR 服务端一键安装
-│   └── start_service.sh           # FunASR 2pass WebSocket 服务启动
+│   ├── voice_control.py           # 语音关键词匹配 + 导航桥接
+│   ├── nav2_goal_client.py        # Nav2 Action 客户端 + 评估触发
+│   └── cmd_vel_bridge_node.py     # cmd_vel 桥接 + IK/FK + 里程计
+├── test/
+│   ├── test_voice_control.py      # 语音控制 pytest 测试
+│   ├── test_cmd_vel_bridge.py     # cmd_vel 桥接 pytest 测试（IK/FK/里程计）
+│   └── test_nav2_goal_client.py   # Nav2 Goal 客户端 pytest 测试
 └── README.md
 ```
 
@@ -413,12 +368,8 @@ robot_navigation/
 
 ### Python 包
 
-- `pyaudio` — 麦克风音频采集
-- `websockets` — FunASR WebSocket 通信
-
-### 系统依赖
-
-- FunASR 2pass 服务端（需单独部署）
+- `sherpa-onnx` — 本地语音识别（由 voice_asr_service 包提供）
+- `ibrobot_msgs` — 自定义消息/服务（SetHotwords 等）
 
 ## 故障排除
 
@@ -458,14 +409,17 @@ sudo usermod -a -G audio $USER
 # 重新登录后生效
 ```
 
-### FunASR 连接失败
+### 语音识别无输出
 
 ```bash
-# 检查 FunASR 服务器是否在运行
-netstat -an | grep 10086
+# 检查 voice_asr_node 是否在运行
+ros2 node list | grep voice
 
-# 检查客户端连接端口配置
-ros2 param get /funasr_client_node port
+# 检查 /voice_command 是否有数据
+ros2 topic echo /voice_command
+
+# 检查 voice_control 是否收到文本
+ros2 topic echo /rosout --filter "msg.name == 'voice_control'"
 ```
 
 ### 底盘无响应

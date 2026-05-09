@@ -2,7 +2,7 @@
 
 Generates:
 - nav2_goal_client: Nav2 goal action client
-- funasr_client_node: FunASR speech-to-text client for voice-controlled navigation
+- voice_control: bridges voice_asr_service (sherpa-onnx) to nav2_goal_client
 """
 
 import json
@@ -57,21 +57,17 @@ def generate_voice_nav_nodes(nav_config: dict[str, Any], use_sim: bool = False) 
         f"use_sim_time: {use_sim})"
     )
 
-    # FunASR client (when voice control enabled)
+    # Voice control (when voice control enabled)
     if robot_navigation_config.get("enable_voice_control", True):
-        funasr_node = _create_funasr_client_node(nav_config, robot_navigation_config)
-        if funasr_node:
-            nodes.append(funasr_node)
+        vc_node = _create_voice_control_node(nav_config, robot_navigation_config)
+        if vc_node:
+            nodes.append(vc_node)
 
     return nodes
 
 
-def _create_funasr_client_node(
-    nav_config: dict[str, Any],
-    robot_navigation_config: dict[str, Any],
-) -> Node:
-    """Create FunASR client node for voice recognition."""
-    # Resolve keywords file path
+def _resolve_keywords_json(robot_navigation_config: dict[str, Any]) -> str:
+    """Load keywords JSON from config file or parameter."""
     keywords_file = robot_navigation_config.get("keywords_file", "")
     if keywords_file:
         keywords_file = resolve_ros_path(keywords_file)
@@ -82,7 +78,6 @@ def _create_funasr_client_node(
         except Exception:
             keywords_file = ""
 
-    # Load keywords JSON
     keywords_json = "{}"
     if keywords_file:
         try:
@@ -91,37 +86,38 @@ def _create_funasr_client_node(
         except Exception as e:
             logger.warning(f"Failed to read keywords file: {e}")
 
+    return keywords_json
+
+
+def _create_voice_control_node(
+    nav_config: dict[str, Any],
+    robot_navigation_config: dict[str, Any],
+) -> Node:
+    """Create voice_control node for keyword matching and navigation bridging."""
+    keywords_json = _resolve_keywords_json(robot_navigation_config)
+
     # Extract destinations from config
     destinations = robot_navigation_config.get("destinations", {})
     destinations_json = json.dumps(destinations) if destinations else "{}"
 
-    # FunASR connection parameters
-    funasr_config = nav_config.get("funasr", {})
-    funasr_params = {
-        "host": funasr_config.get("host", "127.0.0.1"),
-        "port": funasr_config.get("port", "10095"),
-        "mode": funasr_config.get("mode", "2pass"),
-        "hotword_msg": funasr_config.get("hotword_msg", ""),
-        "keywords_json": keywords_json,
-        "destinations_json": destinations_json,
-        "global_frame": robot_navigation_config.get("global_frame", "map"),
-        "topic_text": "/voice_asr/text",
-        "topic_status": "/voice_asr/status",
+    # Get voice_asr config for output topic
+    voice_asr_config = nav_config.get("voice_asr", {})
+    topic_text = voice_asr_config.get("output_topic", "/voice_command")
+
+    bridge_params = {
+        "topic_text": topic_text,
         "topic_keyword_matched": "/voice_asr/keyword_matched",
         "topic_nav_stop": "/voice_asr/nav_stop",
+        "keywords_json": keywords_json,
+        "destinations_json": destinations_json,
     }
 
     node = Node(
         package="robot_navigation",
-        executable="funasr_client_node",
-        name="funasr_client_node",
+        executable="voice_control",
+        name="voice_control",
         output="screen",
-        parameters=[funasr_params],
+        parameters=[bridge_params],
     )
-    logger.info(
-        f"Added funasr_client_node "
-        f"(host: {funasr_params['host']}:{funasr_params['port']}, "
-        f"mode: {funasr_params['mode']}, "
-        f"{len(destinations)} destinations)"
-    )
+    logger.info(f"Added voice_control (sub: {topic_text}, {len(destinations)} destinations)")
     return node

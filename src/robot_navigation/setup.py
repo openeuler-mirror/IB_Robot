@@ -36,8 +36,8 @@ setup(
             "nav2_goal_client = robot_navigation.nav2_goal_client:main",
             # CmdVel Bridge (replaces chassis_driver for ros2_control path)
             "cmd_vel_bridge_node = robot_navigation.cmd_vel_bridge_node:main",
-            # FunASR Voice Recognition Client
-            "funasr_client_node = robot_navigation.funasr_client_node:main",
+            # Voice Control (bridges voice_asr_service to nav2_goal_client)
+            "voice_control = robot_navigation.voice_control:main",
         ],
     },
 )
