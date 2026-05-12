@@ -1,0 +1,16 @@
+string task_id
+string primitive_name
+string pose_name
+float32 relative_dx
+float32 relative_dy
+float32 relative_dz
+float32 gripper_position
+float32 timeout_sec
+---
+bool success
+string error_code
+string message
+string pose_name
+---
+string state
+string detail

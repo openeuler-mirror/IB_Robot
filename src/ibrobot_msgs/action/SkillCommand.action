@@ -1,0 +1,15 @@
+string task_id
+string skill_name
+string target_name
+string place_name
+string motion_direction
+float32 motion_distance
+float32 timeout_sec
+---
+bool success
+string error_code
+string message
+string[] executed_primitives
+---
+string state
+string detail

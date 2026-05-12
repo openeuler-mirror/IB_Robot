@@ -1,0 +1,11 @@
+string task_id
+string source
+string raw_command
+string task_type
+string target_name
+string place_name
+string motion_direction
+float32 motion_distance
+uint8 priority
+float32 timeout_sec
+string context_json

@@ -1,0 +1,12 @@
+string primitive_name
+string pose_name
+float32 relative_dx
+float32 relative_dy
+float32 relative_dz
+float32 target_x
+float32 target_y
+float32 target_z
+float32 gripper_position
+---
+bool allowed
+string reason

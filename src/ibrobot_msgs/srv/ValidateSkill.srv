@@ -1,0 +1,8 @@
+string skill_name
+string target_name
+string place_name
+string motion_direction
+float32 motion_distance
+---
+bool allowed
+string reason

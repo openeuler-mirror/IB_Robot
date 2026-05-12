@@ -1,0 +1,13 @@
+string request_id
+string source
+string session_id
+bool success
+string scene_summary
+string[] visible_objects
+string robot_state_summary
+string ee_pose_interpretation
+string[] risks
+float32 confidence
+string raw_response
+string error_code
+string message

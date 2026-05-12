@@ -22,13 +22,21 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VariantsList.msg"
   "msg/RobotStatus.msg"
   "msg/TaskStep.msg"
+  "msg/TaskCommand.msg"
+  "msg/TaskStatus.msg"
+  "msg/SceneAnalysisRequest.msg"
+  "msg/SceneAnalysisResult.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
   "action/ExecuteTaskPlan.action"
+  "action/SkillCommand.action"
+  "action/PrimitiveCommand.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
   "srv/MoveToPose.srv"
+  "srv/ValidateSkill.srv"
+  "srv/ValidatePrimitive.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs
 )
 
