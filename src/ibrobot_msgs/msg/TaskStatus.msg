@@ -1,5 +1,5 @@
 string task_id
-string state
+string state           # 状态：pending, running, completed, failed, cancelled
 bool success
 string current_skill
 string[] completed_skills

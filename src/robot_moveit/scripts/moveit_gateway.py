@@ -408,15 +408,25 @@ class MoveItGateway(Node):
         except Exception as e:
             self.get_logger().warning(f"Failed to transform to shoulder frame: {e}")
 
-        # 对orientation进行shoulder坐标系XZ平面投影，以适应5自由度机械臂的IK约束
+        self._move_with_strategies(msg.position, msg.orientation)
+
+    def _move_with_strategies(self, position, orientation_msg) -> bool:
+        """尝试多种 5-DOF 姿态策略 + 分层容差，直到 IK 成功。
+
+        被 cmd_pose_callback 和 _move_to_pose_service_cb 共同调用，
+        保证两条路径的 5-DOF 适配行为完全一致。
+
+        Returns:
+            True 表示某个策略成功，False 表示全部策略均失败。
+        """
         orig_quat = (
-            msg.orientation.x,
-            msg.orientation.y,
-            msg.orientation.z,
-            msg.orientation.w,
+            orientation_msg.x,
+            orientation_msg.y,
+            orientation_msg.z,
+            orientation_msg.w,
         )
 
-        # 检查是否为零四元数，如果是则使用默认姿态（无旋转）
+        # 零四元数保护
         if (
             abs(orig_quat[0]) < 1e-9
             and abs(orig_quat[1]) < 1e-9
@@ -426,7 +436,7 @@ class MoveItGateway(Node):
             self.get_logger().warning("Received zero quaternion, using default orientation (0, 0, 0, 1)")
             orig_quat = (0.0, 0.0, 0.0, 1.0)
 
-        # 尝试多种约束策略，从严格到宽松
+        # 5-DOF 姿态约束策略（从严格到宽松）
         strategies = [
             ("Gripper Z-axis constraint", self.constrain_to_z_axis_only(orig_quat)),
             (
@@ -435,7 +445,7 @@ class MoveItGateway(Node):
             ),
         ]
 
-        # Fallback: 尝试使用当前末端姿态（保持姿态不变，只改变位置）
+        # Fallback: 当前末端姿态（只改位置，保持现有姿态）
         try:
             trans = self.tf_buffer.lookup_transform(
                 self.base_link,
@@ -454,19 +464,18 @@ class MoveItGateway(Node):
             self.get_logger().warning(f"Failed to get current orientation: {e}")
             strategies.append(("Default orientation (no rotation)", (0.0, 0.0, 0.0, 1.0)))
 
-        # 定义分层容差策略（从严格到宽松）
+        # 分层容差策略（从严格到宽松）
         tolerance_strategies = [
-            ("Strict tolerance", (0.1, 0.1, 0.05)),  # 严格：X/Y约5.7°，Z约2.8°
-            ("Medium tolerance", (0.3, 0.3, 0.1)),  # 中等：X/Y约17°，Z约5.7°
-            ("Relaxed tolerance", (0.5, 0.5, 0.15)),  # 宽松：X/Y约28°，Z约8.6°
-            ("Z-axis only", (1.0, 1.0, 0.2)),  # 只约束Z轴：X/Y约57°（几乎不约束）
-            ("No constraints", None),  # 无姿态约束
+            ("Strict tolerance", (0.1, 0.1, 0.05)),  # X/Y ~5.7°, Z ~2.8°
+            ("Medium tolerance", (0.3, 0.3, 0.1)),  # X/Y ~17.2°, Z ~5.7°
+            ("Relaxed tolerance", (0.5, 0.5, 0.15)),  # X/Y ~28.6°, Z ~8.6°
+            ("Z-axis only", (1.0, 1.0, 0.2)),  # X/Y ~57.3°, Z ~11.5°
+            ("No constraints", None),
         ]
 
-        # 首先尝试使用约束后的姿态
         for strategy_name, quat in strategies:
             adjusted_pose = Pose()
-            adjusted_pose.position = msg.position
+            adjusted_pose.position = position
             adjusted_pose.orientation.x = quat[0]
             adjusted_pose.orientation.y = quat[1]
             adjusted_pose.orientation.z = quat[2]
@@ -478,16 +487,15 @@ class MoveItGateway(Node):
                 f"({quat[0]:.3f}, {quat[1]:.3f}, {quat[2]:.3f}, {quat[3]:.3f})"
             )
 
-            # 对每种姿态尝试分层容差
             for tol_name, tolerances in tolerance_strategies:
-                full_strategy = f"{strategy_name} + {tol_name}"
                 if self.solve_and_move(adjusted_pose, orientation_tolerance=tolerances):
-                    self.get_logger().info(f"IK succeeded with {full_strategy}")
-                    return
+                    self.get_logger().info(f"IK succeeded with {strategy_name} + {tol_name}")
+                    return True
                 else:
-                    self.get_logger().debug(f"  Failed with {tol_name}, trying next tolerance...")
+                    self.get_logger().debug(f"  Failed with {tol_name}, trying next...")
 
         self.get_logger().error("IK failed with all strategies!")
+        return False
 
     def publish_ee_pose(self):
         try:
@@ -528,9 +536,8 @@ class MoveItGateway(Node):
         self._publish_motion_status("executing")
 
         try:
-            # Use the existing cmd_pose pipeline (includes all 5DOF strategies)
-            # Reuse the full cmd_pose_callback logic via solve_and_move
-            success = self.solve_and_move(target)
+            # Apply the same 5-DOF orientation strategies as cmd_pose_callback
+            success = self._move_with_strategies(target.position, target.orientation)
             if success:
                 # Poll execution state instead of calling wait_until_executed(),
                 # which uses rclpy.spin_once() and deadlocks under MultiThreadedExecutor.
@@ -580,6 +587,9 @@ class MoveItGateway(Node):
             self._publish_motion_status("failed")
 
         response.execution_time_s = time.time() - t0
+        # Brief hold so external observers (e.g., task_dispatch) can read
+        # succeeded/failed before the status transitions back to idle.
+        time.sleep(0.3)
         self._publish_motion_status("idle")
         self.get_logger().info(
             f"[Service] MoveToPose result: success={response.success}, time={response.execution_time_s:.1f}s"

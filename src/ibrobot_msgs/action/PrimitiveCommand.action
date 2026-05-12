@@ -10,7 +10,7 @@ float32 timeout_sec
 bool success
 string error_code
 string message
-string pose_name
+string executed_pose_name  # 实际执行的位姿名称（对应 Goal 中请求的 pose_name）
 ---
 string state
 string detail

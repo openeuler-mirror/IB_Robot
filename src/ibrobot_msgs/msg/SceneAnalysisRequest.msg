@@ -1,5 +1,5 @@
 string request_id
-string source
+string source          # 请求来源：voice, text, vision, api
 string session_id
 string user_text
 string context_json
