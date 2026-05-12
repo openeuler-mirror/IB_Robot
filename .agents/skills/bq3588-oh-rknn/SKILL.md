@@ -12,7 +12,7 @@ Use `ibrobot-hdc` for transport, `ibrobot-bq3588hm-oh` for board facts, and this
 ## Verified Launch Target
 
 - Board: Bearkey BQ3588HM
-- Transport: `hdc -t 192.168.136.111:8710`
+- Transport: `hdc -t <board-ip>:8710` (example form; ask the user for the actual target)
 - Deployed install root: `/data/ibrobot/install`
 - Deployed policy path: `/data/ibrobot/models/502000/pretrained_model`
 - RKNN model file: `/data/ibrobot/models/502000/pretrained_model/model.rknn`
@@ -45,12 +45,17 @@ When the board needs to be prepared from scratch, the verified deployment flow i
 Typical host-side transfer pattern:
 
 ```bash
-hdc -t 192.168.136.111:8710 file send ibrobot-oh-install.tar.gz /data/ibrobot-oh-install.tar.gz
-hdc -t 192.168.136.111:8710 file send ibrobot-models-502000.tar.gz /data/ibrobot-models-502000.tar.gz
-hdc -t 192.168.136.111:8710 shell 'mkdir -p /data/ibrobot && tar -zxpf /data/ibrobot-oh-install.tar.gz -C /data/ibrobot && tar -zxpf /data/ibrobot-models-502000.tar.gz -C /data/ibrobot'
+HDC_TARGET=<board-ip>:8710
+hdc -t "$HDC_TARGET" file send ibrobot-oh-install.tar.gz /data/ibrobot-oh-install.tar.gz
+hdc -t "$HDC_TARGET" file send ibrobot-models-502000.tar.gz /data/ibrobot-models-502000.tar.gz
+hdc -t "$HDC_TARGET" shell 'mkdir -p /data/ibrobot && tar -zxpf /data/ibrobot-oh-install.tar.gz -C /data/ibrobot && tar -zxpf /data/ibrobot-models-502000.tar.gz -C /data/ibrobot'
 ```
 
 If `skh-run` is missing, deploy that runtime payload before launch as well.
+
+Before using this skill, ask the user for the actual TCP target IP or confirm that USB HDC will be
+used directly. Do not assume a fixed board IP. Prefer TCP, but if TCP is not enabled yet, first
+use USB HDC to run `hdc tmode port 8710`, then switch to `hdc tconn <board-ip>:8710`.
 
 ## Why a Dedicated Skill Is Needed
 

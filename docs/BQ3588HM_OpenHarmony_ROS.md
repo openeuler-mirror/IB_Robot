@@ -21,6 +21,22 @@
 > 说明：下面的下载项、目录约定和交叉编译流程，都是在官方文档基础上，结合本仓库的
 > `scripts/openharmony/build_ibrobot_oh_custom.sh` 做的 IB_Robot 化整理。
 
+## 缺少前置条件时先看哪里
+
+- **如果主机侧没有可用的 `hdc`**：
+  - 先看 `docs/BQ3588HM_board_usage.md` → **第一阶段：HDC 调试工具准备**
+  - 再看本文 **1.4 OpenHarmony ROS SDK**
+- **如果主机侧没有预设 `OH_ROOT` / `OH_DOWNLOAD_ROOT` / `OH_CUSTOM_ROOT`**：
+  - 先看本文 **第 2 节：统一放到一个外部目录**
+  - 再看本文 **第 4 节：`build_ibrobot_oh_custom.sh` 里的变量到底对应什么**
+
+如果这些变量在当前 shell 里不存在，不要让自动化工具猜目录；请先按本文整理目录并导出
+`OH_ROOT`，或者在脚本里显式传 `--root`、`--sdk-tar`、`--sysdeps-tar`、`--humble-tar`。
+
+对于 `hdc`，也推荐不要在脚本里写死某个用户私有绝对路径；更稳妥的做法是先把 SDK 的
+`toolchains` 目录导出到 `PATH`，并把这条导出写入 `~/.bashrc` 或 `~/.zshrc`，之后直接
+使用 `hdc` 命令。
+
 ## 1. 需要准备的下载内容
 
 对于 BQ3588HM（`aarch64`）场景，建议至少准备下面四类文件：
@@ -105,6 +121,10 @@ export OH_DOWNLOAD_ROOT="$OH_ROOT/downloads"
 OH_DOWNLOAD_ROOT = $OH_ROOT/downloads
 OH_CUSTOM_ROOT   = $OH_ROOT/custom_build_root
 ```
+
+这里的 `OH_ROOT` / `OH_DOWNLOAD_ROOT` / `OH_CUSTOM_ROOT` 都是**主机侧交叉编译变量**，
+不是开发板上的环境变量。如果当前 shell 里没有这些变量，这通常是正常的；请先按本节准备
+目录布局并自行导出，或者在调用脚本时改用显式参数，不要依赖“自动猜测主机目录”。
 
 ## 3. 板端安装 OpenHarmony ROS 2 Humble
 

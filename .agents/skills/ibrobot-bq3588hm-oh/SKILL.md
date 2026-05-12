@@ -12,9 +12,9 @@ Use `ibrobot-hdc` for connectivity and file transfer. Use this skill for board-l
 ## Current Verified Board State
 
 - Board: Bearkey BQ3588HM
-- OpenHarmony access path: HDC over TCP to `192.168.136.111:8710`
+- OpenHarmony access path: user-provided HDC target, preferably TCP `<board-ip>:8710`, with USB
+  HDC also supported as a direct transport
 - HDC binary available in `$PATH` as `hdc`
-- Host-side SDK path currently used in this repo: `/home/xqw/Research/oh_sdk/toolchains/hdc`
 - Official runtime archives currently on the board:
   - `/data/ohos-humble-build-aarch64-20260115100449.tar.gz`
   - `/data/ohos-18-sysdeps-aarch64-20260115.tar.gz`
@@ -37,6 +37,14 @@ Use `ibrobot-hdc` for connectivity and file transfer. Use this skill for board-l
   - `/usr/lib/librknnrt.so`
 
 ## RKNN Runtime Preparation Checklist
+
+Before using this skill for live board interaction, first confirm transport with the user:
+
+1. preferred: TCP target `<board-ip>:8710`
+2. alternative: USB HDC connected and used directly
+
+Do not assume a fixed board IP. If the user wants TCP but it has not been enabled yet, first use
+USB HDC to run `hdc tmode port 8710`, then reconnect via `hdc tconn <board-ip>:8710`.
 
 Before trying to launch IB_Robot with `device:=rknn`, confirm all of the following are present:
 
