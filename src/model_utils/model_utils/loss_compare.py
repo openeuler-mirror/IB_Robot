@@ -7,12 +7,11 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
-from tqdm import tqdm
-
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference
 from lerobot.utils.control_utils import predict_action
 from lerobot.utils.utils import get_safe_torch_device
+from tqdm import tqdm
 
 
 class LossUtils:
@@ -55,7 +54,7 @@ class LossUtils:
             arr_cos.append(cos)
 
         # Print summary table (unnormalized / physical action space)
-        print(f"\n=== Unnormalized action space (post-postprocessor) ===")
+        print("\n=== Unnormalized action space (post-postprocessor) ===")
         print(f"{'Batch':>6} {'L1 Loss':>12} {'Cosine Sim':>12}")
         print("-" * 32)
         for i in range(len(arr_l1)):
@@ -82,14 +81,18 @@ class LossUtils:
         raw_preds = getattr(self, "_raw_preds", None)
         raw_targets_path = getattr(self.args, "raw_target_path", None)
 
-        if raw_preds is not None and raw_targets_path and os.path.exists(raw_targets_path):
+        # Read raw targets once and reuse in both the normalized-space comparison
+        # and the PI05 distributional evaluation below.
+        raw_targets_data = None
+        if raw_targets_path and os.path.exists(raw_targets_path):
             with open(raw_targets_path, encoding="utf-8") as f:
-                raw_targets = json.load(f)
-            raw_targets = [torch.tensor(t) for t in raw_targets]
+                raw_targets_data = [torch.tensor(t) for t in json.load(f)]
+
+        if raw_preds is not None and raw_targets_data is not None:
+            raw_targets = raw_targets_data
 
             if len(raw_targets) != len(raw_preds):
-                print(f"WARN: raw target/pred length mismatch: "
-                      f"{len(raw_targets)} vs {len(raw_preds)}; skipping raw L1")
+                print(f"WARN: raw target/pred length mismatch: {len(raw_targets)} vs {len(raw_preds)}; skipping raw L1")
             else:
                 arr_raw_l1 = []
                 arr_raw_cos = []
@@ -97,43 +100,51 @@ class LossUtils:
                     rp = raw_preds[i].detach().cpu().float()
                     rt = raw_targets[i].float()
                     if rp.shape != rt.shape:
-                        print(f"WARN: raw shape mismatch on batch {i}: "
-                              f"pred={tuple(rp.shape)} target={tuple(rt.shape)}")
+                        print(f"WARN: raw shape mismatch on batch {i}: pred={tuple(rp.shape)} target={tuple(rt.shape)}")
                         continue
                     arr_raw_l1.append(torch.nn.functional.l1_loss(rp, rt, reduction="mean").item())
-                    arr_raw_cos.append(torch.nn.functional.cosine_similarity(
-                        rp.flatten().unsqueeze(0), rt.flatten().unsqueeze(0)
-                    ).item())
+                    arr_raw_cos.append(
+                        torch.nn.functional.cosine_similarity(
+                            rp.flatten().unsqueeze(0), rt.flatten().unsqueeze(0)
+                        ).item()
+                    )
 
                 if arr_raw_l1:
-                    print(f"\n=== Normalized action space (pre-postprocessor) ===")
+                    print("\n=== Normalized action space (pre-postprocessor) ===")
                     print(f"{'Batch':>6} {'raw L1':>12} {'raw Cos':>12}")
                     print("-" * 32)
                     for i in range(len(arr_raw_l1)):
                         print(f"{i:>6} {arr_raw_l1[i]:>12.6f} {arr_raw_cos[i]:>12.6f}")
                     print("-" * 32)
                     if self.args.policy_type == "pi05":
-                        print(f"{'Avg':>6} {sum(arr_raw_l1)/len(arr_raw_l1):>12.6f} "
-                              f"{'(see dist eval)':>15}")
+                        print(f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} {'(see dist eval)':>15}")
                     else:
-                        print(f"{'Avg':>6} {sum(arr_raw_l1)/len(arr_raw_l1):>12.6f} "
-                              f"{sum(arr_raw_cos)/len(arr_raw_cos):>12.6f}")
-        elif raw_preds is not None and raw_targets_path:
-            print(f"\nNOTE: raw target file not found at {raw_targets_path}; "
-                  f"run --generate-target with --raw-target-path to create it.")
+                        print(
+                            f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} "
+                            f"{sum(arr_raw_cos) / len(arr_raw_cos):>12.6f}"
+                        )
+        elif raw_preds is not None and raw_targets_path and not os.path.exists(raw_targets_path):
+            print(
+                f"\nNOTE: raw target file not found at {raw_targets_path}; "
+                f"run --generate-target with --raw-target-path to create it."
+            )
 
         # Diagnostic dump for batch 0 — physical-space numbers so you can judge
         # whether the unnormalized L1 is "small" (e.g. mm in cartesian) or
         # "large" (e.g. radians in joint space).
         if len(preds) > 0 and len(targets) > 0:
             p, t = preds[0], targets[0]
-            print(f"\n=== batch 0 diagnostic (unnormalized) ===")
+            print("\n=== batch 0 diagnostic (unnormalized) ===")
             print(f"  pred   shape : {tuple(p.shape)}  dtype={p.dtype}")
             print(f"  target shape : {tuple(t.shape)}  dtype={t.dtype}")
-            print(f"  pred   range : [{p.min().item():+.4f}, {p.max().item():+.4f}]  "
-                  f"mean={p.mean().item():+.4f}  std={p.std().item():.4f}")
-            print(f"  target range : [{t.min().item():+.4f}, {t.max().item():+.4f}]  "
-                  f"mean={t.mean().item():+.4f}  std={t.std().item():.4f}")
+            print(
+                f"  pred   range : [{p.min().item():+.4f}, {p.max().item():+.4f}]  "
+                f"mean={p.mean().item():+.4f}  std={p.std().item():.4f}"
+            )
+            print(
+                f"  target range : [{t.min().item():+.4f}, {t.max().item():+.4f}]  "
+                f"mean={t.mean().item():+.4f}  std={t.std().item():.4f}"
+            )
             diff = (p - t).abs()
             if diff.ndim >= 2:
                 # Per-action-dim stats (last axis is action_dim)
@@ -145,23 +156,18 @@ class LossUtils:
                 print(f"  per-dim L1   : {per_dim_l1.cpu().numpy()}")
                 print(f"  per-dim Linf : {per_dim_max.cpu().numpy()}")
                 np.set_printoptions(**_old_np_opts)
-            print(f"  pred   first row: {p.flatten()[:p.shape[-1]].cpu().numpy()}")
-            print(f"  target first row: {t.flatten()[:t.shape[-1]].cpu().numpy()}")
+            print(f"  pred   first row: {p.flatten()[: p.shape[-1]].cpu().numpy()}")
+            print(f"  target first row: {t.flatten()[: t.shape[-1]].cpu().numpy()}")
 
         # ------------------------------------------------------------------
         # PI05 only: replace the meaningless per-sample cosine summary with
         # chaos-robust distributional metrics (see pi05_dist_metrics.py).
         # ------------------------------------------------------------------
         if self.args.policy_type == "pi05":
-            import sys
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from pi05_dist_metrics import evaluate_pi05  # type: ignore[import-not-found]
+            from model_utils.pi05_dist_metrics import evaluate_pi05
 
             raw_preds_list = getattr(self, "_raw_preds", None)
-            raw_targets_list = None
-            if raw_preds_list is not None and raw_targets_path and os.path.exists(raw_targets_path):
-                with open(raw_targets_path, encoding="utf-8") as f:
-                    raw_targets_list = [torch.tensor(t) for t in json.load(f)]
+            raw_targets_list = raw_targets_data
             evaluate_pi05(
                 preds=preds,
                 targets=targets,
@@ -206,6 +212,16 @@ class LossUtils:
             print(f"  Running PT policy in dtype={sample_param.dtype}")
         except (StopIteration, AttributeError):
             pass
+
+        # CRITICAL: switch to eval mode.  Without this, LoRA's default
+        # dropout=0.1 stays active and randomises every forward pass
+        # (independent of seed) — the resulting KV jitter feeds into
+        # PI05's flow-matching ODE which is chaotic, so the 10-step
+        # trajectory diverges to ~zero correlation with the OM's
+        # deterministic output (observed: raw cos ≈ -0.04).
+        # ``predict_action_chunk`` deliberately does NOT call self.eval()
+        # (would break ONNX export on 310p), so the caller MUST do it.
+        policy.eval()
 
         print(f"model loaded: {policy_path}")
         return policy
@@ -283,9 +299,7 @@ class LossUtils:
                 if self.args.generate_target:
                     cfg = self.policy.config
                     noise_shape = (1, cfg.chunk_size, cfg.max_action_dim)
-                    noise = torch.normal(
-                        mean=0.0, std=1.0, size=noise_shape, dtype=torch.float32
-                    )
+                    noise = torch.normal(mean=0.0, std=1.0, size=noise_shape, dtype=torch.float32)
                     os.makedirs(self.args.noise_dir, exist_ok=True)
                     np.save(noise_path, noise.numpy())
                 else:
@@ -307,18 +321,15 @@ class LossUtils:
                 use_amp = self.policy.config.use_amp
                 with (
                     torch.inference_mode(),
-                    torch.autocast(device_type=device.type)
-                        if device.type == "cuda" and use_amp else nullcontext(),
+                    torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
                 ):
-                    obs = prepare_observation_for_inference(
-                        dict(batches[i]), device, None, None
-                    )
+                    obs = prepare_observation_for_inference(dict(batches[i]), device, None, None)
                     obs = preprocessor(obs)
                     chunk = self.policy.predict_action_chunk(obs)  # (1, T, D)
-                    output = postprocessor(chunk)                  # (1, T, D)
+                    output = postprocessor(chunk)  # (1, T, D)
                 # Strip leading batch dim (== 1) for storage symmetry with
                 # the act path which returns (D,) after predict_action.
-                output = output.squeeze(0).detach().cpu()           # (T, D)
+                output = output.squeeze(0).detach().cpu()  # (T, D)
             else:
                 output = predict_action(
                     observation=batches[i],
@@ -369,41 +380,47 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Model Loss Comparison")
     parser.add_argument("--batch_path", type=str, required=True, help="Path to input batches json file")
     parser.add_argument("--target_path", type=str, required=True, help="Path to save target json file")
-    parser.add_argument(
-        "--policy_path", type=str, required=True, help="Path to pretrained policy model directory"
-    )
+    parser.add_argument("--policy_path", type=str, required=True, help="Path to pretrained policy model directory")
     parser.add_argument(
         "--policy_type", type=str, default="act", help="Type of policy model (e.g. act, diffuser, ddpg)"
     )
     parser.add_argument(
-        "--model_dtype", type=str, default="native",
+        "--model_dtype",
+        type=str,
+        default="native",
         choices=["native", "fp16", "bf16", "fp32"],
         help="Cast PT model to this dtype before forward. "
-             "'native' (default) keeps the checkpoint dtype "
-             "(BF16 for PI05). Use 'fp16' for apples-to-apples "
-             "comparison with OM/ORT deployment.",
+        "'native' (default) keeps the checkpoint dtype "
+        "(BF16 for PI05). Use 'fp16' for apples-to-apples "
+        "comparison with OM/ORT deployment.",
     )
     parser.add_argument(
         "--generate-target", action="store_true", help="Reading batches and generating target json file"
     )
     parser.add_argument(
-        "--seed", type=int, default=42,
+        "--seed",
+        type=int,
+        default=42,
         help="Random seed for deterministic inference (fixes diffusion noise).",
     )
     parser.add_argument(
-        "--noise-dir", type=str, default=None,
+        "--noise-dir",
+        type=str,
+        default=None,
         help="Directory for noise file transfer (Scheme C). "
-             "generate-target: saves noise_{NNNN}.npy files here. "
-             "compute-loss: loads noise files from here to ensure identical "
-             "noise across GPU (PyTorch) and NPU (OM) machines.",
+        "generate-target: saves noise_{NNNN}.npy files here. "
+        "compute-loss: loads noise files from here to ensure identical "
+        "noise across GPU (PyTorch) and NPU (OM) machines.",
     )
     parser.add_argument(
-        "--raw-target-path", type=str, default=None,
+        "--raw-target-path",
+        type=str,
+        default=None,
         help="Optional path to dump/read normalized-space (pre-postprocessor) "
-             "actions. generate-target: writes raw target JSON next to the "
-             "regular target. compute-loss: reads it and prints an extra L1 / "
-             "Cosine table in normalized action space — useful for separating "
-             "real model drift from unnormalization scale-up.",
+        "actions. generate-target: writes raw target JSON next to the "
+        "regular target. compute-loss: reads it and prints an extra L1 / "
+        "Cosine table in normalized action space — useful for separating "
+        "real model drift from unnormalization scale-up.",
     )
     return parser.parse_args()
 
