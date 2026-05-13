@@ -50,28 +50,35 @@ upstream  git@atomgit.com:openEuler/IB_Robot.git (push)
 
 ### 创建 PR (推荐 Agent 方式)
 
-Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler/IB_Robot/pull/32) 的极高专业水准。描述文件应采用以下深度结构，并优先使用 **Mermaid 图表** 来解释复杂的逻辑或架构。
+Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler/IB_Robot/pull/32) 的极高专业水准。描述文件应围绕本次提交真正的审阅重点组织内容；复杂流程或架构变化优先使用 **Mermaid 图表**，简单或纯文档类变更不要机械套用重型模板。
 
 **PR 描述强制要求：**
 
 1.  **Markdown 渲染质量**: **必须**确保所有的 Markdown 语法（包括标题、加粗、列表、代码块、Mermaid 图表）都能被正确渲染。避免直接在 shell 命令中使用未处理的换行符。
 2.  **超链接使用**: 对相关的 Issue、PR、技术规范或设计文档，**必须**使用 Markdown 超链接进行关联（如 `[PR #32](https://atomgit.com/openeuler/IB_Robot/pull/32)`），以方便审阅者查阅背景。
 3.  **深度结构化内容**:
-    *   **Background & Motivation (背景与动机)**: 详细说明问题的根源、业务痛点或功能需求。
-    *   **Proposed Solution (方案概述)**: 描述解决思路、架构设计决策。如果涉及流程，**必须使用 Mermaid 流程图或时序图**。
-    *   **Technical Changes (技术细节)**: 按模块拆解代码级变更，解释关键类、函数或配置的逻辑。
-    *   **Impact Assessment (影响范围)**: 评估变更对系统其他部分、现有 API 或性能的潜在影响。
-    *   **Verification (验证结果)**: 
-        *   **Environment**: 测试环境配置。
-        *   **Command**: 具体的运行命令（如 `ros2 launch ...`）。
-        *   **Results**: 截图描述或输出日志片段，证明功能符合预期且无回归风险。
+    *   **按提交内容动态组织**: 不要机械要求每个 PR 都包含同一组标题。围绕 commit 真正的变化点组织内容，确保审阅者快速看到最重要的信息。
+    *   **Background & Motivation (背景与动机)**: 说明问题根源、业务痛点或需求背景；简单修复可简写，但不要省略必要上下文。
+    *   **Proposed Solution (方案概述)**: 描述解决思路、关键设计决策。只有在流程、状态转换或架构关系较复杂时，才使用 Mermaid 流程图或时序图；不要为了凑模板硬加图。
+    *   **Technical Changes (技术细节)**: 按模块拆解代码、配置、脚本或文档层面的关键变更，解释为什么这样改。
+    *   **README / 文档联动**: 如果提交改变了用户可见的安装、构建、运行、依赖、接口、配置或使用方式，应同步更新对应 README / 使用文档；如果判断不需要改文档，也应基于变更内容做出明确判断，而不是机械忽略。
+    *   **Impact Assessment (影响范围)**: 仅在确有影响时说明对系统行为、接口、依赖、性能、部署或使用方式的影响；无明显影响时可简洁说明。
+    *   **Verification (验证结果，条件性章节)**:
+        *   只有当本次 PR 做过**真实验证**且该验证对审阅结论有价值时才写。
+        *   必须写清楚 **Scenario（什么场景下验证）**、**Method（如何验证，可含命令）**、**Result（验证结果是什么）**。
+        *   禁止把 `git diff`、`git status`、文件列表这类仅用于查看变更的命令当作 Verification。
+        *   对纯文档、注释、gitignore、纯元数据等**不涉及运行时行为**的提交，可以省略 Verification，而不是生硬补一个无意义小节。
+        *   如果 PR 修改了 `package.xml` 的依赖声明，或修改了 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、`CMakeLists.txt`、`setup.py`、`pyproject.toml` 等），则 Verification **必须提供**，且必须包含基于 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 的双平台纯净 Docker `setup.sh + build.sh` 完整验证结果。
 
 ```bash
-# 1. 获取变更信息
+# 1. 获取变更信息（仅用于分析变更，不可直接当作 Verification）
 git diff upstream/master..HEAD
 
 # 2. Agent 深度分析并生成专业描述文件 pr_description.md
-# 必须包含上述 5 个部分，并包含 Mermaid 图。
+# 根据 commit 内容选择合适章节；仅在做过真实验证时包含 Verification。
+# Mermaid 仅用于能显著提升理解的复杂流程或架构变更。
+# 如果变更影响用户使用方式，要判断并同步 README / 使用文档。
+# 如果变更触发依赖或 setup/build 门禁，必须补齐 Ubuntu + openEuler 双平台 Docker Verification。
 
 # 3. 创建 PR
 python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "feat(scope): technical summary" --description-file pr_description.md
@@ -83,8 +90,10 @@ python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "f
 # 步骤1: 获取 fork owner
 git remote -v
 
-# 步骤2: 创建 PR (必须包含 Summary/Changes/Verification 三大核心板块)
-python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "fix: specific issue" --body "## Background\n...\n## Changes\n...\n## Verification\n..."
+# 步骤2: 创建 PR（章节按实际变更组织；Verification 仅在存在真实验证时提供）
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "fix: specific issue" --body "## Background\n...\n## Changes\n...\n## Impact\n..."
+
+# 如果本次变更做过真实验证，再补充 Verification 小节，写清场景 / 方法 / 结果
 
 # 跨仓库：直接指定目标仓库
 python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --owner some-org --repo some-repo --body "..."
@@ -166,12 +175,16 @@ python3 pr_creation.py --branch feat/new-feature --fork-owner BreezeWu --title "
 
 ## PR 描述格式
 
-PR 描述会自动包含：
+PR 描述通常应包含与本次提交最相关的内容，而不是固定模板。常见章节包括：
 
-- **Summary**: 变更概述
-- **Changes**: 详细变更列表
-- **Testing**: 测试说明
-- **Checklist**: 检查项
+- **Background / Motivation**：为什么要改
+- **Proposed Solution / Technical Changes**：改了什么、为什么这样改
+- **README / Docs Updates**：用户可见使用方式变更时，说明同步更新了哪些文档；若无需更新，也应基于变更内容判断
+- **Impact Assessment**：影响范围与风险
+- **Verification（可选）**：仅在存在真实验证时写清场景、方法与结果
+
+对于纯文档、注释、`.gitignore`、说明文字等不涉及运行时行为的 PR，可以不写 Verification。
+但若变更涉及 `package.xml` 依赖声明或 setup/build 流程，Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。
 
 ## 注意事项
 

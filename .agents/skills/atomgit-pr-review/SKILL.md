@@ -17,6 +17,30 @@ license: MIT
 
 当用户的目标是“**review 一个 PR / 帮我看看这个 PR 有没有问题**”时，优先使用本 skill。**不需要**先切到 `atomgit-pr` 获取上下文；本 skill 的提取模式默认就会带出 PR 现有评论。
 
+## IB_Robot 专项审查要求
+
+### 1. README / 文档联动检查（按变更内容决定）
+
+- review 时必须判断本次提交是否改变了**用户可见**的使用方式，而不是机械地要求所有 PR 都改 README。
+- 当 PR 修改了以下内容之一时，应检查对应 README / 使用文档是否需要同步更新：
+  - 安装、部署、启动、构建、配置、依赖声明或运行步骤
+  - 对外暴露的命令、接口、参数、launch 用法、目录约定
+  - 会影响用户接入、复现、验证或排障的方法
+- 如果变更只涉及内部重构、实现细节、无用户感知的代码整理，则不应为了凑要求而强行提出 README 修改意见。
+- 如果判断“应该改 README / 文档但没有改”，应将其作为有效 review issue 提出。
+
+### 2. 依赖 / setup / build 变更的 Verification 强制门禁
+
+- 如果 PR 修改了 `package.xml`（尤其是新增/删除/调整 `exec_depend`、`build_depend`、`depend`、`test_depend` 等依赖声明），或修改了 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、`CMakeLists.txt`、`setup.py`、`pyproject.toml` 等），则 **PR 描述中的 Verification 不再是可选项，而是必填项**。
+- 该 Verification 必须体现**真实执行过的验证**，并明确写出：
+  - **Scenario**：在哪类干净环境中验证
+  - **Method**：如何执行 setup 和 build
+  - **Result**：setup / build 是否成功、是否有关键限制或失败点
+- 对此类 PR，review 过程中**必须调用**：
+  - `ibrobot-docker-verify`：在全新 Ubuntu 22.04 Docker 中完整验证 `setup.sh` + `build.sh`
+  - `ibrobot-docker-verify-oee`：在全新 openEuler Embedded Docker 中完整验证 `setup.sh` + `build.sh`
+- 如果缺少任一平台验证，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**。
+
 ## ⚠️ 环境准备
 
 **必须先加载环境变量**：
@@ -81,6 +105,7 @@ python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json 
 - 在步骤3，你必须将审查结果展示给人类确认后再提交
 - **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `claude-sonnet-4`、`gpt-4`、`gemini-pro`）
 - 文件名格式：`./tmp/{repo}_pr_{number}_issues.json`（例如：`./tmp/ib_robot_pr_123_issues.json`）
+- 进行 IB_Robot PR review 时，除代码问题外，还要检查 README / 文档是否应随变更同步，以及 PR 描述中的 Verification 是否满足专项门禁
 
 ## API 说明
 
@@ -128,6 +153,7 @@ python3 pr_review.py --pr 123
 - **不需要** `git fetch` 或 `git diff`
 - **不需要** 切换分支或修改本地代码
 - 直接读取 JSON 文件中的 `changed_files`、`commits` 和 `comments` 进行审查即可
+- 审查时要结合变更文件判断是否需要 README / 文档联动，以及是否触发双平台 Docker Verification 门禁
 - 如果需要“回复某一条已有 review 意见”而不是提交新的审查结果，请切换到 `atomgit-review-resolution`，使用 `--reply-comment <comment_id>`；不要在本 skill 中伪造普通 PR 级评论。
 
 ### 提交审查结果
@@ -215,5 +241,7 @@ python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json 
 - `atomgit-pr`: 创建 PR、同步标题/描述、获取 PR 管理上下文；**不负责**通用 review 判定
 - `atomgit-review-resolution`: 处理检视意见
 - `atomgit-pr-architecture-review`: 架构审查
+- `ibrobot-docker-verify`: Ubuntu 22.04 纯净容器 setup/build 验证
+- `ibrobot-docker-verify-oee`: openEuler Embedded 纯净容器 setup/build 验证
 
 > **注意**: `atomgit-pr-architecture-review` 仍然是 **IB_Robot 专用** 的架构规范审查，不会随着本 skill 一起泛化到其他仓库。
