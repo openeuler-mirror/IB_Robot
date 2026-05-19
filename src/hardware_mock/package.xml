@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>hardware_mock</name>
+  <version>0.1.0</version>
+  <description>
+    Contract-driven mock for IB-Robot end-to-end inference pipelines.
+    Publishes observations and subscribes to actions declared in
+    robot_config YAML, with no real hardware required.
+  </description>
+  <maintainer email="dev@ib-robot.local">IB-Robot Maintainers</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>robot_config</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
