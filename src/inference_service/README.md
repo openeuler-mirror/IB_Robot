@@ -186,44 +186,208 @@ ros2 launch inference_service cloud_inference.launch.py \
 同时要求实际的 RKNN 模型文件随 policy 一起纳管到 `policy_path` 目录内，
 默认文件名为 `model.rknn`。
 
-### 编译模型后端边界
+### 编译模型后端的 Wrapper 设计
 
-`PureInferenceEngine` 仍然只依赖统一的 `PolicyWrapper` 接口。对
-`device:=ascend_om`、`device:=ascend_om_3403` 和 `device:=rknn`，内部会使用
-`CompiledPolicyWrapper` 门面：
+无论使用 PyTorch、Ascend OM 还是 RKNN，`inference_service` 对上层暴露的统一入口始终是
+`PureInferenceEngine`。它内部通过 `PolicyWrapper` 抽象屏蔽不同运行时后端的差异，统一接口为：
 
-- `ACTCompiledAdapter` 和 `PI05CompiledAdapter` 读取 `config.json` 的 `type`、
-  `input_features` 和 `output_features`，负责模型族输入顺序、图像/语言输入、
-  action chunk 解码、`policy_type` 和 chunk-size 语义。
-- `OMRuntimeSession`、`PI05OMRuntimeSession`、`SD3403RuntimeSession` 和
-  `RKNNRuntimeSession` 只负责后端 artifact 解析、运行时加载、执行和资源释放。
-- `policy_type` 表示模型族，例如 `act`；`backend_type` 表示实际运行后端，
-  例如 `ascend_om`、`ascend_om_3403` 或 `rknn`。
+1. `load(path, device)`：加载模型与运行时资源。
+2. `infer(batch)`：对一批已经完成前处理的 Tensor 执行推理。
+3. `get_chunk_size()`：返回动作 chunk 大小。
+4. `policy_type`：返回当前策略类型标识（如 `"act"`、`"pi05"`）。
+5. `backend_type`：返回运行时后端标识（如 `"cuda"`、`"ascend_om"`、`"rknn"`）。
+6. `uses_action_chunking`：当前策略是否使用 action chunk 输出。
 
-编译产物推荐由转换工具在模型目录内生成独立的 `config.om.json`，避免污染
-LeRobot 原生 `config.json`。该文件用 role 到 path 的 map 描述 artifact，并可用
-`execution` 显式声明通用串行 pipeline 的执行顺序：
+这意味着：
+
+1. 前处理和后处理组件不需要感知底层是 PyTorch、ACL 还是 RKNN Lite。
+2. 分布式与单机模式只改变部署位置，不改变 wrapper 设计。
+3. 真正的后端差异被收敛到 `PolicyWrapper` 的实现中。
+
+#### PyTorch 路径：LeRobotPolicyWrapper
+
+常规 `device:=cuda/cpu/npu` 路径使用 `LeRobotPolicyWrapper`。
+
+它的工作方式最接近上游 LeRobot：
+
+1. 从 `policy_path/config.json` 识别 `type`。
+2. 通过 `lerobot.policies.factory.get_policy_class()` 获取对应策略类。
+3. 调用 `from_pretrained(path)` 加载权重。
+4. 根据策略类型调用 `predict_action_chunk()` 或 `select_action()`。
+
+在这条路径里，策略对象本身保留了输入输出语义，因此 wrapper 只是一个很薄的适配层。
+
+#### 编译模型路径：CompiledPolicyWrapper + Adapter + RuntimeSession
+
+`device:=ascend_om`、`device:=ascend_om_3403` 和 `device:=rknn` 均走编译模型路径。
+它们共享同一个 `CompiledPolicyWrapper` 基类，通过 **组合模式** 将后端差异拆解为两个正交维度：
+
+```
+CompiledPolicyWrapper (PolicyWrapper)
+  ├── CompiledModelAdapter (Protocol)  ← 模型语义适配：输入准备、输出解码
+  └── RuntimeSession (Protocol)        ← 硬件运行时：加载、执行、释放
+```
+
+- **CompiledModelAdapter** 负责把 `dict[str, Tensor]` 转为后端可消费的输入格式，
+  并把原始输出恢复为动作 Tensor。当前实现包括 `ACTCompiledAdapter`（ACT 家族）和
+  `PI05CompiledAdapter`（Pi0.5），通过 `ADAPTER_REGISTRY` 按 `config.json` 的 `type` 字段派发。
+- **RuntimeSession** 只负责硬件 artifact 的加载、执行与资源释放。当前实现包括
+  `OMRuntimeSession`（通用 ACL OM）、`PI05OMRuntimeSession`（Pi0.5 VLM+AE 联合推理）、
+  `SD3403RuntimeSession`（SD3403 板卡 worker）和 `RKNNRuntimeSession`（RKNN Lite），
+  通过 `create_runtime_session()` 按 backend 名称和模型类型派发。
+
+推理流程统一为三步：`adapter.prepare_inputs(batch)` → `session.execute(inputs)` →
+`adapter.decode_outputs(outputs, device)`。
+
+外层门面类只负责传入 backend 名称：
+
+| 门面类 | backend | Adapter | RuntimeSession |
+|--------|---------|---------|----------------|
+| `AscendOMPolicyWrapper` | `ascend_om` | ACT: `ACTCompiledAdapter` / PI0.5: `PI05CompiledAdapter` | ACT: `OMRuntimeSession` / PI0.5: `PI05OMRuntimeSession` |
+| `AscendOM3403PolicyWrapper` | `ascend_om_3403` | `ACTCompiledAdapter` | `SD3403RuntimeSession` |
+| `AscendOMPi05PolicyWrapper` | `ascend_om` (Pi0.5) | `PI05CompiledAdapter` | `PI05OMRuntimeSession` |
+| `RKNNPolicyWrapper` | `rknn` | `ACTCompiledAdapter` | `RKNNRuntimeSession` |
+
+##### Ascend OM 路径
+
+`device:=ascend_om` 下，实际执行的不再是 Python 中的 LeRobot policy 对象，
+而是编译后的 `.om` 图。因此 OM 路径需要显式补回"模型语义层"：
+
+- **ACT OM**：`ACTCompiledAdapter` 从 `config.json` 读取 `input_features`、`chunk_size`、
+  `action_dim` 等元数据，负责输入顺序整理和输出 reshape。
+  `OMRuntimeSession` 包装底层的 `OMmodel`（Ascend ACL runtime，包括
+  `acl.init()`、`acl.mdl.load_from_file()`、Host/Device memcpy 与 `acl.mdl.execute()`）。
+- **Pi0.5 OM**：`PI05CompiledAdapter` 处理 VLM 输入（图像 + token + mask）和动作输出。
+  `PI05OMRuntimeSession` 包装底层的 `PI05OMModel`，后者加载 VLM 和 Action Expert
+  两个 OM 模型，通过零拷贝 buffer 共享实现联合推理，并执行多步 denoising 循环。
+
+##### Ascend OM SD3403 路径
+
+`device:=ascend_om_3403` 使用 `ACTCompiledAdapter` + `SD3403RuntimeSession`：
+
+- `SD3403RuntimeSession` 包装 `ACT3403Policy`，后者管理一个常驻 C++ worker 子进程。
+- 通过自定义二进制协议（`PROTOCOL_MAGIC=0x53565031`）把输入写入 worker 的 `stdin`，
+  worker 在板卡侧执行 OM 推理后通过 `stdout` 回传结果。
+- `ACTCompiledAdapter` 负责输入准备和 SD3403 特有的输出 reshape（按 `sd3403_action_stride`
+  裁剪到 `action_dim`）。
+
+##### RKNN 路径
+
+`device:=rknn` 使用 `RKNNPolicyWrapper(CompiledPolicyWrapper)`。
+
+与 OM 路径类似使用 `ACTCompiledAdapter` + `RKNNRuntimeSession` 组合，但运行时更薄——
+相当一部分"模型特定性"已经在导出阶段（`export_onnx_rknn.py`）固化：
+
+1. 导出脚本直接从 `ACTPolicy` 导出 ONNX，用 `ACTONNXWrapper` 固定输入/输出接口，
+   剥离多余输出，仅保留 `action` 输出。
+2. `config.json` 中保留了 `input_features`、`chunk_size` 等元数据供运行时解释。
+3. `RKNNRuntimeSession` 调用 `rknnlite.api.RKNNLite` 的 `load_rknn()` / `init_runtime()` /
+   `inference()` 执行推理。
+4. `ACTCompiledAdapter` 按 `input_features` 顺序从 batch 中抽取输入，将 Tensor 转为
+   `numpy.float32`，并将输出恢复为动作 Tensor。
+
+#### 编译产物配置：config.om.json
+
+编译后端推荐在模型目录内生成独立的 `config.om.json` manifest，避免污染 LeRobot 原生
+`config.json`。该文件描述后端 artifact 的路径和执行顺序：
 
 ```json
 {
   "schema_version": 1,
-  "policy_type": "pi05",
+  "policy_type": "act",
   "backend": "ascend_om",
   "artifact_dir": "om",
   "artifacts": {
-    "vlm": "vlm.om",
-    "action_expert": "action_expert.om"
+    "policy": "act.om"
   },
-  "execution": ["vlm", "action_expert"]
+  "execution": ["policy"]
 }
 ```
 
-ACT 单 OM 使用 `artifacts.policy` 与 `execution: ["policy"]`。OM artifact 不再从
-LeRobot `config.json`、环境变量或目录猜测读取；转换工具必须生成 `config.om.json`。
+各后端要求的 artifact 角色：
 
-编译后端依赖保持惰性加载：只有选中对应后端并执行 `load()` 时，才会导入
-Ascend ACL、PI05 OM、SD3403 worker 或 RKNNLite 运行时依赖。ROS 话题、前处理、
-后处理和 launch 参数保持不变。
+| 后端 | artifacts 键 | execution |
+|------|-------------|-----------|
+| `ascend_om` (ACT) | `policy`（单 `.om` 文件） | `["policy"]` |
+| `ascend_om_3403` | `policy`（`.om`）+ `worker`（可执行二进制） | `["policy", "worker"]` |
+| `ascend_om` (Pi0.5) | `vlm` + `action_expert`（各 `.om`） | `["vlm", "action_expert"]` |
+| `rknn` | 从 `policy_path` 自动搜索 `model.rknn` 或 `*.rknn` | — |
+
+`artifact_dir` 指定 artifact 的基础目录（相对于 manifest 文件解析）。`artifacts` 中
+的值可以是字符串路径或 `{"path": "..."}` 对象。`execution` 显式声明通用串行 pipeline
+的执行顺序。OM artifact 不再从 LeRobot `config.json`、环境变量或目录猜测读取；
+转换工具必须生成 `config.om.json`。
+
+#### 继承体系总览
+
+```text
+PolicyWrapper (ABC)
+├── LeRobotPolicyWrapper          ← PyTorch / LeRobot 原生路径
+└── CompiledPolicyWrapper         ← 所有编译后端的统一基类
+      │   组合: CompiledModelAdapter + RuntimeSession
+      ├── AscendOMPolicyWrapper       backend=ascend_om (ACT / Pi0.5)
+      ├── AscendOM3403PolicyWrapper   backend=ascend_om_3403
+      ├── AscendOMPi05PolicyWrapper   backend=ascend_om (Pi0.5 门面)
+      └── RKNNPolicyWrapper           backend=rknn
+
+CompiledModelAdapter (Protocol)
+├── ACTCompiledAdapter             ← ACT 家族输入/输出语义适配
+└── PI05CompiledAdapter            ← Pi0.5 VLM + Action Expert 适配
+
+RuntimeSession (Protocol)
+├── OMRuntimeSession               ← 包装 OMmodel (Ascend ACL)
+├── PI05OMRuntimeSession           ← 包装 PI05OMModel (VLM+AE 零拷贝联合推理)
+├── SD3403RuntimeSession           ← 包装 ACT3403Policy (板卡 worker 二进制协议)
+└── RKNNRuntimeSession             ← 包装 RKNNLite (RK3588 NPU)
+```
+
+### 编译后端 vs PyTorch 推理流程对比
+
+各路径的前处理与后处理保持一致，差异集中在中间的模型执行层。
+
+#### PyTorch 推理
+
+```text
+Preprocessor -> Tensor batch -> LeRobotPolicyWrapper -> LeRobot policy object
+           -> Action Tensor -> Postprocessor
+```
+
+特点：
+
+1. 输入输出全程都是 `torch.Tensor`。
+2. 策略对象自己知道输入输出语义。
+3. 不需要 wrapper 手动管理运行时 buffer 与显式 memcpy。
+
+#### 编译后端推理（Ascend OM / SD3403 / RKNN）
+
+```text
+Preprocessor -> Tensor batch -> CompiledPolicyWrapper
+           -> Adapter.prepare_inputs() -> RuntimeSession.execute() -> Adapter.decode_outputs()
+           -> Action Tensor -> Postprocessor
+```
+
+特点：
+
+1. 运行时执行的是编译产物（`.om` 图 / worker 进程 / `.rknn` 模型），不是 Python policy 对象。
+2. Adapter 负责输入顺序整理、输出 shape 恢复与 chunk 语义。
+3. RuntimeSession 负责硬件加载、执行和资源释放。
+4. 通用 ACL 路径需要显式执行 Host/Device 内存拷贝。
+5. SD3403 路径通过 Python 与 worker 的二进制 IPC 协议通信。
+6. Pi0.5 路径通过 VLM 和 Action Expert 的零拷贝 buffer 共享实现联合推理。
+7. RKNN 路径的输出语义已在导出阶段固定，运行时恢复逻辑较薄。
+
+### 设计总结
+
+可以把三类后端理解为同一条推理管线中的不同"中间执行器"：
+
+1. PyTorch 路径最原生，依赖完整的 LeRobot policy 类。
+2. RKNN 路径把大量模型特定性前移到导出阶段，运行时 wrapper 更轻。
+3. Ascend OM 路径的 runtime 更底层，因此需要在运行时显式补一层模型语义适配。
+4. 所有编译后端共享 `CompiledPolicyWrapper` 的 Adapter + Session 组合模式，
+   新增后端只需实现 `CompiledModelAdapter` 和 `RuntimeSession` 两个 Protocol。
+
+这也是为什么 `inference_service` 选择通过 `PolicyWrapper` 统一抽象，而不是把不同后端
+的逻辑直接散落到 `lerobot_policy_node.py` 或 ROS 节点实现中。
 
 #### 场景二：单机调试（开发测试用）
 
