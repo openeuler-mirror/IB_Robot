@@ -101,6 +101,11 @@ from launch_ros.actions import Node
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.control import generate_ros2_control_nodes
 from robot_config.launch_builders.execution import generate_execution_nodes
+from robot_config.launch_builders.hardware_mock import (
+    generate_hardware_mock_nodes,
+    mock_mode_skips_subsystem,
+    validate_mock_mode,
+)
 from robot_config.launch_builders.navigation import generate_navigation_nodes
 from robot_config.launch_builders.perception import (
     generate_camera_nodes,
@@ -267,17 +272,27 @@ def launch_setup(context, *args, **kwargs):
     robot_config_name = context.launch_configurations.get("robot_config", "test_cam")
     config_path_override = context.launch_configurations.get("config_path", "")
     use_sim_str = context.launch_configurations.get("use_sim", "false")
+    use_mock_str = context.launch_configurations.get("use_mock", "false")
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
-    voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "false")
+    voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
 
-    # Normalize use_sim to boolean
+    # Normalize use_sim / use_mock to booleans.
     use_sim = parse_bool(use_sim_str, default=False)
+    use_mock = parse_bool(use_mock_str, default=False)
+    # Mutex check lives in the hardware_mock builder so all mock-mode rules
+    # stay in one place; control_mode invariant is enforced later, once the
+    # active mode has been resolved from CLI override + config defaults.
+    validate_mock_mode(use_mock=use_mock, use_sim=use_sim)
+    if use_mock:
+        # Mock pipeline has no controller_manager to spawn into.
+        auto_start_controllers = "false"
 
     logger.info("========== Launch Parameters ==========")
     logger.info(f"robot_config: {robot_config_name}")
     logger.info(f"config_path: {config_path_override if config_path_override else '(none)'}")
     logger.info(f"use_sim: {use_sim} (from '{use_sim_str}')")
+    logger.info(f"use_mock: {use_mock} (from '{use_mock_str}')")
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
@@ -358,15 +373,21 @@ def launch_setup(context, *args, **kwargs):
     deferred_sim_spawners = []
     controller_names = []
     robot_description = {}
-    try:
-        control_nodes, controller_names, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
-            robot_config, use_sim, auto_start_controllers
-        )
-        actions.extend(control_nodes)
-        logger.info(f"Added {len(control_nodes)} control nodes")
-    except Exception as e:
-        logger.error(f"generating control nodes: {e}")
-        raise
+    if use_mock:
+        # Validate the resolved control mode against the mock builder's
+        # supported set, then short-circuit the control subsystem.
+        validate_mock_mode(use_mock=use_mock, use_sim=use_sim, active_control_mode=active_control_mode)
+        logger.info("use_mock=true: skipping ros2_control / controller spawners")
+    else:
+        try:
+            control_nodes, controller_names, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
+                robot_config, use_sim, auto_start_controllers
+            )
+            actions.extend(control_nodes)
+            logger.info(f"Added {len(control_nodes)} control nodes")
+        except Exception as e:
+            logger.error(f"generating control nodes: {e}")
+            raise
 
     controller_ready_waiter = None
     if parse_bool(auto_start_controllers, default=True) and controller_names:
@@ -422,34 +443,40 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 6. Generate Perception Nodes ==========
     logger.info("========== Generating Perception Nodes ==========")
-    try:
-        # Camera nodes (Physical drivers)
-        camera_nodes = generate_camera_nodes(robot_config, use_sim)
-        actions.extend(camera_nodes)
-        logger.info(f"Added {len(camera_nodes)} camera nodes")
+    if mock_mode_skips_subsystem(use_mock, "perception"):
+        logger.info("use_mock=true: skipping camera / lidar / virtual-relay / TF nodes")
+        mock_nodes = generate_hardware_mock_nodes(robot_config)
+        actions.extend(mock_nodes)
+        logger.info(f"Added {len(mock_nodes)} hardware_mock node(s)")
+    else:
+        try:
+            # Camera nodes (Physical drivers)
+            camera_nodes = generate_camera_nodes(robot_config, use_sim)
+            actions.extend(camera_nodes)
+            logger.info(f"Added {len(camera_nodes)} camera nodes")
 
-        # LiDAR nodes (Physical drivers)
-        lidar_nodes = generate_lidar_nodes(robot_config, use_sim)
-        actions.extend(lidar_nodes)
-        print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
+            # LiDAR nodes (Physical drivers)
+            lidar_nodes = generate_lidar_nodes(robot_config, use_sim)
+            actions.extend(lidar_nodes)
+            print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
 
-        # Virtual camera relay nodes (Topic tools)
-        from robot_config.launch_builders.perception import (
-            generate_virtual_camera_relays,
-        )
+            # Virtual camera relay nodes (Topic tools)
+            from robot_config.launch_builders.perception import (
+                generate_virtual_camera_relays,
+            )
 
-        virtual_nodes = generate_virtual_camera_relays(robot_config)
-        actions.extend(virtual_nodes)
-        if virtual_nodes:
-            logger.info(f"Added {len(virtual_nodes)} virtual camera relays")
+            virtual_nodes = generate_virtual_camera_relays(robot_config)
+            actions.extend(virtual_nodes)
+            if virtual_nodes:
+                logger.info(f"Added {len(virtual_nodes)} virtual camera relays")
 
-        # Static TF publishers
-        tf_nodes = generate_tf_nodes(robot_config, use_sim)
-        actions.extend(tf_nodes)
-        logger.info(f"Added {len(tf_nodes)} TF nodes")
-    except Exception as e:
-        logger.error(f"generating perception nodes: {e}")
-        raise
+            # Static TF publishers
+            tf_nodes = generate_tf_nodes(robot_config, use_sim)
+            actions.extend(tf_nodes)
+            logger.info(f"Added {len(tf_nodes)} TF nodes")
+        except Exception as e:
+            logger.error(f"generating perception nodes: {e}")
+            raise
 
     # ========== 7. Generate Teleop Nodes (if in teleop mode) ==========
     logger.info("========== Checking Teleop Mode ==========")
@@ -483,45 +510,51 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 8. Generate Voice ASR Nodes ==========
     logger.info("========== Checking Voice ASR ==========")
-    try:
-        voice_asr_nodes = generate_voice_asr_nodes(robot_config)
-        actions.extend(voice_asr_nodes)
-        if voice_asr_nodes:
-            logger.info(f"Added {len(voice_asr_nodes)} voice ASR node(s)")
-    except Exception as e:
-        logger.error(f"generating voice ASR nodes: {e}")
-        raise
+    if mock_mode_skips_subsystem(use_mock, "voice_asr"):
+        logger.info("use_mock=true: skipping voice ASR nodes (out of mock scope)")
+    else:
+        try:
+            voice_asr_nodes = generate_voice_asr_nodes(robot_config)
+            actions.extend(voice_asr_nodes)
+            if voice_asr_nodes:
+                logger.info(f"Added {len(voice_asr_nodes)} voice ASR node(s)")
+        except Exception as e:
+            logger.error(f"generating voice ASR nodes: {e}")
+            raise
 
     # ========== 9. Generate Navigation Nodes ==========
     logger.info("========== Checking Navigation ==========")
-    try:
-        with_navigation_str = context.launch_configurations.get("with_navigation", "")
-        navigation_mode = context.launch_configurations.get("navigation_mode", "")
-        navigation_config = robot_config.get("navigation", {})
+    if mock_mode_skips_subsystem(use_mock, "navigation"):
+        logger.info("use_mock=true: skipping navigation nodes (out of mock scope)")
+    else:
+        try:
+            with_navigation_str = context.launch_configurations.get("with_navigation", "")
+            navigation_mode = context.launch_configurations.get("navigation_mode", "")
+            navigation_config = robot_config.get("navigation", {})
 
-        if with_navigation_str != "":
-            with_navigation = parse_bool(with_navigation_str, default=False)
-        else:
-            with_navigation = navigation_config.get("enabled", False)
-
-        if with_navigation:
-            navigation_nodes = generate_navigation_nodes(
-                robot_config,
-                use_sim=use_sim,
-                navigation_mode=navigation_mode,
-                force_enable=True,
-            )
-            if controller_ready_waiter is not None:
-                logger.info("Deferring navigation nodes until required controllers are active...")
-                controller_dependent_actions.extend(navigation_nodes)
+            if with_navigation_str != "":
+                with_navigation = parse_bool(with_navigation_str, default=False)
             else:
-                actions.extend(navigation_nodes)
-            logger.info(f"Prepared {len(navigation_nodes)} navigation node(s)")
-        else:
-            logger.info("Skipping navigation nodes")
-    except Exception as e:
-        logger.error(f"generating navigation nodes: {e}")
-        raise
+                with_navigation = navigation_config.get("enabled", False)
+
+            if with_navigation:
+                navigation_nodes = generate_navigation_nodes(
+                    robot_config,
+                    use_sim=use_sim,
+                    navigation_mode=navigation_mode,
+                    force_enable=True,
+                )
+                if controller_ready_waiter is not None:
+                    logger.info("Deferring navigation nodes until required controllers are active...")
+                    controller_dependent_actions.extend(navigation_nodes)
+                else:
+                    actions.extend(navigation_nodes)
+                logger.info(f"Prepared {len(navigation_nodes)} navigation node(s)")
+            else:
+                logger.info("Skipping navigation nodes")
+        except Exception as e:
+            logger.error(f"generating navigation nodes: {e}")
+            raise
 
     # ========== 10. Generate Execution Nodes ==========
     logger.info("========== Generating Execution Nodes ==========")
@@ -675,6 +708,14 @@ def generate_launch_description():
                 description="Use simulation mode (skip camera nodes)",
             ),
             DeclareLaunchArgument(
+                "use_mock",
+                default_value="false",
+                description=(
+                    "Run with hardware_mock contract_mock instead of real hardware / Gazebo. "
+                    "Only valid with control_mode=model_inference. Mutually exclusive with use_sim."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "auto_start_controllers",
                 default_value="true",
                 description="Automatically spawn controllers (set to false for debugging)",
@@ -683,11 +724,6 @@ def generate_launch_description():
                 "control_mode",
                 default_value="",
                 description="Override control mode from YAML (teleop, model_inference, or moveit_planning). If empty, uses default_control_mode from config file",
-            ),
-            DeclareLaunchArgument(
-                "voice_asr_auto_start",
-                default_value="",
-                description="Override robot.voice_asr.enabled. Set to true to force-launch the ASR node.",
             ),
             DeclareLaunchArgument(
                 "voice_asr_device_index",

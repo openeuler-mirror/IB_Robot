@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
+import numpy as np  # noqa: F401  # cv_bridge runtime dependency
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
@@ -101,11 +101,12 @@ class ContractMockNode(Node):
             pub = self.create_publisher(msg_cls, obs.topic, qos)
             period = 1.0 / max(obs.rate_hz, 1e-6)
             if obs.kind == "image":
-                self._image_publishers.append((obs, pub, make_generator(obs.image)))
+                gen = make_generator(obs.image)
+                self._image_publishers.append((obs, pub, gen))
                 self._image_timers.append(
                     self.create_timer(
                         period,
-                        lambda o=obs, p=pub, gen=make_generator(obs.image): self._publish_image(o, p, gen),
+                        lambda o=obs, p=pub, g=gen: self._publish_image(o, p, g),
                     )
                 )
             elif obs.kind == "joint_state":
@@ -190,8 +191,3 @@ def main(args=None) -> None:
     finally:
         node.destroy_node()
         rclpy.shutdown()
-
-
-# numpy unused at top level today, but cv_bridge needs it on the path; keep the
-# import side-effect.
-_ = np
