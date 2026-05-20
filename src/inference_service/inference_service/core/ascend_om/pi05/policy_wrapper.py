@@ -163,8 +163,8 @@ class AscendOMPi05PolicyWrapper(PolicyWrapper):
         vlm_path, ae_path = resolve_pi05_om_paths(path, config)
         wrapper_cls = __getattr__("PI05Wrapper") if PI05Wrapper is None else PI05Wrapper
         self._impl = wrapper_cls(
-            vlm_om_path=str(vlm_path),
-            action_expert_om_path=str(ae_path),
+            vlm_model_path=str(vlm_path),
+            action_expert_model_path=str(ae_path),
             config=config_view,
         )
 

@@ -155,9 +155,7 @@ class LeRobotPolicyNode(Node):
         self.get_logger().info(f"Execution mode: {self._config.execution_mode}")
 
         self._device = resolve_device(self._config.device)
-        self.get_logger().info(
-            f"Using inference_backend={self._config.device}, tensor_device={self._device}"
-        )
+        self.get_logger().info(f"Using inference_backend={self._config.device}, tensor_device={self._device}")
 
         self._last_inference_time: float | None = None
         self._inference_count = 0
@@ -174,6 +172,7 @@ class LeRobotPolicyNode(Node):
         self._policy_config: dict | None = None
         self._required_inputs: set = set()  # Input features required by model
         self._joint_rad_limits: list = []  # populated in _load_contract()
+        self._default_task: str = ""  # static task string, set in _load_contract()
 
         # Load model config first to get required inputs
         self._load_policy_config()
@@ -238,6 +237,14 @@ class LeRobotPolicyNode(Node):
 
         robot_cfg = load_robot_config_dict(robot_config_path)
         self._contract = build_contract_from_robot_config_dict(robot_cfg)
+
+        # Static task prompt for VLA policies (PI0/PI05/SmolVLA).  Injected
+        # into obs_frame as the ``task`` key so lerobot's preprocessor pipeline
+        # (PaliGemma tokenizer step) can produce
+        # ``observation.language.tokens``/``attention_mask``.
+        self._default_task = str(robot_cfg.get("contract", {}).get("default_task", "")).strip()
+        if self._default_task:
+            self.get_logger().info(f"Default task prompt: {self._default_task!r}")
 
         # Build joint conversion table from calibration file
         calib_file = resolve_calibration_path_from_config(robot_cfg)
@@ -587,6 +594,11 @@ class LeRobotPolicyNode(Node):
             # units to match the dataset statistics used for normalization.
             if "observation.state" in obs_frame:
                 obs_frame["observation.state"] = self._rad_to_lerobot(obs_frame["observation.state"])
+
+            # VLA policies (PI0/PI05/SmolVLA) consume a natural-language task
+            # prompt; lerobot's preprocessor pipeline tokenizes it downstream.
+            if self._default_task:
+                obs_frame["task"] = self._default_task
 
             if self._config.execution_mode == "distributed":
                 result = self._execute_distributed(obs_frame, request_id)
