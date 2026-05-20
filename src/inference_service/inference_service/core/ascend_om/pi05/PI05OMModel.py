@@ -8,6 +8,7 @@ PI05 专用的融合 OM 模型管理类
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 import numpy as np
@@ -110,6 +111,11 @@ class PI05OMModel:
         ret = acl.rt.set_device(self.device_id)
         self._check_ret(ret, "Failed to set device")
         logger(f"Set device id {self.device_id}")
+
+        self._context, ret = acl.rt.create_context(self.device_id)
+        self._check_ret(ret, "Failed to create ACL context")
+        self._tls = threading.local()
+        self._tls.bound = True  # 当前 (主) 线程已被 create_context 绑上
 
         # 加载 VLM 模型
         logger(f"Loading VLM model from {vlm_model_path}")
@@ -315,6 +321,23 @@ class PI05OMModel:
                 raise ValueError(f"Buffer size mismatch at index {i}: VLM output={vlm_size}, AE input={ae_size}")
         logger("Buffer size validation passed")
 
+    def _ensure_context(self) -> None:
+        """Bind this model's ACL context to the current thread on first use.
+
+        ACL contexts live in thread-local storage on the host side. Any worker
+        thread spawned *after* ``__init__`` (rclpy executor threads, asyncio
+        thread pools, ...) starts out with a NULL context and will fail any
+        ``acl.rt.memcpy`` / ``acl.mdl.execute`` call with error 107002
+        (``ACL_ERROR_RT_CONTEXT_NULL_ERROR``).
+
+        We pay the one-shot ``set_context`` per thread instead of doing it on
+        every ``forward`` call so the semantics stay explicit and cheap.
+        """
+        if not getattr(self._tls, "bound", False):
+            ret = acl.rt.set_context(self._context)
+            self._check_ret(ret, "Failed to bind ACL context to current thread")
+            self._tls.bound = True
+
     def forward(
         self,
         images: list[np.ndarray],
@@ -339,7 +362,7 @@ class PI05OMModel:
             Action tensor [B, chunk_size, action_dim]
         """
         batch_size = tokens.shape[0]
-
+        self._ensure_context()
         if _DEBUG:
             logger(f"--- forward() begin (batch_size={batch_size}) ---")
             logger(
@@ -682,6 +705,12 @@ class PI05OMModel:
             acl.mdl.unload(self.vlm_model_id)
             acl.mdl.destroy_desc(self.ae_model_desc)
             acl.mdl.unload(self.ae_model_id)
+
+            # 销毁显式 context (与 __init__ 中的 create_context 配对)
+            ctx = getattr(self, "_context", None)
+            if ctx is not None:
+                acl.rt.destroy_context(ctx)
+                self._context = None
 
             # ACL 清理
             acl.rt.reset_device(self.device_id)
