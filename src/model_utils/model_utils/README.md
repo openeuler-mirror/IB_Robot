@@ -33,7 +33,7 @@ train_config.json
 
 > **通用 Ascend 硬件的模型导出工具。**
 >
-> 该脚本会先将模型导出为 ONNX 格式，然后自动调用 ATC 工具将其转换为 OM 格式，适用于通用的 Ascend 硬件（如 310P3 等）。
+> 该脚本会先将模型导出为 ONNX 格式，然后自动调用 ATC 工具将其转换为 OM 格式，适用于通用的 Ascend 硬件（如 310P3 等）。ATC 成功后会在策略模型目录写入 `config.om.json`，供 `device:=ascend_om` 运行时按 manifest 加载。
 
 ### 用法
 
@@ -53,6 +53,31 @@ python export_onnx_atc.py \
 | `--soc_version` | ✅ | — | 目标 Ascend 芯片版本号（如 `Ascend310P3`） |
 | `--onnx_model_path` | ❌ | `{pretrained_model}/model.onnx` | ONNX 模型导出路径 |
 | `--om_model_path` | ❌ | `{pretrained_model}/model.om` | OM 模型导出路径 |
+| `--skip_onnx_export` | ❌ | `false` | 跳过 PyTorch -> ONNX 导出，直接将已有 ONNX 转为 OM |
+
+### 输出文件
+
+默认会生成：
+
+```text
+{pretrained_model}/model.onnx
+{pretrained_model}/model.om
+{pretrained_model}/config.om.json
+```
+
+`config.om.json` 是 compiled runtime 的 sidecar manifest。ACT 单 OM 模型的内容形如：
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "act",
+  "backend": "ascend_om",
+  "artifacts": {"policy": "model.om"},
+  "execution": ["policy"]
+}
+```
+
+运行推理时仍以策略模型目录作为 `policy_path`；`config.json` 保存 LeRobot 策略元数据，`config.om.json` 保存 compiled runtime artifact 信息。已有 ONNX 的输入名与尺寸必须与 `config.json` 匹配。
 
 ### 查看芯片版本号
 
@@ -79,6 +104,17 @@ $ npu-smi info
 python export_onnx_atc.py \
     --pretrained_model=path/to/pretrained_model \
     --soc_version=Ascend310P3
+```
+
+若 ONNX 已存在，可只执行 ATC 转换并生成 `config.om.json`：
+
+```shell
+python export_onnx_atc.py \
+    --pretrained_model=path/to/pretrained_model \
+    --soc_version=Ascend310P3 \
+    --onnx_model_path=path/to/pretrained_model/act_ros2.onnx \
+    --om_model_path=path/to/pretrained_model/model.om \
+    --skip_onnx_export
 ```
 
 ---

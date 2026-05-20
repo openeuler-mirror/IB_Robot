@@ -109,8 +109,7 @@ class ACT3403Policy:
 
     def _resolve_paths(self, cpp_executable: str, model_path: str | None) -> tuple[str, str]:
         env_worker = (
-            os.environ.get("SVP_WORKER_EXECUTABLE", "").strip()
-            or os.environ.get("SVP_CPP_EXECUTABLE", "").strip()
+            os.environ.get("SVP_WORKER_EXECUTABLE", "").strip() or os.environ.get("SVP_CPP_EXECUTABLE", "").strip()
         )
         env_model = os.environ.get("SVP_MODEL_PATH", "").strip()
         arg = cpp_executable.strip()
@@ -136,13 +135,10 @@ class ACT3403Policy:
 
         if not resolved_worker:
             raise RuntimeError(
-                "missing worker executable path: pass binary path to ACT3403Policy(...) "
-                "or set SVP_WORKER_EXECUTABLE"
+                "missing worker executable path: pass binary path to ACT3403Policy(...) or set SVP_WORKER_EXECUTABLE"
             )
         if not resolved_model:
-            raise RuntimeError(
-                "missing model path: pass model_path to ACT3403Policy(...) or set SVP_MODEL_PATH"
-            )
+            raise RuntimeError("missing model path: pass model_path to ACT3403Policy(...) or set SVP_MODEL_PATH")
 
         resolved_worker = os.path.abspath(resolved_worker)
         resolved_model = os.path.abspath(resolved_model)
@@ -290,7 +286,7 @@ class ACT3403Policy:
         # Fallback 2: observation.images can be a list/tuple of image tensors in ACT pipeline.
         if (
             isinstance(state, Tensor)
-            and isinstance(merged_images, (list, tuple))
+            and isinstance(merged_images, list | tuple)
             and len(merged_images) >= 2
             and isinstance(merged_images[0], Tensor)
             and isinstance(merged_images[1], Tensor)
@@ -355,13 +351,8 @@ class ACT3403Policy:
         target_output: np.ndarray | None = None
         for _ in range(output_count):
             entry = _read_exact(self._process.stdout, OUTPUT_ENTRY_STRUCT.size)
-            output_index, elem_type, elem_count, byte_size, dim_count, _reserved = OUTPUT_ENTRY_STRUCT.unpack(
-                entry
-            )
-            dims = [
-                DIM_STRUCT.unpack(_read_exact(self._process.stdout, DIM_STRUCT.size))[0]
-                for _ in range(dim_count)
-            ]
+            output_index, elem_type, elem_count, byte_size, dim_count, _reserved = OUTPUT_ENTRY_STRUCT.unpack(entry)
+            dims = [DIM_STRUCT.unpack(_read_exact(self._process.stdout, DIM_STRUCT.size))[0] for _ in range(dim_count)]
             payload = _read_exact(self._process.stdout, byte_size)
             if output_index == 2:
                 data = np.frombuffer(payload, dtype=_dtype_from_elem_type(elem_type), count=elem_count)
@@ -373,12 +364,22 @@ class ACT3403Policy:
         if error_msg_size:
             error_msg = _read_exact(self._process.stdout, error_msg_size).decode("utf-8", errors="replace")
         if status != WORKER_STATUS_OK:
-            raise RuntimeError(
-                f"worker inference failed (error_code={error_code}): {error_msg or 'unknown error'}"
-            )
+            raise RuntimeError(f"worker inference failed (error_code={error_code}): {error_msg or 'unknown error'}")
         if target_output is None:
             raise RuntimeError("worker response does not contain output index 2")
         return target_output, int(latency_us)
+
+    def _execute_prepared_arrays(self, input_arrays: Sequence[np.ndarray]) -> tuple[np.ndarray, int, int]:
+        request_id = self._write_request(input_arrays)
+        data, worker_latency_us = self._read_response(request_id)
+        return data, worker_latency_us, request_id
+
+    def execute_arrays(self, input_arrays: Sequence[np.ndarray]) -> np.ndarray:
+        """Run worker inference for already prepared arrays."""
+        with self._io_lock:
+            self._ensure_process()
+            data, _worker_latency_us, _request_id = self._execute_prepared_arrays(input_arrays)
+        return data
 
     def predict(self, batch: dict[str, Tensor]) -> tuple[Tensor] | None:
         t0 = time.perf_counter()
@@ -387,9 +388,8 @@ class ACT3403Policy:
             t1 = time.perf_counter()
             input_arrays = self._build_inputs(batch)
             t2 = time.perf_counter()
-            request_id = self._write_request(input_arrays)
+            data, worker_latency_us, request_id = self._execute_prepared_arrays(input_arrays)
             t3 = time.perf_counter()
-            data, worker_latency_us = self._read_response(request_id)
             t4 = time.perf_counter()
 
         flat = data.astype(np.float32, copy=False).reshape(-1)

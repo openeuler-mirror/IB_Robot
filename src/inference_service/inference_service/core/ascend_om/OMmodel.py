@@ -10,6 +10,8 @@ try:
     import acl
 except ImportError:  # pragma: no cover - only available on Ascend runtime hosts
     acl = None
+import contextlib
+
 import numpy as np
 
 ACL_MEM_MALLOC_HUGE_FIRST = 0
@@ -25,6 +27,7 @@ class OMmodel:
     def __init__(self, model_path):
         if acl is None:
             raise RuntimeError("Ascend ACL runtime is required for OM inference")
+        self._closed = False
         logger(f"model path: {model_path}")
         self.device_id = 0
 
@@ -79,7 +82,7 @@ class OMmodel:
             self.check_ret(ret, "Failed to memcpy from device to host")
             bytes_out = acl.util.ptr_to_bytes(buffer_host, self.output_data[i]["size"])
 
-            data = np.frombuffer(bytes_out, dtype=np.float32)
+            data = np.frombuffer(bytes_out, dtype=np.float32).copy()
             inference_result.append(data)
 
             ret = acl.rt.free_host(buffer_host)
@@ -87,9 +90,10 @@ class OMmodel:
 
         return inference_result
 
-    def __del__(self):
-        if acl is None or not hasattr(self, "input_data"):
+    def close(self):
+        if self._closed or acl is None or not hasattr(self, "input_data"):
             return
+        self._closed = True
         for dataset in [self.input_data, self.output_data]:
             while dataset:
                 item = dataset.pop()
@@ -101,6 +105,10 @@ class OMmodel:
         acl.mdl.unload(self.model_id)
         acl.rt.reset_device(self.device_id)
         acl.finalize()
+
+    def __del__(self):
+        with contextlib.suppress(Exception):
+            self.close()
 
     def prepare_dataset(self, io_type):
         if io_type == "input":

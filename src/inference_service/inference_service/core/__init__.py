@@ -49,10 +49,6 @@ _LAZY_EXPORTS = {
         "inference_service.core.ascend_om",
         "create_ascend_om_policy_wrapper",
     ),
-    "resolve_3403_worker_path": (
-        "inference_service.core.ascend_om",
-        "resolve_3403_worker_path",
-    ),
     "resolve_om_model_path": (
         "inference_service.core.ascend_om",
         "resolve_om_model_path",
@@ -76,6 +72,7 @@ def __getattr__(name: str) -> Any:
     globals()[name] = value
     return value
 
+
 __all__ = [
     "PureInferenceEngine",
     "InferenceResult",
@@ -85,7 +82,6 @@ __all__ = [
     "AscendOM3403PolicyWrapper",
     "AscendOMPolicyWrapper",
     "create_ascend_om_policy_wrapper",
-    "resolve_3403_worker_path",
     "resolve_om_model_path",
     "RKNNPolicyWrapper",
     "create_rknn_policy_wrapper",

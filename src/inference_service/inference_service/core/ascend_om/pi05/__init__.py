@@ -8,10 +8,6 @@ _LAZY_EXPORTS = {
         "inference_service.core.ascend_om.pi05.PI05OMModel",
         "PI05OMModel",
     ),
-    "PI05Wrapper": (
-        "inference_service.core.ascend_om.pi05.PI05Wrapper",
-        "PI05Wrapper",
-    ),
     "AscendOMPi05PolicyWrapper": (
         "inference_service.core.ascend_om.pi05.policy_wrapper",
         "AscendOMPi05PolicyWrapper",

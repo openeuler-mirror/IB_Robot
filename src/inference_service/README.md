@@ -168,11 +168,10 @@ ros2 launch inference_service cloud_inference.launch.py \
     device:=ascend_om_3403
 ```
 
-`device:=ascend_om` 会从 `policy_path/config.json` 的 `om_model_path`、环境变量
-`ASCEND_OM_MODEL_PATH`/`OM_MODEL_PATH`，或 `policy_path` 下的 `.om` 文件中解析模型。
-`device:=ascend_om_3403` 额外需要 worker 可执行文件，可通过 `cpp_executable` 配置项、
-`SVP_WORKER_EXECUTABLE` 环境变量或常见 `out/main` 布局解析。两种模式的前/后处理、
-ROS 话题与分布式通信仍沿用 `inference_service` 的现有管线。
+`device:=ascend_om` 会从 `policy_path/config.om.json` 的 `artifacts.policy` 解析
+单 OM 模型。`device:=ascend_om_3403` 需要 `artifacts.policy` 和 `artifacts.worker`，
+并要求 `execution` 为 `["policy", "worker"]`。两种模式的前/后处理、ROS 话题与
+分布式通信仍沿用 `inference_service` 的现有管线。
 
 如果 Cloud 节点运行在 RK3588 / OpenHarmony 板端并使用 RKNN Lite，可直接切换为：
 
@@ -186,6 +185,45 @@ ros2 launch inference_service cloud_inference.launch.py \
 `device:=rknn` 会继续复用 `policy_path/config.json` 中的 LeRobot 配置用于前后处理，
 同时要求实际的 RKNN 模型文件随 policy 一起纳管到 `policy_path` 目录内，
 默认文件名为 `model.rknn`。
+
+### 编译模型后端边界
+
+`PureInferenceEngine` 仍然只依赖统一的 `PolicyWrapper` 接口。对
+`device:=ascend_om`、`device:=ascend_om_3403` 和 `device:=rknn`，内部会使用
+`CompiledPolicyWrapper` 门面：
+
+- `ACTCompiledAdapter` 和 `PI05CompiledAdapter` 读取 `config.json` 的 `type`、
+  `input_features` 和 `output_features`，负责模型族输入顺序、图像/语言输入、
+  action chunk 解码、`policy_type` 和 chunk-size 语义。
+- `OMRuntimeSession`、`PI05OMRuntimeSession`、`SD3403RuntimeSession` 和
+  `RKNNRuntimeSession` 只负责后端 artifact 解析、运行时加载、执行和资源释放。
+- `policy_type` 表示模型族，例如 `act`；`backend_type` 表示实际运行后端，
+  例如 `ascend_om`、`ascend_om_3403` 或 `rknn`。
+
+编译产物推荐由转换工具在模型目录内生成独立的 `config.om.json`，避免污染
+LeRobot 原生 `config.json`。该文件用 role 到 path 的 map 描述 artifact，并可用
+`execution` 显式声明通用串行 pipeline 的执行顺序：
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "pi05",
+  "backend": "ascend_om",
+  "artifact_dir": "om",
+  "artifacts": {
+    "vlm": "vlm.om",
+    "action_expert": "action_expert.om"
+  },
+  "execution": ["vlm", "action_expert"]
+}
+```
+
+ACT 单 OM 使用 `artifacts.policy` 与 `execution: ["policy"]`。OM artifact 不再从
+LeRobot `config.json`、环境变量或目录猜测读取；转换工具必须生成 `config.om.json`。
+
+编译后端依赖保持惰性加载：只有选中对应后端并执行 `load()` 时，才会导入
+Ascend ACL、PI05 OM、SD3403 worker 或 RKNNLite 运行时依赖。ROS 话题、前处理、
+后处理和 launch 参数保持不变。
 
 #### 场景二：单机调试（开发测试用）
 

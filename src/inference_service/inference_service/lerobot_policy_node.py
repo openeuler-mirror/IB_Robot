@@ -246,6 +246,7 @@ class LeRobotPolicyNode(Node):
         self.get_logger().info(
             f"{self._config.name} node ready ({mode_str}): "
             f"policy_type={self._policy_type}, "
+            f"backend_type={self._backend_type or self._config.device}, "
             f"chunk_size={self._chunk_size}"
         )
 
@@ -412,6 +413,7 @@ class LeRobotPolicyNode(Node):
         )
 
         self._policy_type = self._coordinator.policy_type
+        self._backend_type = self._coordinator.backend_type
         self._chunk_size = self._coordinator.chunk_size
         self._use_action_chunking = self._coordinator.use_action_chunking
 
@@ -443,6 +445,7 @@ class LeRobotPolicyNode(Node):
             device="cpu",
         )
         self._policy_type = temp_engine.policy_type
+        self._backend_type = temp_engine.backend_type
         self._chunk_size = temp_engine.chunk_size
         self._use_action_chunking = temp_engine.use_action_chunking
 
@@ -996,6 +999,7 @@ class LeRobotPolicyNode(Node):
             inference_latency_ms=inference_latency,
             postprocess_latency_ms=postprocess_latency,
             policy_type=self._policy_type,
+            backend_type=self._backend_type,
         )
 
     def _cloud_result_callback(self, msg: VariantsList):
@@ -1280,6 +1284,7 @@ class LeRobotPolicyNode(Node):
             KeyValue(key="inference_count", value=str(self._inference_count)),
             KeyValue(key="model_type", value=self._config.model_type),
             KeyValue(key="policy_type", value=self._policy_type),
+            KeyValue(key="backend_type", value=self._backend_type or self._config.device),
             KeyValue(key="chunk_size", value=str(self._chunk_size)),
             KeyValue(key="execution_mode", value=self._config.execution_mode),
         ]

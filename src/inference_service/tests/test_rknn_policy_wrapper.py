@@ -23,6 +23,7 @@ def test_rknn_wrapper_preserves_input_feature_order(tmp_path, monkeypatch):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
+                "type": "act",
                 "chunk_size": 100,
                 "input_features": {
                     "observation.images.wrist": {"shape": [3, 4, 5]},

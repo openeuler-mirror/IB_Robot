@@ -107,12 +107,14 @@ class InferenceResult:
         chunk_size: Number of actions in chunk (1 for single-step policies)
         latency_ms: Inference latency in milliseconds
         policy_type: Type of policy that produced this result
+        backend_type: Runtime backend that produced this result
     """
 
     action: Tensor
     chunk_size: int = 1
     latency_ms: float = 0.0
     policy_type: str = ""
+    backend_type: str = ""
 
     def to_numpy(self) -> np.ndarray:
         """Convert action to numpy array."""
@@ -153,6 +155,16 @@ class PolicyWrapper(ABC):
         """Get policy type identifier."""
         pass
 
+    @property
+    def backend_type(self) -> str:
+        """Get runtime backend identifier for diagnostics."""
+        return ""
+
+    @property
+    def uses_action_chunking(self) -> bool:
+        """Whether this policy emits action chunks."""
+        return self.policy_type in ("act", "tdmpc", "vqbet")
+
 
 class LeRobotPolicyWrapper(PolicyWrapper):
     """
@@ -178,7 +190,7 @@ class LeRobotPolicyWrapper(PolicyWrapper):
         else:
             self._load_from_local(path, device)
 
-        self._use_action_chunking = self._policy_type in ("act", "tdmpc", "vqbet")
+        self._use_action_chunking = self._policy_type in ("act", "tdmpc", "vqbet", "pi0", "pi05", "smolvla")
         self._chunk_size = self._detect_chunk_size()
 
     def _load_from_hf(self, repo_id: str, device: torch.device) -> None:
@@ -248,6 +260,10 @@ class LeRobotPolicyWrapper(PolicyWrapper):
     def policy_type(self) -> str:
         return self._policy_type
 
+    @property
+    def uses_action_chunking(self) -> bool:
+        return self._use_action_chunking
+
 
 class PureInferenceEngine:
     """
@@ -288,11 +304,13 @@ class PureInferenceEngine:
         self._device = resolve_device(device)
         self._wrapper: PolicyWrapper | None = None
         self._policy_type: str = ""
+        self._backend_type: str = ""
         self._chunk_size: int = 1
 
         if policy_wrapper is not None:
             self._wrapper = policy_wrapper
             self._policy_type = policy_wrapper.policy_type
+            self._backend_type = policy_wrapper.backend_type
             self._chunk_size = policy_wrapper.get_chunk_size()
         elif policy_path is not None:
             self._load_policy(policy_path)
@@ -316,6 +334,7 @@ class PureInferenceEngine:
             self._wrapper = LeRobotPolicyWrapper()
         self._wrapper.load(path, self._device)
         self._policy_type = self._wrapper.policy_type
+        self._backend_type = self._wrapper.backend_type
         self._chunk_size = self._wrapper.get_chunk_size()
 
     def __call__(
@@ -340,6 +359,7 @@ class PureInferenceEngine:
         tensor_batch = self._ensure_tensors(batch)
 
         action = self._wrapper.infer(tensor_batch)
+        self._chunk_size = self._wrapper.get_chunk_size()
 
         latency_ms = (time.perf_counter() - start_time) * 1000.0
 
@@ -348,6 +368,7 @@ class PureInferenceEngine:
             chunk_size=self._chunk_size,
             latency_ms=latency_ms,
             policy_type=self._policy_type,
+            backend_type=self._backend_type,
         )
 
     def _ensure_tensors(
@@ -396,6 +417,11 @@ class PureInferenceEngine:
         return self._policy_type
 
     @property
+    def backend_type(self) -> str:
+        """Get the runtime backend identifier."""
+        return self._backend_type
+
+    @property
     def chunk_size(self) -> int:
         """Get the action chunk size."""
         return self._chunk_size
@@ -403,7 +429,7 @@ class PureInferenceEngine:
     @property
     def use_action_chunking(self) -> bool:
         """Check if policy uses action chunking."""
-        return self._policy_type in ("act", "tdmpc", "vqbet", "pi0", "pi05", "smolvla")
+        return bool(self._wrapper is not None and self._wrapper.uses_action_chunking)
 
 
 class MockPolicyWrapper(PolicyWrapper):

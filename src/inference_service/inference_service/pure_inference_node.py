@@ -61,11 +61,13 @@ class PureInferenceNode(Node):
         self._output_topic = output_topic
         self._inference_backend = str(device)
 
-        self.get_logger().info(
-            f"Loading policy from {policy_path} with inference_backend={self._inference_backend}..."
-        )
+        self.get_logger().info(f"Loading policy from {policy_path} with inference_backend={self._inference_backend}...")
         self._engine = PureInferenceEngine(policy_path=policy_path, device=device)
-        self.get_logger().info(f"Engine loaded: {self._engine.policy_type}, chunk_size={self._engine.chunk_size}")
+        self.get_logger().info(
+            f"Engine loaded: policy_type={self._engine.policy_type}, "
+            f"backend_type={self._engine.backend_type or self._inference_backend}, "
+            f"chunk_size={self._engine.chunk_size}"
+        )
 
         self._sub = self.create_subscription(
             VariantsList,

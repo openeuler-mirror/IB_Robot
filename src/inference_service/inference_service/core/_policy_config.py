@@ -22,11 +22,6 @@ from typing import Any
 # upstream may eventually adopt should be removed from here.
 _IBROBOT_ONLY_KEYS: frozenset[str] = frozenset(
     {
-        # Ascend OM backend hints
-        "is_ascend_om_enabled",
-        "om_model_path",
-        "om_vlm_model_path",
-        "om_action_expert_model_path",
         # RKNN backend hints
         "is_rknn_enabled",
         "rknn_model_path",

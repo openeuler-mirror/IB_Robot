@@ -109,12 +109,11 @@ ros2 launch inference_service cloud_inference.launch.py \
     device:=ascend_om_3403
 ```
 
-`device:=ascend_om` resolves the `.om` model from `om_model_path` in
-`policy_path/config.json`, `ASCEND_OM_MODEL_PATH`/`OM_MODEL_PATH`, or common
-files under `policy_path`. `device:=ascend_om_3403` also resolves the worker
-executable from `cpp_executable`, `SVP_WORKER_EXECUTABLE`, or common `out/main`
-layouts. Preprocessing, postprocessing, ROS topics, and distributed transport
-remain the existing `inference_service` pipeline.
+`device:=ascend_om` resolves the single OM model from `artifacts.policy` in
+`policy_path/config.om.json`. `device:=ascend_om_3403` requires both
+`artifacts.policy` and `artifacts.worker`, with `execution` set to
+`["policy", "worker"]`. Preprocessing, postprocessing, ROS topics, and
+distributed transport remain the existing `inference_service` pipeline.
 
 For RK3588 / OpenHarmony boards running RKNN Lite, switch the cloud node to:
 
@@ -128,6 +127,51 @@ ros2 launch inference_service cloud_inference.launch.py \
 `device:=rknn` still uses the LeRobot metadata under `policy_path/config.json`
 for preprocessing and postprocessing, while expecting the actual RKNN artifact to
 live inside `policy_path`, using `model.rknn` as the default filename.
+
+### Compiled Model Backend Boundaries
+
+`PureInferenceEngine` still depends only on the common `PolicyWrapper` interface.
+For `device:=ascend_om`, `device:=ascend_om_3403`, and `device:=rknn`, it uses an
+internal `CompiledPolicyWrapper` facade:
+
+- `ACTCompiledAdapter` and `PI05CompiledAdapter` read `type`, `input_features`,
+  and `output_features` from `config.json` and own model-family input ordering,
+  image/language inputs, action chunk decoding, `policy_type`, and chunk-size
+  semantics.
+- `OMRuntimeSession`, `PI05OMRuntimeSession`, `SD3403RuntimeSession`, and
+  `RKNNRuntimeSession` own backend artifact resolution, runtime loading,
+  execution, and resource cleanup.
+- `policy_type` identifies the model family, such as `act`; `backend_type`
+  identifies the runtime backend, such as `ascend_om`, `ascend_om_3403`, or
+  `rknn`.
+
+Compiled conversion tools should emit a separate `config.om.json` next to the
+LeRobot `config.json` so compiled runtime metadata does not pollute the LeRobot
+schema. The sidecar uses a role-to-path artifact map and can declare a generic
+serial pipeline through `execution`:
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "pi05",
+  "backend": "ascend_om",
+  "artifact_dir": "om",
+  "artifacts": {
+    "vlm": "vlm.om",
+    "action_expert": "action_expert.om"
+  },
+  "execution": ["vlm", "action_expert"]
+}
+```
+
+Single-OM ACT policies use `artifacts.policy` with `execution: ["policy"]`. OM
+artifacts are no longer read from LeRobot `config.json`, environment variables,
+or directory guesses; conversion tools must generate `config.om.json`.
+
+Compiled backend dependencies remain lazily loaded. Ascend ACL, PI05 OM, the
+SD3403 worker stack, and RKNNLite are imported only when the matching backend is
+loaded. ROS topics, preprocessing, postprocessing, and launch arguments stay
+unchanged.
 
 #### Scenario 2: Single-Machine Debug (Development)
 
