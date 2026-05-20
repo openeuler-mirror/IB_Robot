@@ -509,6 +509,7 @@ class PI05OMModel:
             # D2H: x_t (AE 的 sample_actions 内部已执行 Euler step,
             #       输出直接是更新后的 x_t, 不是 v_t)
             buffer_host, ret = acl.rt.malloc_host(self.ae_output_data[0]["size"])
+            self._check_ret(ret, "Failed to malloc host buffer for AE D2H")
             ret = acl.rt.memcpy(
                 buffer_host,
                 self.ae_output_data[0]["size"],

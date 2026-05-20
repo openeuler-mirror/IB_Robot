@@ -83,6 +83,24 @@ def _ordered_image_features(raw_config: dict[str, Any]) -> dict[str, _FeatureSpe
     return result
 
 
+def _real_action_dim(raw_config: dict[str, Any], fallback: int) -> int:
+    """Return the dataset action dim from ``output_features['action']``.
+
+    PI05 always emits actions padded to ``max_action_dim`` (e.g. 32) but the
+    downstream normalizer's q01/q99 stats only cover the real robot DoF
+    (``output_features['action'].shape``).  We must slice the padding off
+    before postprocessing or the broadcast in NormalizeProcessor explodes.
+    """
+    outputs = raw_config.get("output_features") or {}
+    if isinstance(outputs, dict):
+        action_feat = outputs.get("action")
+        if action_feat is not None:
+            shape = _feature_shape(action_feat)
+            if shape:
+                return int(shape[-1])
+    return int(fallback)
+
+
 # ---------------------------------------------------------------------------
 # PI05 config view (duck-typed)
 # ---------------------------------------------------------------------------
@@ -153,6 +171,7 @@ class AscendOMPi05PolicyWrapper(PolicyWrapper):
         self._impl: Any | None = None
         self._device = torch.device("cpu")
         self._chunk_size = 50
+        self._action_dim: int | None = None
         self._policy_type = "pi05"
 
     def load(self, path: str, device: torch.device) -> None:
@@ -160,6 +179,7 @@ class AscendOMPi05PolicyWrapper(PolicyWrapper):
         config = load_policy_config(path)
         config_view = _PI05ConfigView(config)
         self._chunk_size = config_view.chunk_size
+        self._action_dim = _real_action_dim(config, fallback=config_view.max_action_dim)
         vlm_path, ae_path = resolve_pi05_om_paths(path, config)
         wrapper_cls = __getattr__("PI05Wrapper") if PI05Wrapper is None else PI05Wrapper
         self._impl = wrapper_cls(
@@ -172,11 +192,16 @@ class AscendOMPi05PolicyWrapper(PolicyWrapper):
         if self._impl is None:
             raise RuntimeError("AscendOMPi05PolicyWrapper is not loaded")
         # ``PI05Wrapper.predict`` returns a single action tensor of shape
-        # (B, chunk_size, action_dim), unlike the ACT wrapper which returns a
-        # list of outputs.  Don't try to index or truth-test it.
+        # (B, chunk_size, max_action_dim), unlike the ACT wrapper which returns
+        # a list of outputs.  Don't try to index or truth-test it.
         output = self._impl.predict(batch)
         if output is None:
             raise RuntimeError("PI05 OM model returned no outputs")
+        # PI05 pads actions to ``max_action_dim`` (e.g. 32); the downstream
+        # NormalizeProcessor stats only cover the real DoF, so slice the
+        # padding off here (matches lerobot's PI05Policy.select_action).
+        if self._action_dim is not None and output.shape[-1] > self._action_dim:
+            output = output[..., : self._action_dim]
         return as_action_tensor(output, self._device)
 
     def get_chunk_size(self) -> int:
