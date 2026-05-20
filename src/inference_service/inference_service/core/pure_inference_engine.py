@@ -354,7 +354,11 @@ class PureInferenceEngine:
 
         for key, value in batch.items():
             # Skip non-tensor metadata often injected by LeRobot dataset processors
-            if value is None or isinstance(value, dict | str):
+            # (e.g. ``task`` is a str, but the batch collator wraps it into a
+            # ``list[str]`` of length B — neither is convertible to a tensor).
+            if value is None or isinstance(value, dict | str | bytes):
+                continue
+            if isinstance(value, list | tuple) and (len(value) == 0 or isinstance(value[0], str | bytes | dict)):
                 continue
 
             if isinstance(value, np.ndarray):
