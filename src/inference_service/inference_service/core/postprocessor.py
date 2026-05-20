@@ -59,9 +59,9 @@ class LeRobotPostprocessor(PostprocessorBase):
         )
 
     def _load_policy_config(self, policy_path: str) -> Any:
-        from lerobot.configs.policies import PreTrainedConfig
+        from inference_service.core._policy_config import load_pretrained_policy_config
 
-        return PreTrainedConfig.from_pretrained(policy_path)
+        return load_pretrained_policy_config(policy_path)
 
     def __call__(self, action: Any) -> Any:
         return self._postprocessor(action)
