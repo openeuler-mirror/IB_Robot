@@ -171,10 +171,13 @@ class AscendOMPi05PolicyWrapper(PolicyWrapper):
     def infer(self, batch: dict[str, Tensor]) -> Tensor:
         if self._impl is None:
             raise RuntimeError("AscendOMPi05PolicyWrapper is not loaded")
+        # ``PI05Wrapper.predict`` returns a single action tensor of shape
+        # (B, chunk_size, action_dim), unlike the ACT wrapper which returns a
+        # list of outputs.  Don't try to index or truth-test it.
         output = self._impl.predict(batch)
-        if not output:
+        if output is None:
             raise RuntimeError("PI05 OM model returned no outputs")
-        return as_action_tensor(output[0], self._device)
+        return as_action_tensor(output, self._device)
 
     def get_chunk_size(self) -> int:
         return self._chunk_size
