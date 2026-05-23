@@ -68,6 +68,24 @@ def test_request_passes_query_params(monkeypatch):
     assert request_mock.call_args.kwargs["params"] == {"page": 2}
 
 
+def test_request_normalizes_joined_base_url(monkeypatch):
+    client = make_client()
+    client.config = AtomGitConfig(
+        token="test-token",
+        owner="example-org",
+        repo="example-repo",
+        base_url="https://api.atomgit.com/",
+    )
+    response = Mock(status_code=200)
+    response.json.return_value = []
+    request_mock = Mock(return_value=response)
+    monkeypatch.setattr(client.session, "request", request_mock)
+
+    client.request("GET", "/api/v5/user")
+
+    assert request_mock.call_args.kwargs["url"] == "https://api.atomgit.com/api/v5/user"
+
+
 def test_submit_inline_comment_uses_new_line_without_position(monkeypatch):
     client = make_client()
     response = Mock(status_code=200)

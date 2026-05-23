@@ -58,7 +58,7 @@ class AtomGitClient:
         Raises:
             AtomGitAPIError: If request fails after retries
         """
-        url = f"{self.config.base_url}{endpoint}"
+        url = f"{self.config.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
 
         for attempt in range(retry_count):
             try:
