@@ -34,6 +34,24 @@ if [ -f "${WORKSPACE_DIR}/install/setup.sh" ]; then
     source "${WORKSPACE_DIR}/install/setup.sh"
 fi
 
+# 7.1 加载 CANN (华为昇腾 Ascend) 环境，如已安装
+# 按优先级依次探测常见安装位置
+_CANN_CANDIDATES=(
+    "${ASCEND_TOOLKIT_HOME}/set_env.sh"
+    "/usr/local/Ascend/ascend-toolkit/set_env.sh
+    "${HOME}/Ascend/ascend-toolkit/set_env.sh"
+)
+for _cann_env in "${_CANN_CANDIDATES[@]}"; do
+    if [ -n "${_cann_env}" ] && [ -f "${_cann_env}" ]; then
+        source "${_cann_env}"
+        if [[ $- == *i* ]]; then
+            echo -e "${GREEN}[ibrobot_ws]${NC} 已加载 CANN 环境: ${_cann_env}"
+        fi
+        break
+    fi
+done
+unset _CANN_CANDIDATES _cann_env
+
 # 8. 别名设置
 alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='python3 -m colcon build --symlink-install --merge-install --packages-select'
