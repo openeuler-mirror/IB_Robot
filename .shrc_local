@@ -1,19 +1,34 @@
 # ibrobot_ws 通用开发环境脚本 (支持 Bash & Zsh)
 # 使用方法: source .shrc_local
 
+# 0. 颜色定义 & 状态收集
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+GRAY='\033[0;90m'
+NC='\033[0m'
+_IB_STEPS=()        # 已生效的步骤
+_IB_SKIPPED=()      # 未生效/跳过的步骤
+
 # 1. 加载基础 ROS 2 环境
 if [ -f "/opt/ros/humble/setup.sh" ]; then
     source /opt/ros/humble/setup.sh
+    _IB_STEPS+=("ROS 2 Humble")
+else
+    _IB_SKIPPED+=("ROS 2 Humble (未找到 /opt/ros/humble)")
 fi
 
 # 2. 如果当前在 conda 虚拟环境中，先退出
 if [ -n "$CONDA_DEFAULT_ENV" ] && command -v conda &> /dev/null; then
     conda deactivate
+    _IB_STEPS+=("退出 conda 环境")
 fi
 
 # 3. 激活虚拟环境
 if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
+    _IB_STEPS+=("Python venv")
+else
+    _IB_SKIPPED+=("Python venv (未找到 venv/bin/activate)")
 fi
 
 # 4. 禁用用户 site-packages，避免 ~/.local 与 workspace venv 混装
@@ -24,6 +39,7 @@ export PYTHONNOUSERSITE=1
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
 PYTHON_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 export PYTHONPATH="${WORKSPACE_DIR}/libs/lerobot/src:${WORKSPACE_DIR}/libs/atomgit_sdk/src:${WORKSPACE_DIR}/venv/lib/${PYTHON_VER}/site-packages:${PYTHONPATH}"
+_IB_STEPS+=("PYTHONPATH (lerobot/atomgit_sdk)")
 
 # 6. 日志与调试增强
 export RCUTILS_COLORIZED_OUTPUT=1
@@ -32,38 +48,44 @@ export PYTHONUNBUFFERED=1
 # 7. 加载本地编译后的包 (如果已编译)
 if [ -f "${WORKSPACE_DIR}/install/setup.sh" ]; then
     source "${WORKSPACE_DIR}/install/setup.sh"
+    _IB_STEPS+=("workspace install/")
+else
+    _IB_SKIPPED+=("workspace install/ (尚未 colcon build)")
 fi
 
 # 7.1 加载 CANN (华为昇腾 Ascend) 环境，如已安装
 # 按优先级依次探测常见安装位置
 _CANN_CANDIDATES=(
     "${ASCEND_TOOLKIT_HOME}/set_env.sh"
-    "/usr/local/Ascend/ascend-toolkit/set_env.sh
+    "/usr/local/Ascend/ascend-toolkit/set_env.sh"
     "${HOME}/Ascend/ascend-toolkit/set_env.sh"
 )
+_CANN_LOADED=""
 for _cann_env in "${_CANN_CANDIDATES[@]}"; do
     if [ -n "${_cann_env}" ] && [ -f "${_cann_env}" ]; then
         source "${_cann_env}"
-        if [[ $- == *i* ]]; then
-            echo -e "${GREEN}[ibrobot_ws]${NC} 已加载 CANN 环境: ${_cann_env}"
-        fi
+        _CANN_LOADED="${_cann_env}"
         break
     fi
 done
-unset _CANN_CANDIDATES _cann_env
+if [ -n "${_CANN_LOADED}" ]; then
+    _IB_STEPS+=("CANN (${_CANN_LOADED})")
+else
+    _IB_SKIPPED+=("CANN (未检测到 Ascend toolkit)")
+fi
+unset _CANN_CANDIDATES _cann_env _CANN_LOADED
 
 # 8. 别名设置
 alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='python3 -m colcon build --symlink-install --merge-install --packages-select'
 alias src='source install/setup.sh'
 
-# 9. 欢迎信息 (跨 Shell 颜色处理)
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-NC='\033[0m'
-
-# 检查是否为交互式 Shell
+# 9. 欢迎信息 + 步骤摘要 (仅在交互式 Shell 中输出)
 if [[ $- == *i* ]]; then
     echo -e "${GREEN}[ibrobot_ws]${NC} 环境已就绪！"
+    for _s in "${_IB_STEPS[@]}";   do echo -e "  ${GREEN}✔${NC} ${_s}"; done
+    for _s in "${_IB_SKIPPED[@]}"; do echo -e "  ${GRAY}✘ ${_s}${NC}"; done
     echo -e "常用指令: ${YELLOW}cb${NC} (编译全部), ${YELLOW}cbp${NC} (编译指定包), ${YELLOW}src${NC} (刷新环境)"
+    unset _s
 fi
+unset _IB_STEPS _IB_SKIPPED
