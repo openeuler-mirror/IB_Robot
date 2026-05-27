@@ -704,7 +704,7 @@ class LeRobotPolicyNode(Node):
     # LeRobot datasets store joint positions in normalised units that depend
     # on the motor norm mode selected during training:
     #   RANGE_M100_100:  arm [-100,+100], gripper [0,100]
-    #   DEGREES:         centred degrees = (tick - mid) * 360 / 4095
+    #   DEGREES:         arm centred degrees, gripper [0,100]
     #   NONE:            no conversion (pass-through)
     # ros2_control publishes /joint_states in radians.
     #

@@ -244,7 +244,7 @@ _TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 # Supported LeRobot motor normalization modes.
 # Keep in sync with the YAML ``lerobot_norm_mode`` option.
 NORM_MODE_RANGE = "range_m100_100"   # arm [-100,+100], gripper [0,100]
-NORM_MODE_DEGREES = "degrees"         # centred degrees
+NORM_MODE_DEGREES = "degrees"         # arm centred degrees, gripper [0,100]
 NORM_MODE_NONE = "none"               # pass-through (no conversion)
 
 _MODEL_RESOLUTION = 4096              # Feetech STS3215 12-bit encoder
@@ -479,7 +479,7 @@ def build_joint_conversion_table_from_calibration(
         tick_min = int(entry["range_min"])
         tick_max = int(entry["range_max"])
 
-        if mode == NORM_MODE_DEGREES:
+        if mode == NORM_MODE_DEGREES and joint_name not in gripper_joint_set:
             mid = (tick_min + tick_max) / 2.0
             max_res = _MODEL_RESOLUTION - 1  # 4095
             deg_at_tick_min = (tick_min - mid) * 360.0 / max_res
@@ -525,7 +525,9 @@ def build_joint_conversion_table(
         * Gripper      ``RANGE_0_100``:     ``pct = (t-tmin)/(tmax-tmin)*100``
 
     **degrees**
-        * All joints: ``deg = (t - mid) * 360 / 4095``  where ``mid=(tmin+tmax)/2``
+        * Arm joints: ``deg = (t - mid) * 360 / 4095``  where ``mid=(tmin+tmax)/2``
+        * Gripper joints keep ``RANGE_0_100`` semantics so model action ``0``
+          maps to the closed calibration end and ``100`` maps to open.
 
     **none**
         No conversion – returns an empty table so the caller does a pass-through.
@@ -537,8 +539,8 @@ def build_joint_conversion_table(
     joint_names : list[str]
         Ordered joint identifiers (e.g. ``["1","2",…,"6"]``).
     gripper_joints : list[str] | None
-        Only used in ``range_m100_100`` mode to select RANGE_0_100 for these
-        joints.  Ignored in ``degrees`` mode.
+        Selects RANGE_0_100 semantics for these joints in ``range_m100_100``
+        and ``degrees`` modes.
     norm_mode : str
         One of ``"range_m100_100"``, ``"degrees"``, ``"none"``.
 

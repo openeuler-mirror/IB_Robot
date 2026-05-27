@@ -165,6 +165,12 @@ robot:
 - `arm_position_controller` (JointGroupPositionController)
 - `gripper_position_controller` (ForwardCommandController)
 
+The model-level `lerobot_norm_mode` controls conversion between LeRobot
+action/observation units and `ros2_control` radians. `range_m100_100` uses
+arm `[-100,100]` and gripper `[0,100]`; `degrees` uses centered degrees for
+arm joints while joints listed in `joints.gripper` keep `[0,100]` open/close
+semantics.
+
 **Command interface:**
 ```bash
 # Arm position commands

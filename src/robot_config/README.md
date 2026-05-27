@@ -205,6 +205,11 @@ robot:
 - `arm_position_controller` (JointGroupPositionController)
 - `gripper_position_controller` (ForwardCommandController)
 
+模型配置中的 `lerobot_norm_mode` 决定 LeRobot 动作/观测与 `ros2_control`
+弧度命令之间的转换方式。`range_m100_100` 使用机械臂 `[-100,100]`、
+夹爪 `[0,100]`；`degrees` 对机械臂关节使用 centered degrees，但
+`joints.gripper` 中的夹爪关节仍保持 `[0,100]` 开合语义。
+
 **命令接口：**
 ```bash
 # 机械臂位置命令

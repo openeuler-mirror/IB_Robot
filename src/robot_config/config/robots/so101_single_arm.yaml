@@ -27,7 +27,7 @@ robot:
       # LeRobot motor normalization mode used during training.
       # Determines how rad ↔ LeRobot units are converted:
       #   range_m100_100 : arm [-100,+100], gripper [0,100]  (LeRobot default)
-      #   degrees        : centered degrees = (ticks - mid) * 360 / 4095
+      #   degrees        : arm centered degrees; gripper keeps [0,100]
       #   none           : no conversion (pass-through, units already match)
       lerobot_norm_mode: range_m100_100
 
