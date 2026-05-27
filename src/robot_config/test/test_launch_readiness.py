@@ -226,15 +226,12 @@ def test_launch_loader_preserves_config_path_for_runtime_consumers():
     assert robot_config["_config_path"].endswith("config/robots/lekiwi.yaml")
 
 
-def test_generate_inference_node_binds_shared_rknn_resources(monkeypatch):
-    workspace = Path("/home/xqw/Research/IB_Robot")
+def test_generate_inference_node_binds_shared_rknn_resources(monkeypatch, tmp_path):
+    workspace = tmp_path
     model_dir = workspace / "models" / "502000" / "pretrained_model"
     model_dir.mkdir(parents=True, exist_ok=True)
     model_file = model_dir / "model.rknn"
-    created_model = False
-    if not model_file.exists():
-        model_file.write_bytes(b"rknn")
-        created_model = True
+    model_file.write_bytes(b"rknn")
 
     monkeypatch.setenv("WORKSPACE", str(workspace))
 
@@ -263,11 +260,10 @@ def test_generate_inference_node_binds_shared_rknn_resources(monkeypatch):
 
         params = _node_parameters(node)
 
-        assert "/home/xqw/Research/IB_Robot/models/502000/pretrained_model" in params["checkpoint"]
+        assert str(model_dir.resolve()) in params["checkpoint"]
         assert "rknn" in str(params["device"])
     finally:
-        if created_model:
-            model_file.unlink(missing_ok=True)
+        model_file.unlink(missing_ok=True)
 
 
 def test_generate_inference_node_uses_policy_path_only_for_rknn(monkeypatch, tmp_path):
