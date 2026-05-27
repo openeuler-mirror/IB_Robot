@@ -167,6 +167,10 @@ output_dataset/
 ```bash
 ros2 run dataset_tools camera_alignment \
     --cameras_index_or_path /dev/video0 \
+    --width 640 \
+    --height 480 \
+    --fps 60 \
+    --format MJPG \
     --reference-path /tmp/camera_reference_multi.json \
     --reference-image-path /tmp/reference_img.png
 ```
@@ -176,6 +180,7 @@ ros2 run dataset_tools camera_alignment \
 - 保存当前 ArUco 角点作为参考基准
 - 实时显示与参考画面的平均像素误差
 - 进入“虚影对齐”界面辅助恢复视角
+- 显式请求 OpenCV 采集分辨率、帧率和采集格式，并提示实际生效值
 
 详细说明见：
 

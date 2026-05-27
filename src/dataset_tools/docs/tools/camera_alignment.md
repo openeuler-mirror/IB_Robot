@@ -10,9 +10,12 @@
 
 ## 工具能力
 
-当前工具保持原始迁移工具的输入方式：
+当前工具保持原始迁移工具的输入方式，并支持显式指定采集格式：
 
 - `--cameras_index_or_path`：直接从本机摄像头或视频设备读取
+- `--width` / `--height`：请求 OpenCV 以指定分辨率打开设备
+- `--fps`：请求指定帧率
+- `--format`：请求指定采集格式，例如 `MJPG`、`YUYV`
 
 工具支持如下交互：
 
@@ -22,7 +25,7 @@
 
 默认会生成两个文件：
 
-- `camera_reference_multi.json`：保存参考角点
+- `camera_reference_multi.json`：保存参考角点和参考帧尺寸
 - `reference_img.png`：保存参考图像
 
 ## 运行前提
@@ -64,6 +67,10 @@ source .shrc_local
 
 ros2 run dataset_tools camera_alignment \
   --cameras_index_or_path /dev/video0 \
+  --width 640 \
+  --height 480 \
+  --fps 60 \
+  --format MJPG \
   --reference-path /tmp/camera_reference_multi.json \
   --reference-image-path /tmp/reference_img.png
 ```
@@ -113,6 +120,30 @@ q
 | `--cameras_index_or_path` | 本机摄像头索引或设备路径，如 `0`、`/dev/video0` |
 | `--reference-path` | 参考角点 JSON 输出路径 |
 | `--reference-image-path` | 参考图输出路径 |
+| `--width` | 请求采集宽度，单位为像素 |
+| `--height` | 请求采集高度，单位为像素 |
+| `--fps` | 请求采集帧率 |
+| `--format` | 请求四字符采集格式，例如 `MJPG`、`YUYV` |
+
+启动后，工具会在首次读取到画面时打印实际生效的采集参数。如果设备或 OpenCV
+后端没有接受请求值，会打印 warning，例如实际分辨率、帧率或 FOURCC 与请求值不一致。
+
+## 参考文件格式
+
+新保存的参考 JSON 会记录参考帧尺寸：
+
+```json
+{
+  "image_width": 640,
+  "image_height": 480,
+  "markers": {
+    "1": [[...], [...], [...], [...]]
+  }
+}
+```
+
+旧版只包含 marker 映射的 JSON 仍可读取。读取到新版参考文件时，如果当前帧尺寸
+与参考帧尺寸不同，工具会提示像素误差处于不同坐标系中，结果不可靠，建议重新保存参考。
 
 ## 常见问题
 
@@ -134,3 +165,8 @@ q
 
 - `--reference-path`
 - `--reference-image-path`
+
+### 4. 提示参考尺寸和当前画面尺寸不一致
+
+说明当前帧和参考帧不在同一像素坐标系中。请使用相同的 `--width`、`--height`、
+`--fps`、`--format` 参数重新打开设备，并按 `s` 重新保存参考基准。
