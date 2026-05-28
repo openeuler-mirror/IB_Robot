@@ -11,12 +11,36 @@ platform_prepare_host() {
     log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
     export ROS_OS_OVERRIDE=rhel:8
 
+    ensure_openeuler_volatile_dirs
     ensure_openeuler_builtin_repos
+    ensure_openeuler_ca_certificates
     ensure_openeuler_extras_repo
     ensure_openeuler_gpg_key
 
     log_info "Installing openEuler host packages required by the workspace..."
-    run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel
+    run_sudo dnf install -y --nogpgcheck \
+        gcc-c++ \
+        vim-enhanced \
+        ffmpeg-devel \
+        libvpx \
+        libvpx-devel \
+        nlohmann-json-devel
+}
+
+ensure_openeuler_ca_certificates() {
+    log_info "Installing openEuler CA certificates..."
+    run_sudo dnf install -y --nogpgcheck ca-certificates
+    if command -v update-ca-trust >/dev/null 2>&1; then
+        log_info "Refreshing system CA trust store..."
+        run_sudo update-ca-trust extract
+    fi
+}
+
+ensure_openeuler_volatile_dirs() {
+    # openEuler Embedded uses /var/tmp -> volatile/tmp; some validation
+    # rootfs images miss the volatile target, which breaks rpm scriptlets.
+    run_sudo mkdir -p /var/volatile/tmp /var/volatile/log
+    run_sudo chmod 1777 /var/volatile/tmp
 }
 
 platform_install_colcon() {

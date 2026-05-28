@@ -15,6 +15,31 @@ resolve_venv_python() {
     return 1
 }
 
+ensure_python_ssl_cert_file() {
+    if [[ -n "${SSL_CERT_FILE:-}" && -f "${SSL_CERT_FILE}" ]]; then
+        export PYTHONHTTPSVERIFY="${PYTHONHTTPSVERIFY:-1}"
+        return 0
+    fi
+
+    local ca_bundle
+    for ca_bundle in \
+        /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+        /etc/pki/tls/cert.pem \
+        /etc/ssl/certs/ca-certificates.crt \
+        /etc/ssl/cert.pem
+    do
+        if [[ -f "${ca_bundle}" ]]; then
+            export SSL_CERT_FILE="${ca_bundle}"
+            export PYTHONHTTPSVERIFY=1
+            log_info "Using Python SSL_CERT_FILE=${SSL_CERT_FILE}"
+            return 0
+        fi
+    done
+
+    log_warn "No system CA bundle found for Python SSL; rosdep HTTPS may fail."
+    return 1
+}
+
 rosdep_sources_list_needs_refresh() {
     local target_file="${SETUP_ROSDEP_DEFAULT_SOURCES_FILE}"
 
@@ -79,6 +104,7 @@ PIP_CONF
 
 ensure_rosdep() {
     ensure_workspace_venv
+    ensure_python_ssl_cert_file || true
 
     if ! "${ROSDEP_BIN}" --version &>/dev/null; then
         log_info "Installing rosdep into the workspace venv..."
@@ -110,7 +136,7 @@ ensure_rosdep() {
                 ssl_pem=$("${VENV_PYTHON}" -c "import ssl; print(ssl.get_default_verify_paths().openssl_cafile)" 2>/dev/null)
                 if [[ -n "${ssl_pem}" && -f "${ssl_pem}" ]]; then
                     log_info "Retrying with explicit SSL_CERT_FILE=${ssl_pem} (Python CA bundle)..."
-                    if init_output=$(env SSL_CERT_FILE="${ssl_pem}" write_rosdep_sources_list 2>&1); then
+                    if init_output=$(SSL_CERT_FILE="${ssl_pem}" PYTHONHTTPSVERIFY=1 write_rosdep_sources_list 2>&1); then
                         log_done "rosdep sources list configured using explicit SSL_CERT_FILE"
                         return 0
                     fi

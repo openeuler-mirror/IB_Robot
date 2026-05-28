@@ -43,8 +43,11 @@ update_submodules() {
     log_info "Synchronizing submodule URLs..."
     git submodule sync --recursive >/dev/null
 
-    local submodules
-    mapfile -t submodules < <(git config --file .gitmodules --get-regexp path | awk '{ print $2 }')
+    local submodules=()
+    local sm_path
+    while IFS= read -r sm_path; do
+        [[ -n "${sm_path}" ]] && submodules+=("${sm_path}")
+    done <<< "$(git config --file .gitmodules --get-regexp path | awk '{ print $2 }')"
     
     local to_update=()
     local skipped=()
