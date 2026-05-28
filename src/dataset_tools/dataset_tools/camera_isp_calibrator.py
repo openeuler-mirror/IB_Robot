@@ -14,9 +14,12 @@ Designed for **idiot-proof, robust** operation:
   it is computing and the HUD turns yellow.
 * Initial param snapshot is taken at startup; ``r`` always restores it,
   and ``q`` prompts before quitting if there are unsaved changes.
-* All ROS / cv2 / camera-node failures are caught and displayed as a banner;
+* All ROS / OpenCV / camera-node failures are caught and displayed as a banner;
   the GUI never disappears mid-session. Persistent reconnect attempts are
   made silently in the background.
+* For lightweight camera-only calibration, ``--camera_index`` reads
+  directly from a local OpenCV ``VideoCapture`` source and drives controls via
+  V4L2, so ``usb_cam`` / ``robot.launch.py`` are not required.
 * ``s`` saves a JSON override at
   ``~/.ros/ibrobot/camera_isp_overrides/{camera}.json`` so the result is
   re-applied automatically on the next ``robot.launch.py``.
@@ -24,6 +27,9 @@ Designed for **idiot-proof, robust** operation:
 CLI:
     ros2 run dataset_tools camera_isp_calibrator \\
         --camera top --reference ref.png
+
+    ros2 run dataset_tools camera_isp_calibrator \\
+        --camera top --camera_index /dev/video0 --reference ref.png
 
 Public surface kept narrow on purpose; future "Manual + bbox" mode will be
 added as an additional keyboard mode without changing any current handler.
@@ -39,7 +45,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Protocol
 
 import numpy as np
 
@@ -90,6 +96,8 @@ _BOOL_ISP_KEYS = {"auto_white_balance", "autoexposure", "autofocus"}
 _DEBOUNCE_S = 0.4
 _RECONNECT_S = 2.0
 _SOLVER_RETRIES = 4
+_DIRECT_CAPTURE_FAILURE_LIMIT = 20
+_DIRECT_CAPTURE_RETRY_S = 0.05
 
 WHITE = (255, 255, 255)
 YELLOW = (0, 255, 255)
@@ -125,6 +133,65 @@ class _LatestFrame:
     lock: threading.Lock = field(default_factory=threading.Lock)
     frame: np.ndarray | None = None
     stamp: float = 0.0
+
+
+class CameraBridge(Protocol):
+    """Minimal camera surface consumed by :class:`CalibratorWindow`."""
+
+    camera_name: str
+    video_device: str | None
+
+    def latest_frame(self) -> tuple[np.ndarray | None, float]:
+        """Return the newest BGR frame and its monotonic timestamp."""
+
+    def get_params(self, keys: tuple[str, ...]) -> tuple[dict[str, Any], str | None]:
+        """Return current ISP parameters for *keys*."""
+
+    def set_params(self, params: Mapping[str, Any]) -> tuple[bool, str | None]:
+        """Apply ISP parameters."""
+
+    def shutdown(self) -> None:
+        """Release bridge resources."""
+
+
+def normalize_camera_source(camera_source: str) -> str | int:
+    """Normalize a CLI camera source to the value expected by OpenCV.
+
+    Returns an ``int`` for pure-digit strings, which OpenCV treats as a camera
+    index, or the original string unchanged for device paths such as
+    ``/dev/video0``.
+    """
+    return int(camera_source) if camera_source.isdigit() else camera_source
+
+
+def _video_device_from_source(camera_source: str | int) -> str | None:
+    """Best-effort V4L2 device path for an OpenCV camera source."""
+    if isinstance(camera_source, int):
+        return f"/dev/video{camera_source}"
+    if camera_source.isdigit():
+        return f"/dev/video{int(camera_source)}"
+    if camera_source.startswith("/dev/"):
+        return camera_source
+    return None
+
+
+def _camera_name_from_source(camera_source: str) -> str:
+    """Derive a stable override filename stem when --camera is omitted."""
+    if camera_source.isdigit():
+        return f"video{int(camera_source)}"
+    name = Path(camera_source).name or "direct"
+    safe = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in name)
+    return safe or "direct"
+
+
+def _derived_camera_name_notice(camera_name: str) -> str:
+    path = _override_path(camera_name)
+    return (
+        "[camera_isp_calibrator] --camera omitted; derived camera name "
+        f"'{camera_name}'. Overrides will be saved to {path}. Pass --camera "
+        "with the robot_config camera name (for example 'top' or 'wrist') "
+        "if the result should be auto-loaded by robot.launch.py."
+    )
 
 
 class RosBridge:
@@ -334,6 +401,197 @@ class RosBridge:
             pass
 
 
+class OpenCvBridge:
+    """OpenCV frame source plus direct V4L2 parameter bridge."""
+
+    _MAX_CAPTURE_FAILURES = _DIRECT_CAPTURE_FAILURE_LIMIT
+    _CAPTURE_RETRY_S = _DIRECT_CAPTURE_RETRY_S
+
+    _AUTO_PARAM_TO_LOGICAL = {
+        "auto_white_balance": "white_balance_auto",
+        "autoexposure": "exposure_auto",
+        "autofocus": "focus_auto",
+    }
+
+    def __init__(
+        self,
+        camera_name: str,
+        camera_source: str | int,
+        opencv,
+        *,
+        capture_size: tuple[int, int] | None = None,
+    ):
+        self.camera_name = camera_name
+        self.video_device = _video_device_from_source(camera_source)
+        self._opencv = opencv
+        self._source = camera_source
+        self._latest = _LatestFrame()
+        self._stop = threading.Event()
+        self._capture_error: str | None = None
+        self._capture = opencv.VideoCapture(camera_source)
+        if not self._capture.isOpened():
+            raise RuntimeError(f"cannot open camera source: {camera_source}")
+        self._apply_capture_size(capture_size)
+        self._spin_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self._spin_thread.start()
+
+    def _apply_capture_size(self, capture_size: tuple[int, int] | None) -> None:
+        if capture_size is None:
+            return
+        width, height = capture_size
+        self._capture.set(self._opencv.CAP_PROP_FRAME_WIDTH, int(width))
+        self._capture.set(self._opencv.CAP_PROP_FRAME_HEIGHT, int(height))
+
+    def _capture_loop(self) -> None:
+        failures = 0
+        last_error = "no frame returned"
+        while not self._stop.is_set():
+            try:
+                ok, frame = self._capture.read()
+            except Exception as exc:  # noqa: BLE001
+                ok = False
+                frame = None
+                last_error = f"read failed: {exc}"
+            if ok and frame is not None:
+                failures = 0
+                with self._latest.lock:
+                    self._latest.frame = frame.copy()
+                    self._latest.stamp = time.monotonic()
+                continue
+            failures += 1
+            if failures >= self._MAX_CAPTURE_FAILURES:
+                self._capture_error = (
+                    f"direct camera source {self._source!r} stopped after "
+                    f"{failures} consecutive read failures ({last_error})"
+                )
+                self._stop.set()
+                break
+            if self._stop.wait(self._CAPTURE_RETRY_S):
+                break
+
+    @property
+    def capture_error(self) -> str | None:
+        return self._capture_error
+
+    def latest_frame(self) -> tuple[np.ndarray | None, float]:
+        with self._latest.lock:
+            return (
+                None if self._latest.frame is None else self._latest.frame.copy(),
+                self._latest.stamp,
+            )
+
+    @staticmethod
+    def _default_params(keys: tuple[str, ...]) -> dict[str, Any]:
+        defaults = {key: default for _, key, _, _, default in _SLIDERS}
+        defaults.update({
+            "auto_white_balance": True,
+            "autoexposure": True,
+            "autofocus": True,
+        })
+        return {key: defaults[key] for key in keys if key in defaults}
+
+    @staticmethod
+    def _auto_value_from_v4l2(key: str, value: int) -> bool:
+        if key == "autoexposure":
+            # V4L2 auto_exposure: 1=manual, 3=aperture-priority auto.
+            return int(value) != 1
+        return bool(value)
+
+    @staticmethod
+    def _auto_value_to_v4l2(key: str, value: Any) -> int:
+        enabled = bool(value)
+        if key == "autoexposure":
+            return 3 if enabled else 1
+        return 1 if enabled else 0
+
+    def get_params(self, keys: tuple[str, ...]) -> tuple[dict[str, Any], str | None]:
+        params = self._default_params(keys)
+        if "video_device" in keys and self.video_device:
+            params["video_device"] = self.video_device
+        if not self.video_device:
+            return params, "direct camera source has no V4L2 device path"
+
+        from dataset_tools.camera_isp import v4l2_ctl as _v4l2
+
+        if not _v4l2.have_v4l2_ctl():
+            return params, "v4l2-ctl not available; direct parameter reads disabled"
+
+        resolved = _v4l2.resolve_ctrls(self.video_device)
+        if not resolved:
+            return params, f"no V4L2 controls found on {self.video_device}"
+
+        for key in keys:
+            logical = self._AUTO_PARAM_TO_LOGICAL.get(key, key)
+            info = resolved.get(logical)
+            if info is None:
+                continue
+            value = info.value if info.value is not None else info.default
+            if value is None:
+                continue
+            if key in self._AUTO_PARAM_TO_LOGICAL:
+                params[key] = self._auto_value_from_v4l2(key, int(value))
+            else:
+                params[key] = int(value)
+        return params, None
+
+    def set_params(self, params: Mapping[str, Any]) -> tuple[bool, str | None]:
+        if not params:
+            return True, None
+        if not self.video_device:
+            return False, "direct camera source has no V4L2 device path"
+
+        from dataset_tools.camera_isp import v4l2_ctl as _v4l2
+
+        if not _v4l2.have_v4l2_ctl():
+            return False, "v4l2-ctl not available; direct parameter writes disabled"
+
+        resolved = _v4l2.resolve_ctrls(self.video_device)
+        failures: list[str] = []
+        handled: set[str] = set()
+
+        numeric_params = {
+            key: value for key, value in params.items()
+            if key not in self._AUTO_PARAM_TO_LOGICAL and not isinstance(value, bool)
+        }
+        ok, msg, v4l2_handled = _v4l2.apply_params(
+            self.video_device,
+            resolved,
+            dict(numeric_params),
+        )
+        handled.update(v4l2_handled)
+        if not ok:
+            failures.append(msg)
+
+        for key, value in params.items():
+            logical = self._AUTO_PARAM_TO_LOGICAL.get(key)
+            if logical is None:
+                continue
+            handled.add(key)
+            ok, msg = _v4l2.set_ctrl(
+                self.video_device,
+                logical,
+                self._auto_value_to_v4l2(key, value),
+                resolved,
+            )
+            if not ok:
+                failures.append(f"{key}: {msg}")
+
+        unhandled = sorted(key for key in params if key not in handled)
+        if unhandled:
+            failures.append("unsupported direct params: " + ", ".join(unhandled))
+        if failures:
+            return False, "; ".join(failures)[:240]
+        return True, None
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        self._spin_thread.join(timeout=1.0)
+        try:
+            self._capture.release()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 # --------------------------------------------------------------------------
 # Reference loader — image OR video; auto-resize to live frame size.
 # --------------------------------------------------------------------------
@@ -472,7 +730,7 @@ class CalibratorWindow:
 
     def __init__(
         self,
-        bridge: RosBridge,
+        bridge: CameraBridge,
         reference: np.ndarray,
         opencv,
         *,
@@ -570,6 +828,7 @@ class CalibratorWindow:
         self._sw_isp_neutral_n: int = 0       # px count that drove WB (0 = no neutral box)
         self._sw_isp_ref_saturated: bool = False  # True = ref pixels were all clipped
         self._sw_isp_ccm_pairs: int = 0       # >0 means CCM mode active (3x3 in _sw_isp.ccm)
+        self._last_bridge_error: str | None = None
         # CCM variant cache (populated by _update_sw_isp_from_dbg). Keys:
         # "linear" / "rpcc2" / "rpcc2_ridge" / "rpcc2_als". Each value is a
         # dict {"M","feat_dim","n_pairs","lambda","iters","delta_e_median"}
@@ -3852,6 +4111,10 @@ class CalibratorWindow:
         try:
             while not self._stop_render:
                 live, stamp = self._bridge.latest_frame()
+                bridge_error = getattr(self._bridge, "capture_error", None)
+                if bridge_error and bridge_error != self._last_bridge_error:
+                    self._last_bridge_error = bridge_error
+                    self._notify(bridge_error, RED, 6.0)
                 # [GuiRate-debug] commented out — was spamming terminal every second.
                 # now = time.monotonic()
                 # gui_dbg["frames"] += 1
@@ -4031,14 +4294,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="camera_isp_calibrator",
         description=(
-            "Interactive ISP color calibrator. Connects to a running usb_cam "
-            "node, lets you match its output to a reference image, and saves "
-            "the result to ~/.ros/ibrobot/camera_isp_overrides/{camera}.json."
+            "Interactive ISP color calibrator. Reads from a running usb_cam "
+            "node by default, or directly from --camera_index, then "
+            "saves the result to ~/.ros/ibrobot/camera_isp_overrides/{camera}.json."
         ),
     )
     parser.add_argument(
-        "--camera", required=True,
+        "--camera", required=False, default=None,
         help="Camera name as declared in robot_config YAML (e.g. 'top', 'wrist').",
+    )
+    parser.add_argument(
+        "--camera_index",
+        required=False,
+        default=None,
+        help=(
+            "Camera index (e.g. 0) or video device path (e.g. /dev/video0). "
+            "When set, frames are read directly with OpenCV instead of "
+            "subscribing to a ROS image topic."
+        ),
     )
     parser.add_argument(
         "--reference", required=False, default=None,
@@ -4070,6 +4343,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if not args.camera and not args.camera_index:
+        print(
+            "[camera_isp_calibrator] --camera is required unless "
+            "--camera_index is set"
+        )
+        return 2
     if not args.colorchecker and not args.reference:
         print(
             "[camera_isp_calibrator] --reference is required unless "
@@ -4090,15 +4369,28 @@ def main(argv: list[str] | None = None) -> int:
             make_checker_thumbnail,
         )
         reference = make_checker_thumbnail(360, 540, with_index=True)
+        direct_capture_size = None
     else:
         try:
             reference = load_reference(args.reference, opencv)
         except (FileNotFoundError, RuntimeError) as exc:
             print(f"[camera_isp_calibrator] {exc}")
             return 2
+        direct_capture_size = (int(reference.shape[1]), int(reference.shape[0]))
 
+    camera_name = args.camera or _camera_name_from_source(args.camera_index)
+    if args.camera_index and not args.camera:
+        print(_derived_camera_name_notice(camera_name))
     try:
-        bridge = RosBridge(args.camera)
+        if args.camera_index:
+            bridge = OpenCvBridge(
+                camera_name,
+                normalize_camera_source(args.camera_index),
+                opencv,
+                capture_size=direct_capture_size,
+            )
+        else:
+            bridge = RosBridge(camera_name)
     except RuntimeError as exc:
         print(f"[camera_isp_calibrator] {exc}")
         return 3

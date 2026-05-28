@@ -192,20 +192,38 @@ ros2 run dataset_tools camera_alignment \
 方面尽可能接近一张参考图片，并把结果保存为 override JSON，下次启动
 `robot.launch.py` 时自动复用，**不修改 YAML SSOT**。
 
-**前置条件**：
-1. 已经通过 `robot.launch.py` 启动 usb_cam 节点（节点名形如 `/top_camera`）；
-2. 准备一张参考图片或视频（视频会取首帧）。
+**运行模式**：
+1. ROS bridge 模式：不传 `--camera_index` 时，沿用原有行为，
+   订阅 usb_cam 节点（节点名形如 `/top_camera`）并通过 ROS 参数服务兜底写入；
+2. OpenCV 直连模式：传入 `--camera_index` 时，直接从本机摄像头索引
+   或 `/dev/video*` 读取画面，不需要启动 `robot.launch.py` 或 `usb_cam` 节点。
+
+两种模式都需要准备一张参考图片或视频（视频会取首帧）。直连模式会优先通过
+`v4l2-ctl` 写入设备 ISP 参数；建议仍传 `--camera top` / `--camera wrist` 等名称，
+这样保存的 override 文件能继续被 `robot.launch.py` 自动复用。
 
 **基本用法**：
 ```bash
-# 终端 A：启动机器人 / 摄像头
+# 方式 A：ROS bridge 模式，先启动机器人 / 摄像头
 source .shrc_local
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=teleop
 
-# 终端 B：运行校准工具
+# 另一个终端运行校准工具
 source .shrc_local
 ros2 run dataset_tools camera_isp_calibrator \
     --camera top \
+    --reference /path/to/reference.png
+
+# 方式 B：OpenCV 直连模式，不需要启动 robot.launch.py
+source .shrc_local
+ros2 run dataset_tools camera_isp_calibrator \
+    --camera top \
+    --camera_index /dev/video0 \
+    --reference /path/to/reference.png
+
+# 也可以使用整数索引；未传 --camera 时保存名会自动派生为 video0
+ros2 run dataset_tools camera_isp_calibrator \
+    --camera_index 0 \
     --reference /path/to/reference.png
 ```
 
