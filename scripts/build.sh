@@ -234,7 +234,18 @@ require_setup_environment
 # ROS 2 Environment
 # ============================================================================
 source /opt/ros/humble/setup.sh
-[[ -f "${WORKSPACE}/install/setup.sh" ]] && source "${WORKSPACE}/install/setup.sh"
+
+# Clean build: remove stale dirs BEFORE sourcing to prevent overlay chain leaks.
+# Without this, install/setup.sh (which may chain to stale overlays like a
+# dev_worktree) pollutes AMENT_PREFIX_PATH and colcon records it again.
+if ${CLEAN_BUILD}; then
+    log_info "Removing stale install/, build/, log/ to prevent overlay chain leaks..."
+    rm -rf "${WORKSPACE}/install" "${WORKSPACE}/build" "${WORKSPACE}/log"
+fi
+
+if ! ${CLEAN_BUILD}; then
+    [[ -f "${WORKSPACE}/install/setup.sh" ]] && source "${WORKSPACE}/install/setup.sh"
+fi
 
 # ============================================================================
 # openEuler / RedHat FFmpeg header fix
