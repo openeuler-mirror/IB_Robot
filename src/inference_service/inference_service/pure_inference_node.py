@@ -25,6 +25,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from ibrobot_msgs.msg import VariantsList
+from inference_service.core._policy_config import read_local_policy_config_device
 from inference_service.core.pure_inference_engine import (
     PureInferenceEngine,
 )
@@ -60,6 +61,7 @@ class PureInferenceNode(Node):
         self._input_topic = input_topic
         self._output_topic = output_topic
         self._inference_backend = str(device)
+        model_config_device = read_local_policy_config_device(policy_path) or "<unset>"
 
         self.get_logger().info(f"Loading policy from {policy_path} with inference_backend={self._inference_backend}...")
         self._engine = PureInferenceEngine(policy_path=policy_path, device=device)
@@ -67,6 +69,12 @@ class PureInferenceNode(Node):
             f"Engine loaded: policy_type={self._engine.policy_type}, "
             f"backend_type={self._engine.backend_type or self._inference_backend}, "
             f"chunk_size={self._engine.chunk_size}"
+        )
+        self.get_logger().info(
+            f"Runtime device contract: model_config_device={model_config_device}, "
+            f"runtime_backend={self._engine.backend_type or self._inference_backend}, "
+            f"runtime_tensor_device={self._engine.device}; "
+            f"model_config_device is training metadata"
         )
 
         self._sub = self.create_subscription(

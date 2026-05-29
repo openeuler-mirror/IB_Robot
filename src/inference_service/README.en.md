@@ -145,6 +145,13 @@ internal `CompiledPolicyWrapper` facade:
   identifies the runtime backend, such as `ascend_om`, `ascend_om_3403`, or
   `rknn`.
 
+The runtime device comes from launch/ROS parameters. If the LeRobot-exported
+`config.json` still records the training device, such as `"device": "cuda"`,
+`inference_service` overrides that field in a local temporary config copy with
+the current runtime tensor device (CPU for compiled OM/RKNN backends). The
+source model directory is not modified, and training-device metadata does not
+constrain backend selection.
+
 Compiled conversion tools should emit a separate `config.om.json` next to the
 LeRobot `config.json` so compiled runtime metadata does not pollute the LeRobot
 schema. The sidecar uses a role-to-path artifact map and can declare a generic

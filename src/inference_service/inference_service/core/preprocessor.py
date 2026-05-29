@@ -53,7 +53,7 @@ class LeRobotPreprocessor(PreprocessorBase):
         # ``isinstance(policy_cfg, GrootConfig)`` check, but it would silently
         # mis-dispatch for any future policy-specific branch (e.g. PI05).
         # Load a proper config instance via ``PreTrainedConfig.from_pretrained``.
-        self._policy_config = policy_config or self._load_policy_config(policy_path)
+        self._policy_config = policy_config or self._load_policy_config(policy_path, device)
 
         self._preprocessor, _ = make_pre_post_processors(
             policy_cfg=self._policy_config,
@@ -61,10 +61,10 @@ class LeRobotPreprocessor(PreprocessorBase):
             preprocessor_overrides={"device_processor": {"device": str(device)}},
         )
 
-    def _load_policy_config(self, policy_path: str) -> Any:
+    def _load_policy_config(self, policy_path: str, device: torch.device) -> Any:
         from inference_service.core._policy_config import load_pretrained_policy_config
 
-        return load_pretrained_policy_config(policy_path)
+        return load_pretrained_policy_config(policy_path, runtime_device=device)
 
     def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
         return self._preprocessor(batch)

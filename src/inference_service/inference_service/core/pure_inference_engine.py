@@ -201,6 +201,10 @@ class LeRobotPolicyWrapper(PolicyWrapper):
         for policy_type in policy_types:
             try:
                 PolicyCls = get_policy_class(policy_type)
+                # Runtime config materialization is local-directory only.  Hub
+                # policies are moved after load; if a hub config's training
+                # device causes load-time failures, download a local snapshot
+                # and let ``_load_from_local`` rewrite the runtime config.
                 self._policy = PolicyCls.from_pretrained(repo_id)
                 self._policy.to(device)
                 self._policy.eval()
@@ -213,24 +217,27 @@ class LeRobotPolicyWrapper(PolicyWrapper):
             raise RuntimeError(f"Could not load policy from {repo_id}")
 
     def _load_from_local(self, path: str, device: torch.device) -> None:
-        cfg_json = os.path.join(path, "config.json")
-        cfg_type = ""
+        from inference_service.core._policy_config import materialize_runtime_policy_path
 
-        if os.path.exists(cfg_json):
-            with open(cfg_json, encoding="utf-8") as f:
-                cfg = json.load(f)
-                cfg_type = str(cfg.get("type", "")).lower()
+        with materialize_runtime_policy_path(path, runtime_device=device) as runtime_path:
+            cfg_json = os.path.join(runtime_path, "config.json")
+            cfg_type = ""
 
-        if not cfg_type:
-            raise RuntimeError(f"Could not determine policy type from {path}")
+            if os.path.exists(cfg_json):
+                with open(cfg_json, encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    cfg_type = str(cfg.get("type", "")).lower()
 
-        from lerobot.policies.factory import get_policy_class
+            if not cfg_type:
+                raise RuntimeError(f"Could not determine policy type from {path}")
 
-        PolicyCls = get_policy_class(cfg_type)
-        self._policy = PolicyCls.from_pretrained(path)
-        self._policy.to(device)
-        self._policy.eval()
-        self._policy_type = cfg_type
+            from lerobot.policies.factory import get_policy_class
+
+            PolicyCls = get_policy_class(cfg_type)
+            self._policy = PolicyCls.from_pretrained(runtime_path)
+            self._policy.to(device)
+            self._policy.eval()
+            self._policy_type = cfg_type
 
     def _detect_chunk_size(self) -> int:
         if hasattr(self._policy.config, "chunk_size"):

@@ -62,6 +62,7 @@ from inference_service.core import (
     InferenceCoordinator,
     resolve_device,
 )
+from inference_service.core._policy_config import read_local_policy_config_device
 from inference_service.core.postprocessor import TensorPostprocessor
 from inference_service.core.preprocessor import TensorPreprocessor
 from robot_config.contract_utils import (
@@ -406,6 +407,7 @@ class LeRobotPolicyNode(Node):
         policy_path = self._config.repo_id or self._config.checkpoint
         if not policy_path:
             raise RuntimeError("LeRobotPolicyNode: 'repo_id' or 'checkpoint' is required")
+        self._log_runtime_device_contract(policy_path)
 
         self._coordinator = InferenceCoordinator(
             policy_path=policy_path,
@@ -428,6 +430,7 @@ class LeRobotPolicyNode(Node):
         policy_path = self._config.repo_id or self._config.checkpoint
         if not policy_path:
             raise RuntimeError("LeRobotPolicyNode: 'repo_id' or 'checkpoint' is required")
+        self._log_runtime_device_contract(policy_path)
 
         self._preprocessor = TensorPreprocessor(
             policy_path=policy_path,
@@ -594,6 +597,15 @@ class LeRobotPolicyNode(Node):
         )
 
         self.get_logger().info("DispatchInfer Action Server ready")
+
+    def _log_runtime_device_contract(self, policy_path: str) -> None:
+        model_config_device = read_local_policy_config_device(policy_path) or "<unset>"
+        self.get_logger().info(
+            f"Runtime device contract: model_config_device={model_config_device}, "
+            f"runtime_backend={self._config.device}, "
+            f"runtime_tensor_device={self._device}; "
+            f"model_config_device is training metadata"
+        )
 
     def _obs_cb(self, msg, spec: SpecView):
         """Observation callback - push to StreamBuffer."""

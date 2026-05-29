@@ -288,6 +288,11 @@ CompiledPolicyWrapper (PolicyWrapper)
 
 #### 编译产物配置：config.om.json
 
+运行时设备以 launch/ROS 参数为准。若 LeRobot 导出的 `config.json` 内含
+训练时设备记录（例如 `"device": "cuda"`），`inference_service` 会在本地临时
+配置副本中将其覆盖为当前 runtime tensor device（OM/RKNN 等编译后端为 CPU），
+不会修改原始模型目录，也不会让训练设备约束推理后端选择。
+
 编译后端推荐在模型目录内生成独立的 `config.om.json` manifest，避免污染 LeRobot 原生
 `config.json`。该文件描述后端 artifact 的路径和执行顺序：
 

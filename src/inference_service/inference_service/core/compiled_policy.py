@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as functional
 from torch import Tensor
 
+from inference_service.core._policy_config import override_runtime_policy_device
 from inference_service.core.pure_inference_engine import PolicyWrapper
 
 COMPILED_MANIFEST_BASENAME = "config.om.json"
@@ -91,7 +92,11 @@ def _manifest_config_path(path: str) -> Path | None:
     return None
 
 
-def load_compiled_policy_config(path: str, backend: str) -> dict[str, Any]:
+def load_compiled_policy_config(
+    path: str,
+    backend: str,
+    runtime_device: Any | None = None,
+) -> dict[str, Any]:
     config_path = _policy_config_path(path)
     if config_path is None:
         raise FileNotFoundError(
@@ -101,7 +106,7 @@ def load_compiled_policy_config(path: str, backend: str) -> dict[str, Any]:
         data = json.load(f)
     if not isinstance(data, dict):
         raise ValueError(f"Compiled backend {backend} policy config must be a JSON object: {config_path}")
-    return data
+    return override_runtime_policy_device(data, runtime_device)
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -717,7 +722,7 @@ class CompiledPolicyWrapper(PolicyWrapper):
 
     def load(self, path: str, device: torch.device) -> None:
         self._device = device
-        config = load_compiled_policy_config(path, self._backend)
+        config = load_compiled_policy_config(path, self._backend, runtime_device=device)
         self._adapter = create_compiled_model_adapter(config, self._backend)
         if self._runtime_session is None:
             self._runtime_session = create_runtime_session(self._backend, config)

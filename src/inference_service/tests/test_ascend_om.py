@@ -83,7 +83,7 @@ def test_create_ascend_wrapper_by_device_name():
 def test_pure_engine_selects_ascend_wrapper(monkeypatch, tmp_path):
     model_path = tmp_path / "model.om"
     model_path.write_bytes(b"om")
-    _write_act_config(tmp_path)
+    _write_act_config(tmp_path, {"device": "cuda"})
     _write_manifest(
         tmp_path,
         {
@@ -106,6 +106,7 @@ def test_pure_engine_selects_ascend_wrapper(monkeypatch, tmp_path):
     assert result.policy_type == "act"
     assert result.backend_type == "ascend_om"
     assert result.action.shape == (2, 6)
+    assert runtime.loaded[1]["device"] == "cpu"
     assert runtime.inputs[0].shape == (1, 3)
 
 
