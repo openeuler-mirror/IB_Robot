@@ -83,6 +83,7 @@ ensure_openeuler_extras_repo() {
 
     log_info "Adding openEuler extras repo required for python3-lttngust..."
     run_sudo dnf config-manager --add-repo "${extras_repo_url}"
+    run_sudo dnf config-manager --save --setopt="extras.gpgcheck=0"
 }
 
 ensure_openeuler_gpg_key() {
@@ -117,6 +118,14 @@ platform_install_python_bootstrap() {
 
 platform_pre_install_rosdeps() {
     log_info "Updating dnf package repositories..."
+
+    log_info "Disabling per-repo GPG checks for rosdep-managed dnf transactions..."
+    if [[ -f /etc/dnf/dnf.conf ]]; then
+        run_sudo sed -i 's/^\s*gpgcheck\s*=\s*1/gpgcheck=0/' /etc/dnf/dnf.conf
+        if ! grep -q '^\s*gpgcheck\s*=\s*0' /etc/dnf/dnf.conf; then
+            run_sudo sed -i '/^\[main\]/a gpgcheck=0' /etc/dnf/dnf.conf
+        fi
+    fi
 }
 
 platform_get_extra_skip_keys() {
