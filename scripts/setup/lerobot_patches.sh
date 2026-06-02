@@ -79,7 +79,7 @@ _lerobot_resolve_active() {
     fi
 
     local resolved
-    if ! resolved="$("${py_bin}" "${resolver}" --index "${index_file}" 2>&1 1>/dev/stdout)"; then
+    if ! resolved="$("${py_bin}" "${resolver}" --index "${index_file}" 2>&1)"; then
         log_error "lerobot_resolve_active.py failed:"
         sed 's/^/    /' <<<"${resolved}" >&2
         return 1

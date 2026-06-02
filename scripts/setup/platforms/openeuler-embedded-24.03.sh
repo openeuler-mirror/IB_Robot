@@ -83,7 +83,6 @@ ensure_openeuler_extras_repo() {
 
     log_info "Adding openEuler extras repo required for python3-lttngust..."
     run_sudo dnf config-manager --add-repo "${extras_repo_url}"
-    run_sudo dnf config-manager --save --setopt="extras.gpgcheck=0"
 }
 
 ensure_openeuler_gpg_key() {
