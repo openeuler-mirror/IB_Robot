@@ -60,6 +60,7 @@ SETUP_PROFILE="${IBR_SETUP_PROFILE:-full}"
 SKIP_VERIFY=false
 ONLY_PATCH=${ONLY_PATCH:-false}
 INSTALL_DIAGNOSTICS_DEPS="${IBR_SETUP_WITH_DIAGNOSTICS:-false}"
+INSTALL_BENCHMARK_DEPS="${IBR_SETUP_WITH_BENCHMARK:-false}"
 CURRENT_STAGE="initializing"
 SYSTEM_DEPS_STATUS="pending"
 PYTHON_ENV_STATUS="pending"
@@ -206,6 +207,7 @@ Options:
       --with-diagnostics Install optional Plotly/Matplotlib dependencies for
                           the speech_direction_report offline CLI only;
                           the speech_direction_node runtime does not need them.
+      --with-benchmark   Enable optional Benchmark dependencies on supported platforms.
 
       --skip-verify      Skip final ROS/Python verification
       --only-patch       Skip dependency/venv setup and verification; only
@@ -242,6 +244,7 @@ parse_args() {
             --no-sudo) USE_SUDO=false ;;
             --sudo) USE_SUDO=true ;;
             --with-diagnostics|--with-diagnostics-deps) INSTALL_DIAGNOSTICS_DEPS=true ;;
+            --with-benchmark|--with-benchmark-deps) INSTALL_BENCHMARK_DEPS=true ;;
 
             --skip-verify) SKIP_VERIFY=true ;;
             --only-patch) ONLY_PATCH=true ;;
@@ -333,7 +336,11 @@ system_package_installed() {
 preview_system_packages() {
     case "${SETUP_PLATFORM_ID}" in
         ubuntu-22.04)
-            echo "python3-colcon-common-extensions python3-venv python3-pip"
+            local pkgs="python3-colcon-common-extensions python3-venv python3-pip"
+            if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+                pkgs="${pkgs} libosmesa6-dev"
+            fi
+            echo "${pkgs}"
             ;;
         openeuler-embedded-24.03)
             echo "gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel yaml-cpp yaml-cpp-devel python3-virtualenv python3-pip python3-devel"
@@ -436,6 +443,7 @@ platform_install_python_bootstrap() {
     log_error "Python bootstrap hook not implemented for this platform."
     exit 1
 }
+platform_install_benchmark_system_deps() { return 0; }
 
 # --- Template Method Hooks for platform_install_rosdeps ---
 platform_skip_rosdep_install() { return 1; }  # Return 0 to skip rosdep install
@@ -581,6 +589,7 @@ install_system_deps() {
 
     ensure_sudo_session
     platform_install_python_bootstrap
+    platform_install_benchmark_system_deps
     ensure_colcon
     ensure_rosdep
     platform_install_rosdeps

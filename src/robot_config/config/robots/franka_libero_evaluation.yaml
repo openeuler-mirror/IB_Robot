@@ -1,0 +1,226 @@
+robot:
+  name: franka_libero_evaluation
+  type: franka
+  robot_type: franka
+
+  runtime:
+    target: benchmark
+
+  default_control_mode: model_inference
+
+  joints:
+    all: []
+
+  # Franka LIBERO evaluation configuration. Use this single file for all
+  # supported suites; select the suite and episodes in USER SETTINGS below.
+  benchmark:
+    type: libero
+    adapter: libero
+    instance_id: libero
+    identity_packages: [robosuite, mujoco, libero]
+
+    # Simulator interface settings. Most users should leave these unchanged;
+    # they define the camera inputs, image size, and relative action format.
+    headless: true
+    camera_names:
+      - agentview_image
+      - robot0_eye_in_hand_image
+    image_size: [256, 256]
+    control_mode: relative
+
+    # =========================================================================
+    # USER SETTINGS -- select what to evaluate here.
+    # Copy a value from each | separated list to the matching field below.
+    #
+    # suite:             libero_spatial | libero_object | libero_goal | libero_10
+    # tasks:             [0] | [0, 9] | null
+    # episodes_per_task: 2 | 10
+    # max_steps:         600
+    #
+    # Task IDs are relative to the selected suite and run in the listed order.
+    # Use null to run every Task in the suite. Do not use an empty list ([]).
+    # episodes_per_task is the number of Episodes to run for each selected Task,
+    # not a retry count. Keep max_steps at 600 for standard evaluation.
+    # =========================================================================
+    evaluation:
+      enabled: true
+      suite: libero_object
+      tasks: [0]
+      episodes_per_task: 2
+      max_steps: 600
+
+      # Observation transport selection. This is the only field ordinary
+      # users change to switch between the compatible ROS/DDS path and the
+      # low-latency direct-frame H.264/RTP path. Both modes keep the same
+      # distributed loopback inference topology, so this switch changes only
+      # observation delivery. RTP stream defaults are materialized deterministically.
+      observation_transport:
+        mode: dds  # dds | rtp
+        # Advanced RTP overrides are optional. Example:
+        # rtp:
+        #   base_port: 55000
+        #   encoder_backend: software
+        #   decoder_backend: software
+        #   streams:
+        #     observation.images.image:
+        #       endpoint: {host: 127.0.0.1, port: 55000}
+
+      # Controls reproducible initial-state selection. Usually leave unchanged.
+      seed: 10000
+
+      # Episodes run serially; parallel evaluation is not supported.
+      use_mp: false
+      num_procs: 1
+
+      # Save the initial simulator state and one state after every action.
+      # State files and videos can use substantial disk space; available space
+      # is checked before evaluation starts.
+      save_sim_states: true
+      video:
+        enabled: true
+        camera_name: agentview_image
+        fps: 30
+        # false saves one MP4 per Episode; true merges a Task into one MP4.
+        single_video: false
+
+      output:
+        # Parent directory for all evaluation results. ~ expands to the current
+        # user's home directory. To choose another location, replace this value
+        # with an absolute path such as: <ABSOLUTE_OUTPUT_DIRECTORY>
+        # Each launch creates a new run directory; existing runs are not changed.
+        root: ~/ibrobot_libero_outputs
+        # Used as the readable suffix of each automatically generated run ID.
+        # Run directories are named: <UTC_TIMESTAMP>_<SUITE>_<RUN_NAME>.
+        run_name: franka_libero_evaluation
+        # Save LIBERO artifacts: Episode videos, simulator states, Task
+        # manifests, and native evaluation statistics.
+        write_native: true
+        # Save summary.json, episodes.jsonl, and run_manifest.json. Keep this
+        # enabled to inspect success rates and per-Episode results.
+        write_canonical: true
+
+      timeouts:
+        # Maximum time to wait for required ROS nodes and model inference to
+        # become ready. This is a startup limit, not a limit for the whole run.
+        startup_timeout_sec: 120.0
+        # Maximum wall-clock duration for one Episode. max_steps separately
+        # limits the number of actions sent during that Episode.
+        max_duration_sec: 180.0
+
+      # Continue with later Episodes after a recoverable Episode or video
+      # error. All failures are still recorded in the final reports.
+      failure_policy:
+        continue_recoverable_episode_errors: true
+        continue_video_errors: true
+
+      # Optional: uncomment to assign a specific run directory name. Use one
+      # safe path component only. The launch fails if that directory already exists.
+      # run_id: my_explicit_run_id
+
+  # Observation interface shared by the LIBERO simulator and policy model.
+  # The topics, image settings, state fields, and timing rules must match the
+  # packaged model bundle. Most users should leave this section unchanged.
+  contract:
+    observations:
+      - key: observation.images.image
+        topic: /benchmark/libero/observation/images/image
+        type: sensor_msgs/msg/Image
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        image:
+          encoding: rgb8
+          resize: [256, 256]
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+      - key: observation.images.image2
+        topic: /benchmark/libero/observation/images/image2
+        type: sensor_msgs/msg/Image
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        image:
+          encoding: rgb8
+          resize: [256, 256]
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+      - key: observation.state
+        topic: /benchmark/libero/observation/state
+        type: ibrobot_msgs/msg/StampedFloat32MultiArray
+        qos:
+          reliability: reliable
+          durability: transient_local
+          depth: 1
+        selector:
+          names:
+            - eef_x
+            - eef_y
+            - eef_z
+            - eef_ax
+            - eef_ay
+            - eef_az
+            - gripper_q0
+            - gripper_q1
+        align:
+          strategy: hold
+          stamp: header
+          max_age_ms: 5000
+    actions:
+      - key: action
+        publish:
+          topic: /benchmark/libero/action
+          type: std_msgs/msg/Float32MultiArray
+        selector:
+          names:
+            - delta_x
+            - delta_y
+            - delta_z
+            - delta_ax
+            - delta_ay
+            - delta_az
+            - gripper
+
+  control_modes:
+    model_inference:
+      # MODEL SETTINGS -- replace <MODEL_BUNDLE_DIRECTORY> before running.
+      # model_path must point to the packaged model directory, not directly to
+      # a weight file. The directory must contain inference_manifest.json and
+      # every model/runtime artifact referenced by that manifest. Use an absolute
+      # path so the same configuration works from any terminal location.
+      inference:
+        enabled: true
+        pipelines:
+          policy:
+            model_path: "<MODEL_BUNDLE_DIRECTORY>"
+            deployment: torch-cuda
+            # Fixed for this Benchmark profile so DDS/RTP compare the same
+            # inference topology. Users only switch observation_transport.mode.
+            execution_mode: distributed
+            request_timeout: 60.0
+            default_task: ""
+      executor:
+        type: benchmark
+        mode: benchmark
+        inference_pipeline: policy
+        queue_size: 100
+        chunk_size: 100
+        control_frequency: 20.0
+        temporal_smoothing_enabled: false
+      dispatch:
+        scheduler: wait_for_feedback
+        execution_timeout_sec: 30.0
+
+  voice_asr:
+    enabled: false
+
+  navigation:
+    enabled: false
+
+  embodied:
+    enabled: false

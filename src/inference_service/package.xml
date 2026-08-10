@@ -26,6 +26,7 @@
   <depend>inference_manifest</depend>
   <exec_depend>python3-numpy</exec_depend>
   <depend>tensormsg</depend>
+  <depend>observation_transport</depend>
   <depend>robot_config</depend>
   <depend>dataset_tools</depend>
 

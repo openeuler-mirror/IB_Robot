@@ -64,6 +64,8 @@ known-first-party = [
     "ibrobot_msgs",
     "semantic_mapping",
     "robot_calibration",
+    "benchmark_runtime",
+    "benchmark_libero",
 ]
 
 [tool.ruff.format]

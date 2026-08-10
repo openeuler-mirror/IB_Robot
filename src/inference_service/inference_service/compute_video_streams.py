@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from collections.abc import Iterable
@@ -40,6 +41,7 @@ class _ComputeStream:
     mapper: RtpTimestampMapper
     buffer: StreamBuffer
     receiver: H264RtpReceiver
+    sender_status: VideoStreamRuntimeStatus | None = None
 
 
 class _RecordingOnlyDecoder:
@@ -165,6 +167,7 @@ class ComputeVideoStreamManager:
         for stream in streams:
             receiver_status = stream.receiver.status
             metrics = receiver_status.metrics
+            sender_status = stream.sender_status
             statuses.append(
                 VideoStreamRuntimeStatus(
                     protocol_version=stream.descriptor.protocol_version,
@@ -176,14 +179,58 @@ class ComputeVideoStreamManager:
                     lifecycle_state=receiver_status.state.value,
                     ready=receiver_status.ready and stream.mapper.ready,
                     selected_backend=receiver_status.selected_backend,
+                    status_origin="receiver",
+                    timestamp_mapping_valid=bool(sender_status and sender_status.timestamp_mapping_valid),
+                    mapping_rtp_timestamp=sender_status.mapping_rtp_timestamp if sender_status else 0,
+                    mapping_capture_timestamp_ns=(sender_status.mapping_capture_timestamp_ns if sender_status else 0),
                     keyframe_ready=receiver_status.ready,
+                    encoded_frames=sender_status.encoded_frames if sender_status else 0,
                     decoded_frames=metrics.decoded_frames,
+                    sent_packets=sender_status.sent_packets if sender_status else 0,
                     received_packets=metrics.received_packets,
+                    dropped_frames=sender_status.dropped_frames if sender_status else 0,
                     dropped_packets=metrics.dropped_packets,
                     lost_packets=metrics.lost_packets,
+                    sender_queue_depth=sender_status.sender_queue_depth if sender_status else 0,
                     receiver_queue_depth=metrics.queued_packets,
                     decoded_buffer_depth=len(stream.buffer),
                     reconnect_count=metrics.reconnect_count,
+                    sender_queue_overflow_drops=(sender_status.sender_queue_overflow_drops if sender_status else 0),
+                    receiver_queue_overflow_drops=metrics.receiver_queue_overflow_drops,
+                    sequence_gap_events=metrics.sequence_gap_events,
+                    reordered_packets=metrics.reordered_packets,
+                    recovery_keyframes=metrics.recovery_keyframes,
+                    jitter_ns=metrics.jitter_ns,
+                    encode_start_monotonic_ns=sender_status.encode_start_monotonic_ns if sender_status else 0,
+                    encode_end_monotonic_ns=sender_status.encode_end_monotonic_ns if sender_status else 0,
+                    send_start_monotonic_ns=sender_status.send_start_monotonic_ns if sender_status else 0,
+                    send_end_monotonic_ns=sender_status.send_end_monotonic_ns if sender_status else 0,
+                    receive_monotonic_ns=metrics.receive_monotonic_ns,
+                    decode_start_monotonic_ns=metrics.decode_start_monotonic_ns,
+                    decode_end_monotonic_ns=metrics.decode_end_monotonic_ns,
+                    last_decoded_capture_timestamp_ns=metrics.last_capture_timestamp_ns,
+                    last_accepted_admission_id=sender_status.last_accepted_admission_id if sender_status else "",
+                    last_encoded_admission_id=sender_status.last_encoded_admission_id if sender_status else "",
+                    last_sent_admission_id=sender_status.last_sent_admission_id if sender_status else "",
+                    last_dropped_admission_id=sender_status.last_dropped_admission_id if sender_status else "",
+                    last_dropped_capture_timestamp_ns=max(
+                        sender_status.last_dropped_capture_timestamp_ns if sender_status else 0,
+                        metrics.last_dropped_capture_timestamp_ns,
+                    ),
+                    dropped_capture_history_json=(
+                        sender_status.dropped_capture_history_json if sender_status else "[]"
+                    ),
+                    last_drop_reason=(
+                        "receiver_queue_overflow"
+                        if metrics.receiver_queue_overflow_drops
+                        else "rtp_sequence_gap"
+                        if metrics.sequence_gap_events
+                        else "rtp_reordered_packet"
+                        if metrics.reordered_packets
+                        else sender_status.last_drop_reason
+                        if sender_status
+                        else ""
+                    ),
                     last_error=receiver_status.last_error,
                 )
             )
@@ -228,13 +275,16 @@ class ComputeVideoStreamManager:
             or status.stream_id != expected.stream_id
         ):
             return False
-        if status.timestamp_mapping_valid:
+        if status.status_origin != "sender":
+            return False
+        if status.timestamp_mapping_valid and status.encoded_frames > 0:
             stream.mapper.update(
                 status.mapping_rtp_timestamp,
                 status.mapping_capture_timestamp_ns,
                 time.time_ns() if receive_time_ns is None else receive_time_ns,
                 session_generation=status.session_generation,
             )
+            stream.sender_status = status
         return True
 
     def assemble_inputs(self, target_timestamp_ns: int, *, now_ns: int | None = None) -> dict[str, np.ndarray]:
@@ -364,11 +414,52 @@ class ComputeVideoStreamManager:
                     timestamp_mapping_ready=stream.mapper.ready,
                     keyframe_ready=stream.receiver.status.ready,
                     pad_before_first=self.n_obs_steps > 1,
+                    # A 90 kHz RTP timestamp quantizes capture time to about
+                    # 11.1 us. Accept only that tiny future offset so a shared
+                    # multi-camera reset frame cannot split across epochs.
+                    future_tolerance_ns=(1_000_000_000 + 90_000 - 1) // 90_000,
+                    session_generation=stream.descriptor.session_generation,
+                    last_dropped_capture_timestamp_ns=max(
+                        stream.sender_status.last_dropped_capture_timestamp_ns if stream.sender_status else 0,
+                        stream.receiver.status.metrics.last_dropped_capture_timestamp_ns,
+                    ),
+                    dropped_capture_history=self._drop_history(stream),
+                    last_dropped_admission_id=(
+                        stream.sender_status.last_dropped_admission_id if stream.sender_status else ""
+                    ),
+                    last_drop_reason=(
+                        stream.receiver.status.last_error
+                        if stream.receiver.status.metrics.last_dropped_capture_timestamp_ns
+                        >= (stream.sender_status.last_dropped_capture_timestamp_ns if stream.sender_status else 0)
+                        else stream.sender_status.last_drop_reason
+                        if stream.sender_status
+                        else ""
+                    ),
                 )
                 for key, stream in streams.items()
             },
             max_skew_ns,
         )
+
+    @staticmethod
+    def _drop_history(stream: _ComputeStream) -> tuple[tuple[int, str, str], ...]:
+        status = stream.sender_status
+        if status is None:
+            return ()
+        try:
+            value = json.loads(status.dropped_capture_history_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        if not isinstance(value, list):
+            return ()
+        history = []
+        for item in value:
+            if isinstance(item, list) and len(item) == 3:
+                try:
+                    history.append((int(item[0]), str(item[1]), str(item[2])))
+                except (TypeError, ValueError):
+                    continue
+        return tuple(history)
 
     @staticmethod
     def _canonical_frame(value: object, spec: SpecView) -> np.ndarray:

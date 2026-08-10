@@ -8,6 +8,7 @@ This package contains modules for building ROS2 launch components:
 - execution.py: Action dispatcher and inference nodes
 """
 
+from robot_config.launch_builders.benchmark import generate_benchmark_nodes
 from robot_config.launch_builders.control import (
     generate_controller_spawners,
     generate_ros2_control_nodes,
@@ -85,4 +86,6 @@ __all__ = [
     # Hardware mock
     "generate_hardware_mock_nodes",
     "mock_mode_skips_subsystem",
+    # Benchmark
+    "generate_benchmark_nodes",
 ]

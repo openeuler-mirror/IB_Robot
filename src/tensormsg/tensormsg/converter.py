@@ -8,7 +8,12 @@ import torch
 from rosidl_runtime_py.utilities import get_message
 from torch import Tensor
 
-from tensormsg.registry import DECODER_REGISTRY, ENCODER_REGISTRY, register_decoder, register_encoder
+from tensormsg.registry import (
+    DECODER_REGISTRY,
+    ENCODER_REGISTRY,
+    register_decoder,
+    register_encoder,
+)
 from tensormsg.utils import dot_get, dot_set, nearest_resize_any, nearest_resize_rgb
 
 _COLOR_ENCODING_CHANNELS = {
@@ -46,6 +51,7 @@ class TensorMsgConverter:
     def decode(msg, spec: Any = None) -> np.ndarray:
         """
         Decode a ROS message to a numpy array.
+
         spec can be an object with .names, .image_encoding, .image_resize attributes.
         """
         pkg_name = msg.__class__.__module__.split(".")[0]
@@ -491,6 +497,7 @@ def _enc_twist(names, data, clamp):
 def _dec_image(msg, spec):
     """
     Robust image decoder for common ROS encodings.
+
     Ported from rosetta/common/decoders.py
     """
     if spec and hasattr(spec, "names") and spec.names:
@@ -508,7 +515,10 @@ def _dec_image(msg, spec):
         if resize_hw is not None:
             hwc = nearest_resize_any(hwc, *resize_hw)
         hwc_normalized = np.where(np.isfinite(hwc), np.clip(hwc, 0, 50) / 50, hwc)
-        return np.ascontiguousarray(np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)), dtype=np.float32)
+        return np.ascontiguousarray(
+            np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)),
+            dtype=np.float32,
+        )
 
     elif enc in ("16uc1", "mono16"):
         byte_order = ">" if bool(getattr(msg, "is_bigendian", False)) else "<"
@@ -521,7 +531,10 @@ def _dec_image(msg, spec):
         if resize_hw is not None:
             hwc = nearest_resize_any(hwc, *resize_hw)
         hwc_normalized = np.where(np.isfinite(hwc), np.clip(hwc, 0, 10) / 10, hwc)
-        return np.ascontiguousarray(np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)), dtype=np.float32)
+        return np.ascontiguousarray(
+            np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)),
+            dtype=np.float32,
+        )
 
     hwc_rgb = ros_image_to_hwc_uint8(msg, resize=resize_hw)
     return np.ascontiguousarray(np.transpose(hwc_rgb, (2, 0, 1)), dtype=np.float32) / 255.0
@@ -560,6 +573,18 @@ def _dec_f32(msg, spec):
     return np.asarray(msg.data, dtype=np.float32)
 
 
+@register_decoder("ibrobot_msgs/msg/StampedFloat32MultiArray")
+def _dec_stamped_f32(msg, spec):
+    """
+    Decode a StampedFloat32MultiArray to a float32 ndarray.
+
+    Only the value payload is decoded; header.stamp is left untouched.
+    The timestamp is still read by the existing stamp_from_header_ns(message)
+    path in robot_config.contract_utils, never embedded into the tensor.
+    """
+    return np.asarray(msg.value.data, dtype=np.float32)
+
+
 @register_decoder("std_msgs/msg/Float64MultiArray")
 def _dec_f64(msg, spec):
     return np.asarray(msg.data, dtype=np.float64)
@@ -573,8 +598,9 @@ def _dec_i32(msg, spec):
 @register_decoder("sensor_msgs/msg/PointCloud2")
 def _dec_pointcloud2(msg, spec):
     """
-    解码无序 PointCloud2（height=1, width=N_valid）。
-    返回 {"xyz": (N,3) float32, "rgb": (N,3) uint8}。
+    解码无序 PointCloud2（height=1, width=N_valid）.
+
+    返回 {"xyz": (N,3) float32, "rgb": (N,3) uint8}.
     """
     import sensor_msgs_py.point_cloud2 as pc2
 

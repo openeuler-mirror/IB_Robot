@@ -527,6 +527,13 @@ class StreamBuffer:
         with self._lock:
             return tuple(self.history)
 
+    def first_entry_after(self, timestamp_ns: int) -> tuple[int, int, Any] | None:
+        """Return the earliest entry strictly newer than ``timestamp_ns``."""
+        with self._lock:
+            timestamps = [item[0] for item in self.history]
+            index = bisect_right(timestamps, int(timestamp_ns))
+            return self.history[index] if index < len(self.history) else None
+
     @staticmethod
     def _stale_issue(
         constraint: str,

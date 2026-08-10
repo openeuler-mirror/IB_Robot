@@ -67,6 +67,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SpeechDirection.msg"
   "msg/MHandProFrame.msg"
   "msg/HumanHandState.msg"
+  "msg/StampedFloat32MultiArray.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
@@ -116,6 +117,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/StartTracking.srv"
   "srv/StopTracking.srv"
   "srv/GetTrackState.srv"
+  "srv/ResetBenchmark.srv"
+  "srv/StepBenchmark.srv"
+  "srv/PreparePolicyEpisode.srv"
+  "srv/GetBenchmarkPlan.srv"
+  "srv/FinalizeBenchmarkScope.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

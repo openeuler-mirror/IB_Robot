@@ -86,6 +86,7 @@ class VideoStreamRuntimeStatus:
     lifecycle_state: str
     ready: bool
     selected_backend: str
+    status_origin: str
     timestamp_mapping_valid: bool = False
     mapping_rtp_timestamp: int = 0
     mapping_capture_timestamp_ns: int = 0
@@ -101,6 +102,27 @@ class VideoStreamRuntimeStatus:
     receiver_queue_depth: int = 0
     decoded_buffer_depth: int = 0
     reconnect_count: int = 0
+    sender_queue_overflow_drops: int = 0
+    receiver_queue_overflow_drops: int = 0
+    sequence_gap_events: int = 0
+    reordered_packets: int = 0
+    recovery_keyframes: int = 0
+    jitter_ns: int = 0
+    encode_start_monotonic_ns: int = 0
+    encode_end_monotonic_ns: int = 0
+    send_start_monotonic_ns: int = 0
+    send_end_monotonic_ns: int = 0
+    receive_monotonic_ns: int = 0
+    decode_start_monotonic_ns: int = 0
+    decode_end_monotonic_ns: int = 0
+    last_decoded_capture_timestamp_ns: int = 0
+    last_accepted_admission_id: str = ""
+    last_encoded_admission_id: str = ""
+    last_sent_admission_id: str = ""
+    last_dropped_admission_id: str = ""
+    last_dropped_capture_timestamp_ns: int = 0
+    dropped_capture_history_json: str = "[]"
+    last_drop_reason: str = ""
     last_error: str = ""
 
     def __post_init__(self) -> None:
@@ -115,9 +137,12 @@ class VideoStreamRuntimeStatus:
                 self.stream_id,
                 self.lifecycle_state,
                 self.selected_backend,
+                self.status_origin,
             )
         ):
-            raise ValueError("stream status identity and lifecycle fields must be non-empty")
+            raise ValueError("stream status identity, lifecycle, and origin fields must be non-empty")
+        if self.status_origin not in {"sender", "receiver"}:
+            raise ValueError("stream status origin must be sender or receiver")
         counters = (
             self.encoded_frames,
             self.decoded_frames,
@@ -130,6 +155,21 @@ class VideoStreamRuntimeStatus:
             self.receiver_queue_depth,
             self.decoded_buffer_depth,
             self.reconnect_count,
+            self.sender_queue_overflow_drops,
+            self.receiver_queue_overflow_drops,
+            self.sequence_gap_events,
+            self.reordered_packets,
+            self.recovery_keyframes,
+            self.jitter_ns,
+            self.encode_start_monotonic_ns,
+            self.encode_end_monotonic_ns,
+            self.send_start_monotonic_ns,
+            self.send_end_monotonic_ns,
+            self.receive_monotonic_ns,
+            self.decode_start_monotonic_ns,
+            self.decode_end_monotonic_ns,
+            self.last_decoded_capture_timestamp_ns,
+            self.last_dropped_capture_timestamp_ns,
         )
         if any(value < 0 for value in counters):
             raise ValueError("stream status counters cannot be negative")

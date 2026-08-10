@@ -131,6 +131,16 @@ class LeRobotTorchModelSession(ModelSession):
             raise BackendLoadError(
                 "LeRobot policy config does not permit runtime device placement", code="incompatible_policy_config"
             ) from exc
+        # Avoid network access during policy construction. The strict checkpoint load
+        # restores the bundled backbone parameters from the local model artifacts.
+        try:
+            if getattr(policy_config, "pretrained_backbone_weights", None) is not None:
+                policy_config.pretrained_backbone_weights = None
+        except (AttributeError, TypeError) as exc:
+            raise BackendLoadError(
+                "LeRobot policy config does not permit the backbone weights override",
+                code="incompatible_policy_config",
+            ) from exc
         try:
             local_vlm_path = resolve_local_semantic_reference(
                 context.validated_manifest.bundle_root, "config.json", VLM_REFERENCE_KEYS
@@ -143,7 +153,12 @@ class LeRobotTorchModelSession(ModelSession):
         if local_vlm_path is not None:
             policy_config.vlm_model_name = local_vlm_path
         policy_class = get_policy_class(context.model_type)
-        policy = policy_class.from_pretrained(bundle_path, config=policy_config, local_files_only=True)
+        policy = policy_class.from_pretrained(
+            bundle_path,
+            config=policy_config,
+            local_files_only=True,
+            strict=True,
+        )
 
         self._torch = torch_module
         self._device = device

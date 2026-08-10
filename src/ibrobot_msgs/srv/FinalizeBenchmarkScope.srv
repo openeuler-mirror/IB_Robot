@@ -1,0 +1,14 @@
+string scope
+string identity_json
+string result_json
+string termination_reason
+string error_category
+bool partial
+string artifact_refs_json
+---
+bool success
+string message
+string committed_scope
+string artifact_refs_json
+string artifact_status_json
+bool already_committed

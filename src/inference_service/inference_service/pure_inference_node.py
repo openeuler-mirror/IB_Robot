@@ -175,7 +175,7 @@ class PureInferenceNode(Node):
             callback_group=ReentrantCallbackGroup(),
         )
         self._status_timer = self.create_timer(0.5, self._publish_status)
-        self._video_status_timer = self.create_timer(0.25, self._publish_video_status)
+        self._video_status_timer = self.create_timer(0.02, self._publish_video_status)
         self._log_video_stream_diagnostics()
         self.get_logger().info(
             f"Distributed cloud pipeline loaded: id={config.pipeline_id}, deployment={config.deployment}, "
@@ -253,7 +253,41 @@ class PureInferenceNode(Node):
         request = None
         try:
             request = request_from_message(message)
+            self.get_logger().info(
+                "[IBROBOT_INFERENCE][DISTRIBUTED_REQUEST] "
+                f"request={request.request_id} tensor_keys={sorted(request.inputs)} "
+                f"stream_keys={[item.observation_key for item in request.stream_references]}"
+            )
             result = self._service.handle(request)
+            if request.operation.name == "INFER":
+                performance = dict(result.performance)
+                self.get_logger().info(
+                    "[IBROBOT_INFERENCE][INFERENCE_TIMING] "
+                    f"request={request.request_id} "
+                    f"request_start_mono_ns={performance.get('request_start_monotonic_ns', 0)} "
+                    f"assembly_start_mono_ns={performance.get('stream_assembly_start_monotonic_ns', 0)} "
+                    f"assembly_end_mono_ns={performance.get('stream_assembly_end_monotonic_ns', 0)} "
+                    f"inference_start_mono_ns={performance.get('inference_start_monotonic_ns', 0)} "
+                    f"inference_end_mono_ns={performance.get('inference_end_monotonic_ns', 0)} "
+                    f"result_mono_ns={performance.get('result_monotonic_ns', 0)} "
+                    f"backend_latency_ms={result.backend_latency_ms:.6f}"
+                )
+            if request.operation.name == "INFER" and self._stream_manager is not None:
+                for status in self._stream_manager.statuses():
+                    self.get_logger().info(
+                        "[IBROBOT_INFERENCE][VIDEO_RECEIVER] "
+                        f"request={request.request_id} observation={status.observation_key} "
+                        f"stream={status.stream_id} ready={status.ready} "
+                        f"received_packets={status.received_packets} decoded_frames={status.decoded_frames} "
+                        f"lost_packets={status.lost_packets} dropped_packets={status.dropped_packets} "
+                        f"queue_overflow={status.receiver_queue_overflow_drops} "
+                        f"sequence_gaps={status.sequence_gap_events} reordered={status.reordered_packets} "
+                        f"recovery_keyframes={status.recovery_keyframes} jitter_ns={status.jitter_ns} "
+                        f"receive_mono_ns={status.receive_monotonic_ns} "
+                        f"decode_start_mono_ns={status.decode_start_monotonic_ns} "
+                        f"decode_end_mono_ns={status.decode_end_monotonic_ns} "
+                        f"decoded_capture_ns={status.last_decoded_capture_timestamp_ns}"
+                    )
         except Exception as exc:
             result = decode_failure_result(message, exc, self._fingerprint, self._config.pipeline_id)
             self.get_logger().error(f"distributed request decode failed: {exc}")

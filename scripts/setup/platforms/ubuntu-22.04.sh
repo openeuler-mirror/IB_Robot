@@ -20,6 +20,15 @@ platform_install_python_bootstrap() {
     run_sudo apt-get install -y python3-venv python3-pip -qq
 }
 
+platform_install_benchmark_system_deps() {
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" != true ]]; then
+        return 0
+    fi
+
+    log_info "Installing benchmark headless rendering dependency..."
+    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev -qq
+}
+
 platform_pre_install_rosdeps() {
     log_info "Updating apt package lists..."
     run_sudo apt-get update -qq

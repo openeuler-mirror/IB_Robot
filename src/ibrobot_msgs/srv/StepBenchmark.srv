@@ -1,0 +1,19 @@
+# Request
+uint64 episode_id
+uint64 expected_step_id
+ibrobot_msgs/VariantsList action
+---
+# Response
+bool success
+string message
+builtin_interfaces/Time obs_timestamp
+uint64 step_id
+bool has_reward
+float64 reward
+bool terminated
+bool truncated
+bool has_is_success
+bool is_success
+string standard_metrics_json
+string native_metrics_json
+string info_json

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import replace
+import time
+from dataclasses import asdict, replace
 
 from inference_service.distributed.runtime import CloudBackendRuntime
 from inference_service.distributed.session import CloudSession, DistributedProtocolError
@@ -25,7 +26,9 @@ class _StreamManager:
 
     def reset_session(self, session_id: str, session_generation: int) -> None: ...
 
-    def assemble_inputs(self, target_timestamp_ns: int) -> dict[str, object]: ...
+    def assemble_inputs(self, target_timestamp_ns: int, *, now_ns: int | None = None) -> dict[str, object]: ...
+
+    def statuses(self) -> tuple[object, ...]: ...
 
     def close(self) -> None: ...
 
@@ -105,7 +108,14 @@ class DistributedCloudService:
             )
 
     def handle(self, request: DistributedRequest) -> DistributedResult:
+        request_start_monotonic_ns = time.monotonic_ns()
+        stream_assembly_start_monotonic_ns = 0
+        stream_assembly_end_monotonic_ns = 0
+        inference_start_monotonic_ns = 0
+        inference_end_monotonic_ns = 0
+        transport_streams: tuple[dict[str, object], ...] = ()
         if self.runtime is None:
+            result_monotonic_ns = time.monotonic_ns()
             return DistributedResult(
                 operation=request.operation,
                 pipeline_id=self.identity.pipeline_id,
@@ -114,6 +124,15 @@ class DistributedCloudService:
                 session_generation=request.session_generation,
                 deployment_fingerprint=self.identity.deployment_fingerprint,
                 success=False,
+                performance=self._performance_payload(
+                    request_start_monotonic_ns=request_start_monotonic_ns,
+                    stream_assembly_start_monotonic_ns=0,
+                    stream_assembly_end_monotonic_ns=0,
+                    inference_start_monotonic_ns=0,
+                    inference_end_monotonic_ns=0,
+                    result_monotonic_ns=result_monotonic_ns,
+                    transport_streams=(),
+                ),
                 backend_ready=False,
                 backend_state="failed",
                 target_request_id=request.target_request_id,
@@ -123,8 +142,16 @@ class DistributedCloudService:
             with self.session.operation(request):
                 if request.operation is Operation.INFER:
                     inputs = dict(request.inputs)
+                    stream_assembly_start_monotonic_ns = time.monotonic_ns()
                     if self.stream_manager is not None:
-                        inputs.update(self.stream_manager.assemble_inputs(request.observation_timestamp_ns))
+                        inputs.update(
+                            self.stream_manager.assemble_inputs(
+                                request.observation_timestamp_ns,
+                                now_ns=time.time_ns(),
+                            )
+                        )
+                    stream_assembly_end_monotonic_ns = time.monotonic_ns()
+                    inference_start_monotonic_ns = time.monotonic_ns()
                     pipeline_result = self.runtime.infer(
                         request.request_id,
                         inputs,
@@ -134,10 +161,15 @@ class DistributedCloudService:
                     action = pipeline_result.action
                     chunk_size = pipeline_result.actual_chunk_size
                     latency_ms = pipeline_result.backend_latency_ms
+                    inference_end_monotonic_ns = time.monotonic_ns()
+                    transport_streams = self._transport_performance()
                 elif request.operation is Operation.RESET:
                     self.runtime.reset(deadline=request.deadline)
-                    if self.stream_manager is not None:
-                        self.stream_manager.reset_session(request.session_id, request.session_generation)
+                    # A policy reset does not roll over the distributed session.
+                    # Preserve negotiated descriptors, UDP sockets, timestamp
+                    # mappings, and the reset observation already delivered by
+                    # an external direct-frame producer. Session replacement is
+                    # handled exclusively by observe_edge()/rollover.
                     action = None
                     chunk_size = 0
                     latency_ms = 0.0
@@ -154,6 +186,7 @@ class DistributedCloudService:
                 exc.error if isinstance(exc, DistributedProtocolError) else structured_error_from_exception(exc, stage)
             )
             _, backend_available, runtime_state = self._runtime_status()
+            result_monotonic_ns = time.monotonic_ns()
             return DistributedResult(
                 operation=request.operation,
                 pipeline_id=self.identity.pipeline_id,
@@ -162,6 +195,15 @@ class DistributedCloudService:
                 session_generation=request.session_generation,
                 deployment_fingerprint=self.identity.deployment_fingerprint,
                 success=False,
+                performance=self._performance_payload(
+                    request_start_monotonic_ns=request_start_monotonic_ns,
+                    stream_assembly_start_monotonic_ns=stream_assembly_start_monotonic_ns,
+                    stream_assembly_end_monotonic_ns=stream_assembly_end_monotonic_ns,
+                    inference_start_monotonic_ns=inference_start_monotonic_ns,
+                    inference_end_monotonic_ns=inference_end_monotonic_ns,
+                    result_monotonic_ns=result_monotonic_ns,
+                    transport_streams=transport_streams,
+                ),
                 backend_ready=backend_available,
                 backend_state=runtime_state,
                 target_request_id=request.target_request_id,
@@ -169,6 +211,7 @@ class DistributedCloudService:
             )
 
         _, backend_available, runtime_state = self._runtime_status()
+        result_monotonic_ns = time.monotonic_ns()
         return DistributedResult(
             operation=request.operation,
             pipeline_id=self.identity.pipeline_id,
@@ -180,10 +223,71 @@ class DistributedCloudService:
             action=action,
             actual_chunk_size=chunk_size,
             backend_latency_ms=latency_ms,
+            performance=self._performance_payload(
+                request_start_monotonic_ns=request_start_monotonic_ns,
+                stream_assembly_start_monotonic_ns=stream_assembly_start_monotonic_ns,
+                stream_assembly_end_monotonic_ns=stream_assembly_end_monotonic_ns,
+                inference_start_monotonic_ns=inference_start_monotonic_ns,
+                inference_end_monotonic_ns=inference_end_monotonic_ns,
+                result_monotonic_ns=result_monotonic_ns,
+                transport_streams=transport_streams,
+            ),
             backend_ready=backend_available,
             backend_state=runtime_state,
             target_request_id=request.target_request_id,
         )
+
+    @staticmethod
+    def _performance_payload(
+        *,
+        request_start_monotonic_ns: int,
+        stream_assembly_start_monotonic_ns: int,
+        stream_assembly_end_monotonic_ns: int,
+        inference_start_monotonic_ns: int,
+        inference_end_monotonic_ns: int,
+        result_monotonic_ns: int,
+        transport_streams: tuple[dict[str, object], ...],
+    ) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "clock_domain": "monotonic",
+            "request_start_monotonic_ns": request_start_monotonic_ns,
+            "stream_assembly_start_monotonic_ns": stream_assembly_start_monotonic_ns,
+            "stream_assembly_end_monotonic_ns": stream_assembly_end_monotonic_ns,
+            "inference_start_monotonic_ns": inference_start_monotonic_ns,
+            "inference_end_monotonic_ns": inference_end_monotonic_ns,
+            "result_monotonic_ns": result_monotonic_ns,
+        }
+        if transport_streams:
+            payload["transport_streams"] = list(transport_streams)
+        return payload
+
+    def _transport_performance(self) -> tuple[dict[str, object], ...]:
+        if self.stream_manager is None:
+            return ()
+        snapshots = []
+        for status in self.stream_manager.statuses():
+            snapshot = asdict(status)
+            snapshot["clock_domain"] = "monotonic"
+            encode_start = int(snapshot["encode_start_monotonic_ns"])
+            encode_end = int(snapshot["encode_end_monotonic_ns"])
+            send_start = int(snapshot["send_start_monotonic_ns"])
+            send_end = int(snapshot["send_end_monotonic_ns"])
+            receive = int(snapshot["receive_monotonic_ns"])
+            decode_start = int(snapshot["decode_start_monotonic_ns"])
+            decode_end = int(snapshot["decode_end_monotonic_ns"])
+            if encode_end >= encode_start > 0:
+                snapshot["encode_latency_ns"] = encode_end - encode_start
+            if send_end >= send_start > 0:
+                snapshot["send_latency_ns"] = send_end - send_start
+            if decode_end >= decode_start > 0:
+                snapshot["decode_latency_ns"] = decode_end - decode_start
+            if (
+                int(snapshot["mapping_capture_timestamp_ns"]) == int(snapshot["last_decoded_capture_timestamp_ns"])
+                and receive >= send_end > 0
+            ):
+                snapshot["network_latency_ns"] = receive - send_end
+            snapshots.append(snapshot)
+        return tuple(snapshots)
 
     def close(self) -> None:
         error: Exception | None = None

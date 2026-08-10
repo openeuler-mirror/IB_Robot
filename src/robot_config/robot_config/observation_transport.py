@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 _STREAM_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,62}$")
-_BACKENDS = {"auto", "software", "ascend", "nvidia", "vaapi", "v4l2m2m", "rkmpp"}
+VIDEO_CODEC_BACKENDS = frozenset({"auto", "software", "ascend", "nvidia", "vaapi", "v4l2m2m", "rkmpp"})
 _PROFILES = {"baseline", "main", "high"}
 _COLOR_RANGES = {"limited", "full"}
 
@@ -306,7 +306,7 @@ def validate_observation_transports(
             errors.append(f"Observation '{key}' transport.media requires positive even dimensions and frame rate")
         elif media.pixel_format != "nv12" or media.color_space != "bt709" or media.color_range not in _COLOR_RANGES:
             errors.append(f"Observation '{key}' has unsupported transport media format or color metadata")
-        if value.encoder_backend not in _BACKENDS or value.decoder_backend not in _BACKENDS:
+        if value.encoder_backend not in VIDEO_CODEC_BACKENDS or value.decoder_backend not in VIDEO_CODEC_BACKENDS:
             errors.append(f"Observation '{key}' has unsupported video codec backend")
         if value.security != "none":
             errors.append(f"Observation '{key}' transport.security currently must be none")

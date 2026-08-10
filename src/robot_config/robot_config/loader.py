@@ -17,6 +17,7 @@ from embodied_common.skill_templates import (
 )
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.audio_contract import find_microphones, is_audio_io_enabled
+from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
 from robot_config.config import (
     AudioIOConfig,
     CameraConfig,
@@ -1565,6 +1566,7 @@ def load_robot_config_dict(
         resolve_robot_config_path(config_path=config_path)
     )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    materialize_benchmark_observation_transport(robot_config)
     mount_file = robot_config.get("mid360_mount_file")
     if mount_file:
         mount_path = Path(resolve_ros_path(mount_file)).expanduser()

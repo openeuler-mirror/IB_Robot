@@ -1,0 +1,15 @@
+# Request
+string suite
+int32 task_id
+int64 seed
+int32 init_state_id
+bool use_init_state_id
+---
+# Response
+bool success
+string message
+builtin_interfaces/Time obs_timestamp
+uint64 episode_id
+uint64 step_id
+string task_prompt
+string metadata_json

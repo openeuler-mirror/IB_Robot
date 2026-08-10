@@ -52,6 +52,30 @@ class ObservationSynchronizationError(RuntimeError):
         super().__init__(f"streamed observations are not ready: {summary}")
 
 
+class TargetFrameDroppedError(RuntimeError):
+    """Definitive failure for a requested frame known to be irrecoverably dropped."""
+
+    code = "target_frame_dropped"
+    recoverable = False
+    stage = "observation_sync"
+
+    def __init__(self, issues: list[SynchronizationIssue]) -> None:
+        self.issues = tuple(issues)
+        self.details = {
+            "streams": [
+                {
+                    "reason": issue.reason,
+                    "observation_key": issue.observation_key,
+                    "stream_id": issue.stream_id,
+                    **dict(issue.details),
+                }
+                for issue in issues
+            ]
+        }
+        summary = ", ".join(f"{issue.stream_id} ({issue.observation_key}): {issue.reason}" for issue in issues)
+        super().__init__(f"requested streamed observation was dropped: {summary}")
+
+
 @dataclass(frozen=True, slots=True)
 class StreamSelection:
     observation_key: str
@@ -60,6 +84,12 @@ class StreamSelection:
     timestamp_mapping_ready: bool = True
     keyframe_ready: bool = True
     pad_before_first: bool = False
+    future_tolerance_ns: int = 0
+    session_generation: int = 0
+    last_dropped_capture_timestamp_ns: int = 0
+    last_dropped_admission_id: str = ""
+    dropped_capture_history: tuple[tuple[int, str, str], ...] = ()
+    last_drop_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +222,8 @@ def select_synchronized_streams(
             maximum_timestamp_ns=maximum_timestamp_ns,
             skew_ns=skew_ns,
             max_inter_camera_skew_ns=max_inter_camera_skew_ns,
+            target_timestamp_ns=target_timestamp_ns,
+            session_generation=streams[key].session_generation,
         )
         for key, item in selected.items()
     ]
@@ -264,25 +296,81 @@ def _select_stream_entries(
 ) -> tuple[dict[str, SelectedStreamValue], list[SynchronizationIssue]]:
     selected: dict[str, SelectedStreamValue] = {}
     issues: list[SynchronizationIssue] = []
+    dropped_issues: list[SynchronizationIssue] = []
     for observation_key, stream in streams.items():
         if observation_key != stream.observation_key:
             raise ValueError(f"stream mapping key {observation_key!r} does not match its observation key")
+        dropped = next(
+            (item for item in reversed(stream.dropped_capture_history) if item[0] == target_timestamp_ns),
+            None,
+        )
+        if dropped is None and stream.last_dropped_capture_timestamp_ns == target_timestamp_ns:
+            dropped = (
+                target_timestamp_ns,
+                stream.last_dropped_admission_id,
+                stream.last_drop_reason,
+            )
+        if dropped is not None:
+            dropped_issues.append(
+                _stream_issue(
+                    stream,
+                    "target_frame_dropped",
+                    target_timestamp_ns=target_timestamp_ns,
+                    session_generation=stream.session_generation,
+                    admission_id=dropped[1],
+                    drop_reason=dropped[2],
+                )
+            )
+            continue
         if not stream.timestamp_mapping_ready:
-            issues.append(_stream_issue(stream, "unmapped"))
+            issues.append(
+                _stream_issue(
+                    stream,
+                    "unmapped",
+                    target_timestamp_ns=target_timestamp_ns,
+                    session_generation=stream.session_generation,
+                )
+            )
             continue
         if not stream.keyframe_ready:
-            issues.append(_stream_issue(stream, "pre_keyframe"))
+            issues.append(
+                _stream_issue(
+                    stream,
+                    "pre_keyframe",
+                    target_timestamp_ns=target_timestamp_ns,
+                    session_generation=stream.session_generation,
+                )
+            )
             continue
         item, issue = stream.buffer.select_entry(target_timestamp_ns, now_ns=now_ns)
-        if issue is not None and issue.get("reason") == "newer_than_request" and stream.pad_before_first:
-            item = stream.buffer.first_entry()
-            issue = None if item is not None else issue
+        if issue is not None:
+            future = None
+            if issue.get("reason") == "newer_than_request" and stream.pad_before_first:
+                future = stream.buffer.first_entry()
+            elif stream.future_tolerance_ns > 0:
+                candidate = stream.buffer.first_entry_after(target_timestamp_ns)
+                candidate_live_age_ns = max(0, now_ns - candidate[1]) if candidate is not None else 0
+                if (
+                    candidate is not None
+                    and candidate[0] - target_timestamp_ns <= stream.future_tolerance_ns
+                    and (stream.buffer.max_age_ns <= 0 or candidate_live_age_ns <= stream.buffer.max_age_ns)
+                ):
+                    future = candidate
+            if future is not None:
+                item = future
+                issue = None
         if issue is not None:
             reason = str(issue["reason"])
             if reason == "newer_than_request":
                 reason = "missing"
             issues.append(
-                _stream_issue(stream, reason, **{key: value for key, value in issue.items() if key != "reason"})
+                _stream_issue(
+                    stream,
+                    reason,
+                    target_timestamp_ns=target_timestamp_ns,
+                    session_generation=stream.session_generation,
+                    **{key: value for key, value in issue.items() if key != "reason"},
+                )
             )
             continue
         assert item is not None
@@ -294,6 +382,8 @@ def _select_stream_entries(
             receive_timestamp_ns=receive_timestamp_ns,
             value=value,
         )
+    if dropped_issues:
+        raise TargetFrameDroppedError(dropped_issues)
     return selected, issues
 
 

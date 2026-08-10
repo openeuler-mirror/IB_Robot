@@ -19,6 +19,7 @@ string pipeline_id
 string request_id
 string deployment_fingerprint
 float64 backend_latency_ms
+string performance_json                  # Provider-neutral phase timing and transport diagnostics JSON
 InferenceError error
 ---
 # Feedback: Progress updates

@@ -73,6 +73,9 @@
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>robot_navigation</exec_depend>
 
+  <!-- Benchmark runtime launched when runtime.target=benchmark -->
+  <exec_depend>benchmark_runtime</exec_depend>
+
   <!-- Tracing -->
   <exec_depend>tracetools</exec_depend>
   <exec_depend>tracetools_analysis</exec_depend>

@@ -13,7 +13,7 @@ from types import MappingProxyType
 
 from inference_manifest import PolicyMetadata, ValidatedManifest
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 5
 
 
 class UnsupportedDistributedRuntimeError(ValueError):
@@ -218,6 +218,7 @@ class DistributedResult:
     action: object | None = None
     actual_chunk_size: int = 0
     backend_latency_ms: float = 0.0
+    performance: Mapping[str, object] = field(default_factory=dict)
     backend_ready: bool = False
     backend_state: str = ""
     target_request_id: str = ""
@@ -230,6 +231,7 @@ class DistributedResult:
             raise ValueError("session_generation cannot be negative")
         if not math.isfinite(self.backend_latency_ms) or self.backend_latency_ms < 0:
             raise ValueError("backend_latency_ms must be finite and non-negative")
+        object.__setattr__(self, "performance", _immutable_mapping(self.performance))
         if self.success and self.error is not None:
             raise ValueError("successful results cannot contain an error")
         if self.success and self.operation is Operation.UNKNOWN:

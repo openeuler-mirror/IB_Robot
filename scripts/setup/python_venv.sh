@@ -151,6 +151,24 @@ setup_python_venv() {
         full_profile=false
     fi
 
+    # Runtime identity: Outer identity protection via production helpers.
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/setup/outer_identity_guard.sh"
+    local outer_identity_script="${SCRIPT_DIR}/setup/torch_identity.py"
+    # Pass executable/arguments only. outer_identity_guard injects
+    # PYTHONNOUSERSITE=1 while executing the collector.
+    local outer_collector_cmd=("${venv_path}/bin/python3" "${outer_identity_script}")
+
+    outer_identity_begin "${venv_path}" "${INSTALL_BENCHMARK_DEPS:-false}" "${outer_collector_cmd[@]}" >&2 || {
+        log_error "Outer identity begin failed."
+        exit 1
+    }
+    if [[ "${OUTER_IDENTITY_MODE}" == "protected" ]]; then
+        log_info "Outer inference identity protection: protected-existing-runtime mode."
+    elif [[ "${OUTER_IDENTITY_MODE}" == "fresh" ]]; then
+        log_info "Outer inference identity protection skipped: no pre-existing workspace venv/runtime."
+    fi
+
     # 0. Python interpreter preflight
     local host_python_path host_python_version host_py_major host_py_minor
     host_python_path="$(command -v python3 || true)"
@@ -198,6 +216,7 @@ setup_python_venv() {
     fi
 
     local pip_install=("${VENV_PYTHON}" -m pip install)
+    local installed_benchmark_deps=false
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
 
     # Upgrade pip
@@ -444,6 +463,144 @@ EOF
         log_info "Skipping optional speech_direction report dependencies. Re-run setup with --with-diagnostics if needed."
     fi
 
+    # ------------------------------------------------------------------
+    # Benchmark (LIBERO) optional dependency layer (benchmark setup).
+    #
+    # Installs the pinned libs/libero provider and the curated LIBERO
+    # runtime deps (robosuite, bddl, gym, imageio, etc.) into the
+    # workspace venv. Does NOT install torch/torchvision/robomimic.
+    # Records torch/python/torchvision identity before and after;
+    # fails-closed if the inference runtime was changed.
+    # ------------------------------------------------------------------
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional benchmark dependencies on openEuler; LIBERO/MuJoCo are validated on Ubuntu only."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Installing optional benchmark (LIBERO) dependencies..."
+        export WORKSPACE="${WORKSPACE}"
+
+        local benchmark_constraints="${WORKSPACE}/constraints/benchmark.txt"
+        local benchmark_req="${WORKSPACE}/requirements/benchmark.txt"
+        local benchmark_combined_constraints="${venv_path}/benchmark_combined_constraints.txt"
+
+        # Combine ros_abi_constraints + benchmark constraints into one file
+        # so a single --constraint flag covers both.
+        cat "${ros_abi_constraints}" > "${benchmark_combined_constraints}"
+        if [[ -f "${benchmark_constraints}" ]]; then
+            cat "${benchmark_constraints}" >> "${benchmark_combined_constraints}"
+        fi
+
+        # 1. Record inference runtime identity BEFORE benchmark install.
+        #    Uses the shared torch_identity.py collector to avoid drift
+        #    between before/after snapshots. Fail-closed: non-zero exit
+        #    from the collector aborts setup (torch is a required component;
+        #    installed-but-broken must not be masked as "not installed").
+        local torch_identity_script="${SCRIPT_DIR}/setup/torch_identity.py"
+        local torch_before_file="${venv_path}/benchmark_torch_identity_before.txt"
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${torch_identity_script}" > "${torch_before_file}"
+        local torch_before_rc=$?
+        if [[ ${torch_before_rc} -ne 0 ]]; then
+            log_error "Failed to record torch identity (before). Setup aborts (fail-closed)."
+            cat "${torch_before_file}" 2>/dev/null || true
+            exit 1
+        fi
+        log_info "Benchmark torch identity (before) recorded."
+
+        # 2. Verify libs/libero submodule gitlink/HEAD/dirty before install.
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup/benchmark_guard.sh"
+        if ! verify_libero_gitlink "${WORKSPACE}"; then
+            log_error "libs/libero gitlink verification failed. Aborting before editable install."
+            exit 1
+        fi
+        log_info "libs/libero gitlink verified."
+
+        # Workspace-owned LIBERO configuration: Generate workspace-owned LIBERO config BEFORE any import.
+        # Without this, the pinned provider calls input() on fresh HOME,
+        # which fails non-interactively with EOFError.
+        local libero_config_script="${SCRIPT_DIR}/setup/libero_config.py"
+        local libero_config_dir="${venv_path}/ibrobot_libero"
+        log_info "Generating workspace-owned LIBERO config..."
+        if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${libero_config_script}" \
+            > "${venv_path}/benchmark_libero_config_output.txt" 2>&1; then
+            log_error "Failed to generate workspace-owned LIBERO config."
+            cat "${venv_path}/benchmark_libero_config_output.txt" 2>/dev/null || true
+            exit 1
+        fi
+        export LIBERO_CONFIG_PATH="${libero_config_dir}"
+        log_info "LIBERO config generated at ${libero_config_dir}/config.yaml"
+
+        # 3. Install the pinned libs/libero provider in editable mode
+        #    with --no-deps so its legacy requirements.txt does not pull
+        #    in robomimic/transformers/wandb (which would pull torch).
+        local libero_dir_local="${WORKSPACE}/libs/libero"
+        log_info "Installing pinned libs/libero (editable compat mode, --no-deps)..."
+        # Editable compatibility: Use editable_mode=compat to generate a .pth file that
+        # points to libs/libero directly, instead of the default PEP 660
+        # finder which produces an empty MAPPING for this package layout.
+        run_cmd "${pip_install[@]}" --no-build-isolation --no-deps \
+            --config-settings editable_mode=compat \
+            -e "${libero_dir_local}" --quiet
+
+        # 4. Install the curated benchmark requirements.
+        log_info "Installing benchmark requirements..."
+        run_cmd "${pip_install[@]}" --constraint "${benchmark_combined_constraints}" \
+            -r "${benchmark_req}" --quiet
+
+        # 5. Record inference runtime identity AFTER benchmark install.
+        #    Uses the same shared collector as step 1.
+        local torch_after_file="${venv_path}/benchmark_torch_identity_after.txt"
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${torch_identity_script}" > "${torch_after_file}"
+        local torch_after_rc=$?
+        if [[ ${torch_after_rc} -ne 0 ]]; then
+            log_error "Failed to record torch identity (after). Setup aborts (fail-closed)."
+            cat "${torch_after_file}" 2>/dev/null || true
+            exit 1
+        fi
+        log_info "Benchmark torch identity (after) recorded."
+
+        # 6. Compare before/after; fail-closed on ANY identity field change.
+        #    Every field is compared, including torch_file, torchvision_file,
+        #    python_version, build suffix, CUDA runtime, and device capability.
+        local torch_before_summary torch_after_summary
+        torch_before_summary="$(cat "${torch_before_file}" 2>/dev/null)"
+        torch_after_summary="$(cat "${torch_after_file}" 2>/dev/null)"
+        if [[ "${torch_before_summary}" != "${torch_after_summary}" ]]; then
+            log_error "Benchmark dependency installation changed the inference runtime identity."
+            log_error "This is a fail-closed condition. The benchmark stack must not modify torch/torchvision."
+            log_error "--- BEFORE ---"
+            cat "${torch_before_file}" 2>/dev/null || true
+            log_error "--- AFTER ---"
+            cat "${torch_after_file}" 2>/dev/null || true
+            log_error "--- DIFF ---"
+            diff "${torch_before_file}" "${torch_after_file}" 2>/dev/null || true
+            exit 1
+        fi
+        log_done "Benchmark dependencies installed; torch/torchvision identity unchanged (all fields compared)"
+
+        # 7. Record provider identity for the benchmark setup report.
+        # Provider identity: Use unified standalone collector to avoid contract drift.
+        local provider_identity_script="${SCRIPT_DIR}/setup/provider_identity.py"
+        local provider_identity_file="${venv_path}/benchmark_provider_identity.txt"
+        local provider_rc=0
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${provider_identity_script}" \
+            > "${provider_identity_file}" 2>&1 || provider_rc=$?
+        if [[ ${provider_rc} -ne 0 ]]; then
+            log_error "Provider identity collector failed (rc=${provider_rc})."
+            cat "${provider_identity_file}" 2>/dev/null || true
+            exit 1
+        fi
+        if ! grep -q "PROVIDER_IDENTITY_OK" "${provider_identity_file}" 2>/dev/null; then
+            log_error "Provider identity verification failed (no PROVIDER_IDENTITY_OK marker)."
+            cat "${provider_identity_file}" 2>/dev/null || true
+            exit 1
+        fi
+        log_done "Provider identity verified"
+
+        installed_benchmark_deps=true
+    else
+        log_info "Skipping optional benchmark dependencies. Re-run setup with --with-benchmark if needed."
+    fi
+
     # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
     # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
     log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."
@@ -468,6 +625,29 @@ try:
 except Exception as exc:
     raise SystemExit(f"Missing grasp_gen after default grasp install: {exc}")
 print("Grasp dependencies smoke test passed")
+PY
+    fi
+    if [[ "${installed_benchmark_deps}" == true ]]; then
+        log_info "Running benchmark (LIBERO) import smoke test..."
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib
+
+required = [
+    "libero",
+    "libero.libero",
+    "robosuite",
+    "mujoco",
+    "imageio",
+]
+missing = []
+for name in required:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name}: {exc}")
+if missing:
+    raise SystemExit("Benchmark import smoke test failed:\n  " + "\n  ".join(missing))
+print("Benchmark (LIBERO) import smoke test passed")
 PY
     fi
 
@@ -524,4 +704,14 @@ PY
     fi
 
     PYTHON_ENV_STATUS="done"
+
+    # Runtime identity: Finalize outer identity via production helper.
+    local outer_finalize_collector=("${VENV_PYTHON}" "${outer_identity_script}")
+    outer_identity_finalize "${venv_path}" "${INSTALL_BENCHMARK_DEPS:-false}" "${outer_finalize_collector[@]}" >&2 || {
+        log_error "Outer inference identity comparison failed."
+        exit 1
+    }
+    if [[ "${OUTER_IDENTITY_MODE}" == "protected" ]]; then
+        log_done "Outer inference identity unchanged (full setup scope)"
+    fi
 }

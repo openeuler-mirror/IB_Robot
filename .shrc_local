@@ -119,6 +119,14 @@ else
 fi
 unset _CANN_CANDIDATES _cann_env _CANN_LOADED
 
+# 7.2 加载 workspace-owned LIBERO benchmark 配置 (如果已由 setup.sh --with-benchmark 生成)
+_IB_LIBERO_CONFIG_PATH="${WORKSPACE_DIR}/venv/ibrobot_libero"
+if [ -f "${_IB_LIBERO_CONFIG_PATH}/config.yaml" ]; then
+    export LIBERO_CONFIG_PATH="${_IB_LIBERO_CONFIG_PATH}"
+    _IB_STEPS+=("LIBERO benchmark config")
+fi
+unset _IB_LIBERO_CONFIG_PATH
+
 # 8. 别名设置
 alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
 alias cbp='python3 -m colcon build --symlink-install --merge-install --packages-select'

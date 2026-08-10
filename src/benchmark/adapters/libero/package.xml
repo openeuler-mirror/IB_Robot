@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>benchmark_libero</name>
+  <version>0.0.1</version>
+  <description>LIBERO child adapter package for IB-Robot benchmark evaluation</description>
+  <maintainer email="ib-robot@example.com">ib-robot</maintainer>
+  <license>Apache-2.0</license>
+
+  <build_depend>benchmark_runtime</build_depend>
+  <exec_depend>benchmark_runtime</exec_depend>
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -32,3 +32,7 @@
 	path = src/fast_calib
 	url = https://atomgit.com/ib_robot/FAST-Calib_Ros2.git
 	ignore = dirty
+[submodule "libs/libero"]
+	path = libs/libero
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+	ignore = dirty

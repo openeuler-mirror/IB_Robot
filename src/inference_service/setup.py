@@ -23,6 +23,7 @@ setup(
         "trajectory_msgs",
         "std_msgs",
         "inference_manifest",
+        "observation_transport",
     ],
     zip_safe=True,
     maintainer="xqw",

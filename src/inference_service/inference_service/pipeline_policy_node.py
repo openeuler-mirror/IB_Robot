@@ -63,6 +63,7 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
     video_descriptor_to_message,
+    video_status_from_message,
     video_status_to_message,
 )
 from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
@@ -91,6 +92,7 @@ from inference_service.scheduler.ledger import (
 from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from inference_service.unified_runtime import RegistrySet, RuntimeProviders
+from observation_transport.frame_ingress import StreamSessionView
 from robot_config.contract_utils import (
     SpecView,
     StreamBuffer,
@@ -135,6 +137,7 @@ class PipelineNodeConfig:
     heartbeat_topic: str
     video_descriptor_topic: str = ""
     video_status_topic: str = ""
+    external_video_producer: bool = False
     # Empty when scheduler is disabled.
     scheduled_open_session: str = ""
     scheduled_dispatch: str = ""
@@ -235,6 +238,111 @@ class DeadlineExceededError(RuntimeError):
     code = "deadline_exceeded"
     recoverable = True
     stage = "deadline"
+
+
+class _ExternalVideoProducerView:
+    """Request-side session view for an out-of-process frame producer.
+
+    This object never owns a sender, descriptor publisher, or stream-status
+    publisher. It only keeps request stream references aligned with the active
+    distributed inference session.
+    """
+
+    def __init__(
+        self,
+        observation_specs: list[SpecView],
+        *,
+        pipeline_id: str,
+        contract_fingerprint: str,
+        deployment_fingerprint: str,
+    ) -> None:
+        from robot_config.observation_transport import effective_observation_transport
+
+        self._references = tuple(
+            StreamReference(spec.key, transport.stream_id or "")
+            for spec in observation_specs
+            if (transport := effective_observation_transport(spec.transport)).mode == "rtp"
+        )
+        self._session = StreamSessionView.inactive(
+            pipeline_id=pipeline_id,
+            contract_fingerprint=contract_fingerprint,
+            deployment_fingerprint=deployment_fingerprint,
+        )
+        self._latest_sent_capture_ns: dict[str, int] = {}
+        self._status_lock = threading.Lock()
+
+    @property
+    def observation_keys(self) -> frozenset[str]:
+        return frozenset(reference.observation_key for reference in self._references)
+
+    @property
+    def stream_references(self) -> tuple[StreamReference, ...]:
+        return self._references
+
+    @property
+    def session(self) -> StreamSessionView:
+        return self._session
+
+    def bind_session(self, session: StreamSessionView) -> bool:
+        changed = self._session != session
+        self._session = session
+        if changed:
+            with self._status_lock:
+                self._latest_sent_capture_ns.clear()
+        return changed
+
+    def clear_session(self) -> None:
+        self._session = StreamSessionView.inactive(
+            pipeline_id=self._session.pipeline_id,
+            contract_fingerprint=self._session.contract_fingerprint,
+            deployment_fingerprint=self._session.deployment_fingerprint,
+        )
+        with self._status_lock:
+            self._latest_sent_capture_ns.clear()
+
+    def latest_sent_capture_ns(self, observation_key: str) -> int:
+        with self._status_lock:
+            return self._latest_sent_capture_ns.get(observation_key, 0)
+
+    def observe_sender_status(self, status: object) -> bool:
+        """Record the sender's post-send capture mapping for external RTP input."""
+        if (
+            getattr(status, "status_origin", "") != "sender"
+            or getattr(status, "pipeline_id", "") != self._session.pipeline_id
+            or not self._session.active
+            or getattr(status, "session_id", "") != self._session.session_id
+            or int(getattr(status, "session_generation", 0)) != self._session.generation
+            or getattr(status, "observation_key", "") not in self.observation_keys
+            or not bool(getattr(status, "timestamp_mapping_valid", False))
+            or int(getattr(status, "encoded_frames", 0)) <= 0
+            or int(getattr(status, "sent_packets", 0)) <= 0
+        ):
+            return False
+        capture_ns = int(getattr(status, "mapping_capture_timestamp_ns", 0))
+        if capture_ns <= 0:
+            return False
+        key = status.observation_key
+        with self._status_lock:
+            if capture_ns < self._latest_sent_capture_ns.get(key, 0):
+                return False
+            self._latest_sent_capture_ns[key] = capture_ns
+        return True
+
+    def reset(self) -> None:
+        with self._status_lock:
+            self._latest_sent_capture_ns.clear()
+
+    def close(self) -> None:
+        self.clear_session()
+
+    def descriptors(self) -> tuple[()]:
+        return ()
+
+    def statuses(self) -> tuple[()]:
+        return ()
+
+    def diagnostic_snapshots(self) -> tuple[()]:
+        return ()
 
 
 class PipelinePolicyNode(Node):
@@ -344,12 +452,20 @@ class PipelinePolicyNode(Node):
             self._edge_runtime.load()
             self._edge_session = EdgeSession(build_pipeline_identity(config.pipeline_id, self._manifest))
             self._edge_session.start()
-            self._video_stream_manager = DeviceVideoStreamManager(
-                pipeline_id=config.pipeline_id,
-                contract_fingerprint=contract_fingerprint(self._contract),
-                deployment_fingerprint=self._manifest.fingerprint,
-                observation_specs=self._obs_specs,
-            )
+            if config.external_video_producer:
+                self._video_stream_manager = _ExternalVideoProducerView(
+                    self._obs_specs,
+                    pipeline_id=config.pipeline_id,
+                    contract_fingerprint=contract_fingerprint(self._contract),
+                    deployment_fingerprint=self._manifest.fingerprint,
+                )
+            else:
+                self._video_stream_manager = DeviceVideoStreamManager(
+                    pipeline_id=config.pipeline_id,
+                    contract_fingerprint=contract_fingerprint(self._contract),
+                    deployment_fingerprint=self._manifest.fingerprint,
+                    observation_specs=self._obs_specs,
+                )
 
         self._action_pub = None
         if not config.scheduler_enabled:
@@ -375,10 +491,23 @@ class PipelinePolicyNode(Node):
                 callback_group=ReentrantCallbackGroup(),
             )
             self._status_pub = self.create_publisher(InferencePipelineStatus, config.heartbeat_topic, status_qos)
-            self._video_descriptor_pub = self.create_publisher(
-                VideoStreamDescriptor, config.video_descriptor_topic, descriptor_qos
-            )
-            self._video_status_pub = self.create_publisher(VideoStreamStatus, config.video_status_topic, 10)
+            self._video_descriptor_pub = None
+            self._video_status_pub = None
+            self._video_status_timer = None
+            if config.external_video_producer:
+                self.create_subscription(
+                    VideoStreamStatus,
+                    config.video_status_topic,
+                    self._external_video_status_callback,
+                    10,
+                    callback_group=ReentrantCallbackGroup(),
+                )
+            else:
+                self._video_descriptor_pub = self.create_publisher(
+                    VideoStreamDescriptor, config.video_descriptor_topic, descriptor_qos
+                )
+                self._video_status_pub = self.create_publisher(VideoStreamStatus, config.video_status_topic, 10)
+                self._video_status_timer = self.create_timer(0.25, self._publish_video_stream_control)
             self.create_subscription(
                 InferencePipelineStatus,
                 config.heartbeat_topic,
@@ -388,7 +517,6 @@ class PipelinePolicyNode(Node):
             )
             self._status_timer = self.create_timer(0.5, self._publish_distributed_status)
             self._heartbeat_timer = self.create_timer(0.25, self._check_heartbeat)
-            self._video_status_timer = self.create_timer(0.25, self._publish_video_stream_control)
         self._action_server = None
         self._reset_server = None
         self._reset_callback_group = MutuallyExclusiveCallbackGroup()
@@ -828,9 +956,15 @@ class PipelinePolicyNode(Node):
         cpu = getattr(candidate, "cpu", None)
         if callable(cpu):
             candidate = cpu()
-        converted = np.asarray(candidate).astype(np.float64).copy()
         if not self._joint_rad_limits:
-            return converted
+            # closed-loop inference: when no joint conversion is configured, the action
+            # must still be returned as contiguous float32 so the
+            # StepBenchmark wire contract (and the LIBERO adapter's
+            # validate_libero_action_dict) accepts it. The previous code
+            # converted to float64 before this early return, producing a
+            # float64 payload that the adapter rejects.
+            return np.ascontiguousarray(candidate, dtype=np.float32)
+        converted = np.asarray(candidate).astype(np.float64).copy()
         for index, (minimum, maximum, span, offset) in enumerate(self._joint_rad_limits):
             if index < converted.shape[-1]:
                 converted[..., index] = (converted[..., index] - offset) / span * (maximum - minimum) + minimum
@@ -851,6 +985,7 @@ class PipelinePolicyNode(Node):
         if sample_time <= 0:
             sample_time = self.get_clock().now().nanoseconds
         total_start = time.perf_counter()
+        request_start_monotonic_ns = time.monotonic_ns()
 
         try:
             if self._goal_cancel_requested(goal_handle):
@@ -859,7 +994,14 @@ class PipelinePolicyNode(Node):
             try:
                 if self._goal_cancel_requested(goal_handle):
                     raise RequestCanceledError(f"inference request {request_id!r} was canceled before execution")
-                return self._execute_inference_request(goal_handle, request, request_id, sample_time, total_start)
+                return self._execute_inference_request(
+                    goal_handle,
+                    request,
+                    request_id,
+                    sample_time,
+                    total_start,
+                    request_start_monotonic_ns,
+                )
             finally:
                 self._operation_lock.release()
         except Exception as exc:
@@ -891,6 +1033,17 @@ class PipelinePolicyNode(Node):
             response.request_id = request_id
             response.deployment_fingerprint = self._manifest.fingerprint
             response.backend_latency_ms = 0.0
+            response.performance_json = json.dumps(
+                {
+                    "clock_domain": "monotonic",
+                    "execution_mode": self._config.execution_mode,
+                    "request_start_monotonic_ns": request_start_monotonic_ns,
+                    "result_monotonic_ns": time.monotonic_ns(),
+                    "error_stage": error.stage,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
             response.error = error_to_message(error)
             if error.code == "request_canceled":
                 self._finish_canceled_goal(goal_handle)
@@ -983,6 +1136,7 @@ class PipelinePolicyNode(Node):
         request_id: str,
         sample_time: int,
         total_start: float,
+        request_start_monotonic_ns: int,
     ) -> DispatchInfer.Result:
         deadline = self._goal_deadline(request.deadline)
         if deadline is None:
@@ -997,8 +1151,10 @@ class PipelinePolicyNode(Node):
         self._raise_if_deadline_expired(deadline, request_id)
         if "observation.state" in observations:
             observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
+        service_performance: dict[str, object]
         if self._config.execution_mode == "monolithic":
             observations = self._to_policy_inputs(observations)
+            inference_start_monotonic_ns = time.monotonic_ns()
             result = self._require_manager().infer(
                 self._config.pipeline_id,
                 InferenceRequest(
@@ -1011,8 +1167,17 @@ class PipelinePolicyNode(Node):
             )
             raw_action = result.action
             chunk_size = result.actual_chunk_size
+            inference_end_monotonic_ns = time.monotonic_ns()
             backend_latency_ms = result.backend_latency_ms
             total_latency_ms = result.total_latency_ms
+            service_performance = {
+                "clock_domain": "monotonic",
+                "execution_mode": "monolithic",
+                "request_start_monotonic_ns": request_start_monotonic_ns,
+                "inference_start_monotonic_ns": inference_start_monotonic_ns,
+                "inference_end_monotonic_ns": inference_end_monotonic_ns,
+                "transport": {"mode": "dds", "streams": []},
+            }
         else:
             edge_runtime = self._require_edge_runtime()
             try:
@@ -1052,6 +1217,8 @@ class PipelinePolicyNode(Node):
                 chunk_size = distributed_result.actual_chunk_size
                 backend_latency_ms = distributed_result.backend_latency_ms
                 total_latency_ms = (time.perf_counter() - total_start) * 1000.0
+                service_performance = dict(distributed_result.performance)
+                service_performance["execution_mode"] = "distributed"
             except Exception as exc:
                 self._fail_distributed_after_deadline(request_id, exc)
                 raise
@@ -1072,6 +1239,8 @@ class PipelinePolicyNode(Node):
         response.request_id = request_id
         response.deployment_fingerprint = self._manifest.fingerprint
         response.backend_latency_ms = backend_latency_ms
+        service_performance["pipeline_result_monotonic_ns"] = time.monotonic_ns()
+        response.performance_json = json.dumps(service_performance, sort_keys=True, separators=(",", ":"))
         response.error = error_to_message(None)
         self._last_inference_time = time.time()
         self._inference_count += 1
@@ -1106,12 +1275,26 @@ class PipelinePolicyNode(Node):
                     self._require_manager().reset(self._config.pipeline_id, deadline)
                 except Exception as exc:
                     reset_error = exc
+                    # Only clear the observation buffers when the pipeline is
+                    # broken after a failed reset. On success the pipeline
+                    # state is already reset by ``manager.reset()``; keeping
+                    # the observation history intact allows the first
+                    # inference of a freshly-prepared episode to sample the
+                    # reset observation at the exact reset timestamp. The
+                    # prepare-flow reset (benchmark episode controller PreparePolicyEpisode) runs
+                    # between ResetBenchmark and RunPolicy, so clearing the
+                    # buffers here would discard the reset observations the
+                    # first inference needs.
                     clear_observations = not self._require_manager().health(self._config.pipeline_id).ready
                 else:
-                    clear_observations = True
+                    clear_observations = False
             else:
                 reset_error, terminal_reset_failure = self._reset_distributed_pipeline(deadline)
-                clear_observations = reset_error is None or terminal_reset_failure
+                # PreparePolicyEpisode runs after ResetBenchmark has delivered
+                # the reset observation. A successful policy reset must retain
+                # both DDS state history and externally streamed frames. Only a
+                # terminal/unknown distributed failure invalidates that data.
+                clear_observations = terminal_reset_failure
             if clear_observations:
                 self._clear_observation_buffers(self.get_clock().now().nanoseconds)
 
@@ -1193,7 +1376,9 @@ class PipelinePolicyNode(Node):
                     "deployment_fingerprint": self._manifest.fingerprint,
                     "backend": self._manifest.deployment.backend,
                     "state": session.state.value,
+                    "backend_state": self._remote_state,
                     "remote_state": self._remote_state,
+                    "external_video_producer": bool(getattr(self._config, "external_video_producer", False)),
                     "session_id": session_id,
                     "session_generation": generation,
                 }
@@ -1931,6 +2116,16 @@ class PipelinePolicyNode(Node):
                 f"diagnostic={self._format_video_stream_diagnostic(snapshot)}"
             )
 
+    def _external_video_status_callback(self, message: VideoStreamStatus) -> None:
+        manager = self._video_stream_manager
+        if manager is None or not isinstance(manager, _ExternalVideoProducerView):
+            return
+        try:
+            manager.observe_sender_status(video_status_from_message(message))
+        except Exception as exc:
+            self._last_error = f"invalid external video status: {exc}"
+            self.get_logger().error(self._last_error)
+
     def _cloud_status_callback(self, message: InferencePipelineStatus) -> None:
         if message.role != InferencePipelineStatus.ROLE_CLOUD:
             return
@@ -1952,7 +2147,14 @@ class PipelinePolicyNode(Node):
             if video_manager is not None:
                 session_id, session_generation = self._require_edge_session().session
                 if session_id:
-                    if video_manager.bind_session(session_id, session_generation):
+                    session = StreamSessionView(
+                        pipeline_id=self._config.pipeline_id,
+                        session_id=session_id,
+                        generation=session_generation,
+                        contract_fingerprint=contract_fingerprint(self._contract),
+                        deployment_fingerprint=self._manifest.fingerprint,
+                    )
+                    if video_manager.bind_session(session):
                         self._publish_video_stream_control()
                 else:
                     video_manager.clear_session()
@@ -1998,14 +2200,16 @@ class PipelinePolicyNode(Node):
 
     def _publish_video_stream_control(self) -> None:
         manager = self._video_stream_manager
-        if manager is None:
+        descriptor_publisher = getattr(self, "_video_descriptor_pub", None)
+        status_publisher = getattr(self, "_video_status_pub", None)
+        if manager is None or descriptor_publisher is None or status_publisher is None:
             return
         stamp = self.get_clock().now().to_msg()
         try:
             for descriptor in manager.descriptors():
-                self._video_descriptor_pub.publish(video_descriptor_to_message(descriptor, stamp=stamp))
+                descriptor_publisher.publish(video_descriptor_to_message(descriptor, stamp=stamp))
             for status in manager.statuses():
-                self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+                status_publisher.publish(video_status_to_message(status, stamp=stamp))
             diagnostics = manager.sender_diagnostics()
             if diagnostics:
                 self.get_logger().info(
@@ -2344,6 +2548,7 @@ def _read_config() -> tuple[PipelineNodeConfig, str]:
         "terminal_session_retention_ns": 1,
         "video_descriptor_topic": "/inference/policy/video/descriptors",
         "video_status_topic": "/inference/policy/video/status",
+        "external_video_producer": False,
     }
     for name, default in defaults.items():
         reader.declare_parameter(name, default)
