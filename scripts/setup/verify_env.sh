@@ -301,17 +301,54 @@ print("legacy libero distribution rejected by provider probe")
 # Missing or broken runtime dependencies are Setup failures, never blockers.
 import cv2
 import libero
+import llvmlite
 import mujoco
+import numba
 import numpy as np
 import robosuite
 import torch
 import torchvision
+from torchcodec.decoders import VideoDecoder
 from libero.libero import benchmark as libero_benchmark
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-for module in (cv2, libero, robosuite, mujoco, torch, torchvision):
+for module in (cv2, libero, robosuite, mujoco, numba, llvmlite, torch, torchvision):
     print(f"imported {module.__name__} from {getattr(module, '__file__', '<builtin>')}")
+
+expected_torch = os.environ["BENCHMARK_TORCH_VERSION"]
+expected_torchvision = os.environ["BENCHMARK_TORCHVISION_VERSION"]
+expected_torchcodec = os.environ["BENCHMARK_TORCHCODEC_VERSION"]
+expected_numba = os.environ["BENCHMARK_NUMBA_VERSION"]
+expected_llvmlite = os.environ["BENCHMARK_LLVM_LITE_VERSION"]
+if torch.__version__ != expected_torch:
+    raise RuntimeError(f"torch is {torch.__version__}; expected {expected_torch}")
+if torchvision.__version__ != expected_torchvision:
+    raise RuntimeError(f"torchvision is {torchvision.__version__}; expected {expected_torchvision}")
+actual_torchcodec = importlib.metadata.version("torchcodec")
+if actual_torchcodec != expected_torchcodec:
+    raise RuntimeError(f"torchcodec is {actual_torchcodec}; expected {expected_torchcodec}")
+if not callable(VideoDecoder):
+    raise RuntimeError("torchcodec VideoDecoder API is unavailable")
+if numba.__version__ != expected_numba:
+    raise RuntimeError(f"numba is {numba.__version__}; expected {expected_numba}")
+if llvmlite.__version__ != expected_llvmlite:
+    raise RuntimeError(f"llvmlite is {llvmlite.__version__}; expected {expected_llvmlite}")
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "torch-cuda is unavailable after Benchmark setup: "
+        f"torch={torch.__version__}, torch_cuda={torch.version.cuda}"
+    )
+device = torch.device("cuda:0")
+probe = torch.ones((2, 2), device=device) @ torch.ones((2, 2), device=device)
+torch.cuda.synchronize(device)
+if not torch.isfinite(probe).all():
+    raise RuntimeError("Benchmark CUDA tensor smoke test returned non-finite values")
+print(
+    f"Benchmark CUDA profile: torch={torch.__version__}, torchvision={torchvision.__version__}, "
+    f"torchcodec={actual_torchcodec}, numba={numba.__version__}, llvmlite={llvmlite.__version__}, "
+    f"gpu={torch.cuda.get_device_name(device)}"
+)
 
 # Validate the provider API and task-0 metadata/resources used by the adapter.
 suite_factory = libero_benchmark.get_benchmark_dict().get("libero_10")

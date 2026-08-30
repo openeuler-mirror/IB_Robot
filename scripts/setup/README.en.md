@@ -5,6 +5,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | File | Responsibility |
 | --- | --- |
 | `detect.sh` | OS / arch / Python detection; resolves `IBR_HOST_*` and `IBR_LEROBOT_PROFILES`. |
+| `benchmark_profile.sh` | Ubuntu GPU preflight, validated PyTorch/TorchVision/TorchCodec CUDA profile, and provider ABI boundary for `--with-benchmark`; NVIDIA driver >=560.28.03 is required, local nvcc is not required and GraspGen is excluded. |
 | `platforms/<id>.sh` | Per-platform package managers, ROS source, and `platform_lerobot_profiles()` defaults. |
 | `lerobot_patches.sh` | Drives `git am` of the curated lerobot patch stack into `libs/lerobot`. |
 | `lerobot_resolve_active.py` | Resolves the active lerobot tag from `INDEX.yaml`; cross-checks the per-tag `manifest.yaml`. |

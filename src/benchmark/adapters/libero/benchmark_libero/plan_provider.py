@@ -19,7 +19,7 @@ class NativeLiberoPlanProvider:
         try:
             suite_factory = libero_benchmark.get_benchmark_dict()[suite]
         except KeyError as exc:
-            raise ValueError(f"pinned LIBERO provider does not expose suite {suite!r}") from exc
+            raise ValueError(f"verified hf-libero provider does not expose suite {suite!r}") from exc
         native_suite = suite_factory(task_order_index=task_order_index)
         tasks: list[ProviderTask] = []
         for index in range(native_suite.get_num_tasks()):

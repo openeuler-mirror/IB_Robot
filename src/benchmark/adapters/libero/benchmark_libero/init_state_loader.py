@@ -1,6 +1,6 @@
-"""Explicit trusted init-state loader for the pinned LIBERO provider (Trusted initial-state loading).
+"""Explicit trusted init-state loader for the verified hf-libero provider.
 
-LIBERO runtime Trusted initial-state loading: the pinned ``libs/libero`` ``benchmark.get_task_init_states(i)``
+LIBERO runtime trusted initial-state loading: ``benchmark.get_task_init_states(i)``
 calls ``torch.load(init_states_path)`` without ``weights_only=False``. Under
 torch 2.6+ the default changed to ``weights_only=True``, which rejects the
 legacy numpy pickle used by LIBERO's init-state files.
@@ -9,10 +9,10 @@ This module resolves the trusted fixed init-state asset from the pinned
 LIBERO task metadata + ``get_libero_path("init_states")`` and loads it
 locally with an explicit ``torch.load(path, weights_only=False)``.
 
-Security comment: the init-state files are pinned repository assets inside
-``libs/libero`` at commit ``8f1084e3132a39270c3a13ebe37270a43ece2a01``. The
-adapter only loads files resolved through the pinned LIBERO API and never
-accepts arbitrary user paths. ``weights_only=False`` is therefore acceptable
+Security comment: provider identity verification pins ``hf-libero`` to the
+accepted version range and proves that init-state paths resolve inside that
+installed distribution. The adapter never accepts arbitrary user paths.
+``weights_only=False`` is therefore acceptable
 here; it must NOT be used for arbitrary external checkpoints.
 """
 
@@ -52,18 +52,17 @@ def resolve_init_states_path(task: Any, get_libero_path_fn: Any) -> str:
 def load_trusted_init_states(init_states_path: str) -> Any:
     """Load a trusted LIBERO init-state file with explicit ``weights_only=False``.
 
-    The file is a pinned repository asset under ``libs/libero`` at the
-    verified commit. ``weights_only=False`` is required because the pinned
-    LIBERO provider pickles init states with the legacy numpy format. This
+    The file is a provider-owned asset inside the identity-verified
+    ``hf-libero`` distribution. ``weights_only=False`` is required because
+    LIBERO pickles init states with the legacy numpy format. This
     function must NOT be used for arbitrary external checkpoints.
     """
     import torch  # noqa: PLC0415 -- heavy import deferred to adapter boundary
 
     if not os.path.isfile(init_states_path):
         raise InitStateLoadError(f"trusted init-state file does not exist: {init_states_path}")
-    # SECURITY: weights_only=False is acceptable ONLY because this file is a
-    # pinned repository asset under libs/libero at a verified commit. The
-    # adapter resolves the path through the pinned LIBERO API and never
+    # SECURITY: weights_only=False is acceptable ONLY because this file is
+    # resolved through the identity-verified hf-libero API and never
     # accepts arbitrary user-supplied paths.
     try:
         return torch.load(init_states_path, weights_only=False)

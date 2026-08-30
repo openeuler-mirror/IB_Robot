@@ -108,6 +108,8 @@ source "${SCRIPT_DIR}/setup/ros_third_party.sh"
 source "${SCRIPT_DIR}/setup/rosdep.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/setup/python_venv.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup/benchmark_profile.sh"
 
 # Overrides for setup.sh specific logging behavior
 log_done()    { SUMMARY+=("${GREEN}✓${NC} $*"); }
@@ -207,7 +209,10 @@ Options:
       --with-diagnostics Install optional Plotly/Matplotlib dependencies for
                           the speech_direction_report offline CLI only;
                           the speech_direction_node runtime does not need them.
-      --with-benchmark   Enable optional Benchmark dependencies on supported platforms.
+      --with-benchmark   Install the Ubuntu 22.04 x86_64 GPU LIBERO profile.
+                          Pins the validated PyTorch/TorchCodec CUDA ABI, needs
+                          NVIDIA driver >=560.28.03, does not need local nvcc,
+                          and skips unrelated GraspGen dependencies.
 
       --skip-verify      Skip final ROS/Python verification
       --only-patch       Skip dependency/venv setup and verification; only
@@ -338,7 +343,7 @@ preview_system_packages() {
         ubuntu-22.04)
             local pkgs="python3-colcon-common-extensions python3-venv python3-pip"
             if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
-                pkgs="${pkgs} libosmesa6-dev"
+                pkgs="${pkgs} libosmesa6-dev ffmpeg"
             fi
             echo "${pkgs}"
             ;;
@@ -629,6 +634,9 @@ main() {
     set_stage "detecting system"
     initialize_platform
     print_platform_summary
+    if [[ "${INSTALL_BENCHMARK_DEPS}" == true ]]; then
+        benchmark_preflight_host || exit 1
+    fi
     set_stage "checking system dependencies"
     print_dependency_preview
     

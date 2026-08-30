@@ -80,8 +80,12 @@ ensure_workspace_venv() {
     VENV_PATH="${WORKSPACE}/venv"
 
     if [[ ! -d "${VENV_PATH}" ]]; then
-        log_info "Creating workspace venv at ${VENV_PATH} (early, for rosdep)..."
-        run_cmd python3 -m venv --system-site-packages "${VENV_PATH}"
+        local bootstrap_python="python3"
+        if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+            bootstrap_python="${SETUP_BOOTSTRAP_PYTHON_BIN:-python3}"
+        fi
+        log_info "Creating workspace venv at ${VENV_PATH} (early, for rosdep) with ${bootstrap_python}..."
+        run_cmd "${bootstrap_python}" -m venv --system-site-packages "${VENV_PATH}"
     fi
 
     VENV_PYTHON="$(resolve_venv_python "${VENV_PATH}" || true)"

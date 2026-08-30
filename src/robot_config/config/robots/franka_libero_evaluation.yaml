@@ -17,7 +17,7 @@ robot:
     type: libero
     adapter: libero
     instance_id: libero
-    identity_packages: [robosuite, mujoco, libero]
+    identity_packages: [robosuite, mujoco, hf-libero]
 
     # Simulator interface settings. Most users should leave these unchanged;
     # they define the camera inputs, image size, and relative action format.

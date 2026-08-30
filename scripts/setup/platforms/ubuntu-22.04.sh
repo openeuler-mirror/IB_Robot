@@ -26,7 +26,7 @@ platform_install_benchmark_system_deps() {
     fi
 
     log_info "Installing benchmark headless rendering dependency..."
-    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev -qq
+    run_sudo apt-get install -y --no-install-recommends libosmesa6-dev ffmpeg -qq
 }
 
 platform_pre_install_rosdeps() {

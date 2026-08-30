@@ -26,16 +26,12 @@ from benchmark_libero.plugin import (
     validate_environment_config,
 )
 from benchmark_libero.version_probe import (
-    EXPECTED_LIBERO_COMMIT_SHA_PREFIX,
-    EXPECTED_LIBERO_PACKAGE_VERSION,
     ProviderIdentity,
     ProviderProbeError,
     probe_libero_provider,
 )
 
 __all__ = [
-    "EXPECTED_LIBERO_COMMIT_SHA_PREFIX",
-    "EXPECTED_LIBERO_PACKAGE_VERSION",
     "LiberoAdapter",
     "ObservationCodecError",
     "POLICY_IMAGE2_KEY",

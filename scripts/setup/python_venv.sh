@@ -75,7 +75,7 @@ if version not in spec:
 
 install_lerobot_editable() {
     local pip_runner=("$@")
-    
+
     if ! check_lerobot_python_compat; then
         log_error "Cannot install lerobot: Python version is incompatible."
         log_error "Ensure patches 0001/0002 from scripts/setup/lerobot_patches.sh are applied"
@@ -94,16 +94,28 @@ install_lerobot_editable() {
     # so101_hardware already provides the Python feetech-servo-sdk via its
     # setup.py install_requires, and the C++ ftservo_sdk is built by
     # so101_hardware's CMake for the ros2_control node — neither should be
-    # re-installed via pip here. See libs/lerobot/pyproject.toml.
-    #
-    # The inference profile keeps diffusion/dataset (policy inference and
-    # video decoding for the streamed observation path) but drops kinematics,
-    # which only serves teleop.
-    local lerobot_extras="smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep"
-    if [[ "${SETUP_PROFILE:-full}" == "inference" ]]; then
-        lerobot_extras="smolvla,pi,diffusion,dataset,deepdiff-dep"
+    # re-installed via pip here. See libs/lerobot/pyproject.toml. LIBERO is
+    # Ubuntu-only and opt-in. Remove the legacy editable ``libero``
+    # distribution before installing hf-libero so the two providers never
+    # coexist under the same top-level Python package.
+    local lerobot_extras=(smolvla pi diffusion dataset deepdiff-dep)
+    if [[ "${SETUP_PROFILE:-full}" != "inference" ]]; then
+        lerobot_extras+=(kinematics)
     fi
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[${lerobot_extras}]"
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID:-unknown}" == "ubuntu-22.04" ]]; then
+        log_info "Removing the legacy libs/libero editable provider, if installed..."
+        "${pip_runner[@]}" uninstall -y libero >/dev/null 2>&1 || true
+        lerobot_extras+=(libero)
+        log_info "Enabling the local LeRobot libero extra for Ubuntu benchmark setup."
+    fi
+
+    local lerobot_extras_csv
+    lerobot_extras_csv="$(IFS=,; printf '%s' "${lerobot_extras[*]}")"
+    local constraint_args=()
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && -n "${BENCHMARK_PIP_CONSTRAINTS:-}" ]]; then
+        constraint_args+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
+    fi
+    "${pip_runner[@]}" install "${constraint_args[@]}" -e "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
 }
 
 install_graspgen_torch_abi() {
@@ -151,35 +163,20 @@ setup_python_venv() {
         full_profile=false
     fi
 
-    # Runtime identity: Outer identity protection via production helpers.
-    # shellcheck disable=SC1091
-    source "${SCRIPT_DIR}/setup/outer_identity_guard.sh"
-    local outer_identity_script="${SCRIPT_DIR}/setup/torch_identity.py"
-    # Pass executable/arguments only. outer_identity_guard injects
-    # PYTHONNOUSERSITE=1 while executing the collector.
-    local outer_collector_cmd=("${venv_path}/bin/python3" "${outer_identity_script}")
-
-    outer_identity_begin "${venv_path}" "${INSTALL_BENCHMARK_DEPS:-false}" "${outer_collector_cmd[@]}" >&2 || {
-        log_error "Outer identity begin failed."
-        exit 1
-    }
-    if [[ "${OUTER_IDENTITY_MODE}" == "protected" ]]; then
-        log_info "Outer inference identity protection: protected-existing-runtime mode."
-    elif [[ "${OUTER_IDENTITY_MODE}" == "fresh" ]]; then
-        log_info "Outer inference identity protection skipped: no pre-existing workspace venv/runtime."
-    fi
-
     # 0. Python interpreter preflight
     local host_python_path host_python_version host_py_major host_py_minor
     host_python_path="$(command -v python3 || true)"
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        host_python_path="${SETUP_BOOTSTRAP_PYTHON_BIN:-${host_python_path}}"
+    fi
     if [[ -z "${host_python_path}" ]]; then
-        log_error "python3 not found on PATH. Install python3 (>=3.10) before running setup.sh."
+        log_error "No bootstrap Python was selected. Install a platform-supported Python before running setup.sh."
         exit 1
     fi
-    host_python_version="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown")"
-    log_info "Using host python3: ${host_python_path} (version ${host_python_version})"
-    host_py_major="$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
-    host_py_minor="$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
+    host_python_version="$(${host_python_path} -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown")"
+    log_info "Using setup bootstrap Python: ${host_python_path} (version ${host_python_version})"
+    host_py_major="$(${host_python_path} -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
+    host_py_minor="$(${host_python_path} -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
     if (( host_py_major < 3 )) || { (( host_py_major == 3 )) && (( host_py_minor < 10 )); }; then
         log_error "Python ${host_python_version} is too old. setup.sh requires Python >= 3.10."
         log_error "On openEuler: 'sudo dnf install -y python3.10 python3.10-devel' and re-run."
@@ -215,9 +212,25 @@ setup_python_venv() {
         exit 1
     fi
 
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        local bootstrap_python_mm venv_python_mm
+        bootstrap_python_mm="$(${host_python_path} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        venv_python_mm="$(${VENV_PYTHON} -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+        if [[ "${venv_python_mm}" != "${bootstrap_python_mm}" ]]; then
+            log_error "Existing workspace venv uses Python ${venv_python_mm}, but Benchmark setup requires Python ${bootstrap_python_mm}."
+            log_error "Remove ${venv_path} and rerun setup; setup will not mutate a foreign-ABI venv in place."
+            exit 1
+        fi
+    fi
+
     local pip_install=("${VENV_PYTHON}" -m pip install)
-    local installed_benchmark_deps=false
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
+    local ros_abi_pin_packages=("numpy==1.26.4" "opencv-python-headless<4.12")
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then
+        # hf-libero requires the GUI OpenCV distribution. Keep both wheels on
+        # the same NumPy-1-compatible line in benchmark environments.
+        ros_abi_pin_packages+=("opencv-python<4.12")
+    fi
 
     # Upgrade pip
     run_cmd "${VENV_PYTHON}" -m pip install --upgrade pip --quiet
@@ -242,7 +255,14 @@ setup_python_venv() {
         ensure_lerobot_patch_stack_applied
     fi
 
-    install_graspgen_torch_abi
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then
+        benchmark_prepare_torch_profile "${VENV_PYTHON}" "${venv_path}/benchmark_torch_constraints.txt"
+        # Protect the validated Torch/TorchVision/TorchCodec ABI during every
+        # subsequent dependency install, not only the LeRobot editable step.
+        pip_install+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
+    else
+        install_graspgen_torch_abi
+    fi
 
     # Install LeRobot in editable mode
     # Note: Do not pass the -c numpy==1.26.4 constraint. The lerobot dependency graph
@@ -365,15 +385,18 @@ PY
     # Only install the headless OpenCV wheel by default; keep opencv-python in
     # the constraints file below so optional dependencies cannot pull 4.12+ and
     # force NumPy 2.x back into the ROS environment.
-    log_info "Pinning NumPy 1.26.4 + opencv-python-headless<4.12 (ROS 2 Humble ABI)..."
-    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
-        "opencv-python-headless<4.12" --quiet
+    log_info "Pinning NumPy/OpenCV to the ROS 2 Humble ABI-compatible versions..."
+    run_cmd "${pip_install[@]}" --force-reinstall "${ros_abi_pin_packages[@]}" --quiet
+    benchmark_install_runtime_abi "${VENV_PYTHON}" -m pip install
 
     cat > "${ros_abi_constraints}" <<'EOF'
 numpy==1.26.4
 opencv-python<4.12
 opencv-python-headless<4.12
 EOF
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        cat "${BENCHMARK_PIP_CONSTRAINTS}" >> "${ros_abi_constraints}"
+    fi
 
     # Install the ZipVoice frontend after creating the ROS ABI constraints.
     # Vocos itself is maintained in voice_tts_service.vocos_backend because
@@ -442,6 +465,8 @@ EOF
     # audited pointnet2_ops wheel and validates its Torch/Python ABI contract.
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping grasp dependencies (inference profile)."
+    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        log_info "Skipping GraspGen/manipulation dependencies for Benchmark setup."
     elif [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
     else
@@ -464,148 +489,40 @@ EOF
     fi
 
     # ------------------------------------------------------------------
-    # Benchmark (LIBERO) optional dependency layer (benchmark setup).
+    # Benchmark (LIBERO) optional resource configuration.
     #
-    # Installs the pinned libs/libero provider and the curated LIBERO
-    # runtime deps (robosuite, bddl, gym, imageio, etc.) into the
-    # workspace venv. Does NOT install torch/torchvision/robomimic.
-    # Records torch/python/torchvision identity before and after;
-    # fails-closed if the inference runtime was changed.
+    # The conditional LeRobot libero extra above installs the sole hf-libero
+    # provider. This layer only prepares the workspace-owned config/assets;
+    # provider identity and runtime API checks belong to the LIBERO adapter.
     # ------------------------------------------------------------------
-    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_warn "Skipping optional benchmark dependencies on openEuler; LIBERO/MuJoCo are validated on Ubuntu only."
-    elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
-        log_info "Installing optional benchmark (LIBERO) dependencies..."
-        export WORKSPACE="${WORKSPACE}"
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
+        if [[ "${SETUP_PLATFORM_ID}" != "ubuntu-22.04" ]]; then
+            log_warn "Skipping optional benchmark dependencies on ${SETUP_PLATFORM_ID}; LIBERO/MuJoCo are validated on Ubuntu only."
+        else
+            log_info "Configuring optional benchmark (LIBERO) runtime..."
+            export WORKSPACE="${WORKSPACE}"
 
-        local benchmark_constraints="${WORKSPACE}/constraints/benchmark.txt"
-        local benchmark_req="${WORKSPACE}/requirements/benchmark.txt"
-        local benchmark_combined_constraints="${venv_path}/benchmark_combined_constraints.txt"
-
-        # Combine ros_abi_constraints + benchmark constraints into one file
-        # so a single --constraint flag covers both.
-        cat "${ros_abi_constraints}" > "${benchmark_combined_constraints}"
-        if [[ -f "${benchmark_constraints}" ]]; then
-            cat "${benchmark_constraints}" >> "${benchmark_combined_constraints}"
+            # Generate workspace-owned config and fetch/reuse official assets
+            # before importing hf-libero. This prevents the provider's legacy
+            # first-import prompt and makes get_assets_path() deterministic.
+            local libero_config_script="${SCRIPT_DIR}/setup/libero_config.py"
+            local libero_config_dir="${venv_path}/ibrobot_libero"
+            log_info "Preparing workspace-owned hf-libero config and assets..."
+            if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${libero_config_script}" \
+                > "${venv_path}/benchmark_libero_config_output.txt" 2>&1; then
+                log_error "Failed to prepare workspace-owned hf-libero config/assets."
+                cat "${venv_path}/benchmark_libero_config_output.txt" 2>/dev/null || true
+                exit 1
+            fi
+            export LIBERO_CONFIG_PATH="${libero_config_dir}"
+            log_info "hf-libero config/assets ready at ${libero_config_dir}"
         fi
-
-        # 1. Record inference runtime identity BEFORE benchmark install.
-        #    Uses the shared torch_identity.py collector to avoid drift
-        #    between before/after snapshots. Fail-closed: non-zero exit
-        #    from the collector aborts setup (torch is a required component;
-        #    installed-but-broken must not be masked as "not installed").
-        local torch_identity_script="${SCRIPT_DIR}/setup/torch_identity.py"
-        local torch_before_file="${venv_path}/benchmark_torch_identity_before.txt"
-        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${torch_identity_script}" > "${torch_before_file}"
-        local torch_before_rc=$?
-        if [[ ${torch_before_rc} -ne 0 ]]; then
-            log_error "Failed to record torch identity (before). Setup aborts (fail-closed)."
-            cat "${torch_before_file}" 2>/dev/null || true
-            exit 1
-        fi
-        log_info "Benchmark torch identity (before) recorded."
-
-        # 2. Verify libs/libero submodule gitlink/HEAD/dirty before install.
-        # shellcheck disable=SC1091
-        source "${SCRIPT_DIR}/setup/benchmark_guard.sh"
-        if ! verify_libero_gitlink "${WORKSPACE}"; then
-            log_error "libs/libero gitlink verification failed. Aborting before editable install."
-            exit 1
-        fi
-        log_info "libs/libero gitlink verified."
-
-        # Workspace-owned LIBERO configuration: Generate workspace-owned LIBERO config BEFORE any import.
-        # Without this, the pinned provider calls input() on fresh HOME,
-        # which fails non-interactively with EOFError.
-        local libero_config_script="${SCRIPT_DIR}/setup/libero_config.py"
-        local libero_config_dir="${venv_path}/ibrobot_libero"
-        log_info "Generating workspace-owned LIBERO config..."
-        if ! PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${libero_config_script}" \
-            > "${venv_path}/benchmark_libero_config_output.txt" 2>&1; then
-            log_error "Failed to generate workspace-owned LIBERO config."
-            cat "${venv_path}/benchmark_libero_config_output.txt" 2>/dev/null || true
-            exit 1
-        fi
-        export LIBERO_CONFIG_PATH="${libero_config_dir}"
-        log_info "LIBERO config generated at ${libero_config_dir}/config.yaml"
-
-        # 3. Install the pinned libs/libero provider in editable mode
-        #    with --no-deps so its legacy requirements.txt does not pull
-        #    in robomimic/transformers/wandb (which would pull torch).
-        local libero_dir_local="${WORKSPACE}/libs/libero"
-        log_info "Installing pinned libs/libero (editable compat mode, --no-deps)..."
-        # Editable compatibility: Use editable_mode=compat to generate a .pth file that
-        # points to libs/libero directly, instead of the default PEP 660
-        # finder which produces an empty MAPPING for this package layout.
-        run_cmd "${pip_install[@]}" --no-build-isolation --no-deps \
-            --config-settings editable_mode=compat \
-            -e "${libero_dir_local}" --quiet
-
-        # 4. Install the curated benchmark requirements.
-        log_info "Installing benchmark requirements..."
-        run_cmd "${pip_install[@]}" --constraint "${benchmark_combined_constraints}" \
-            -r "${benchmark_req}" --quiet
-
-        # 5. Record inference runtime identity AFTER benchmark install.
-        #    Uses the same shared collector as step 1.
-        local torch_after_file="${venv_path}/benchmark_torch_identity_after.txt"
-        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${torch_identity_script}" > "${torch_after_file}"
-        local torch_after_rc=$?
-        if [[ ${torch_after_rc} -ne 0 ]]; then
-            log_error "Failed to record torch identity (after). Setup aborts (fail-closed)."
-            cat "${torch_after_file}" 2>/dev/null || true
-            exit 1
-        fi
-        log_info "Benchmark torch identity (after) recorded."
-
-        # 6. Compare before/after; fail-closed on ANY identity field change.
-        #    Every field is compared, including torch_file, torchvision_file,
-        #    python_version, build suffix, CUDA runtime, and device capability.
-        local torch_before_summary torch_after_summary
-        torch_before_summary="$(cat "${torch_before_file}" 2>/dev/null)"
-        torch_after_summary="$(cat "${torch_after_file}" 2>/dev/null)"
-        if [[ "${torch_before_summary}" != "${torch_after_summary}" ]]; then
-            log_error "Benchmark dependency installation changed the inference runtime identity."
-            log_error "This is a fail-closed condition. The benchmark stack must not modify torch/torchvision."
-            log_error "--- BEFORE ---"
-            cat "${torch_before_file}" 2>/dev/null || true
-            log_error "--- AFTER ---"
-            cat "${torch_after_file}" 2>/dev/null || true
-            log_error "--- DIFF ---"
-            diff "${torch_before_file}" "${torch_after_file}" 2>/dev/null || true
-            exit 1
-        fi
-        log_done "Benchmark dependencies installed; torch/torchvision identity unchanged (all fields compared)"
-
-        # 7. Record provider identity for the benchmark setup report.
-        # Provider identity: Use unified standalone collector to avoid contract drift.
-        local provider_identity_script="${SCRIPT_DIR}/setup/provider_identity.py"
-        local provider_identity_file="${venv_path}/benchmark_provider_identity.txt"
-        local provider_rc=0
-        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" "${provider_identity_script}" \
-            > "${provider_identity_file}" 2>&1 || provider_rc=$?
-        if [[ ${provider_rc} -ne 0 ]]; then
-            log_error "Provider identity collector failed (rc=${provider_rc})."
-            cat "${provider_identity_file}" 2>/dev/null || true
-            exit 1
-        fi
-        if ! grep -q "PROVIDER_IDENTITY_OK" "${provider_identity_file}" 2>/dev/null; then
-            log_error "Provider identity verification failed (no PROVIDER_IDENTITY_OK marker)."
-            cat "${provider_identity_file}" 2>/dev/null || true
-            exit 1
-        fi
-        log_done "Provider identity verified"
-
-        installed_benchmark_deps=true
-    else
-        log_info "Skipping optional benchmark dependencies. Re-run setup with --with-benchmark if needed."
     fi
 
     # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
     # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
     log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."
-    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
-        "opencv-python-headless<4.12" --quiet
+    run_cmd "${pip_install[@]}" --force-reinstall "${ros_abi_pin_packages[@]}" --quiet
 
     log_info "Running NumPy/OpenCV dependency smoke test..."
     PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
@@ -616,7 +533,7 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${full_profile}" == true ]] && [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
+    if [[ "${full_profile}" == true && "${INSTALL_BENCHMARK_DEPS:-false}" != true && "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 
@@ -627,30 +544,6 @@ except Exception as exc:
 print("Grasp dependencies smoke test passed")
 PY
     fi
-    if [[ "${installed_benchmark_deps}" == true ]]; then
-        log_info "Running benchmark (LIBERO) import smoke test..."
-        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
-import importlib
-
-required = [
-    "libero",
-    "libero.libero",
-    "robosuite",
-    "mujoco",
-    "imageio",
-]
-missing = []
-for name in required:
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing.append(f"{name}: {exc}")
-if missing:
-    raise SystemExit("Benchmark import smoke test failed:\n  " + "\n  ".join(missing))
-print("Benchmark (LIBERO) import smoke test passed")
-PY
-    fi
-
     # gitlint ships in dev-tools.txt, which the inference profile skips.
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping gitlint commit-msg hook (inference profile)."
@@ -705,13 +598,4 @@ PY
 
     PYTHON_ENV_STATUS="done"
 
-    # Runtime identity: Finalize outer identity via production helper.
-    local outer_finalize_collector=("${VENV_PYTHON}" "${outer_identity_script}")
-    outer_identity_finalize "${venv_path}" "${INSTALL_BENCHMARK_DEPS:-false}" "${outer_finalize_collector[@]}" >&2 || {
-        log_error "Outer inference identity comparison failed."
-        exit 1
-    }
-    if [[ "${OUTER_IDENTITY_MODE}" == "protected" ]]; then
-        log_done "Outer inference identity unchanged (full setup scope)"
-    fi
 }
