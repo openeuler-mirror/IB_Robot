@@ -23,8 +23,13 @@ speech_direction_node:
       0.02285, -0.02285
     ]
 
-    # 模型 bundle；具体 deployment、backend、device 和 artifact 由 manifest/profile 决定。
-    speech_direction_inference_bundle: "voice_asr"
+    input_source: "device"
+    # 在线模式不读取离线 WAV；保留空路径供参数契约使用。
+    wav_path: ""
+    wav_replay_rate: 1.0
+
+    # FullSubNet bundle；具体 deployment、backend、device 和 artifact 由 manifest/profile 决定。
+    speech_direction_inference_bundle: "fullsubnet"
 
     speech_direction_max_age_ms: 1300
 

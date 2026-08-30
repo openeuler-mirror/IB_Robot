@@ -53,7 +53,7 @@ class FullSubNetEnhancer:
     ):
         """
         Args:
-            ckpt: models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar 路径
+            ckpt: models/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar 路径
             device: cuda / cpu / auto(auto=优先 CUDA,无 CUDA 提示风险退 CPU)
             n_fft/hop/win: FullSubNet 内部 STFT 参数(固定 512/256/512)
             num_freqs: FullSubNet 频点数(257 = 512//2+1)

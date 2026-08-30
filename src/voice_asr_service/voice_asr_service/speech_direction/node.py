@@ -71,6 +71,7 @@ _PARAMETER_TYPES = {
     "angle_step_degree": Parameter.Type.INTEGER,
     "audio_topic": Parameter.Type.STRING,
     "speech_direction_inference_bundle": Parameter.Type.STRING,
+    "silero_vad_inference_bundle": Parameter.Type.STRING,
     "silero_vad_backend": Parameter.Type.STRING,
     "fullsubnet_backend": Parameter.Type.STRING,
     "speech_direction_max_age_ms": Parameter.Type.INTEGER,
@@ -186,6 +187,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if fullsubnet_backend not in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu", "torch"}:
         raise ValueError("参数 fullsubnet_backend 不是受支持的 Ascend/Torch 后端")
     bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
+    silero_bundle = _require_string(values, "silero_vad_inference_bundle", allow_empty=True)
     # Torch stateful 后端需要 checkpoint + manifest；Model 类由 ibrobot-fullsubnet wheel 提供。
     max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
     if max_age_ms <= 0:
@@ -225,6 +227,8 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.doa.input_channels = list(channel_indices)
     cfg.doa.mic_positions = mic_positions
     cfg.fullnet.inference_bundle = bundle
+    if silero_bundle:
+        cfg.vad.inference_bundle = silero_bundle
     cfg.fullnet.device = {"stateful_torch_cuda": "cuda", "stateful_torch_cpu": "cpu", "torch": "cpu"}.get(
         fullsubnet_backend, "cuda"
     )
@@ -344,22 +348,27 @@ class SpeechDirectionNode(Node):
 
     @staticmethod
     def _apply_bundle_artifacts(cfg: SpeechDirectionConfig) -> None:
-        """Derive Ascend artifact paths from the selected speech bundle manifest."""
-        if cfg.fullnet.backend != "ascend":
-            return
-        bundle = Path(cfg.fullnet.inference_bundle)
-        fullsubnet = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
-        silero = load_inference_manifest(bundle, "ascend_310p_silero")
-        full_artifacts = fullsubnet.deployment.artifacts
-        silero_artifacts = silero.deployment.artifacts
-        full_profile = fullsubnet.role_runtime_profiles.get("fullsubnet_fb")
-        if full_profile is None:
-            raise ValueError("speech_direction FullSubNet deployment has no runtime profile")
-        cfg.fullnet.device_id = int(full_profile.profile.device_id)
-        cfg.fullnet.stateful_fb_om_path = str(bundle / full_artifacts["fullsubnet_fb"].path)
-        cfg.fullnet.stateful_sb_om_path = str(bundle / full_artifacts["fullsubnet_sb"].path)
-        cfg.fullnet.stateful_manifest_path = str(bundle / full_artifacts["fullsubnet_checkpoint_manifest"].path)
-        cfg.vad.model_path = str(bundle / silero_artifacts["silero_vad"].path)
+        """Derive artifact paths from the standalone FullSubNet/Silero bundles."""
+        if cfg.fullnet.backend == "ascend":
+            bundle = Path(cfg.fullnet.inference_bundle)
+            fullsubnet = load_inference_manifest(bundle, "ascend_310p")
+            artifacts = fullsubnet.deployment.artifacts
+            cfg.fullnet.stateful_fb_om_path = str(bundle / artifacts["fullsubnet_fb"].path)
+            cfg.fullnet.stateful_sb_om_path = str(bundle / artifacts["fullsubnet_sb"].path)
+            cfg.fullnet.stateful_manifest_path = str(
+                bundle / "assets" / "cum_fullsubnet_best_model_218epochs.manifest.json"
+            )
+            profile = getattr(fullsubnet.runtime_profile, "profile", None)
+            cfg.fullnet.device_id = int(getattr(profile, "device_id", 0) if profile is not None else 0)
+
+        # Silero VAD always resolves through the standalone reusable bundle.
+        silero_bundle = Path(cfg.vad.inference_bundle)
+        deployment_name = "ascend_310p" if cfg.vad.backend == "ascend" else "torch_cpu"
+        silero = load_inference_manifest(silero_bundle, deployment_name)
+        if cfg.vad.backend == "ascend":
+            cfg.vad.model_path = str(silero_bundle / silero.deployment.artifacts["model"].path)
+        else:
+            cfg.vad.model_path = str(silero_bundle / "assets" / "silero_vad.onnx")
 
     # ------------------------------------------------------------------ 算法链构建
     def _make_session_dir(self) -> str:
@@ -385,21 +394,11 @@ class SpeechDirectionNode(Node):
         stateful_backend = cfg.fullnet.backend in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu"}
         if stateful_backend and cfg.fullnet.backend == "ascend":
             bundle = Path(cfg.fullnet.inference_bundle)
-            fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
-            fullsubnet_role = next(
-                (
-                    role
-                    for role, identity in fullsubnet_manifest.role_identities.items()
-                    if identity.model_type == "fullsubnet"
-                ),
-                None,
-            )
-            if fullsubnet_role is None:
-                raise ValueError("speech_direction FullSubNet deployment has no fullsubnet role identity")
+            fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p")
+            fullsubnet_role = "fullsubnet_fb"
             fullsubnet_context = RuntimeContext(
                 fullsubnet_manifest,
                 {"device_id": cfg.fullnet.device_id},
-                runtime_profile=fullsubnet_manifest.role_runtime_profiles.get(fullsubnet_role),
                 role=fullsubnet_role,
             )
             fullsubnet_session = self._registry_set.session_builder_registry.create(
@@ -438,14 +437,11 @@ class SpeechDirectionNode(Node):
 
         vad_runner = None
         if cfg.fullnet.backend == "ascend" and cfg.vad.backend == "ascend":
-            vad_manifest = load_inference_manifest(Path(cfg.fullnet.inference_bundle), "ascend_310p_silero")
+            vad_manifest = load_inference_manifest(Path(cfg.vad.inference_bundle), "ascend_310p")
             vad_context = RuntimeContext(
                 vad_manifest,
                 {"device_id": cfg.fullnet.device_id},
-                runtime_profile=vad_manifest.role_runtime_profiles.get("silero_vad")
-                if "silero_vad" in vad_manifest.role_runtime_profiles
-                else vad_manifest.runtime_profile,
-                role="silero_vad" if "silero_vad" in vad_manifest.role_identities else None,
+                role="model",
             )
             vad_session = self._registry_set.session_builder_registry.create(
                 vad_context,
@@ -457,7 +453,12 @@ class SpeechDirectionNode(Node):
                 self._session_resources = SpeechDirectionSessionResources({"silero_vad": (vad_session, vad_context)})
             else:
                 self._session_resources.add("silero_vad", vad_session, vad_context)
-            vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context, owns_session=False)
+            vad_runner = SpeechDirectionRoleRunner(
+                vad_session,
+                vad_context,
+                owns_session=False,
+                role_aliases={"silero_vad": "model"},
+            )
 
         # 人声门控(复用 common/vad/silero)
         # vad_runner(manifest 驱动)只做裸推理转发，不含 SileroVadEngine 的帧间 context 拼接

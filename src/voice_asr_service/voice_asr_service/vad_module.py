@@ -229,16 +229,10 @@ class VADModule:
         return str(resolved) if resolved.exists() else None
 
     def _get_default_local_onnx_model_path(self) -> str | None:
-        """获取默认本地 silero-vad ONNX 模型路径。"""
-        candidates = (
-            Path(__file__).resolve().parents[3] / "models" / "voice_asr" / "silero-vad" / "silero_vad.onnx",
-            Path(__file__).resolve().parents[3] / "models" / "voice_asr" / "silero-vad" / "silero_vad_v5.onnx",
-        )
-        for candidate in candidates:
-            resolved = candidate.resolve()
-            if resolved.exists():
-                return str(resolved)
-        return None
+        """获取默认本地 silero-vad ONNX 模型路径（独立 bundle，唯一来源）。"""
+        candidate = Path(__file__).resolve().parents[3] / "models" / "silero-vad" / "assets" / "silero_vad.onnx"
+        resolved = candidate.resolve()
+        return str(resolved) if resolved.exists() else None
 
     def process(self, audio_frame: np.ndarray) -> VADResult:
         """

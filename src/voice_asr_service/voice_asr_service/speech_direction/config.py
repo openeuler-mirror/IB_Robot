@@ -53,29 +53,24 @@ class PipelineConfig:
 class FullSubNetConfig:
     """FullSubNet 4ch 增强参数。"""
 
-    # cumulative stateful checkpoint；Ubuntu CUDA 与 310P OM 必须来自同一权重。
-    ckpt: str = field(
-        default_factory=lambda: _model_path(
-            "voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
-        )
-    )
+    # 独立 fullsubnet bundle（models/fullsubnet）是唯一资产来源；
+    # cumulative stateful checkpoint 与 310P OM 同权重同 bundle。
+    ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar"))
     # cumulative stateful T=2 拆分 OM；每次处理512 samples并显式续传FB/SB h/c。
     stateful_fb_om_path: str = field(
         default_factory=lambda: _model_path(
-            "voice_asr/artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
+            "fullsubnet/artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
         )
     )
     stateful_sb_om_path: str = field(
         default_factory=lambda: _model_path(
-            "voice_asr/artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
+            "fullsubnet/artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
         )
     )
     stateful_manifest_path: str = field(
-        default_factory=lambda: _model_path(
-            "voice_asr/artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
-        )
+        default_factory=lambda: _model_path("fullsubnet/assets/cum_fullsubnet_best_model_218epochs.manifest.json")
     )
-    inference_bundle: str = field(default_factory=lambda: _model_path("voice_asr"))
+    inference_bundle: str = field(default_factory=lambda: _model_path("fullsubnet"))
     device_id: int = 0
     device: str = "cuda"  # Ubuntu stateful Torch 固定 CUDA；禁止静默回退 CPU
     # ACL is the backend identity; statefulness is selected by the streaming execution path.
@@ -91,14 +86,17 @@ class VadConfig:
     """Silero VAD 参数。"""
 
     # Silero VAD OM 在 310P 使用 Ascend ACL；ONNX 用于 Ubuntu 的相同门控流程。
+    # 默认指向独立 bundle 的 310P 部署工件；实际路径由 _apply_bundle_artifacts 推导。
     model_path: str = field(
-        default_factory=lambda: _model_path("voice_asr/artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om")
+        default_factory=lambda: _model_path("silero-vad/artifacts/ascend/ascend_310p/silero_vad_v6_310p_mixed16.om")
     )
     sample_rate: int = 16000
     frame_size: int = 512  # Silero 子帧 = 32ms @ 16kHz
     input_source: str = "enh_mic1_mono"  # 增强 ch1 单麦
     # 推理后端:ascend(Ascend NPU,默认) 或 onnx(Ubuntu)
     backend: str = "ascend"
+    # 独立 Silero VAD bundle(models/silero-vad):多业务共享的同源部署,唯一解析来源。
+    inference_bundle: str = field(default_factory=lambda: _model_path("silero-vad"))
 
 
 @dataclass

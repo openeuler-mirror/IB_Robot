@@ -105,15 +105,12 @@ def _build_pipeline():
     # Ubuntu 仅替换模型执行后端，算法编排和 256/512/4096/512 时序不变。
     cfg.fullnet.backend = "stateful_torch_cuda"
     cfg.fullnet.device = "cuda"
-    cfg.fullnet.ckpt = str(
-        _SRC.parents[1] / "models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
-    )
+    cfg.fullnet.ckpt = str(_SRC.parents[1] / "models/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar")
     cfg.fullnet.stateful_manifest_path = str(
-        _SRC.parents[1]
-        / "models/voice_asr/artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+        _SRC.parents[1] / "models/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.manifest.json"
     )
     cfg.vad.backend = "onnx"
-    cfg.vad.model_path = str(_SRC.parents[1] / "models/voice_asr/artifacts/torch/silero-vad/silero_vad.onnx")
+    cfg.vad.model_path = str(_SRC.parents[1] / "models/silero-vad/assets/silero_vad.onnx")
     if not __import__("torch").cuda.is_available():
         pytest.skip("Ubuntu 主流程回归要求 CUDA，不允许静默回退 CPU")
 

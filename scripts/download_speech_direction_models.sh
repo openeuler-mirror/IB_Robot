@@ -147,10 +147,28 @@ download_file() {
 download_silero() {
     local dest="${MODELS_DIR}/voice_asr/artifacts/torch/silero-vad/silero_vad.onnx"
     download_file "${SILERO_URL}" "${dest}" "Silero VAD ONNX" "${SILERO_SIZE}" "${SILERO_SHA256}"
+    package_silero_bundle
+}
+
+# 独立 Silero VAD bundle（models/silero-vad）：多业务共享的同源部署。
+# 打包器按 #378 的 v3 typed API 构造 manifest；缺少 310P OM 时仅生成 torch_cpu 部署。
+package_silero_bundle() {
+    local bundle_root="${MODELS_DIR}/silero-vad"
+    if [[ ! -s "${bundle_root}/assets/silero_vad.onnx" ]]; then
+        echo "[skip] silero-vad bundle packaging (ONNX not downloaded)"
+        return 0
+    fi
+    local python_bin="${PYTHON:-python3}"
+    echo "[package] refreshing silero-vad bundle manifest"
+    PYTHONPATH="${SCRIPT_DIR}/../src/inference_manifest:${SCRIPT_DIR}/../src/voice_asr_service${PYTHONPATH:+:${PYTHONPATH}}" \
+        "${python_bin}" -m voice_asr_service.package_silero_vad_bundle \
+        --bundle-root "${bundle_root}" --workspace "${SCRIPT_DIR}/.."
 }
 
 download_fullnet_ckpt() {
-    local dest="${MODELS_DIR}/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+    # 独立 fullsubnet bundle（models/fullsubnet）的 torch 部署权重；
+    # 310P OM 与 cum manifest 已随 bundle 发布（openEuler/fullsubnet）。
+    local dest="${MODELS_DIR}/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar"
     download_file "${FULLSUBNET_CKPT_URL}" "${dest}" "FullSubNet ckpt 218epochs (~67MB)" \
         "${FULLSUBNET_CKPT_SIZE}" "${FULLSUBNET_CKPT_SHA256}"
 }

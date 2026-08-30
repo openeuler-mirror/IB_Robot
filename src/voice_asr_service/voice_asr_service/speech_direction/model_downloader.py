@@ -9,9 +9,8 @@
 自检与兼容入口,不再代表生产资产清单。
 
 生产资产(均不入库,放 models/ 下,通过 python3 scripts/verify_speech_direction_assets.py 校验):
-   1. Silero VAD OM/ONNX — 310P Ascend ACL 用 OM;Ubuntu 用 ONNX(与 voice_asr 共用目录)
-   2. FullSubNet cumulative ckpt — models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar
-   3. stateful FB/SB 拆分 OM + manifest(310P Ascend ACL 专用,由 HF 脚本拉取)
+   1. Silero VAD OM/ONNX — models/silero-vad 独立 bundle
+   2. FullSubNet cumulative ckpt/OM — models/fullsubnet 独立 bundle
 
 FullSubNet 源码(model.py + audio_zen)已打包为 ibrobot-fullsubnet wheel,
 通过 scripts/setup.sh 安装到 venv;不再需要 git clone 上游源码仓到 models/ 下。
@@ -30,10 +29,10 @@ _WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
 _DEFAULT_MODELS_ROOT = _WORKSPACE_ROOT / "models"
 
 # Silero VAD(与 voice_asr_service 共用目录);310P 用 OM,Ubuntu 用 ONNX,具体文件名由 yaml 指定。
-SILERO_VAD_REL = "voice_asr/artifacts/torch/silero-vad/silero_vad.onnx"
+SILERO_VAD_REL = "silero-vad/assets/silero_vad.onnx"
 
 # FullSubNet cumulative ckpt(218epochs,两平台共用同一权重)
-FULLSUBNET_CKPT_REL = "voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+FULLSUBNET_CKPT_REL = "fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar"
 
 
 @dataclass(frozen=True)

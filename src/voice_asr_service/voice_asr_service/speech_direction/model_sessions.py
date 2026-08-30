@@ -15,13 +15,24 @@ from inference_service.unified_runtime import ExecutionContext, ModelRequest
 class SpeechDirectionRoleRunner:
     """Protocol adapter retained for the Host FullSubNet and VAD layers."""
 
-    def __init__(self, session: ModelSession, context: RuntimeContext, *, owns_session: bool = False) -> None:
+    def __init__(
+        self,
+        session: ModelSession,
+        context: RuntimeContext,
+        *,
+        owns_session: bool = False,
+        role_aliases: Mapping[str, str] | None = None,
+    ) -> None:
         self.session = session
         self.context = context
         self.backend = "ascend"
         self._owns_session = bool(owns_session)
+        self._role_aliases = dict(role_aliases or {})
         self._request_counter = 0
         self._execution_context: ExecutionContext | None = None
+
+    def _role(self, role: str) -> str:
+        return self._role_aliases.get(role, role)
 
     @property
     def last_timing_ms(self) -> dict[str, float]:
@@ -49,7 +60,7 @@ class SpeechDirectionRoleRunner:
             self._execution_context = None
 
     def infer_named(self, values: Mapping[str, object]) -> Mapping[str, object]:
-        return self._invoke("silero_vad", values)
+        return self._invoke(self._role("silero_vad"), values)
 
     def run_fb(self, frame: np.ndarray) -> np.ndarray:
         output = self._invoke("fullsubnet_fb", {"host.fullsubnet.fb_spectrum": np.ascontiguousarray(frame)})
@@ -60,7 +71,7 @@ class SpeechDirectionRoleRunner:
         return np.asarray(output["host.fullsubnet.sb_mask"], dtype=np.float32)
 
     def infer(self, audio: np.ndarray) -> float:
-        output = self._invoke("silero_vad", {"host.silero.audio": np.ascontiguousarray(audio)})
+        output = self._invoke(self._role("silero_vad"), {"host.silero.audio": np.ascontiguousarray(audio)})
         return float(np.asarray(output["host.silero.prob"]).reshape(-1)[0])
 
     inference = infer

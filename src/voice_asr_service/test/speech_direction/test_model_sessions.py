@@ -142,23 +142,34 @@ def test_silero_inference_uses_standalone_session_execution() -> None:
     assert [call[0] for call in session.execute_role_calls] == ["silero_vad"]
 
 
-@pytest.mark.parametrize("deployment_name", ["ascend_310p_fullsubnet", "ascend_310p_silero"])
-def test_checked_in_speech_manifest_selects_generic_stateful_session(tmp_path, deployment_name) -> None:
-    config_root = _WORKSPACE_SRC.parent / "models" / "voice_asr"
+@pytest.mark.parametrize(
+    "bundle_rel,deployment_name,role",
+    [
+        ("fullsubnet", "ascend_310p", "fullsubnet_fb"),
+        ("silero-vad", "ascend_310p", "model"),
+    ],
+)
+def test_checked_in_speech_manifest_selects_generic_stateful_session(
+    tmp_path, bundle_rel, deployment_name, role
+) -> None:
+    config_root = _WORKSPACE_SRC.parent / "models" / bundle_rel
     manifest = json.loads((config_root / "inference_manifest.json").read_text(encoding="utf-8"))
     for deployment in manifest["deployments"].values():
-        for artifact in deployment["artifacts"].values():
+        for artifact in deployment.get("artifacts", {}).values():
             artifact.pop("sha256", None)
     (tmp_path / "inference_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (tmp_path / "assets").mkdir()
     (tmp_path / "assets" / "README.md").write_text("test bundle\n", encoding="utf-8")
     for deployment in manifest["deployments"].values():
-        for artifact in deployment["artifacts"].values():
+        for artifact in deployment.get("artifacts", {}).values():
             path = tmp_path / artifact["path"]
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"mock-om")
+    for entry in manifest["bundle"]["files"]:
+        path = tmp_path / entry["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"mock-file")
 
-    role = "fullsubnet_fb" if deployment_name.endswith("fullsubnet") else "silero_vad"
     context = RuntimeContext(load_inference_manifest(tmp_path, deployment_name), {"device_id": 0}, role=role)
     assert context.target_runtime == "acl"
     assert context.runtime_abi == "cann-8.1.RC1"
