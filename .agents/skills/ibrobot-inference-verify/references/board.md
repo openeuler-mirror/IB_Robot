@@ -126,7 +126,7 @@ c["robot"]["perception_services"] = {"services": [
      "endpoint": "/perception/ram_plus/recognize_tags", "node_name": "ram_plus_tags",
      "runtime_options": {"device_id": 0}},
     {"id": "siglip2_image", "enabled": True, "required": True,
-     "bundle_path": "/IB_Robot/models/siglip2_so400m_patch14_384_ascend", "deployment": "ascend_310b",
+     "bundle_path": "/IB_Robot/models/siglip2_so400m_patch14_384", "deployment": "ascend_310b",
      "adapter_class": "perception_service.model_service_plugins:SigLIP2EncodeEmbeddingsPlugin",
      "service_type": "ibrobot_msgs/srv/EncodeEmbeddings",
      "endpoint": "/perception/siglip2/encode_embeddings", "node_name": "siglip2_image",

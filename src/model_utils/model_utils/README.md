@@ -450,7 +450,7 @@ device 检查 OM，并把 `<role>.om.abi.json` 写入 `--om-abi-dir`：
 
 ```bash
 ros2 run perception_service package_graspgen_ascend_bundle \
-    --bundle-root models/grasp/graspgen_robotiq_2f_140 \
+    --bundle-root models/graspgen \
     --onnx-manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
     --om-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
     --om-abi-dir models/_work/graspgen_robotiq_2f_140/model_utils/abi \

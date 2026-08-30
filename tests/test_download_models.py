@@ -202,6 +202,63 @@ def test_split_csv_and_resolve_names():
     assert names == ["totally_new_bundle"]
 
 
+def test_repository_aliases_and_runtime_directories():
+    assert (
+        dm.repository_for_name("ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515")
+        == "IB_Robot_ACT_banana_pick_distill"
+    )
+    assert dm.runtime_directory("graspgen", "grasp") == "graspgen"
+    assert dm.runtime_directory("fullsubnet", "fullsubnet") == "voice_asr"
+    assert (
+        dm.runtime_directory("grounding_dino_swint_seq8_1280x720", "grounding_dino_swint_seq8_1280x720")
+        == "grounded_sam2_swint_ogc"
+    )
+    assert dm.resolve_names("all", ["pi05", "zipvoice"]) == ["pi05", "zipvoice"]
+
+
+def test_build_plan_separates_repository_from_local_directory():
+    plan = dm.build_plan(
+        "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
+        "openEuler",
+        _pi05_like_manifest(),
+        [],
+        [],
+        repo_name="IB_Robot_ACT_banana_pick_distill",
+    )
+    assert plan.name == "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515"
+    assert plan.repo_id == "openEuler/IB_Robot_ACT_banana_pick_distill"
+
+
+def test_fullsubnet_runtime_aliases(tmp_path):
+    source_root = tmp_path / "voice_asr"
+    assets = source_root / "assets"
+    assets.mkdir(parents=True)
+    checkpoint = assets / "cum_fullsubnet_best_model_218epochs.tar"
+    manifest = assets / "cum_fullsubnet_best_model_218epochs.manifest.json"
+    checkpoint.write_bytes(b"checkpoint")
+    manifest.write_text("{}")
+
+    dm.materialize_runtime_aliases("fullsubnet", source_root)
+
+    torch_alias = source_root / "artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+    ascend_alias = source_root / "artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+    assert torch_alias.is_symlink() and torch_alias.read_bytes() == b"checkpoint"
+    assert ascend_alias.is_symlink() and ascend_alias.read_text() == "{}"
+
+
+def test_legacy_download_uses_filtered_snapshot(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_snapshot(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(dm, "snapshot_download", fake_snapshot)
+    target = dm.download_legacy_repo("witty-tune-model", tmp_path)
+    assert target == tmp_path / "witty-tune-model"
+    assert captured["repo_id"] == "openEuler/witty-tune-model"
+    assert "*.mp4" in captured["ignore_patterns"]
+
+
 def test_main_reports_failure_per_bundle_without_aborting(monkeypatch, tmp_path):
     def boom(org, name, dest_root):
         raise RuntimeError(f"repo not found: {name}")

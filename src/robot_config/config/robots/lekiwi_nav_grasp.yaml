@@ -269,7 +269,7 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+        bundle_path: models/grounding_dino_swint_seq8_1280x720
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
@@ -317,7 +317,7 @@ robot:
       - id: semantic_siglip2_image
         enabled: true
         required: true
-        bundle_path: models/siglip2_so400m_patch14_384_ascend
+        bundle_path: models/siglip2_so400m_patch14_384
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SigLIP2EncodeEmbeddingsPlugin
         service_type: ibrobot_msgs/srv/EncodeEmbeddings
@@ -330,7 +330,7 @@ robot:
         # image service and must stay non-required per the role policy.
         enabled: true
         required: false
-        bundle_path: models/siglip2_so400m_patch14_384_ascend
+        bundle_path: models/siglip2_so400m_patch14_384
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SigLIP2EncodeTextPlugin
         service_type: ibrobot_msgs/srv/EncodeText
@@ -773,7 +773,7 @@ robot:
           - id: grasp_grounding
             enabled: true
             required: true
-            bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+            bundle_path: models/grounding_dino_swint_seq8_1280x720
             deployment: ascend_310p
             adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
             service_type: ibrobot_msgs/srv/GroundingDetect

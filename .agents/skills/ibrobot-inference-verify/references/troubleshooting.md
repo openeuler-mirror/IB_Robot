@@ -169,7 +169,7 @@ rejected at config-validation time (this is by design, not a bug).
 **Symptom**: Same validation error as above, and the manifest only lists
 `ascend_310p` (or `ascend_310b`).
 
-**Known bundles**: `models/grounding_dino_swint_seq8_1280x720_ascend`,
+**Known bundles**: `models/grounding_dino_swint_seq8_1280x720`,
 `models/grasp` (graspgen).
 
 **Fix**: Skip on host and mark as "board-only" in the verification report;

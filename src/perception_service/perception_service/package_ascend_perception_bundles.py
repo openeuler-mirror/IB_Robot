@@ -424,7 +424,7 @@ def _specs() -> dict[str, BundleSpec]:
             ),
         ),
         "siglip2": BundleSpec(
-            name="siglip2_so400m_patch14_384_ascend",
+            name="siglip2_so400m_patch14_384",
             model_type="siglip2",
             operation="encode",
             inputs=(
@@ -478,7 +478,7 @@ def _specs() -> dict[str, BundleSpec]:
             ),
         ),
         "grounding_dino": BundleSpec(
-            name="grounding_dino_swint_seq8_1280x720_ascend",
+            name="grounding_dino_swint_seq8_1280x720",
             model_type="grounding_dino",
             operation="detect",
             inputs=(

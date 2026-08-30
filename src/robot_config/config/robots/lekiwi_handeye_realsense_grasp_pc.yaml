@@ -87,9 +87,9 @@ robot:
     action_name: /manipulation/execute_pick
     auto_start_dependencies: true
     # PC and 310P share this bundle and select different named deployments.
-    model_bundle_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    model_bundle_path: "$(env WORKSPACE)/models/graspgen"
     model_deployment: torch_cuda
-    planner_model_dir: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    planner_model_dir: "$(env WORKSPACE)/models/graspgen"
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
     detect_service: /perception/grasp/grounding_detect
@@ -233,7 +233,7 @@ robot:
     planner_node:
       inference_backend: local_cuda
       device: cuda
-      local_manifest_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+      local_manifest_path: "$(env WORKSPACE)/models/graspgen"
       local_deployment_name: torch_cuda
       startup_warmup: true
       host_runtime:

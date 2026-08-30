@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -64,6 +65,26 @@ KNOWN_BUNDLES = {
     "fullsubnet",
 }
 
+# Hugging Face repository names are not always the paths consumed by the
+# runtime. Keep this mapping explicit so repository renames do not silently
+# move an installed model bundle.
+REPOSITORY_ALIASES = {
+    "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515": "IB_Robot_ACT_banana_pick_distill",
+    "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
+    "graspgen": "graspgen",
+}
+RUNTIME_DIRECTORIES = {
+    "IB_Robot_ACT_banana_pick_distill": "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
+    "fullsubnet": "voice_asr",
+    "graspgen": "graspgen",
+    "grounding_dino_swint_seq8_1280x720": "grounded_sam2_swint_ogc",
+}
+LEGACY_REPOSITORIES = {
+    "IB_Robot_ACT_banana_pick": "IB_Robot_ACT_banana_pick",
+    "IB_Robot_ACT_dual_arm_banana_pick": "IB_Robot_ACT_dual_arm_banana_pick",
+    "witty-tune-model": "witty-tune-model",
+}
+
 
 class DownloadError(RuntimeError):
     """Raised for bundle selection, planning or verification failures."""
@@ -81,7 +102,7 @@ class BundlePlan:
 
     @property
     def artifact_count(self) -> int:
-        return len(self.patterns) - 1
+        return sum(1 for path in self.patterns if path in self.verify_map)
 
 
 @dataclass
@@ -138,7 +159,14 @@ def filter_deployments(infos: list[DeploymentInfo], keywords: list[str]) -> tupl
     return matches, bool(lowered)
 
 
-def build_plan(name: str, org: str, manifest: dict[str, Any], targets: list[str], deployments: list[str]) -> BundlePlan:
+def build_plan(
+    name: str,
+    org: str,
+    manifest: dict[str, Any],
+    targets: list[str],
+    deployments: list[str],
+    repo_name: str | None = None,
+) -> BundlePlan:
     shared_paths = sorted(
         {
             entry.get("path", "")
@@ -179,7 +207,7 @@ def build_plan(name: str, org: str, manifest: dict[str, Any], targets: list[str]
 
     return BundlePlan(
         name=name,
-        repo_id=f"{org}/{name}",
+        repo_id=f"{org}/{repo_name or name}",
         patterns=sorted(patterns),
         verify_map=verify_map,
         matched_deployments=[info.name for info in selected],
@@ -223,6 +251,36 @@ def prune_hf_cache(bundle_dir: Path) -> None:
         print(f"[clean] removed snapshot transfer metadata: {bundle_dir / '.cache'}")
 
 
+def runtime_directory(repo_name: str, bundle_name: str | None = None) -> str:
+    return RUNTIME_DIRECTORIES.get(repo_name, bundle_name or repo_name)
+
+
+def repository_for_name(name: str) -> str:
+    return REPOSITORY_ALIASES.get(name, name)
+
+
+def materialize_runtime_aliases(repo_name: str, bundle_dir: Path) -> None:
+    """Expose legacy runtime paths while preserving manifest-relative files."""
+    if repo_name != "fullsubnet":
+        return
+    aliases = {
+        "assets/cum_fullsubnet_best_model_218epochs.tar": "artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar",
+        "assets/cum_fullsubnet_best_model_218epochs.manifest.json": "artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json",
+    }
+    for source_name, target_name in aliases.items():
+        source = bundle_dir / source_name
+        target = bundle_dir / target_name
+        if not source.is_file():
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() or target.is_symlink():
+            if target.is_symlink() and target.resolve() == source.resolve():
+                continue
+            target.unlink()
+        target.symlink_to(Path(os.path.relpath(source, target.parent)))
+        print(f"[alias] {target.relative_to(bundle_dir)} -> {source_name}")
+
+
 def download_bundle(plan: BundlePlan, dest_root: Path, dry_run: bool = False) -> Path:
     bundle_dir = dest_root / plan.name
     if dry_run:
@@ -234,38 +292,68 @@ def download_bundle(plan: BundlePlan, dest_root: Path, dry_run: bool = False) ->
     snapshot_download(repo_id=plan.repo_id, local_dir=str(bundle_dir), allow_patterns=plan.patterns)
     verify_downloads(bundle_dir, plan.verify_map)
     prune_hf_cache(bundle_dir)
+    materialize_runtime_aliases(plan.repo_id.rsplit("/", 1)[-1], bundle_dir)
+    return bundle_dir
+
+
+def download_legacy_repo(repo_name: str, dest_root: Path, dry_run: bool = False) -> Path:
+    """Download a published repository that predates the manifest contract."""
+    bundle_dir = dest_root / LEGACY_REPOSITORIES.get(repo_name, repo_name)
+    if dry_run:
+        print(f"[dry-run] {DEFAULT_ORG}/{repo_name}: legacy repository -> {bundle_dir}")
+        return bundle_dir
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[legacy] {DEFAULT_ORG}/{repo_name} -> {bundle_dir}")
+    snapshot_download(
+        repo_id=f"{DEFAULT_ORG}/{repo_name}",
+        local_dir=str(bundle_dir),
+        ignore_patterns=[".gitattributes", "README*", "*.mp4"],
+    )
+    prune_hf_cache(bundle_dir)
     return bundle_dir
 
 
 def fetch_manifest(org: str, name: str, dest_root: Path) -> dict[str, Any]:
-    """Download just the manifest into <dest_root>/<name>/ and parse it."""
-    bundle_dir = dest_root / name
-    local = hf_hub_download(repo_id=f"{org}/{name}", filename=MANIFEST_FILENAME, local_dir=str(bundle_dir))
+    """Fetch a manifest through the HF cache without mutating the destination."""
+    del dest_root
+    local = hf_hub_download(repo_id=f"{org}/{name}", filename=MANIFEST_FILENAME)
     return load_manifest(Path(local))
 
 
 def list_bundles(api_token: str | None) -> None:
     api = HfApi(token=api_token)
-    known = ", ".join(sorted(KNOWN_BUNDLES))
-    print(f"Known bundles (org={DEFAULT_ORG}):")
-    print(f"  {known}")
     try:
-        remote = api.list_repo_files(repo_id=f"{DEFAULT_ORG}/{next(iter(sorted(KNOWN_BUNDLES)))}")
-    except Exception:
-        print("\n(note: could not probe remote; pass --token or check network)")
-        return
-    del remote
+        models = sorted(api.list_models(author=DEFAULT_ORG, full=True), key=lambda item: item.id.lower())
+    except Exception as exc:
+        raise DownloadError(f"could not list Hugging Face organization {DEFAULT_ORG}: {exc}") from exc
+    print(f"Models published by {DEFAULT_ORG}:")
+    for model in models:
+        repo_name = model.id.split("/", 1)[1]
+        try:
+            files = api.list_repo_files(model.id, repo_type="model")
+            has_manifest = MANIFEST_FILENAME in files
+        except Exception as exc:
+            print(f"  {repo_name} -> {runtime_directory(repo_name)} (probe failed: {exc})")
+            continue
+        kind = "manifest" if has_manifest else "legacy"
+        print(f"  {repo_name} -> {runtime_directory(repo_name)} [{kind}]")
 
 
-def resolve_names(requested: str) -> list[str]:
+def resolve_names(requested: str, available: list[str] | None = None) -> list[str]:
     names = [item.strip() for item in requested.split(",") if item.strip()]
     if not names:
         raise DownloadError("--models requires at least one bundle name (see --list)")
-    unknown = [name for name in names if name not in KNOWN_BUNDLES]
+    if names == ["all"]:
+        if available is None:
+            raise DownloadError("--models all requires querying the Hugging Face organization")
+        return available
+    available_set = set(available or ()) | KNOWN_BUNDLES | set(REPOSITORY_ALIASES)
+    resolved = [repository_for_name(name) for name in names]
+    unknown = [name for name in names if name not in available_set]
     if unknown:
         preview = ", ".join(unknown)
         print(f"[warn] not in the known-bundle registry; assuming repo id {DEFAULT_ORG}/<name>: {preview}")
-    return names
+    return resolved
 
 
 def split_csv(values: list[str]) -> list[str]:
@@ -285,8 +373,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"HF_ENDPOINT can point to a mirror; default org is {DEFAULT_ORG}."
         ),
     )
-    parser.add_argument("--list", action="store_true", help="list known bundles and exit")
-    parser.add_argument("--models", help="comma-separated bundle names, e.g. pi05,sam2.1_hiera_tiny")
+    parser.add_argument("--list", action="store_true", help="list all model repositories in the organization and exit")
+    parser.add_argument("--models", help="comma-separated repository/bundle names, or 'all'")
     parser.add_argument(
         "--target",
         action="append",
@@ -319,16 +407,30 @@ def main(argv: list[str] | None = None) -> int:
         print("Error: --models is required (or use --list)", file=sys.stderr)
         return 2
 
-    names = resolve_names(args.models)
+    available: list[str] | None = None
+    repository_files: dict[str, list[str]] = {}
+    if args.models.strip().lower() == "all":
+        api = HfApi(token=args.token)
+        models = sorted(api.list_models(author=DEFAULT_ORG, full=True), key=lambda item: item.id.lower())
+        available = [model.id.split("/", 1)[1] for model in models]
+        repository_files = {name: api.list_repo_files(f"{DEFAULT_ORG}/{name}", repo_type="model") for name in available}
+    names = resolve_names(args.models, available)
     targets = split_csv(args.target)
     deployments = split_csv(args.deployment)
     failures = 0
     for name in names:
         try:
+            if name in LEGACY_REPOSITORIES or (
+                repository_files and MANIFEST_FILENAME not in repository_files.get(name, [])
+            ):
+                download_legacy_repo(name, args.dest, args.dry_run)
+                continue
             manifest = fetch_manifest(DEFAULT_ORG, name, args.dest)
-            plan = build_plan(name, DEFAULT_ORG, manifest, targets, deployments)
+            bundle_name = manifest.get("bundle", {}).get("name") or name
+            local_name = runtime_directory(name, bundle_name)
+            plan = build_plan(local_name, DEFAULT_ORG, manifest, targets, deployments, repo_name=name)
             if args.dry_run:
-                artifacts = len(plan.patterns) - 1
+                artifacts = plan.artifact_count
                 print(
                     f"[dry-run] {plan.repo_id}: {artifacts} artifact file(s), "
                     f"{len(plan.patterns) - artifacts} shared file(s), deployments: "
@@ -336,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 continue
             download_bundle(plan, args.dest)
-            print(f"[done] {plan.repo_id} -> {args.dest / name}")
+            print(f"[done] {plan.repo_id} -> {args.dest / local_name}")
         except Exception as exc:  # noqa: BLE001 - report per-bundle, keep going
             failures += 1
             print(f"[error] {name}: {exc}", file=sys.stderr)

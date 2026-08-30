@@ -86,17 +86,17 @@ PC 额外下载 Grounded-SAM2 Torch bundle：
 | 平台 | 用途 | Bundle | Named deployment | 准备方式 |
 |---|---|---|---|---|
 | PC | 检测与分割 | `models/grounded_sam2_swint_ogc/` | `torch_cuda` | `download_perception_models.sh --gdino-only` |
-| PC | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `torch_cuda` | 从已审核 checkpoint 生成 |
-| 310P | Grounding-DINO | `models/grounding_dino_swint_seq8_1280x720_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| PC | GraspGen | `models/graspgen/` | `torch_cuda` | 从统一 HF bundle 下载 |
+| 310P | Grounding-DINO | `models/grounding_dino_swint_seq8_1280x720/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
 | 310P | SAM2 prompt | `models/sam2.1_hiera_tiny_prompt_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
-| 310P | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| 310P | GraspGen | `models/graspgen/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
 
 310P 不在板端临时编译模型。将发布流程产出的三个完整 bundle 同步到 `models/` 后检查：
 
 ```bash
-test -f models/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
+test -f models/grounding_dino_swint_seq8_1280x720/inference_manifest.json
 test -f models/sam2.1_hiera_tiny_prompt_ascend/inference_manifest.json
-test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
+test -f models/graspgen/inference_manifest.json
 ```
 
 Ascend 感知 bundle 的 promotion 命令和候选目录约束见
@@ -118,8 +118,8 @@ test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140_gen.pth"
 test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140_dis.pth"
 ros2 run perception_service package_graspgen_torch_bundle \
   --source-root "$GRASPGEN_SOURCE_ROOT" \
-  --bundle-root models/grasp/graspgen_robotiq_2f_140
-test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
+  --bundle-root models/graspgen
+test -f models/graspgen/inference_manifest.json
 ```
 
 `models/grasp/checkpoints/` 仅是旧部署的兼容输入布局，不是 fresh clone 应自带的仓库内容。任一检查失败时，先从

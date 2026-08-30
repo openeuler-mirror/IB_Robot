@@ -57,7 +57,7 @@ PERCEPTION_PRESETS = {
         "node_name": "sam2_masks",
     },
     "grounding_dino": {
-        "bundle_path": "models/grounding_dino_swint_seq8_1280x720_ascend",
+        "bundle_path": "models/grounding_dino_swint_seq8_1280x720",
         "adapter_class": "perception_service.model_service_plugins:GroundingDINORawDetectPlugin",
         "service_type": "ibrobot_msgs/srv/GroundingDetect",
         "endpoint": "/perception/grounding_dino/detect",

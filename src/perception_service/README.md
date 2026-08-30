@@ -321,7 +321,7 @@ ros2 run perception_service package_ascend_perception_bundles \
 ```
 
 `--models-root` 必须与 robot config 的 bundle 根目录一致。打包器从 `models/_work/` 中读取已经验证的候选，
-并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720_ascend/` 和
+并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720/` 和
 `models/sam2.1_hiera_tiny_prompt_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
 
 SAM2 的 operation 是 v3 manifest 的 bundle 级模型身份，不是 deployment 属性：
