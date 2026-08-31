@@ -74,6 +74,10 @@ def generate_launch_description():
             {
                 "robot_config_path": LaunchConfiguration("robot_config_path"),
                 "pipeline_id": LaunchConfiguration("pipeline_id"),
+                # cloud_node is excluded when recording, so the recorder is the
+                # only remaining peer that can supply the ROLE_CLOUD heartbeat
+                # the edge needs before it will bind a video session.
+                "heartbeat_topic": LaunchConfiguration("heartbeat_topic"),
                 "video_descriptor_topic": LaunchConfiguration("video_descriptor_topic"),
                 "video_status_topic": LaunchConfiguration("video_status_topic"),
                 "runtime_options_json": ParameterValue(LaunchConfiguration("runtime_options_json"), value_type=str),
