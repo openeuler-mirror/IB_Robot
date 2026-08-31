@@ -105,7 +105,21 @@ class TeleopNode(Node):
             self.get_logger().error(f"Failed to create/connect device: {e}")
             raise
 
-        # Initialize safety filter
+        # Initialize safety filter.
+        # Let the device override the static YAML gripper limits with values
+        # derived from the follower calibration (so swapping or re-calibrating
+        # the follower needs no YAML edit). Devices that don't implement this
+        # return an empty dict and the YAML limits stand unchanged.
+        #
+        # Without this the gripper, now emitting radians, gets clipped back to
+        # the legacy [0.0, 1.0] range and only closes halfway again.
+        if self.device is not None:
+            for joint_name, limits in self.device.get_gripper_limits().items():
+                joint_limits[joint_name] = limits
+                self.get_logger().info(
+                    f"Overriding '{joint_name}' safety limits from device: "
+                    f"[{limits['min']:.3f}, {limits['max']:.3f}] rad"
+                )
         self.safety_filter = SafetyFilter(joint_limits)
 
         # Publishers
