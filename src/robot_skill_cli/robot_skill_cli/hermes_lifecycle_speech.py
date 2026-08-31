@@ -69,11 +69,32 @@ def _event(payload: dict[str, Any]) -> str | None:
             return "status_check_started"
         if " plan-workflow" in command:
             return "planning_started"
+        if " run-workflow" in command:
+            return "planning_started"
     if hook_event == "post_tool_call" and " confirm-plan" in command:
         extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
         if str(extra.get("status") or "") == "ok" and _result_success(extra.get("result")):
             return "plan_authorized"
+    if hook_event == "post_tool_call" and " run-workflow" in command:
+        return None
     return None
+
+
+def notify_plan_authorized(*, session_id: str, turn_id: str = "") -> None:
+    """Emit the authorization event when a composite workflow confirms internally."""
+    handle(
+        {
+            "hook_event_name": "post_tool_call",
+            "session_id": session_id,
+            "tool_name": "terminal",
+            "tool_input": {"command": "robot-skill confirm-plan --internal"},
+            "extra": {
+                "turn_id": turn_id or session_id,
+                "status": "ok",
+                "result": '{"ok":true,"command":"confirm-plan","data":{"confirmed":true}}',
+            },
+        }
+    )
 
 
 def _result_success(result: Any) -> bool:
@@ -91,12 +112,16 @@ def _result_success(result: Any) -> bool:
         return value.get("success") is True or value.get("confirmed") is True
 
     if isinstance(result, dict):
+        if result.get("event") == "workflow_terminal":
+            result = result.get("data")
+        if isinstance(result, dict) and isinstance(result.get("result"), dict):
+            result = result["result"]
         return confirmed(result)
     if not isinstance(result, str):
         return False
     candidate = result.rpartition("Final output:")[2] if "Final output:" in result else result
     try:
-        return confirmed(json.loads(candidate.strip()))
+        return _result_success(json.loads(candidate.strip()))
     except json.JSONDecodeError:
         return False
 

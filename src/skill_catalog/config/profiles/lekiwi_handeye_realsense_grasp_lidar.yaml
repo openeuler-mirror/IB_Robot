@@ -2,6 +2,12 @@ schema_version: 1
 name: lekiwi_handeye_realsense_grasp_lidar
 robot_name: lekiwi_handeye_realsense_grasp_lidar
 enabled_skills:
+- name: act_cute
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: celebrate
+  implementation: so101_arm_v1
+  planner_visible: true
 - name: resolve_object_pose
   implementation: lekiwi_navigation_v2
   planner_visible: true
@@ -31,6 +37,30 @@ enabled_skills:
   planner_visible: true
 - name: recover_zero_pose
   implementation: lekiwi_handeye_realsense_grasp
+  planner_visible: true
+- name: dance_basic
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: greet_observe_raise
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: happy_spin_upright
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: nod_yes
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: rotate_gripper_ccw
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: rotate_gripper_cw
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: shake_no
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: wave_hello
+  implementation: so101_arm_v1
   planner_visible: true
 - name: nav_abs_coordinate
   implementation: lekiwi_navigation_v2

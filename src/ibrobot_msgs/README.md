@@ -133,6 +133,11 @@ plan/validate/confirm/execute 端点可达；且系统未处于初始编译、re
 `control_plane_state=READY` 且 `motion_authorized=false` 时继续工作，运动授权在 action admission 时返回
 `MOTION_NOT_AUTHORIZED`。状态服务永远不会暴露任一 nonce。
 
+Agent plan 的 `execution_mode` 是显式控制模式契约：`interactive_confirmation` 为旧分阶段入口默认值，
+`immediate_after_presentation` 仅由 `robot-skill run-workflow` 使用。模式在计划创建时捕获，写入
+`AgentPlan`，并由 `ConfirmAgentPlan` 精确匹配；它不授予或修改 `authorize_motion`。立即模式仍必须完成
+exact catalog、validation、计划展示并 flush、技术绑定、action admission、停止收敛和权威终态校验。
+
 Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `ValidateSkill.srv`。状态服务不携带
 执行器依赖、ROS transport 名称、配置路径、primitive sequence、坐标或底层控制器状态；这些都不是
 `SkillCapabilityStatus` 或 `GetSkillGatewayStatus` 字段。

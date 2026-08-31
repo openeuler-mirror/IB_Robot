@@ -6,14 +6,14 @@ from pathlib import Path
 
 import pytest
 import yaml
+from skill_catalog.compiler import compile_skill_catalog
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
+from skill_catalog.source import DevelopmentStagingSkillSource
 
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from robot_config.loader import load_robot_config_dict, robot_config_digest
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_skill_cli.catalog import compile_local_snapshot
-from skill_catalog.compiler import compile_skill_catalog
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
-from skill_catalog.source import DevelopmentStagingSkillSource
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG_ROOT = Path(__file__).resolve().parents[1]

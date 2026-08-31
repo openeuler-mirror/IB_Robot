@@ -110,6 +110,9 @@ def test_generated_wrappers_source_shrc_local_and_run_python3(tmp_path: Path) ->
         synthesis_timeout_sec=90.0,
     )
     lifecycle_hook = hermes_configure._lifecycle_hook_wrapper(workspace=workspace, shrc=shrc)
+    interim_hook = hermes_configure._interim_hook_wrapper(
+        workspace=workspace, shrc=shrc, speaker_path=tmp_path / "profile" / "hooks" / "ibrobot-speak"
+    )
     robot_skill = hermes_configure._robot_skill_wrapper(
         workspace=workspace,
         shrc=shrc,
@@ -133,11 +136,14 @@ def test_generated_wrappers_source_shrc_local_and_run_python3(tmp_path: Path) ->
     assert "IBROBOT_TTS_PLAYBACK_TIMEOUT_SEC=300" in hook
     assert "venv/bin/python3" not in hook
     assert str(shrc) not in lifecycle_hook
-    assert "HERMES_CUSTOM_AZ_GPTPLUS5_COM_API_KEY" in lifecycle_hook
+    assert str(shrc) in interim_hook
+    assert str(tmp_path / "profile" / "hooks" / "ibrobot-speak") in interim_hook
+    assert "exec python3 -m robot_skill_cli.hermes_interim_speech" in interim_hook
     assert "exec python3 -m robot_skill_cli.hermes_lifecycle_speech" in lifecycle_hook
     assert "-m robot_skill_cli.cli" in robot_skill
     assert "source /opt/ros/humble/setup.bash" not in robot_skill
     assert "exec python3 -m robot_skill_cli.cli" in robot_skill
+    assert "IBROBOT_HERMES_LIFECYCLE_SPEECH=1" in robot_skill
     assert '--config-path "$ROBOT_CONFIG"' in robot_skill
     assert "configuration is bound" in robot_skill
     assert "source /opt/ros/humble/setup.bash" not in environment
@@ -154,6 +160,7 @@ def test_configure_dry_run_does_not_create_profile_files(tmp_path: Path, monkeyp
     (resource / "SOUL.md").write_text("soul\n", encoding="utf-8")
     (resource / "POLICY.md").write_text("policy\n", encoding="utf-8")
     (resource / "hooks" / "ibrobot-speak").write_text("hook\n", encoding="utf-8")
+    (resource / "hooks" / "ibrobot-interim-speech").write_text("interim\n", encoding="utf-8")
     skill = install / "share" / "robot_skill_cli" / "skills" / "ibrobot-control" / "SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("skill\n", encoding="utf-8")
@@ -194,6 +201,7 @@ def test_configure_dry_run_reports_stale_managed_plugin(tmp_path: Path, monkeypa
     (resource / "SOUL.md").write_text("soul\n", encoding="utf-8")
     (resource / "POLICY.md").write_text("policy\n", encoding="utf-8")
     (resource / "hooks" / "ibrobot-speak").write_text("hook\n", encoding="utf-8")
+    (resource / "hooks" / "ibrobot-interim-speech").write_text("interim\n", encoding="utf-8")
     skill = install / "share" / "robot_skill_cli" / "skills" / "ibrobot-control" / "SKILL.md"
     skill.parent.mkdir(parents=True)
     skill.write_text("skill\n", encoding="utf-8")
@@ -337,6 +345,8 @@ def test_tts_payload_extraction_preserves_text_for_voice_tts(payload: dict, expe
         ("你好世界", "你好世界"),
         ("v1.0 发布", "1.0 发布"),
         ("```robot-skill status```", "```- ```"),
+        ("任务 71faa17ea1e843f2aeb800d3184ec320 完成", "任务  完成"),
+        ("完成 123456 次", "完成 123456 次"),
     ],
 )
 def test_sanitize_for_tts_strips_english_letters(text: str, expected: str) -> None:

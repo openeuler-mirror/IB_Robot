@@ -37,6 +37,28 @@ def test_event_gating() -> None:
     assert (
         speech._event(_payload("post_tool_call", "robot-skill confirm-plan --x", result=wrapped)) == "plan_authorized"
     )
+    assert speech._event(_payload("pre_tool_call", "robot-skill run-workflow --text x")) == "planning_started"
+    workflow_result = '{"event":"workflow_terminal","data":{"result":{"success":true}}}'
+    assert (
+        speech._event(_payload("post_tool_call", "robot-skill run-workflow --text x", result=workflow_result)) is None
+    )
+    internal_confirmation = '{"ok":true,"command":"confirm-plan","data":{"confirmed":true}}'
+    assert (
+        speech._event(_payload("post_tool_call", "robot-skill confirm-plan --internal", result=internal_confirmation))
+        == "plan_authorized"
+    )
+
+
+def test_composite_workflow_can_emit_authorization_at_confirm_boundary(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("IBROBOT_LIFECYCLE_SPEECH_STATE", str(tmp_path))
+    spawned = []
+    monkeypatch.setattr(speech, "_spawn_play", lambda *args: spawned.append(args))
+
+    speech.notify_plan_authorized(session_id="task-1")
+
+    assert len(spawned) == 1
+    assert spawned[0][2] == "plan_authorized"
+    assert spawned[0][3] == speech.FALLBACK_COPY["plan_authorized"]
 
 
 def test_confirmation_requires_successful_confirm_plan_envelope() -> None:

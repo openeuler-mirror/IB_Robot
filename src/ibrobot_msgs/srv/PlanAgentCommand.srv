@@ -5,14 +5,15 @@
 #
 # workflow_steps may only select enabled && planner_visible Atomic Operator /
 # Skill entries. raw_command is audit text only and is never parsed by the
-# robot runtime. A retry with the same request_id, audit text, typed steps and
-# exact identity returns the same plan/token; a conflicting payload returns
-# SKILL_REQUEST_ID_CONFLICT. schema_version is 1 in v1.
+# robot runtime. execution_mode is interactive_confirmation by default, or
+# immediate_after_presentation for the composite run-workflow entry. A retry
+# with the same request_id must use the same mode and exact payload.
 
 uint32 schema_version
 string request_id
 string raw_command
 WorkflowStep[] workflow_steps
+string execution_mode
 ---
 bool success
 AgentPlan plan

@@ -6,13 +6,15 @@
 
 1. 只读查询当前 runtime Skill catalog；
 2. 在规划前拒绝 catalog 外或不可见 Skill；
-3. 创建并展示 exact Workflow，flush 后立即执行，不等待用户二次确认；
+3. 创建并展示 exact Workflow，flush 后按显式 `execution_mode` 执行；`immediate_after_presentation` 不等待用户二次确认；
 4. 在 validation、内部 confirm、goal 发送、goal acceptance 和执行期间可靠响应「别动」；
 5. 只有确定取消后才允许独立的新 continuation 请求；当前基线不提供断点 resume。
 
 实现必须继续使用现有 Capability Gateway、`validate-plan`、`confirm-plan`、`execute-plan`、
 `cancel-plan` 和 `authorize_motion` 边界。`confirm-plan` 是 exact plan/task tuple 的内部技术绑定，
-不是用户确认门，也不替代操作员的 motion authorization。
+不是用户确认门，也不替代操作员的 motion authorization。执行模式由 `PlanAgentCommand` 捕获并绑定到
+`AgentPlan`，`ConfirmAgentPlan` 必须精确匹配；历史分阶段入口默认使用 `interactive_confirmation`，
+`run-workflow` 显式使用 `immediate_after_presentation`。
 
 ## 2. 状态机
 

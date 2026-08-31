@@ -14,8 +14,10 @@
 - 用户询问当前电机或关节角度时，只能运行
   `ibrobot-perceive --source arm_joint_position --field position`（可用 `--config-name` 指定机器人）。
   该接口返回原始弧度数组且不返回 `name` 字段，不得编造关节名称、重排数值或把数组索引解释为具体关节。
-- 生成并验证冻结计划后，先展示并 flush exact ordered steps、参数、plan digest、registry identity 和 task ID，
-  随后立即调用内部 `confirm-plan` 绑定 exact tuple 并执行；不得询问“确认执行吗”，不得等待用户再次回复。
+- `run-workflow` 请求使用显式 `execution_mode=immediate_after_presentation`：生成并验证冻结计划后，先展示并
+  flush exact ordered steps、参数、plan digest、registry identity 和 task ID，随后立即调用内部 `confirm-plan`
+  绑定 exact tuple 并执行；不得询问“确认执行吗”，不得等待用户再次回复。历史分阶段入口默认使用
+  `interactive_confirmation`，不会被该模式改变。
 - `confirm-plan` 是 Gateway 技术绑定，不是用户确认门禁。物理运动仍只能由操作员启动 pipeline 时设置的
   `authorize_motion` 授权；Hermes 不得启动或重启 pipeline、修改 ROS 参数或开启运动授权。
 - Gateway 不可用、未授权、计划校验失败、执行超时或状态未知时必须停止，不得自动重试或发起新运动。

@@ -2,9 +2,6 @@ schema_version: 1
 name: lekiwi_lidar
 robot_name: lekiwi_lidar
 enabled_skills:
-- name: resolve_object_pose
-  implementation: lekiwi_navigation_v2
-  planner_visible: true
 - name: nav_abs_coordinate
   implementation: lekiwi_navigation_v2
   planner_visible: true

@@ -3,7 +3,7 @@
 此目录是 IB-Robot Hermes 集成的唯一发布源，包含推荐 `SOUL.md`、强制策略 (`POLICY.md`)、
 `pre_tool_call` / `post_llm_call` hook 与手动同步入口。同步会安装当前 `ibrobot-control` Skill，
 绑定当前 workspace、robot config 和 ROS Domain，并清理已退役的 `ibrobot-robot-control` Plugin
-遗留副本（即时执行改由 `robot-skill` 的 `confirm-plan` + `execute-plan` 承担）。
+遗留副本（即时执行改由 `robot-skill run-workflow` 的显式 `immediate_after_presentation` 模式承担）。
 
 ## 资源
 
@@ -14,6 +14,7 @@
 | `hooks/ibrobot-block-raw-ros` | Hermes `pre_tool_call` hook，用 `shlex` 分词拦截裸 `ros2`/`rclpy`/`roslaunch` 调用 |
 | `hooks/ibrobot-speak` | Hermes `post_llm_call` speech hook wrapper，source `.shrc_local` 后 `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT |
 | `hooks/ibrobot-lifecycle-speech` | Hermes `pre_tool_call` / `post_tool_call` hook；只投递状态检查、规划和计划授权事件，文案生成、TTS 合成和播放均在后台执行 |
+| `hooks/ibrobot-interim-speech` | Hermes `on_interim_message` hook；加载 workspace `.shrc_local` 后异步转交当前 profile 的 TTS hook |
 | `sync_hermes.sh` | 手动同步入口（等价于 `hermes-robot-configure`） |
 
 ## `ibrobot-perceive`（感知读取唯一入口）
@@ -103,6 +104,8 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
   `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT。
 - `hooks/ibrobot-lifecycle-speech`：机器人任务生命周期 speech hook wrapper，使用当前 IB-Robot
   workspace 中的 `robot_skill_cli` 和 `embodied_agent` 异步生成文案，并投递状态检查、规划和计划授权成功三类语音事件。
+- `hooks/ibrobot-interim-speech`：由配置器绑定当前 workspace 和 `ibrobot-speak` 绝对路径，使用完整
+  `.shrc_local` 环境启动；每个 `(session_id, turn_id, text)` 最多投递一次，失败不阻塞 Hermes。
 
 `--accept-hooks` 先 `hermes hooks revoke` 清理旧 mtime，再用
 `hermes --accept-hooks hooks doctor` 重新批准；首次安装无既有审批时，revoke 的非零退出经

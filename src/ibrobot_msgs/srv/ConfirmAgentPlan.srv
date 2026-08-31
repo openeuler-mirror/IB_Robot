@@ -14,7 +14,9 @@
 # tuple. Mismatch, duplicate
 # confirmation, expired plan or reload-changed identity all fail closed.
 #
-# confirmation_token does not grant motion authorization, does not hold the
+# execution_mode must match the mode captured by PlanAgentCommand. The
+# immediate mode removes only the user confirmation wait; all Gateway and
+# operator authorization checks remain mandatory. confirmation_token does not grant motion authorization, does not hold the
 # root lease and does not enter any digest; it only proves that this exact
 # plan/task pair has been bound once. schema_version is 1 in v1.
 
@@ -26,6 +28,7 @@ string registry_epoch
 uint64 registry_generation
 string registry_digest
 float32 task_budget_sec
+string execution_mode
 ---
 bool confirmed
 string confirmation_token

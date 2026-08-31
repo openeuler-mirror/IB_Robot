@@ -694,6 +694,115 @@ def test_agent_plan_parser_uses_typed_workflow_option_and_lifecycle_commands():
     assert confirm.command == "confirm-plan"
 
 
+def test_run_workflow_parser_accepts_one_typed_workflow():
+    from robot_skill_cli.cli import _build_parser
+
+    parser = _build_parser()
+    run = parser.parse_args(
+        [
+            "run-workflow",
+            "--text",
+            "打开夹爪",
+            "--workflow-json",
+            '[{"schema_version":1,"skill_name":"open_gripper_skill"}]',
+        ]
+    )
+
+    assert run.command == "run-workflow"
+    assert run.raw_command == "打开夹爪"
+
+
+def test_run_workflow_delegates_lifecycle_to_controller(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from robot_skill_cli import interactive_control
+    from robot_skill_cli.cli import _run_workflow
+
+    calls = []
+
+    class _Controller:
+        def __init__(self, bridge, *, timeout_policy, execution_mode):
+            calls.append((bridge, timeout_policy, execution_mode))
+
+        def run(self, raw_command, workflow_steps, *, presentation_callback, authorization_callback, stop_event):
+            calls.append((raw_command, workflow_steps, stop_event))
+            presentation_callback({"task_id": "task-1"})
+            authorization_callback({"task_id": "task-1"})
+            return {"state": "succeeded", "task_id": "task-1", "result": {"success": True}}
+
+    monkeypatch.setattr(interactive_control, "InteractiveController", _Controller)
+    args = SimpleNamespace(
+        raw_command="打开夹爪",
+        workflow_json='[{"schema_version":1,"skill_name":"open_gripper_skill"}]',
+    )
+    context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 5.0}})
+
+    result = _run_workflow(args, context, object())
+
+    assert result.exit_code == 0
+    assert calls[0][2] == "immediate_after_presentation"
+    assert calls[1] == (
+        "打开夹爪",
+        [{"schema_version": 1, "skill_name": "open_gripper_skill"}],
+    )
+    assert [json.loads(line)["event"] for line in capsys.readouterr().out.strip().splitlines()] == [
+        "workflow_presentation",
+        "workflow_terminal",
+    ]
+
+
+def test_run_workflow_signal_requests_controller_stop_and_restores_handlers(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from robot_skill_cli import cli, interactive_control
+    from robot_skill_cli.cli import _run_workflow
+
+    calls = []
+    installed = {}
+
+    class _Controller:
+        def __init__(self, _bridge, *, timeout_policy, execution_mode):
+            calls.append((timeout_policy, execution_mode))
+
+        def request_stop(self):
+            calls.append("request_stop")
+
+        def run(self, _raw_command, _workflow_steps, *, presentation_callback, authorization_callback, stop_event):
+            calls.append(stop_event)
+            installed[cli.signal.SIGINT](cli.signal.SIGINT, None)
+            assert stop_event.is_set()
+            presentation_callback({"task_id": "task-stop"})
+            return {
+                "state": "stopped",
+                "task_id": "task-stop",
+                "error_code": "SKILL_CANCELLED",
+                "result": {"success": False, "error_code": "SKILL_CANCELLED"},
+            }
+
+    def install(signum, handler):
+        previous = installed.get(signum, cli.signal.SIG_DFL)
+        installed[signum] = handler
+        return previous
+
+    monkeypatch.setattr(interactive_control, "InteractiveController", _Controller)
+    monkeypatch.setattr(cli.signal, "signal", install)
+    args = SimpleNamespace(
+        raw_command="打开夹爪",
+        workflow_json='[{"schema_version":1,"skill_name":"open_gripper_skill"}]',
+    )
+    context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 5.0}})
+
+    result = _run_workflow(args, context, object())
+
+    assert result.exit_code == 13
+    assert "request_stop" in calls
+    assert calls[0][1] == "immediate_after_presentation"
+    assert installed[cli.signal.SIGINT] is cli.signal.SIG_DFL
+    assert installed[cli.signal.SIGTERM] is cli.signal.SIG_DFL
+    events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert [event["event"] for event in events] == ["workflow_presentation", "workflow_terminal"]
+
+
 @pytest.mark.parametrize(
     ("skill_name", "arguments", "properties", "expected"),
     [

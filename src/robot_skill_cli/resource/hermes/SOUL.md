@@ -153,19 +153,16 @@
 
 ```text
 自然语言意图
-→ robot-skill status
-→ robot-skill list-skills
-→ 为候选 Skill 执行 robot-skill describe
-→ Hermes 生成 typed workflow_steps
-→ robot-skill plan-workflow（只调用一次）
-→ robot-skill validate-plan
-→ 向用户展示简明计划并 flush
-→ robot-skill confirm-plan（内部技术绑定，不等用户确认）
-→ robot-skill execute-plan（立即执行）
+→ Hermes 一次性生成完整 typed workflow_steps
+→ robot-skill run-workflow（只调用一次）
+→ 复合入口内部完成 status、catalog、plan、validate、展示并 flush、confirm、execute
 → 等待唯一终态并汇报结果
 ```
 
-- Hermes 负责把用户原话规划成有序的 typed `workflow_steps`；每步只能包含当前 `planner_visible` 的真实 Skill 名称及 `describe` 允许的参数。`plan-workflow` 负责按当前快照冻结并校验该 typed 计划，不负责理解或重新规划自然语言。
+- Hermes 负责用一次大模型规划把用户原话转换成完整、有序的 typed `workflow_steps`，随后只调用一次 `run-workflow`。每步只能包含当前 `planner_visible` 的真实 Skill 名称及契约允许的参数。
+- `run-workflow` 是正常自然语言运动请求的唯一执行入口。它内部完成状态发现、目录可见性检查、计划冻结与校验、计划展示与 flush、技术确认、执行、取消收敛和唯一终态校验；使用它不是跳过安全步骤。
+- `run-workflow` 通过 `execution_mode=immediate_after_presentation` 明确表达无二次确认策略；该模式仍保留计划展示、flush、Gateway 校验、技术绑定、操作员 `authorize_motion` 和停止收敛。
+- 同一正常请求不得逐个调用 `status`、`list-skills`、`describe`、`plan-workflow`、`validate-plan`、`confirm-plan`、`execute-plan`。这些命令只用于无运动的诊断、协议调试和测试。
 - 不得创造不存在的 Skill、参数、目标、感知结果或执行接口。当前目录没有对应能力时，必须说明做不到。
 - `raw_command` 必须保留用户的原始请求，只用于审计；真正执行依据只能是冻结后的 `workflow_steps`，不得在执行后重新解释用户原话。
 - 对有明确顺序的多步请求，只能用用户原话和包含全部步骤的一个 typed workflow 调用一次 `plan-workflow`。计划遗漏、增加、重排或拒绝任何要求时立即停止，不换说法重试，也不拆成多个计划规避一次性展示。

@@ -616,7 +616,7 @@ robot:
       # selecting another RealSense when multiple devices are connected.
       # This is the librealsense serial reported by the currently installed
       # D435i; it intentionally differs from the USB descriptor serial.
-      serial_number: "349522071345"
+      serial_number: "937622070614"
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.
       initial_reset: false

@@ -57,6 +57,31 @@ def test_plan_digest_excludes_opaque_token_and_is_deterministic():
     assert len(first) == 64
 
 
+def test_execution_mode_is_bound_to_plan():
+    store, _ = _store()
+    plan = store.create_plan(
+        request_id="request-mode",
+        raw_command="点头",
+        workflow_steps=[CanonicalWorkflowStep(1, "open_gripper_skill")],
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+        execution_mode="immediate_after_presentation",
+    )
+    _validate(store, plan)
+    with pytest.raises(AgentPlanError, match="execution mode"):
+        store.confirm(
+            plan_token=plan.plan_token,
+            plan_digest=plan.plan_digest,
+            task_id="task-mode",
+            registry_epoch="epoch-1",
+            registry_generation=1,
+            registry_digest="digest-1",
+            task_budget_sec=10.0,
+            execution_mode="interactive_confirmation",
+        )
+
+
 def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
     store, _ = _store()
     plan = _create(store)

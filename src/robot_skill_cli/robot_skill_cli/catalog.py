@@ -9,11 +9,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from embodied_common.capability_view import project_capability_timeout_policy
-from embodied_common.dispatch_binding import (
-    delegated_executor_identity,
-    load_delegated_model_identity,
+from skill_catalog.compiler import compile_skill_catalog
+from skill_catalog.digest import (
+    derive_capability_digest,
+    derive_provenance_digest,
+    derive_registry_digest,
+    to_canonical_json,
 )
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
+
+from embodied_common.capability_view import project_capability_timeout_policy
+from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
 from embodied_common.primitive_contracts import primitive_contract_for_version
 from embodied_common.visual_game_contracts import build_visual_game_capability_view
 from robot_config.config_path import resolve_robot_config_path
@@ -26,15 +33,6 @@ from robot_config.loader import (
     robot_supported_control_modes,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
-from skill_catalog.compiler import compile_skill_catalog
-from skill_catalog.digest import (
-    derive_capability_digest,
-    derive_provenance_digest,
-    derive_registry_digest,
-    to_canonical_json,
-)
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 
 _LIST_CAPABILITY_FIELDS = (
     "summary",
@@ -367,6 +365,12 @@ def capability_view_from_snapshot(snapshot: dict[str, Any], status: dict[str, An
     capability_mapping = capability_preimage.get("capability_view")
     if not isinstance(capability_mapping, dict):
         raise ValueError("SKILL_SNAPSHOT_DIGEST_MISMATCH: capability view is invalid")
+    planner_visible_names = {str(name) for name in capability_preimage.get("planner_visible_skill_names", [])}
+    semantic_levels = {
+        str(entry["name"]): str(entry["semantic_level"])
+        for entry in registry_preimage.get("skills", [])
+        if isinstance(entry, dict) and "name" in entry and "semantic_level" in entry
+    }
     timeout_caps = {
         str(entry["name"]): float(entry["template"]["timeout_sec"])
         for entry in registry_preimage.get("skills", [])
@@ -374,6 +378,8 @@ def capability_view_from_snapshot(snapshot: dict[str, Any], status: dict[str, An
     }
     skills = [copy.deepcopy(capability_mapping[name]) for name in sorted(capability_mapping)]
     for skill in skills:
+        skill["planner_visible"] = skill["name"] in planner_visible_names
+        skill["semantic_level"] = semantic_levels.get(skill["name"], "")
         if skill["name"] in timeout_caps:
             skill["timeout_sec"] = timeout_caps[skill["name"]]
     return {

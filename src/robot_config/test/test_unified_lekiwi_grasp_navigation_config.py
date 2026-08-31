@@ -6,7 +6,7 @@ import yaml
 
 from robot_config.launch_builders.perception import generate_camera_nodes
 from robot_config.launch_builders.perception_models import generate_perception_model_nodes
-from robot_config.loader import load_robot_config_dict, validate_motion_mode_config
+from robot_config.loader import load_robot_config_dict, robot_context_schema_version, validate_motion_mode_config
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT / "src/robot_config/config/robots/lekiwi_nav_grasp.yaml"
@@ -157,6 +157,14 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["navigation"]["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel_safe"
     assert navigation["navigation"]["command_server"]["enabled"] is True
     assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
+
+
+def test_grasp_stage_uses_matching_v1_manipulation_catalog():
+    grasp = load_robot_config_dict(CONFIG_PATH, nav_stage="grasp")
+
+    assert grasp["name"] == "lekiwi_handeye_realsense_grasp"
+    assert grasp["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp"
+    assert robot_context_schema_version(grasp) == 1
 
 
 def test_hybrid_keeps_static_semantic_query_and_disables_online_services():

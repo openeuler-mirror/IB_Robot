@@ -6,12 +6,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import signal
 import threading
 import time
 from collections.abc import Sequence
 from typing import Any
 
+from embodied_common.agent_execution_contract import IMMEDIATE_AFTER_PRESENTATION
 from embodied_common.agent_terminal_contract import TERMINAL_GOAL_STATUSES, classify_agent_terminal
 from robot_skill_cli import __version__
 from robot_skill_cli.output import (
@@ -120,6 +122,11 @@ def _build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--text", dest="raw_command", required=True, help="audit text for this workflow")
     plan_parser.add_argument("--request-id", required=True)
     plan_parser.add_argument("--workflow-json", required=True)
+    run_workflow_parser = subparsers.add_parser(
+        "run-workflow", help="run one typed workflow through the complete Gateway lifecycle"
+    )
+    run_workflow_parser.add_argument("--text", dest="raw_command", required=True, help="audit text for this workflow")
+    run_workflow_parser.add_argument("--workflow-json", required=True)
     validate_plan_parser = subparsers.add_parser("validate-plan", help="preflight an Agent plan")
     validate_plan_parser.add_argument("--plan-token", required=True)
     confirm_plan_parser = subparsers.add_parser("confirm-plan", help="confirm one exact Agent plan")
@@ -1098,6 +1105,55 @@ def _run_execute(args: argparse.Namespace, context, bridge) -> _CommandExit:
             signal.signal(signum, handler)
 
 
+def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
+    """Run the complete Agent workflow without returning to an LLM between phases."""
+    try:
+        workflow_steps = json.loads(args.workflow_json)
+    except json.JSONDecodeError as exc:
+        raise _CliArgumentError(f"workflow-json must be valid JSON: {exc.msg}") from exc
+    if not isinstance(workflow_steps, list) or not workflow_steps:
+        raise _CliArgumentError("workflow-json must be a non-empty array")
+
+    from robot_skill_cli.interactive_control import InteractiveControlError, InteractiveController
+
+    controller = InteractiveController(
+        bridge,
+        timeout_policy=context.view["timeout_policy"],
+        execution_mode=IMMEDIATE_AFTER_PRESENTATION,
+    )
+    interrupt_event = threading.Event()
+
+    def _handle_signal(signum, _frame) -> None:
+        interrupt_event.set()
+        controller.request_stop()
+
+    def _notify_authorized(confirmation: dict[str, Any]) -> None:
+        if os.environ.get("IBROBOT_HERMES_LIFECYCLE_SPEECH") != "1":
+            return
+        try:
+            from robot_skill_cli.hermes_lifecycle_speech import notify_plan_authorized
+
+            notify_plan_authorized(session_id=str(confirmation["task_id"]))
+        except (ImportError, KeyError, OSError, ValueError):
+            pass
+
+    previous_handlers: dict[int, Any] = {}
+    try:
+        terminal = controller.run(
+            args.raw_command,
+            workflow_steps,
+            presentation_callback=lambda presentation: print(
+                json_dumps({"event": "workflow_presentation", "data": presentation}), flush=True
+            ),
+            authorization_callback=_notify_authorized,
+            stop_event=interrupt_event,
+        )
+        print(json_dumps({"event": "workflow_terminal", "data": terminal}), flush=True)
+    except InteractiveControlError as exc:
+        raise _CommandError(exc.code, str(exc), exit_code=_agent_error_exit_code(exc.code)) from exc
+    return _CommandExit(_result_exit_code(terminal.get("result", terminal), agent=True))
+
+
 def _task_status(bridge, task_id: str, timeout_sec: float) -> dict[str, Any]:
     status = bridge.get_status(task_id=task_id, payload_hash="", timeout_sec=timeout_sec)
     if status["request_error_code"] in {"DUPLICATE_TASK_ID", "TASK_ID_CONFLICT"}:
@@ -1219,6 +1275,8 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
             return _run_cancel(args, context, bridge)
         if args.command == "plan-workflow":
             return _run_plan_workflow(args, context, bridge)
+        if args.command == "run-workflow":
+            return _run_workflow(args, context, bridge)
         if args.command == "validate-plan":
             return _run_validate_plan(args, context, bridge)
         if args.command == "confirm-plan":

@@ -20,6 +20,7 @@ from rclpy.node import Node
 from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
+from embodied_common.agent_execution_contract import validate_agent_execution_mode
 from embodied_common.agent_terminal_contract import stable_agent_execution_error_code
 from embodied_common.dispatch_binding import new_binding, workflow_step
 from embodied_common.skill_request import derive_skill_task_id
@@ -268,6 +269,7 @@ class AgentPlanNode(Node):
         message.registry_generation = plan.registry_generation
         message.registry_digest = plan.registry_digest
         message.expires_at.sec, message.expires_at.nanosec = plan.expires_at
+        message.execution_mode = plan.execution_mode
         return message
 
     @staticmethod
@@ -340,6 +342,7 @@ class AgentPlanNode(Node):
         try:
             if request.schema_version != 1:
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
+            execution_mode = validate_agent_execution_mode(request.execution_mode)
             status = self._gateway_status()
             catalog = self._catalog_view(status)
             steps = self._normalize_steps(request.workflow_steps, status, catalog)
@@ -352,6 +355,7 @@ class AgentPlanNode(Node):
                     registry_epoch=epoch,
                     registry_generation=generation,
                     registry_digest=digest,
+                    execution_mode=execution_mode,
                 )
             response.success = True
             response.plan = self._to_plan_message(plan)
@@ -400,6 +404,7 @@ class AgentPlanNode(Node):
         try:
             if request.schema_version != 1:
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
+            execution_mode = validate_agent_execution_mode(request.execution_mode)
             status = self._gateway_status()
             with self._store_lock:
                 plan = self._store.validate(
@@ -408,6 +413,8 @@ class AgentPlanNode(Node):
                     registry_generation=status.registry_generation,
                     registry_digest=status.registry_digest,
                 )
+            if plan.execution_mode != execution_mode:
+                raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "execution mode does not match the planned mode")
             response.plan_id = plan.plan_id
             response.plan_digest = plan.plan_digest
             first_error_code = ""
@@ -465,6 +472,7 @@ class AgentPlanNode(Node):
                 request.registry_digest,
             ):
                 raise AgentPlanError("SKILL_REGISTRY_VERSION_MISMATCH")
+            execution_mode = validate_agent_execution_mode(request.execution_mode)
             task_budget_sec = self._float32(request.task_budget_sec)
             if task_budget_sec > float(status.task_budget_sec):
                 raise AgentPlanError("TIMEOUT_EXCEEDS_POLICY")
@@ -477,6 +485,7 @@ class AgentPlanNode(Node):
                     registry_generation=request.registry_generation,
                     registry_digest=request.registry_digest,
                     task_budget_sec=task_budget_sec,
+                    execution_mode=execution_mode,
                 )
             response.confirmed = confirmation.confirmed
             response.confirmation_token = confirmation.confirmation_token

@@ -12,6 +12,10 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from embodied_common.agent_execution_contract import (
+    INTERACTIVE_CONFIRMATION,
+    validate_agent_execution_mode,
+)
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.workflow_contracts import CanonicalWorkflowStep, normalize_workflow_steps
 
@@ -47,6 +51,7 @@ class AgentPlan:
     registry_generation: int
     registry_digest: str
     expires_at: tuple[int, int]
+    execution_mode: str = INTERACTIVE_CONFIRMATION
 
     SINGLE_SKILL = 1
     WORKFLOW = 2
@@ -135,8 +140,13 @@ class AgentPlanStore:
         registry_epoch: str,
         registry_generation: int,
         registry_digest: str,
+        execution_mode: str = INTERACTIVE_CONFIRMATION,
     ) -> AgentPlan:
         self._purge()
+        try:
+            execution_mode = validate_agent_execution_mode(execution_mode)
+        except ValueError as exc:
+            raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
         if not request_id.strip() or not raw_command.strip() or not registry_epoch or not registry_digest:
             raise AgentPlanError("SKILL_SCHEMA_INVALID", "plan request fields are incomplete")
         try:
@@ -157,6 +167,7 @@ class AgentPlanStore:
                     registry_epoch=registry_epoch,
                     registry_generation=registry_generation,
                     registry_digest=registry_digest,
+                    execution_mode=execution_mode,
                 ):
                     return existing.plan
                 raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "request_id payload conflicts with the stored plan")
@@ -180,6 +191,7 @@ class AgentPlanStore:
             registry_generation=registry_generation,
             registry_digest=registry_digest,
             expires_at=_wall_time(self._wall_now() + self._ttl_sec),
+            execution_mode=execution_mode,
         )
         self._records[plan.plan_token] = _PlanRecord(
             plan=plan,
@@ -236,8 +248,15 @@ class AgentPlanStore:
         registry_generation: int,
         registry_digest: str,
         task_budget_sec: float,
+        execution_mode: str = INTERACTIVE_CONFIRMATION,
     ) -> PlanConfirmation:
         record = self._get_record(plan_token)
+        try:
+            execution_mode = validate_agent_execution_mode(execution_mode)
+        except ValueError as exc:
+            raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
+        if record.plan.execution_mode != execution_mode:
+            raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "execution mode does not match the planned mode")
         self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
         if not hmac.compare_digest(record.plan.plan_digest, plan_digest):
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan digest does not match")
@@ -474,6 +493,7 @@ def _plan_payload_matches(
     registry_epoch: str,
     registry_generation: int,
     registry_digest: str,
+    execution_mode: str,
 ) -> bool:
     return (
         plan.raw_command == raw_command
@@ -481,6 +501,7 @@ def _plan_payload_matches(
         and plan.registry_epoch == registry_epoch
         and plan.registry_generation == registry_generation
         and plan.registry_digest == registry_digest
+        and plan.execution_mode == execution_mode
     )
 
 

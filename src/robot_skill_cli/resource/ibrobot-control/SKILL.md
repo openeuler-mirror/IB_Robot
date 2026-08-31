@@ -37,16 +37,63 @@ must be parsed into finite numeric literals before creating one typed AgentPlan.
 plan. Compose new tasks by matching each Skill's input, output, precondition, and postcondition; do not search source or
 invent a special-case recipe while handling a task.
 
+## Skill Composition
+
+Treat Skills as typed operators, not as a list of user phrases:
+
+- `resolve_object_pose` provides a map pose `[x, y, yaw_degrees]`; it does not move or manipulate.
+- `nav_abs_coordinate` consumes that pose as literal `x`, `y`, `yaw`; it does not resolve names.
+- `nav_straight` consumes direction and distance; `nav_turn` consumes direction and angle.
+- `pick_object` consumes an object name and performs visual grasping at the current base pose.
+- `place_in_container` consumes a held object and container name and performs release/verification at the current base pose.
+- `recover_safe_pose` returns the arm to home and is the final step after successful placement.
+
+Use this generic routing:
+
+- Need an object's semantic position: `resolve_object_pose(target_name, stand_off_distance_m=0.0)`.
+- Need the base to approach an object for grasping: `resolve_object_pose(..., stand_off_distance_m=0.30)` ->
+  `nav_abs_coordinate` -> `pick_object`.
+- Need to approach a container for placement: `resolve_object_pose(..., stand_off_distance_m=0.30)` ->
+  `nav_abs_coordinate` -> `place_in_container`.
+- Need to transport an object: resolve the source and destination poses before motion -> navigate to source -> pick ->
+  navigate to destination -> place -> recover safe pose.
+
+Semantic queries are read-only single-skill calls performed before the motion plan. Their successful JSON pose results
+must be parsed into finite numeric literals before creating one typed AgentPlan. The current workflow has no
+`$previous.x`, `output_of`, or other runtime reference syntax; never put a placeholder or query step into the motion
+plan. Compose new tasks by matching each Skill's input, output, precondition, and postcondition; do not search source or
+invent a special-case recipe while handling a task.
+
 When launched by `hermes-robot`, the `robot-skill` executable on `PATH` is already bound to the preflighted robot config
 and ROS domain. Invoke that exact executable directly. Never source `.shrc_local` or another setup script, inspect or
 modify ROS/Python environment variables, search for robot configs or repositories, load `ibrobot-env`, use an absolute
 `robot-skill` path, or add `--config-name`/`--config-path`. On any nonzero exit, report the exact CLI error and stop; a
 failed command never proves that a status check completed.
 
-## Natural-Language Plan Workflow
+## Composite Workflow Entry
 
-Run natural-language motion requests in this order. Resolve required semantic values before freezing the motion plan;
-never put placeholders into `workflow-json`.
+For every normal natural-language motion request, use the deterministic composite entry:
+
+```text
+robot-skill run-workflow --text TEXT --workflow-json JSON
+```
+
+Hermes produces the complete typed workflow once. `run-workflow` then performs discovery, catalog
+visibility checks, planning, validation, presentation, confirmation, execution, and terminal-result
+collection internally in one controlled call. Do not call the lifecycle commands separately for the
+same normal request. They remain available for diagnostics and protocol tests.
+
+For a single-step request, use one flat typed step, for example:
+
+```bash
+robot-skill run-workflow --text "打开夹爪" \
+  --workflow-json '[{"schema_version":1,"skill_name":"open_gripper_skill"}]'
+```
+
+## Diagnostic Plan Workflow
+
+When explicitly testing the lifecycle commands directly, resolve required semantic values before freezing the motion
+plan and never put placeholders into `workflow-json`.
 
 1. Query the Gateway: `robot-skill status`.
 2. Discover capabilities: `robot-skill list-skills`.
@@ -79,13 +126,13 @@ Construct request IDs and task IDs directly in the conversation and `robot-skill
 approval, authorizes only that command and is not motion authorization. The displayed plan/task tuple is bound internally
 by `confirm-plan` immediately after the presentation flush.
 
-Natural-language single-Skill and Workflow requests both use the plan workflow above. The internal `confirm-plan` call is
+Natural-language single-Skill and Workflow requests use the composite entry above. The internal `confirm-plan` call is
 the Gateway's technical binding for the exact plan/task tuple, not a second user confirmation gate. For an explicitly
 selected single skill, the direct `describe -> validate -> execute` path remains valid.
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, or rejected validation.
 Do not invent parameters absent from `describe`.
-For an ordered multi-Skill request, call `plan-workflow` exactly once for the motion steps with the user's original
+For an ordered multi-Skill request, call `plan-workflow` exactly once with the user's original
 wording and typed steps. Read-only semantic queries needed to obtain literal coordinates happen before this call and
 are not workflow steps. The returned single plan must contain all ordered motion `workflow_steps`. If planning omits,
 reorders, or rejects a requested step, report that exact result and stop; do not retry alternate phrasings and do not
@@ -193,9 +240,7 @@ Example flow for "转向我" (requires a robot with a mobile base, e.g. lekiwi):
 2. Convert azimuth_rad (radians, REP-103: 0=front, +π/2=left, -π/2=right) to
    direction and degree: positive => left, negative => right;
    degree = abs(azimuth_rad) * 180 / pi  (e.g. 0.5236 rad => 30.0 degrees).
-3. `robot-skill describe nav_turn` (confirm it takes `direction` and `degree`)
-4. `robot-skill plan-workflow --workflow-json '[{"schema_version":2,"skill_name":"nav_turn","direction":"left","degree":30.0}]'`
-5. validate-plan -> confirm-plan -> execute-plan as usual.
+3. `robot-skill run-workflow --text "转向我" --workflow-json '[{"schema_version":2,"skill_name":"nav_turn","direction":"left","degree":30.0}]'`
 
 Do **not** map "转向我" to `rotate_gripper_cw`/`rotate_gripper_ccw` — those
 rotate the wrist/gripper, not the robot base, and will not face the user.

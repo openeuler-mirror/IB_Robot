@@ -27,6 +27,10 @@ source .shrc_local
 
 `.shrc_local` 是 ROS+venv+install overlay 的 SSOT 入口（见 `AGENTS.md` 环境初始化章节），无需重复 `source install/setup.bash`。
 
+`run-workflow` 会先完成 exact plan 的展示回调并 flush 输出，再执行内部技术 confirm；展示失败或收到停止请求时不会
+进入运动执行。`immediate_after_presentation` 只取消二次用户确认等待，不绕过 Gateway validation、operator
+`authorize_motion` 或 action admission。
+
 每个命令可用 `--config-name NAME` 选择配置，或用 `--config-path PATH` 指向 YAML；两个 flag 在 CLI 中互斥。
 配置解析完全复用 `robot_config.resolve_robot_config_path()`，CLI 不维护第二套路径优先级：底层选择顺序是
 显式 path、显式 name、`ROBOT_CONFIG`、`ROBOT_NAME`、默认 `so101_single_arm`。按名称先查安装目录，再查
@@ -47,6 +51,7 @@ source .shrc_local
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
 | `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 提交一份短时 typed Agent plan |
+| `run-workflow --text TEXT --workflow-json JSON` | 是 | 展示后按显式 immediate admission policy 自动执行 |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
 | `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
 | `execute-plan ... --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 执行已确认的 Agent plan，并以展示过的 tuple 校验终态 |
@@ -193,7 +198,10 @@ CLI 与运行中 Gateway 必须使用相同的视觉游戏 `config_digest`。sta
 4. `validate SKILL`
 5. `execute SKILL --task-id ID`
 
-自然语言计划必须按以下顺序工作：
+以下分阶段顺序仅用于诊断、协议测试和明确的低层集成调试。正常 Hermes 自然语言运动请求不得逐个调用这些
+命令，必须使用上文的 `run-workflow` 单一复合入口。
+
+在明确进行分阶段协议测试时，顺序为：
 
 1. `plan-workflow --text TEXT --workflow-json JSON --request-id ID`
 2. `validate-plan --plan-token TOKEN`
@@ -302,8 +310,8 @@ hermes-robot --config-name so101_single_arm --mode both
 `motion_authorized=false` 不阻止 Hermes 启动，只会继续由 Gateway 拒绝运动。启动器仅设置精确
 `ROBOT_CONFIG` 并预加载 `ibrobot-control`；它不会启动/重启 pipeline、修改 ROS 参数或开启运动授权。
 进入 Hermes 会话后只调用启动器注入到 `PATH` 的 `robot-skill`，不得再传 `--config-name` 或
-`--config-path`。自然语言抓取与其他 motion Skill 使用同一套
-`status -> list-skills -> plan-workflow -> describe -> validate-plan -> confirm-plan -> execute-plan` 生命周期；
+`--config-path`。自然语言抓取与其他 motion Skill 使用统一的 `run-workflow` 复合入口；该入口内部完成
+`status -> catalog -> plan -> validate -> present/flush -> confirm -> execute` 生命周期；
 抓取计划使用 `pick_object` 和必填的 `target_name`，Gateway 再将其委派给配置绑定的 `grasp_pipeline`。
 
 运动 catalog 的 `reload-catalog` 是显式、受控的运行时 snapshot 切换，不是自动监听文件。视觉游戏当前
@@ -354,14 +362,13 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
   写入 profile/SOUL.md，`skip` 不修改 SOUL；`replace` 会先备份。
 - 把 `ibrobot-control` Skill 幂等注册到 `profile/skills/`，仅替换带 `robot_skill_cli` 所有权标记
   的副本，遇到同名用户自管 skill 时以 `AGENT_SKILL_CONFLICT` 退出。
-- 生成两个 wrapper 与一个环境文件：`profile/ibrobot/bin/robot-skill`（绑定 `ROBOT_CONFIG` 并 source
-  `.shrc_local`）、`profile/hooks/ibrobot-speak`（TTS hook）和 `profile/ibrobot/ibrobot-env.sh`
-  （写入 `terminal.shell_init_files` 并把 `auto_source_bashrc` 置 `false`，使 managed 环境优先于
-  用户 bashrc）。三者全部 source workspace `.shrc_local`，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
-- 安装 `post_llm_call` speech hook（`ibrobot-speak`），移除同路径旧 managed 副本；
-  `--disable-speech` 仅移除 speech hook。
-- 移除已退役的 `ibrobot-robot-control` Plugin 副本（即时执行改由 `robot-skill` 的
-  `confirm-plan` + `execute-plan` 承担），并清理 `external_dirs` 缓存目录下同名的 stale skill 副本。
+- 生成 `robot-skill`、最终回复 speech、生命周期 speech 和 interim speech wrapper，以及一个环境文件；
+  所有 wrapper 都 source workspace `.shrc_local`，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
+  interim wrapper 还绑定当前 Hermes profile 的 `ibrobot-speak` 路径。
+- 安装 `post_llm_call`、生命周期和 `on_interim_message` speech hook，移除对应的旧 managed 副本；
+  `--disable-speech` 移除全部受管 speech hook。
+- 移除已退役的 `ibrobot-robot-control` Plugin 副本（即时执行改由 `robot-skill run-workflow` 的
+  显式 `immediate_after_presentation` 模式承担），并清理 `external_dirs` 缓存目录下同名的 stale skill 副本。
   Plugin 目录只在带 `hermes-robot-configure` managed 标记时才会被 quarantine（重命名），
   不删除无标记或用户自管内容。
 - `--accept-hooks` 先调用 `hermes hooks revoke` 清理旧 mtime（首次安装无既有审批时经

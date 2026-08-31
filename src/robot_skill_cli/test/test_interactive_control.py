@@ -142,8 +142,13 @@ class FakeBridge:
         self._record("get_skill_snapshot", {"registry_epoch": registry_epoch, "generation": generation})
         return dict(self.snapshot)
 
-    def plan_agent_command(self, *, request_id, raw_command, workflow_steps, timeout_sec):
-        self._record("plan_agent_command", {"request_id": request_id, "raw_command": raw_command})
+    def plan_agent_command(
+        self, *, request_id, raw_command, workflow_steps, timeout_sec, execution_mode="interactive_confirmation"
+    ):
+        self._record(
+            "plan_agent_command",
+            {"request_id": request_id, "raw_command": raw_command, "execution_mode": execution_mode},
+        )
         self.plan_result["plan_id"] = "pid-" + request_id
         self.plan_result["completed_step_count"] = len(workflow_steps)
         return {
@@ -158,6 +163,7 @@ class FakeBridge:
                 "registry_epoch": "epoch-1",
                 "registry_generation": 1,
                 "registry_digest": "regdig",
+                "execution_mode": execution_mode,
             },
             "error_code": "",
             "message": "",
@@ -175,8 +181,26 @@ class FakeBridge:
             "message": "",
         }
 
-    def confirm_agent_plan(self, *, plan_token, plan_digest, task_id, status, task_budget_sec, timeout_sec):
-        self._record("confirm_agent_plan", {"plan_token": plan_token, "plan_digest": plan_digest, "task_id": task_id})
+    def confirm_agent_plan(
+        self,
+        *,
+        plan_token,
+        plan_digest,
+        task_id,
+        status,
+        task_budget_sec,
+        timeout_sec,
+        execution_mode="interactive_confirmation",
+    ):
+        self._record(
+            "confirm_agent_plan",
+            {
+                "plan_token": plan_token,
+                "plan_digest": plan_digest,
+                "task_id": task_id,
+                "execution_mode": execution_mode,
+            },
+        )
         if self.confirm_hook is not None:
             self.confirm_hook()
         return {
@@ -292,7 +316,7 @@ def test_prepare_then_confirm_presentation_and_nl_grammar(rig):
     assert presentation["steps"][0]["skill_name"] == "nod_yes"
     assert presentation["plan_digest"] == "pdig"
     assert presentation["task_id"] == "id-2"
-    assert presentation["execution_mode"] == "immediate_after_presentation"
+    assert presentation["execution_mode"] == "interactive_confirmation"
 
     # Open grammar must not confirm.
     with pytest.raises(ic.NotConfirmedError):
@@ -356,6 +380,47 @@ def test_run_executes_immediately_after_required_presentation(rig):
     assert "get_agent_plan_result" in methods
 
 
+def test_run_uses_explicit_immediate_execution_mode(rig):
+    controller, bridge = rig
+    controller = ic.InteractiveController(
+        bridge,
+        timeout_policy={"rpc_timeout_sec": 5.0},
+        execution_mode="immediate_after_presentation",
+        view_resolver=lambda _snapshot, _status: {
+            "robot_name": "test",
+            "capability_digest": "capdig",
+            "skills": bridge.status["capabilities"],
+        },
+    )
+    bridge.result_future = FakeFuture(None, done=True)
+    bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
+
+    controller.run("点个头", [_step("nod_yes")], presentation_callback=lambda _presentation: None)
+
+    plan_call = next(call for method, call in bridge.calls if method == "plan_agent_command")
+    confirm_call = next(call for method, call in bridge.calls if method == "confirm_agent_plan")
+    assert plan_call.get("execution_mode") == "immediate_after_presentation"
+    assert confirm_call.get("execution_mode") == "immediate_after_presentation"
+
+
+def test_run_notifies_authorization_before_goal_submission(rig):
+    controller, bridge = rig
+    bridge.result_future = FakeFuture(None, done=True)
+    bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
+    events = []
+
+    controller.run(
+        "点个头",
+        [_step("nod_yes")],
+        presentation_callback=lambda _presentation: None,
+        authorization_callback=lambda _confirmation: events.append([method for method, _ in bridge.calls]),
+    )
+
+    assert events
+    assert "confirm_agent_plan" in events[0]
+    assert "send_agent_plan_goal" not in events[0]
+
+
 def test_run_presents_before_internal_confirm_and_goal_send(rig):
     controller, bridge = rig
     bridge.result_future = FakeFuture(None, done=True)
@@ -372,6 +437,19 @@ def test_run_presents_before_internal_confirm_and_goal_send(rig):
     assert "validate_agent_plan" not in methods_at_presentation
     assert "confirm_agent_plan" not in methods_at_presentation
     assert "send_agent_plan_goal" not in methods_at_presentation
+
+
+def test_run_does_not_confirm_when_presentation_requests_stop(rig):
+    controller, bridge = rig
+
+    result = controller.run(
+        "点个头",
+        [_step("nod_yes")],
+        presentation_callback=lambda _presentation: controller.request_stop(),
+    )
+
+    assert result["state"] == ic.STOPPED
+    assert "confirm_agent_plan" not in [method for method, _ in bridge.calls]
 
 
 def test_run_no_gate_stop_interrupts(rig):

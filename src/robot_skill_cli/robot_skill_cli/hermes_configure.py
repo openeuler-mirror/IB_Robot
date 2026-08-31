@@ -221,6 +221,22 @@ def _lifecycle_hook_wrapper(*, workspace: Path, shrc: Path) -> str:
     )
 
 
+def _interim_hook_wrapper(*, workspace: Path, shrc: Path, speaker_path: Path | None = None) -> str:
+    speaker = speaker_path or workspace / "build/robot_skill_cli/hermes-speak"
+    return "\n".join(
+        (
+            "#!/usr/bin/env bash",
+            "set -eo pipefail",
+            _MANAGED_FILE_HEADER,
+            f"cd {shlex.quote(str(workspace))}",
+            f"source {shlex.quote(str(shrc))} >/dev/null",
+            f"export IBROBOT_INTERIM_SPEAKER={shlex.quote(str(speaker))}",
+            "exec python3 -m robot_skill_cli.hermes_interim_speech",
+            "",
+        )
+    )
+
+
 def _robot_skill_wrapper(*, workspace: Path, shrc: Path, config_path: Path, ros_domain_id: str) -> str:
     return "\n".join(
         (
@@ -239,6 +255,7 @@ def _robot_skill_wrapper(*, workspace: Path, shrc: Path, config_path: Path, ros_
             f"source {shlex.quote(str(shrc))} >/dev/null",
             f"export ROS_DOMAIN_ID={shlex.quote(ros_domain_id)}",
             f"export ROBOT_CONFIG={shlex.quote(str(config_path))}",
+            "export IBROBOT_HERMES_LIFECYCLE_SPEECH=1",
             'exec python3 -m robot_skill_cli.cli --config-path "$ROBOT_CONFIG" "$@"',
             "",
         )
@@ -373,6 +390,7 @@ def _update_config(
     hook_path: Path,
     speech_enabled: bool,
     lifecycle_hook_path: Path | None = None,
+    interim_hook_path: Path | None = None,
 ) -> dict[str, Any]:
     plugins = config.setdefault("plugins", {})
     if not isinstance(plugins, dict):
@@ -430,6 +448,17 @@ def _update_config(
                 hooks[event] = entries
             else:
                 hooks.pop(event, None)
+    if interim_hook_path is not None:
+        entries = hooks.get("on_interim_message", [])
+        if not isinstance(entries, list):
+            raise ConfigureError("Hermes hooks.on_interim_message must be a list")
+        entries = [entry for entry in entries if not _is_managed_hook(entry, interim_hook_path)]
+        if speech_enabled:
+            entries.append({"command": str(interim_hook_path), "timeout": 2})
+        if entries:
+            hooks["on_interim_message"] = entries
+        else:
+            hooks.pop("on_interim_message", None)
     return config
 
 
@@ -508,6 +537,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         profile_config_path = profile / "config.yaml"
         hook_path = profile / "hooks" / "ibrobot-speak"
         lifecycle_hook_path = profile / "hooks" / "ibrobot-lifecycle-speech"
+        interim_hook_path = profile / "hooks" / "ibrobot-interim-speech"
         environment_file = profile / "ibrobot" / "ibrobot-env.sh"
         profile_bin = profile / "ibrobot" / "bin"
         robot_skill_path = profile_bin / "robot-skill"
@@ -522,6 +552,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             synthesis_timeout_sec=robot.voice_tts.synthesis_timeout_sec,
         )
         desired_lifecycle_hook = _lifecycle_hook_wrapper(workspace=workspace, shrc=shrc)
+        desired_interim_hook = _interim_hook_wrapper(workspace=workspace, shrc=shrc, speaker_path=hook_path)
         desired_environment = _shell_environment(
             workspace=workspace,
             shrc=shrc,
@@ -542,6 +573,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             environment_file=environment_file,
             hook_path=hook_path,
             lifecycle_hook_path=lifecycle_hook_path,
+            interim_hook_path=interim_hook_path,
             speech_enabled=not args.disable_speech,
         )
         soul_changed, soul_backup = _sync_soul(profile, resource, args.soul_mode, dry_run=args.dry_run)
@@ -564,12 +596,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 or lifecycle_hook_path.read_text(encoding="utf-8") != desired_lifecycle_hook
             )
         )
+        interim_changed = (
+            interim_hook_path.is_file()
+            if args.disable_speech
+            else not interim_hook_path.is_file()
+            or interim_hook_path.read_text(encoding="utf-8") != desired_interim_hook
+        )
         writes_needed = (
             not skill_target.is_file()
             or skill_target.read_bytes()
             != (install_prefix / "share/robot_skill_cli/skills/ibrobot-control/SKILL.md").read_bytes()
             or hook_changed
             or lifecycle_changed
+            or interim_changed
             or plugin_removal_needed
             or not environment_file.is_file()
             or environment_file.read_text(encoding="utf-8") != desired_environment
@@ -595,9 +634,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.disable_speech:
             hook_path.unlink(missing_ok=True)
             lifecycle_hook_path.unlink(missing_ok=True)
+            interim_hook_path.unlink(missing_ok=True)
         else:
             _atomic_write(hook_path, desired_hook, executable=True)
             _atomic_write(lifecycle_hook_path, desired_lifecycle_hook, executable=True)
+            _atomic_write(interim_hook_path, desired_interim_hook, executable=True)
         if _yaml_config(profile_config_path) != desired_config:
             config_backup = _backup(profile_config_path)
             _write_yaml(profile_config_path, desired_config)
@@ -605,7 +646,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             config_backup = None
 
         if args.accept_hooks and not args.disable_speech:
-            _approve_hooks(hermes, [hook_path, lifecycle_hook_path])
+            _approve_hooks(hermes, [hook_path, lifecycle_hook_path, interim_hook_path])
         if args.restart_gateway:
             result = _run([hermes, "gateway", "restart"], timeout=60.0)
             if result.returncode != 0:

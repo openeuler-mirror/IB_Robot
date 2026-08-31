@@ -57,6 +57,7 @@ def extract_response(payload: dict[str, Any]) -> str:
 
 
 _ASCII_LETTER_RUN = re.compile(r"[A-Za-z]+")
+_LONG_DIGIT_RUN = re.compile(r"\d{7,}")
 
 
 def sanitize_for_tts(text: str) -> str:
@@ -68,7 +69,8 @@ def sanitize_for_tts(text: str) -> str:
     preserved and the service-side segmenter inserts pauses as needed.
     """
     normalized = unicodedata.normalize("NFKC", text)
-    return _ASCII_LETTER_RUN.sub("", normalized)
+    normalized = _ASCII_LETTER_RUN.sub("", normalized)
+    return _LONG_DIGIT_RUN.sub("", normalized)
 
 
 def _positive_float_env(name: str, default: float) -> float:
