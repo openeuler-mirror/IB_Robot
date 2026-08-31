@@ -108,6 +108,10 @@ EPISODE_DIR_PREFIX = "episode_"
 EPISODE_DIR_WIDTH = 6
 DATASET_LAYOUT_VERSION = 1
 DEFAULT_DATASET_NAME = "dataset"
+# Last-resort location only. Both the launch builder and the robot config's
+# `recording` section normally supply a durable path; /tmp does not survive a
+# reboot, so anything landing here is a misconfiguration worth noticing.
+DEFAULT_BAG_BASE_DIR = "/tmp/episodes"
 
 
 def _utc_now_iso() -> str:
@@ -120,6 +124,36 @@ def _sanitize_dataset_name(value: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     normalized = normalized.strip("._-")
     return normalized or DEFAULT_DATASET_NAME
+
+
+def _resolve_dataset_location(
+    *,
+    bag_base_param: str,
+    dataset_name_param: str,
+    recording_section: dict,
+    contract_robot_type: str,
+    config_stem: str,
+) -> tuple[Path, str]:
+    """Resolve where episodes are written, in descending order of precedence.
+
+    1. Explicit ROS parameters. ``launch_builders/recording.py`` passes both
+       for DDS-only recording, and an operator override must still win.
+    2. The ``recording`` section of the robot config, which is the SSOT.
+    3. ``DEFAULT_BAG_BASE_DIR`` plus the contract robot type.
+
+    Step 2 exists because RTP recording never goes through the launch builder:
+    ``recording_node`` constructs this server in-process, so without the config
+    fallback the recorder silently lands in ``/tmp`` and the episodes are lost
+    on the next reboot.
+    """
+    bag_base = bag_base_param.strip() or str(recording_section.get("bag_base_dir") or "") or DEFAULT_BAG_BASE_DIR
+    dataset_name = (
+        dataset_name_param.strip()
+        or str(recording_section.get("dataset_name") or "")
+        or contract_robot_type
+        or config_stem
+    )
+    return Path(bag_base).expanduser(), _sanitize_dataset_name(dataset_name)
 
 
 # ------------------------------ Dataclasses ----------------------------
@@ -235,7 +269,9 @@ class EpisodeRecorderServer(Node):
 
         # Parameters
         self.declare_parameter("robot_config_path", "")
-        self.declare_parameter("bag_base_dir", "/tmp/episodes")
+        # Empty means "not set", so the robot config's `recording` section can
+        # supply it; see _resolve_dataset_location for the precedence order.
+        self.declare_parameter("bag_base_dir", "")
         self.declare_parameter("dataset_name", "")
         self.declare_parameter("control_mode", "")
         self.declare_parameter("default_task", "")
@@ -247,10 +283,6 @@ class EpisodeRecorderServer(Node):
         self.declare_parameter("max_cache_size", DEFAULT_MAX_CACHE_SIZE)
         self.declare_parameter("storage_preset_profile", "")  # e.g., "zstd_fast"
         self.declare_parameter("storage_config_uri", "")  # file:// or path
-
-        bag_base = self.get_parameter("bag_base_dir").get_parameter_value().string_value
-        self._bag_base = Path(bag_base).expanduser().resolve()
-        self._bag_base.mkdir(parents=True, exist_ok=True)
 
         # Load contract from robot_config_path (Single Source of Truth)
         robot_config_path = self.get_parameter("robot_config_path").get_parameter_value().string_value
@@ -266,11 +298,17 @@ class EpisodeRecorderServer(Node):
         else:
             raise RuntimeError("The 'robot_config_path' parameter is required.")
 
-        dataset_name_param = self.get_parameter("dataset_name").get_parameter_value().string_value
-        fallback_dataset_name = (
-            dataset_name_param or getattr(self._contract, "robot_type", "") or self._robot_config_path.stem
+        # Resolved after the config is loaded so the `recording` section can act
+        # as the fallback; RTP recording never passes these as parameters.
+        bag_base, self._dataset_name = _resolve_dataset_location(
+            bag_base_param=self.get_parameter("bag_base_dir").get_parameter_value().string_value,
+            dataset_name_param=self.get_parameter("dataset_name").get_parameter_value().string_value,
+            recording_section=robot_config.get("recording") or {},
+            contract_robot_type=getattr(self._contract, "robot_type", ""),
+            config_stem=self._robot_config_path.stem,
         )
-        self._dataset_name = _sanitize_dataset_name(fallback_dataset_name)
+        self._bag_base = bag_base.resolve()
+        self._bag_base.mkdir(parents=True, exist_ok=True)
         self._control_mode = self.get_parameter("control_mode").get_parameter_value().string_value
         self._default_task = self.get_parameter("default_task").get_parameter_value().string_value
         self._task_family = self.get_parameter("task_family").get_parameter_value().string_value
