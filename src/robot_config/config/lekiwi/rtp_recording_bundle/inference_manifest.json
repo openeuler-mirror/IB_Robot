@@ -1,0 +1,49 @@
+{
+  "schema_version": 3,
+  "bundle": {
+    "uuid": "8f2cb853-b262-4d72-a41d-b15b97e6e320",
+    "revision": 1,
+    "name": "lekiwi-rtp-recording-metadata",
+    "files": [
+      {
+        "path": "config.json"
+      },
+      {
+        "path": "policy_postprocessor.json"
+      },
+      {
+        "path": "policy_preprocessor.json"
+      }
+    ],
+    "digest": {
+      "algorithm": "sha256",
+      "scope": "structure",
+      "value": "12bdb891a89cd67a251b646c0657b27f7f3de16d374bf56a4673deeab5fb46ec"
+    }
+  },
+  "model": {
+    "interface": "policy",
+    "model_type": "act",
+    "operation": "predict"
+  },
+  "deployments": {
+    "recording": {
+      "uuid": "a1a42a6d-cd71-4cb3-8680-00ebc18b37d5",
+      "revision": 1,
+      "execution_contract": {
+        "state_scope": "request",
+        "execution_structure": "direct",
+        "cancellation_granularity": "request_boundary"
+      },
+      "runtime_profile": {
+        "backend": "torch",
+        "target": {
+          "runtime": "torch"
+        },
+        "profile": {
+          "device": "cpu"
+        }
+      }
+    }
+  }
+}

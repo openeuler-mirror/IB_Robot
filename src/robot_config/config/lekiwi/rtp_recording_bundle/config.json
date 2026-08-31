@@ -1,0 +1,27 @@
+{
+  "type": "act",
+  "n_obs_steps": 1,
+  "input_features": {
+    "observation.state": {
+      "type": "STATE",
+      "shape": [9]
+    },
+    "observation.images.front": {
+      "type": "VISUAL",
+      "shape": [3, 480, 640]
+    },
+    "observation.images.wrist": {
+      "type": "VISUAL",
+      "shape": [3, 480, 640]
+    }
+  },
+  "output_features": {
+    "action": {
+      "type": "ACTION",
+      "shape": [9]
+    }
+  },
+  "device": "cpu",
+  "chunk_size": 1,
+  "n_action_steps": 1
+}

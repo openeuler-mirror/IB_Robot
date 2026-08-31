@@ -1,0 +1,489 @@
+# LeKiwi Mobile Manipulator - Teleoperated data collection with RTP video
+#
+# The LeKiwi counterpart of so101_rtp_distributed, with a mobile base added.
+# A human drives the robot while a recorder on another host assembles episodes
+# from everything the contract declares. One episode needs all three streams,
+# not just the video:
+#
+#   robot host                                          recorder host
+#   ----------                                          -------------
+#   front / wrist cameras -> H.264 encode ----RTP-----> observation.images.*
+#   /joint_states ----------------------------DDS-----> observation.state
+#   arm / gripper / base commands ------------DDS-----> action
+#
+# Video takes RTP because raw 640x480 rgb8 at 30 Hz is about 27 MB/s per
+# camera and saturates a wireless link; states and commands are small enough
+# to stay on DDS. The recorder pairs them by timestamp, so losing either side
+# yields an unusable episode.
+#
+# BEFORE USE set every `transport.endpoint.host` below to the recorder host's
+# address on the robot network. An unreachable address fails silently: the
+# sender keeps reporting a healthy stream while the receiver records a
+# zero-byte .h264.
+#
+# WHERE THE TELEOPERATION HARDWARE LIVES
+#
+# The leader arm and the gamepad are operator hardware, and they are commonly
+# plugged into the operator's workstation rather than the robot host. This
+# file therefore ships with `teleoperation.enabled: false`, which is the safe
+# default: only enable it on the machine the leader arm and gamepad are
+# actually attached to.
+#
+#   - Leader arm and gamepad on the robot host: set `teleoperation.enabled`
+#     to true here and `robot.launch.py` starts the whole teleop stack.
+#   - Leader arm and gamepad on a separate workstation (the common case):
+#     leave it false here, keep this same file on both ends so the contract
+#     fingerprint matches, and start the teleop stack on the workstation.
+#
+# The teleoperation block is not part of the contract fingerprint, so the two
+# ends may legitimately disagree on it. Enabling it on a host that has no
+# leader arm makes teleop_node open the follower's serial port, which
+# ros2_control already holds.
+
+robot:
+  name: lekiwi_rtp_distributed
+  type: lekiwi
+  robot_type: lekiwi  # For LeRobot dataset metadata
+
+  # ============================================
+  # Unified joint definitions (Single Source of Truth)
+  # ============================================
+  joints:
+    arm:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+    gripper:
+      - "6"
+    all: ["1", "2", "3", "4", "5", "6"]
+
+  # Control mode management
+  default_control_mode: "teleop"
+
+  control_modes:
+    teleop:
+      description: "Human teleoperation mode (leader arm + gamepad base)"
+      description_cn: "人工遥操作模式（leader arm + 手柄底盘）"
+      controllers:
+        - joint_state_broadcaster
+        - arm_position_controller
+        - gripper_position_controller
+        - base_velocity_controller
+      # The pipeline owns the video encoder and the RTP sender, so it has to be
+      # enabled even though teleoperation runs no policy. `executor.enabled:
+      # false` below keeps it from ever driving the robot.
+      #
+      # model_path is resolved against $WORKSPACE when relative, and does not
+      # expand $(find ...). Recording needs no weights, only the metadata the
+      # pipeline validates the contract against, so copy the ready-made bundle
+      # this package ships:
+      #
+      #   mkdir -p "$WORKSPACE/models"
+      #   cp -r "$(ros2 pkg prefix robot_config)/share/robot_config/config/lekiwi/rtp_recording_bundle" \
+      #         "$WORKSPACE/models/lekiwi_rtp_recording"
+      inference:
+        enabled: true
+        pipelines:
+          policy:
+            model_path: models/lekiwi_rtp_recording
+            deployment: recording
+            execution_mode: distributed
+            request_timeout: 5.0
+      executor:
+        enabled: false
+        type: topic
+        mode: teleop
+        inference_pipeline: policy
+        queue_size: 100
+        control_frequency: 50.0
+
+  # ============================================
+  # Voice ASR Configuration
+  # ============================================
+  voice_asr:
+    enabled: false
+    active_mode: continuous
+    language: zh
+    model_path: models/voice_asr/sherpa-onnx-streaming-paraformer-zh
+    model_type: streaming
+    auto_download_model: true
+    publish_partial: true
+    output_topic: /voice_command
+    device_index: 9
+
+  # ============================================
+  # Navigation Configuration
+  # ============================================
+  navigation:
+    enabled: true
+
+    robot_description:
+      urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+
+    nav2_bringup:
+      enabled: false
+      map_file: "~/workspace/map/rtabmap.yaml"
+      params_file: ""
+
+    ekf_rtabmap:
+      enabled: false
+      rtabmap:
+        database_path: "~/workspace/map/rtabmap.db"
+        localization: true
+        frame_id: realsense_link
+        odom_frame_id: odom
+        # RealSense 通过 peripherals 启动，RGB 话题已重映射
+        rgb_topic: /camera/realsense_camera/color/image_raw
+        depth_topic: /camera/realsense_camera/aligned_depth_to_color/image_raw
+        camera_info_topic: /camera/realsense_camera/color/camera_info
+        approx_sync: true
+        queue_size: 20
+        rtabmap_args: "--Mem/InitWMWithAllNodes true --Mem/IncrementalMemory true --Mem/PermanentMemory false --Mem/STMSize 8 --Reg/Force3DoF true"
+        log_level: error
+      ekf:
+        config_file: ""
+
+    cmd_vel_bridge:
+      enabled: true
+      wheel_radius: 0.05
+      base_radius: 0.125
+      max_radps: 4.602  # Max wheel angular velocity (rad/s), matches base_vel_max_rad
+      odom_frame: odom
+      base_frame: base_link
+      publish_tf: false
+      control_frequency: 50.0
+      cmd_timeout: 0.2
+      cmd_vel_topic: /cmd_vel
+      joint_states_topic: /joint_states
+      odom_topic: /odom
+
+    robot_navigation:
+      enabled: false
+      enable_voice_control: true
+      keywords_file: ""
+      global_frame: map
+      enable_feedback: true
+      trigger_evaluation: false
+      destinations:
+        point_a:
+          x: 0.0
+          y: 0.2
+          theta: 1.5708  # rad (90 deg)
+        point_b:
+          x: 0.2
+          y: 0.0
+          theta: 0.0
+        origin:
+          x: 0.0
+          y: 0.0
+          theta: 0.0
+
+    rviz:
+      enabled: false
+      config_file: ""
+
+  simulation:
+    platform: gazebo
+    scene: null
+
+  # ============================================
+  # ros2_control
+  # ============================================
+  ros2_control:
+    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
+    port: /dev/ttyACM0
+    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+    joint_names: ["1", "2", "3", "4", "5", "6"]
+    velocity_joints: ["7", "8", "9"]
+    # Max base velocity in physical units (rad/s).
+    # Equivalent to the former base_vel_max_raw=3000 (≈4.602 rad/s).
+    # ros2_control velocity controller commands are in rad/s;
+    # lekiwi_hardware converts rad/s → raw steps/s for the STS3215 motors.
+    base_vel_max_rad: 4.602
+    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+    controllers_config: $(find lekiwi_hardware)/config/lekiwi_controllers.yaml
+
+  # ============================================
+  # Peripheral devices
+  # ============================================
+  peripherals:
+    - type: camera
+      name: front
+      driver: opencv
+      index: 0
+      width: 640
+      height: 480
+      fps: 30
+      fovy: 60
+      pixel_format: mjpeg2rgb
+      frame_id: camera_front_frame
+      optical_frame_id: camera_front_optical_frame
+      brightness: -1
+      contrast: -1
+      saturation: -1
+      autoexposure: true
+      exposure: -1
+      auto_white_balance: true
+      white_balance: -1
+      transform:
+        parent_frame: base_link
+        x: 0.1
+        y: 0.2
+        z: 0.0
+        roll: -1.5708
+        pitch: 0.0
+        yaw: 0.0
+
+    - type: camera
+      name: wrist
+      driver: opencv
+      index: 2
+      width: 640
+      height: 480
+      fps: 30
+      fovy: 60
+      pixel_format: mjpeg2rgb
+      frame_id: camera_wrist_frame
+      optical_frame_id: camera_wrist_optical_frame
+      brightness: -1
+      contrast: -1
+      saturation: -1
+      autoexposure: true
+      exposure: -1
+      auto_white_balance: true
+      white_balance: -1
+      transform:
+        parent_frame: gripper
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+
+    # RealSense 深度相机（用于导航定位）
+    # camera_name=realsense → 驱动 TF 帧：realsense_link -> realsense_color_optical_frame
+  # ============================================
+  # Contract - I/O mapping for policy inference
+  # ============================================
+  contract:
+    rate_hz: 30
+    max_duration_s: 600.0
+
+    observations:
+      # Front camera image, encoded on the edge and streamed over RTP.
+      - key: observation.images.front
+        topic: /camera/front/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: front
+        image:
+          resize: [480, 640]
+          encoding: rgb8
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+        transport:
+          mode: rtp
+          stream_id: front
+          # Operator station address; see the note at the top of this file.
+          endpoint: {host: 192.0.2.1, port: 5004}
+          codec: h264
+          h264: {profile: main, bitrate_bps: 2500000, gop_frames: 15}
+          # encoder_backend is part of the contract fingerprint, so the sender
+          # and the receiver must agree on it or every descriptor is rejected.
+          encoder_backend: software
+          decoder_backend: software
+          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
+          buffer:
+            sender_queue_frames: 2
+            receiver_queue_packets: 512
+            decoded_frame_capacity: 4
+            retention_ms: 1500
+          readiness:
+            keyframe_timeout_ms: 5000
+            timestamp_mapping_max_age_ms: 1500
+            max_inter_camera_skew_ms: 200
+          recording: {integrity_mode: tolerant}
+          security: none
+
+      # Wrist camera image, same transport on the next RTP port.
+      - key: observation.images.wrist
+        topic: /camera/wrist/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: wrist
+        image:
+          resize: [480, 640]
+          encoding: rgb8
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+        transport:
+          mode: rtp
+          stream_id: wrist
+          endpoint: {host: 192.0.2.1, port: 5006}
+          codec: h264
+          h264: {profile: main, bitrate_bps: 2500000, gop_frames: 15}
+          encoder_backend: software
+          decoder_backend: software
+          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
+          buffer:
+            sender_queue_frames: 2
+            receiver_queue_packets: 512
+            decoded_frame_capacity: 4
+            retention_ms: 1500
+          readiness:
+            keyframe_timeout_ms: 5000
+            timestamp_mapping_max_age_ms: 1500
+            max_inter_camera_skew_ms: 200
+          recording: {integrity_mode: tolerant}
+          security: none
+
+      # Joint state: 6 arm/gripper positions + 3 base velocities
+      # Published by ros2_control joint_state_broadcaster
+      # dot_get format: "<ros_field>.<joint_name>" where ros_field = position | velocity
+      - key: observation.state
+        topic: /joint_states
+        type: sensor_msgs/msg/JointState
+        selector:
+          names:
+            - "position.1"
+            - "position.2"
+            - "position.3"
+            - "position.4"
+            - "position.5"
+            - "position.6"
+            - "velocity.7"
+            - "velocity.8"
+            - "velocity.9"
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+
+    actions:
+      # Arm joints (5) via ros2_control position controller
+      - key: action
+        selector:
+          names:
+            - "action.0"
+            - "action.1"
+            - "action.2"
+            - "action.3"
+            - "action.4"
+        publish:
+          topic: /arm_position_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+        safety_behavior: hold
+
+      # Gripper (1) via ros2_control position controller
+      - key: action
+        selector:
+          names:
+            - "action.5"
+        publish:
+          topic: /gripper_position_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+        safety_behavior: hold
+
+      # Base wheel velocities (3) via ros2_control velocity controller
+      - key: action
+        selector:
+          names:
+            - "action.6"
+            - "action.7"
+            - "action.8"
+        publish:
+          topic: /base_velocity_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+        safety_behavior: zeros
+
+  # ============================================
+  # Teleoperation Configuration (leader arm for the arm, gamepad for the base)
+  # ============================================
+  teleoperation:
+    # Off by default because the leader arm and the gamepad usually hang off
+    # the operator's workstation, not the robot host, and only the machine
+    # they are attached to can drive them. Set this to true on that machine.
+    # See "WHERE THE TELEOPERATION HARDWARE LIVES" at the top of this file.
+    enabled: false
+    # Plural form: every listed device is launched, so the operator drives the
+    # arm and the base at the same time. Drop an entry to run just one, for
+    # example ["lekiwi_gamepad"] to drive the base without a leader arm.
+    active_devices: ["so101_leader", "lekiwi_gamepad"]
+    devices:
+      - name: "so101_leader"
+        type: "leader_arm"
+        # Only meaningful when the leader is on this host. It must then differ
+        # from robot.ros2_control.port, which ros2_control holds open for the
+        # follower.
+        port: "/dev/ttyACM1"
+        calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
+        # The leader reports the gripper as a 0~1 percentage while the follower
+        # runs a radian position controller. The follower calibration supplies
+        # the physical stroke the percentage is mapped onto; without it the
+        # command is executed as radians and the gripper only half closes.
+        follower_calib_file: "$(env HOME)/.calibrate/so101_follower_calibrate.json"
+
+      - name: "lekiwi_gamepad"
+        type: "joy_teleop"
+        input_device: "/dev/input/js0"
+        deadzone: 0.1
+        autorepeat_rate: 20.0
+        sticky_buttons: false
+        config_path: "$(find robot_config)/config/lekiwi/lekiwi_gamepad_base.yaml"
+        # joy_teleop drives the base over /cmd_vel and publishes no joint
+        # groups at all. Saying so explicitly keeps it from inheriting the
+        # default arm and gripper topics, which would collide with the leader
+        # arm and make the pair fail validation.
+        target:
+          publish_groups: []
+    safety:
+      joint_limits:
+        "1": {"min": -3.14159, "max": 3.14159}
+        "2": {"min": -3.14159, "max": 3.14159}
+        "3": {"min": -3.14159, "max": 3.14159}
+        "4": {"min": -3.14159, "max": 3.14159}
+        "5": {"min": -3.14159, "max": 3.14159}
+        # Left at the 0~1 range on purpose. A device that emits radian gripper
+        # commands reports its own limits through get_gripper_limits() and the
+        # teleop node overrides this entry at runtime, so re-calibrating the
+        # follower needs no edit here.
+        "6": {"min": 0.0, "max": 1.0}
+
+  # ============================================
+  # Recording Configuration
+  # ============================================
+  recording:
+    bag_base_dir: "~/rosbag/episodes"
+    storage: mcap

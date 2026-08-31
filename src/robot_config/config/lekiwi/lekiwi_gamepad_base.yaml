@@ -1,0 +1,36 @@
+# Gamepad -> LeKiwi base mapping for joy_teleop.
+#
+# Referenced from a `joy_teleop` teleoperation device (see
+# config/robots/lekiwi_rtp_distributed.yaml), which launches joy_node
+# alongside it. Publishes to /cmd_vel, which cmd_vel_bridge converts into
+# base_velocity_controller commands.
+#
+# Axis and button indices are for an Xbox Series X|S controller on the Linux
+# joystick driver. Other pads renumber them: check with
+#   ros2 topic echo /joy
+# and edit the indices below rather than the scales.
+#
+# Scales are the base's maximum commanded speed on each axis (m/s, m/s, rad/s).
+# They are deliberately conservative for teleoperated data collection.
+joy_teleop:
+  ros__parameters:
+    base_drive:
+      type: topic
+      interface_type: geometry_msgs/msg/Twist
+      topic_name: /cmd_vel
+      # Deadman: the base only moves while this button is held. Releasing it
+      # publishes a zero Twist, so letting go is also the stop.
+      deadman_buttons: [4]  # Xbox LB
+      axis_mappings:
+        linear-x:
+          axis: 1  # Left stick vertical, forward/backward
+          scale: 0.13
+          offset: 0.0
+        linear-y:
+          axis: 0  # Left stick horizontal, strafe
+          scale: 0.11
+          offset: 0.0
+        angular-z:
+          axis: 3  # Right stick horizontal, yaw
+          scale: 0.44
+          offset: 0.0
