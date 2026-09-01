@@ -292,6 +292,11 @@ class InteractiveController:
                 "SKILL_SNAPSHOT_DIGEST_MISMATCH",
                 "planned workflow uses a different registry identity",
             )
+        if validate_agent_execution_mode(plan.get("execution_mode", "")) != self._execution_mode:
+            raise InteractiveControlError(
+                "SKILL_REQUEST_ID_CONFLICT",
+                "planned workflow uses a different execution mode",
+            )
         pending = {
             "plan_token": plan["plan_token"],
             "plan_digest": plan["plan_digest"],
@@ -788,7 +793,7 @@ class InteractiveController:
             "task_id": task_id,
             "error_code": "SKILL_CANCELLED",
             "message": message,
-            "result": {},
+            "result": {"success": False, "error_code": "SKILL_CANCELLED", "message": message},
             "stopped_before_execution": True,
         }
         with self._state_lock:
@@ -809,7 +814,7 @@ class InteractiveController:
             "task_id": task_id,
             "error_code": "SKILL_CANCEL_TIMEOUT",
             "message": message,
-            "result": {},
+            "result": {"success": False, "error_code": "SKILL_CANCEL_TIMEOUT", "message": message},
         }
         with self._state_lock:
             self._terminal = terminal

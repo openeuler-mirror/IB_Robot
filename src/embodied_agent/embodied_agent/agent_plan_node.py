@@ -404,7 +404,6 @@ class AgentPlanNode(Node):
         try:
             if request.schema_version != 1:
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
-            execution_mode = validate_agent_execution_mode(request.execution_mode)
             status = self._gateway_status()
             with self._store_lock:
                 plan = self._store.validate(
@@ -413,8 +412,6 @@ class AgentPlanNode(Node):
                     registry_generation=status.registry_generation,
                     registry_digest=status.registry_digest,
                 )
-            if plan.execution_mode != execution_mode:
-                raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "execution mode does not match the planned mode")
             response.plan_id = plan.plan_id
             response.plan_digest = plan.plan_digest
             first_error_code = ""

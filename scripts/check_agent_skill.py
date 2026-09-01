@@ -37,7 +37,7 @@ REQUIRED_RULES = {
     "must not automatically retry after failure, timeout, or unknown result": (
         "missing prohibition: automatic retry after failure, timeout, or unknown result"
     ),
-    "natural-language single-skill and workflow requests both use the plan workflow": (
+    "natural-language single-skill and workflow requests both use the plan workflow above through the composite entry": (
         "missing natural-language single-Skill/Workflow routing rule"
     ),
     "stop on any failure": "missing stop-on-failure rule",
@@ -98,6 +98,21 @@ def _required_workflow(content: str) -> str | None:
         content,
         flags=re.MULTILINE | re.DOTALL,
     )
+    if match is None:
+        match = re.search(
+            r"^## Diagnostic Plan Workflow\s*$\n(.*?)(?=^## |\Z)",
+            content,
+            flags=re.MULTILINE | re.DOTALL,
+        )
+    return None if match is None else match.group(1)
+
+
+def _required_composite_workflow(content: str) -> str | None:
+    match = re.search(
+        r"^## Composite Workflow Entry\s*$\n(.*?)(?=^## |\Z)",
+        content,
+        flags=re.MULTILINE | re.DOTALL,
+    )
     return None if match is None else match.group(1)
 
 
@@ -118,6 +133,9 @@ def validate_skill(skill_path: Path) -> list[str]:
 
     normalized = " ".join(content.lower().split())
     workflow = _required_workflow(content)
+    composite = _required_composite_workflow(content)
+    if composite is None or re.search(r"robot-skill\s+run-workflow\b", composite) is None:
+        errors.append("composite workflow entry is missing run-workflow")
     if workflow is None or any(
         re.search(rf"`robot-skill\b[^`]*\b{re.escape(command)}\b[^`]*`", workflow) is None for command in PLAN_COMMANDS
     ):

@@ -99,9 +99,12 @@ Construct request IDs and task IDs directly in the conversation and `robot-skill
 approval, authorizes only that command and is not motion authorization. The displayed plan/task tuple is bound internally
 by `confirm-plan` immediately after the presentation flush.
 
-The internal `confirm-plan` call is the Gateway's technical binding for the exact plan/task tuple, not a second user
+The internal `confirm-plan` call is the Gateway's technical binding for the exact plan/task tuple, rather than a user
 confirmation gate. For an explicitly selected single skill, the direct `describe -> validate -> execute` path remains
 valid.
+
+Natural-language single-Skill and Workflow requests both use the plan workflow above through the composite entry. This is not a second user confirmation gate.
+The internal binding remains separate from the user confirmation gate.
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, or rejected validation.
 Do not invent parameters absent from `describe`.

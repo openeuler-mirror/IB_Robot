@@ -37,33 +37,6 @@ must be parsed into finite numeric literals before creating one typed AgentPlan.
 plan. Compose new tasks by matching each Skill's input, output, precondition, and postcondition; do not search source or
 invent a special-case recipe while handling a task.
 
-## Skill Composition
-
-Treat Skills as typed operators, not as a list of user phrases:
-
-- `resolve_object_pose` provides a map pose `[x, y, yaw_degrees]`; it does not move or manipulate.
-- `nav_abs_coordinate` consumes that pose as literal `x`, `y`, `yaw`; it does not resolve names.
-- `nav_straight` consumes direction and distance; `nav_turn` consumes direction and angle.
-- `pick_object` consumes an object name and performs visual grasping at the current base pose.
-- `place_in_container` consumes a held object and container name and performs release/verification at the current base pose.
-- `recover_safe_pose` returns the arm to home and is the final step after successful placement.
-
-Use this generic routing:
-
-- Need an object's semantic position: `resolve_object_pose(target_name, stand_off_distance_m=0.0)`.
-- Need the base to approach an object for grasping: `resolve_object_pose(..., stand_off_distance_m=0.30)` ->
-  `nav_abs_coordinate` -> `pick_object`.
-- Need to approach a container for placement: `resolve_object_pose(..., stand_off_distance_m=0.30)` ->
-  `nav_abs_coordinate` -> `place_in_container`.
-- Need to transport an object: resolve the source and destination poses before motion -> navigate to source -> pick ->
-  navigate to destination -> place -> recover safe pose.
-
-Semantic queries are read-only single-skill calls performed before the motion plan. Their successful JSON pose results
-must be parsed into finite numeric literals before creating one typed AgentPlan. The current workflow has no
-`$previous.x`, `output_of`, or other runtime reference syntax; never put a placeholder or query step into the motion
-plan. Compose new tasks by matching each Skill's input, output, precondition, and postcondition; do not search source or
-invent a special-case recipe while handling a task.
-
 When launched by `hermes-robot`, the `robot-skill` executable on `PATH` is already bound to the preflighted robot config
 and ROS domain. Invoke that exact executable directly. Never source `.shrc_local` or another setup script, inspect or
 modify ROS/Python environment variables, search for robot configs or repositories, load `ibrobot-env`, use an absolute
@@ -126,7 +99,7 @@ Construct request IDs and task IDs directly in the conversation and `robot-skill
 approval, authorizes only that command and is not motion authorization. The displayed plan/task tuple is bound internally
 by `confirm-plan` immediately after the presentation flush.
 
-Natural-language single-Skill and Workflow requests use the composite entry above. The internal `confirm-plan` call is
+Natural-language single-Skill and Workflow requests both use the plan workflow above through the composite entry. This is not a second user confirmation gate. The internal `confirm-plan` call is
 the Gateway's technical binding for the exact plan/task tuple, not a second user confirmation gate. For an explicitly
 selected single skill, the direct `describe -> validate -> execute` path remains valid.
 

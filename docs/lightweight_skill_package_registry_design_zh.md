@@ -1937,7 +1937,7 @@ Hermes 是本地交互 Agent，不是新的运动执行器。自然语言入口�
 用户自然语言
   -> local Hermes Agent
   -> ibrobot-control Agent Skill
-  -> robot-skill status / list-skills / plan-workflow / describe / validate-plan
+  -> robot-skill run-workflow（内部完成 status / catalog / plan / validate）
   -> 展示并 flush exact plan + fresh task ID -> 立即 confirm-plan（内部技术绑定）
   -> execute-plan；root cancel 单独使用 cancel-plan
   -> embodied_agent Agent plan store / task executor
@@ -1965,10 +1965,12 @@ string registry_epoch
 uint64 registry_generation
 string registry_digest
 builtin_interfaces/Time expires_at
+string execution_mode
 ```
 
 `plan_digest` 使用 6.4 节 canonical JSON 规则，对
-`(schema_version, raw_command, ordered workflow_steps, registry_epoch, registry_generation, registry_digest)` 计算
+`(schema_version, raw_command, ordered workflow_steps, registry_epoch, registry_generation, registry_digest,
+execution_mode)` 计算
 SHA-256。它不是最终 `workflow_digest`：后者还绑定执行时才确定的 root task ID 和 `TaskBudget`。v1 单个 plan
 最多包含 16 个 typed steps；超过上限必须在 plan 阶段返回 `SKILL_SCHEMA_INVALID`。`plan_token` 是至少 128 bit
 随机的 opaque lookup token，不进入 digest、不属于 motion authorization，也不能由 Hermes 构造。
@@ -1978,6 +1980,8 @@ SHA-256。它不是最终 `workflow_digest`：后者还绑定执行时才确定�
 uint32 schema_version
 string request_id
 string raw_command
+WorkflowStep[] workflow_steps
+string execution_mode
 ---
 bool success
 AgentPlan plan
@@ -1992,7 +1996,7 @@ resolver 只读取 snapshot 中的 alias/description；VLM resolver 使用同一
 其输出仍由 deterministic validator 完整校验。未知、歧义、部分可解析、参数缺失或额外字段全部 fail closed，
 不能执行已识别的前半段。
 
-相同 `(request_id, raw_command, exact identity)` 的重试返回同一 plan/token；同一 request ID 的不同 payload 返回
+相同 `(request_id, raw_command, typed steps, execution_mode, exact identity)` 的重试返回同一 plan/token；同一 request ID 的不同 payload 返回
 `SKILL_REQUEST_ID_CONFLICT`。Plan store 默认 TTL 为 300 秒、最多 1024 条；过期返回
 `SKILL_AGENT_PLAN_EXPIRED`。Store 只受 `embodied_agent` 自身 state lock 保护，不获取 coordinator lock，也不持有
 bundle lease。TTL 使用 process monotonic clock 判定，`expires_at` 只作为 ROS-facing 时间展示；clock jump 不能
@@ -2027,6 +2031,7 @@ string registry_epoch
 uint64 registry_generation
 string registry_digest
 float32 task_budget_sec
+string execution_mode
 ---
 bool confirmed
 string confirmation_token
@@ -2042,7 +2047,7 @@ SkillDiagnostic[] diagnostics
 `authorize_motion`。Agent 必须先生成 fresh `task_id`，向用户展示包含 plan kind、ordered steps、typed
 parameters、exact snapshot identity 和该 task ID 的计划并 flush 输出；随后 CLI 立即调用此 service。
 Coordinator/plan store 必须原子校验
-`(plan_token, plan_digest, task_id, registry_epoch, registry_generation, registry_digest, task_budget_sec)`，将 plan
+`(plan_token, plan_digest, task_id, registry_epoch, registry_generation, registry_digest, task_budget_sec, execution_mode)`，将 plan
 从 `VALIDATED` 转为 `CONFIRMED`，并返回绑定同一 tuple 的单次 `confirmation_token`。`task_budget_sec` 必须为有限
 正数且不超过 Gateway task budget，并以 float32 规范化冻结，同时冻结绝对 `started_at/deadline`；
 `ExecuteAgentPlan.timeout_sec` 必须精确复用该值，执行时必须传播已冻结的绝对 deadline，不能重新计时。
@@ -2130,8 +2135,8 @@ typed step 或 action result 的必填 public 字段：
 snapshot 同步且 launcher prerequisite check 通过后，才能作为已部署能力使用。`cancel` 只取消 direct Skill
 action，`cancel-plan` 取消 Agent plan root action，两者不能互换。
 
-自然语言请求的 Agent workflow 固定为
-`status -> list-skills -> plan-workflow -> describe(each step) -> validate-plan -> 生成并展示 fresh task ID 和 exact plan ->
+正常自然语言请求的 Agent workflow 固定为
+`run-workflow -> 内部 status/catalog/plan/validate -> 生成并展示 fresh task ID 和 exact plan ->
 confirm-plan -> execute-plan`。显式单 Skill 请求可继续使用现有 `validate/execute` 路径。展示必须发生在 plan 和
 validation 之后，完整包含 plan kind、顺序、参数、snapshot identity 和 task ID，并在内部 `confirm-plan` 前
 同步 flush；随后立即绑定并执行，不等待用户二次确认。`confirm-plan` 只是 exact tuple 的技术绑定，不修改

@@ -74,7 +74,7 @@ def test_checker_requires_plan_cancel_and_routing(valid_skill):
     content = valid_skill.read_text(encoding="utf-8")
     content = content.replace("cancel-plan", "cancel")
     content = content.replace(
-        "Natural-language single-Skill and Workflow requests both use the plan workflow above.",
+        "Natural-language single-Skill and Workflow requests both use the plan workflow above through the composite entry.",
         "Natural language is routed by the model.",
     )
     valid_skill.write_text(content, encoding="utf-8")

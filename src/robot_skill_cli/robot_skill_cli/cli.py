@@ -881,7 +881,7 @@ def _print_result(task_id: str, payload_hash: str, data: dict[str, Any]) -> None
 
 
 def _result_exit_code(data: dict[str, Any], *, agent: bool = False) -> int:
-    if data["success"]:
+    if data.get("success") is True:
         return EXIT_SUCCESS
     if agent:
         return _agent_error_exit_code(str(data.get("error_code") or "CAPABILITY_NOT_READY"))
@@ -1139,6 +1139,8 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
 
     previous_handlers: dict[int, Any] = {}
     try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _handle_signal)
         terminal = controller.run(
             args.raw_command,
             workflow_steps,
@@ -1151,7 +1153,11 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
         print(json_dumps({"event": "workflow_terminal", "data": terminal}), flush=True)
     except InteractiveControlError as exc:
         raise _CommandError(exc.code, str(exc), exit_code=_agent_error_exit_code(exc.code)) from exc
-    return _CommandExit(_result_exit_code(terminal.get("result", terminal), agent=True))
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+    result = terminal.get("result") or terminal
+    return _CommandExit(_result_exit_code(result, agent=True))
 
 
 def _task_status(bridge, task_id: str, timeout_sec: float) -> dict[str, Any]:

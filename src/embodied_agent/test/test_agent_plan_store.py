@@ -82,6 +82,29 @@ def test_execution_mode_is_bound_to_plan():
         )
 
 
+def test_execution_mode_changes_plan_digest():
+    store, _ = _store()
+    interactive = store.create_plan(
+        request_id="request-interactive",
+        raw_command="open",
+        workflow_steps=[CanonicalWorkflowStep(1, "open_gripper_skill")],
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+    )
+    immediate = store.create_plan(
+        request_id="request-immediate",
+        raw_command="open",
+        workflow_steps=[CanonicalWorkflowStep(1, "open_gripper_skill")],
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+        execution_mode="immediate_after_presentation",
+    )
+
+    assert interactive.plan_digest != immediate.plan_digest
+
+
 def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
     store, _ = _store()
     plan = _create(store)

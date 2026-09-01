@@ -4,6 +4,7 @@ import copy
 import importlib
 import json
 import math
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -741,10 +742,11 @@ def test_run_workflow_delegates_lifecycle_to_controller(monkeypatch, capsys):
 
     assert result.exit_code == 0
     assert calls[0][2] == "immediate_after_presentation"
-    assert calls[1] == (
+    assert calls[1][0:2] == (
         "打开夹爪",
         [{"schema_version": 1, "skill_name": "open_gripper_skill"}],
     )
+    assert isinstance(calls[1][2], threading.Event)
     assert [json.loads(line)["event"] for line in capsys.readouterr().out.strip().splitlines()] == [
         "workflow_presentation",
         "workflow_terminal",
@@ -801,6 +803,35 @@ def test_run_workflow_signal_requests_controller_stop_and_restores_handlers(monk
     assert installed[cli.signal.SIGTERM] is cli.signal.SIG_DFL
     events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
     assert [event["event"] for event in events] == ["workflow_presentation", "workflow_terminal"]
+
+
+def test_run_workflow_handles_local_terminal_without_nested_result(monkeypatch, capsys):
+    from types import SimpleNamespace
+
+    from robot_skill_cli import interactive_control
+    from robot_skill_cli.cli import _run_workflow
+
+    class _Controller:
+        def __init__(self, _bridge, *, timeout_policy, execution_mode):
+            pass
+
+        def run(self, *_args, **_kwargs):
+            return {
+                "state": "unknown",
+                "task_id": "task-unknown",
+                "error_code": "SKILL_CANCEL_TIMEOUT",
+                "message": "robot stop state is unknown",
+                "result": {},
+            }
+
+    monkeypatch.setattr(interactive_control, "InteractiveController", _Controller)
+    args = SimpleNamespace(raw_command="stop", workflow_json='[{"schema_version":1,"skill_name":"wave_hello"}]')
+    context = SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 5.0}})
+
+    result = _run_workflow(args, context, object())
+
+    assert result.exit_code == 15
+    assert json.loads(capsys.readouterr().out.strip())["event"] == "workflow_terminal"
 
 
 @pytest.mark.parametrize(

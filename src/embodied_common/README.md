@@ -78,6 +78,14 @@ ibrobot_msgs / rclpy
 - `embodied_common.wire_contracts.PRIMITIVE_CONTRACT_V2`（V2 primitive contract digest 常量，含 nav_* primitive）
 - `embodied_common.wire_contracts.primitive_contract_for_version(version)`（按 context_schema_version 选择 V1/V2/V3 digest）
 - `embodied_common.wire_contracts.PrimitiveContractSet`（持有 V1/V2/V3 digest 与对应 primitive 名称集合，供工具与跨版本比对使用）
+- `embodied_common.agent_execution_contract.INTERACTIVE_CONFIRMATION`
+- `embodied_common.agent_execution_contract.IMMEDIATE_AFTER_PRESENTATION`
+- `embodied_common.agent_execution_contract.validate_agent_execution_mode`
+
+Agent execution mode is captured when an Agent plan is created and must match
+at confirmation. `immediate_after_presentation` only removes the second user
+confirmation wait; it never grants motion authorization or bypasses Gateway
+admission.
 
 视觉游戏 JSON loader 供 `embodied_agent.visual_game_gateway_node` 解析 ROS 参数；
 `get_default_visual_game_handler` 供

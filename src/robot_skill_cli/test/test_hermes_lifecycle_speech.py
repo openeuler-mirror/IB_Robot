@@ -27,16 +27,12 @@ def test_event_gating() -> None:
     assert speech._event(_payload("pre_tool_call", "robot-skill status")) == "status_check_started"
     assert speech._event(_payload("pre_tool_call", "robot-skill plan-workflow --text x")) == "planning_started"
     success = '{"ok":true,"command":"confirm-plan","data":{"confirmed":true},"error":null}'
-    assert (
-        speech._event(_payload("post_tool_call", "robot-skill confirm-plan --x", result=success)) == "plan_authorized"
-    )
+    assert speech._event(_payload("post_tool_call", "robot-skill confirm-plan --x", result=success)) == "plan_confirmed"
     assert (
         speech._event(_payload("post_tool_call", "robot-skill confirm-plan --x", result='{"confirmed":false}')) is None
     )
     wrapped = f"Process exited with code 0\nFinal output:\n{success}"
-    assert (
-        speech._event(_payload("post_tool_call", "robot-skill confirm-plan --x", result=wrapped)) == "plan_authorized"
-    )
+    assert speech._event(_payload("post_tool_call", "robot-skill confirm-plan --x", result=wrapped)) == "plan_confirmed"
     assert speech._event(_payload("pre_tool_call", "robot-skill run-workflow --text x")) == "planning_started"
     workflow_result = '{"event":"workflow_terminal","data":{"result":{"success":true}}}'
     assert (
@@ -45,7 +41,7 @@ def test_event_gating() -> None:
     internal_confirmation = '{"ok":true,"command":"confirm-plan","data":{"confirmed":true}}'
     assert (
         speech._event(_payload("post_tool_call", "robot-skill confirm-plan --internal", result=internal_confirmation))
-        == "plan_authorized"
+        == "plan_confirmed"
     )
 
 
@@ -57,8 +53,8 @@ def test_composite_workflow_can_emit_authorization_at_confirm_boundary(tmp_path,
     speech.notify_plan_authorized(session_id="task-1")
 
     assert len(spawned) == 1
-    assert spawned[0][2] == "plan_authorized"
-    assert spawned[0][3] == speech.FALLBACK_COPY["plan_authorized"]
+    assert spawned[0][2] == "plan_confirmed"
+    assert spawned[0][3] == speech.FALLBACK_COPY["plan_confirmed"]
 
 
 def test_confirmation_requires_successful_confirm_plan_envelope() -> None:

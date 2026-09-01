@@ -22,7 +22,7 @@ from typing import Any
 FALLBACK_COPY = {
     "status_check_started": "任务已收到，小鸭子正在观察环境嘎嘎。",
     "planning_started": "看清楚了，让小鸭子先想想怎么执行。",
-    "plan_authorized": "小鸭子知道了，开始工作嘎嘎。",
+    "plan_confirmed": "计划已绑定，正在等待执行检查嘎嘎。",
 }
 EVENTS = frozenset(FALLBACK_COPY)
 _LOG_PATH = Path(os.environ.get("IBROBOT_LIFECYCLE_SPEECH_LOG", "/tmp/hermes-lifecycle-speech.log"))
@@ -74,7 +74,7 @@ def _event(payload: dict[str, Any]) -> str | None:
     if hook_event == "post_tool_call" and " confirm-plan" in command:
         extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
         if str(extra.get("status") or "") == "ok" and _result_success(extra.get("result")):
-            return "plan_authorized"
+            return "plan_confirmed"
     if hook_event == "post_tool_call" and " run-workflow" in command:
         return None
     return None

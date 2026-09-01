@@ -4,7 +4,8 @@
 # See docs/lightweight_skill_package_registry_design_zh.md section 11.6.
 #
 # plan_digest is the SHA-256 over (schema_version, raw_command, ordered
-# workflow_steps, registry_epoch, registry_generation, registry_digest) and is
+# workflow_steps, registry_epoch, registry_generation, registry_digest,
+# execution_mode) and is
 # NOT the final workflow_digest (which also binds root task id + TaskBudget).
 # plan_token is an opaque >=128-bit random lookup token; it does not enter the
 # digest, is not motion authorization and cannot be constructed by Hermes.

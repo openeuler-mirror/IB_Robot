@@ -186,6 +186,7 @@ class AgentPlanStore:
                 registry_epoch=registry_epoch,
                 registry_generation=registry_generation,
                 registry_digest=registry_digest,
+                execution_mode=execution_mode,
             ),
             registry_epoch=registry_epoch,
             registry_generation=registry_generation,
@@ -472,6 +473,7 @@ def compute_plan_digest(
     registry_epoch: str,
     registry_generation: int,
     registry_digest: str,
+    execution_mode: str = INTERACTIVE_CONFIRMATION,
 ) -> str:
     steps = normalize_workflow_steps(workflow_steps, max_steps=MAX_PLAN_STEPS)
     preimage = {
@@ -481,6 +483,7 @@ def compute_plan_digest(
         "registry_epoch": registry_epoch,
         "registry_generation": registry_generation,
         "registry_digest": registry_digest,
+        "execution_mode": validate_agent_execution_mode(execution_mode),
     }
     return sha256_text(to_canonical_json(preimage))
 
