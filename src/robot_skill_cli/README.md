@@ -29,7 +29,7 @@ source .shrc_local
 
 `run-workflow` 会先完成 exact plan 的展示回调并 flush 输出，再执行内部技术 confirm；展示失败或收到停止请求时不会
 进入运动执行。`immediate_after_presentation` 只取消二次用户确认等待，不绕过 Gateway validation、operator
-`authorize_motion` 或 action admission。
+`authorize_motion` 或 action admission。可选 `--request-id` 是调用方幂等键；timeout 或结果未知时不得自动重放。
 
 每个命令可用 `--config-name NAME` 选择配置，或用 `--config-path PATH` 指向 YAML；两个 flag 在 CLI 中互斥。
 配置解析完全复用 `robot_config.resolve_robot_config_path()`，CLI 不维护第二套路径优先级：底层选择顺序是
@@ -51,7 +51,7 @@ source .shrc_local
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
 | `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 提交一份短时 typed Agent plan |
-| `run-workflow --text TEXT --workflow-json JSON` | 是 | 展示后按显式 immediate admission policy 自动执行 |
+| `run-workflow [--request-id ID] --text TEXT --workflow-json JSON` | 是 | 展示后按显式 immediate admission policy 自动执行 |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
 | `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
 | `execute-plan ... --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 执行已确认的 Agent plan，并以展示过的 tuple 校验终态 |
@@ -241,7 +241,7 @@ UUIDv5（`ibrobot:{task_id}`）。`cancel` 只对 ledger 中 `active` task 发�
 
 ## 输出契约
 
-除 `execute`、`execute-plan` 和 `ibrobot-perceive` 外，命令向 stdout 输出单行 JSON envelope：
+除 `execute`、`execute-plan`、`run-workflow` 和 `ibrobot-perceive` 外，命令向 stdout 输出单行 JSON envelope：
 
 ```json
 {"command":"status","data":{},"error":null,"ok":true,"schema_version":1}
@@ -257,6 +257,10 @@ UUIDv5（`ibrobot:{task_id}`）。`cancel` 只对 ledger 中 `active` task 发�
 {"data":{"detail":"step 1 of 1","state":"executing"},"event":"feedback","payload_hash":"...","schema_version":1,"task_id":"task-20260725-001"}
 {"data":{"error_code":"","executed_step_count":1,"message":"skill completed","success":true},"event":"result","payload_hash":"...","schema_version":1,"task_id":"task-20260725-001"}
 ```
+
+`run-workflow` 也使用版本化 JSONL：先输出一条 `workflow_presentation`，最后输出一条
+`workflow_terminal`。两条记录都包含 `schema_version`、`command` 和 `task_id`；展示记录必须包含完整
+步骤、plan digest、registry identity 和 execution mode。
 
 普通命令错误也使用同一 JSON envelope 的 `error.code` 与 `error.message`。当 Gateway capability reason
 为 `CODE: detailed message` 时，CLI 用第一个冒号前的文本作为 `error.code`；`error.message` 保留原始
@@ -363,7 +367,8 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
 - 把 `ibrobot-control` Skill 幂等注册到 `profile/skills/`，仅替换带 `robot_skill_cli` 所有权标记
   的副本，遇到同名用户自管 skill 时以 `AGENT_SKILL_CONFLICT` 退出。
 - 生成 `robot-skill`、最终回复 speech、生命周期 speech 和 interim speech wrapper，以及一个环境文件；
-  所有 wrapper 都 source workspace `.shrc_local`，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
+  `robot-skill`、最终回复 speech 和 interim wrapper source workspace `.shrc_local`；lifecycle wrapper
+  依赖 Hermes 已初始化的 workspace 环境，不硬编码 `/opt/ros/humble/setup.bash` 或 venv 路径。
   interim wrapper 还绑定当前 Hermes profile 的 `ibrobot-speak` 路径。
 - 安装 `post_llm_call`、生命周期和 `on_interim_message` speech hook，移除对应的旧 managed 副本；
   `--disable-speech` 移除全部受管 speech hook。
@@ -377,7 +382,8 @@ bash src/robot_skill_cli/resource/hermes/sync_hermes.sh \
 
 `hermes-robot-speak` 是 `post_llm_call` hook 的 Python 入口（由 `ibrobot-speak` shell wrapper 调用），
 从 stdin 读取 Hermes hook payload，提取最终 assistant 回复，经 `sanitize_for_tts` 移除 ASCII
-字母 run（ZipVoice 中文前端不发音英文），调用 `ibrobot_msgs.srv.SynthesizeSpeech` 合成 WAV
+字母 run 和连续 7 位以上数字（避免播报技术标识符；ZipVoice 中文前端不发音英文），调用
+`ibrobot_msgs.srv.SynthesizeSpeech` 合成 WAV
 并通过 `PlayAudioFile` 服务播放。TTS 是系统自动功能，不是机器人 Skill，不进入 `workflow_json`。
 诊断日志位于 `/tmp/hermes-speak.log`（受 `IBROBOT_HERMES_TTS_LOG` 覆盖）。
 

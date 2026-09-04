@@ -207,6 +207,40 @@ def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
     assert all(vars(node).get("_Node__package") != "robot_moveit" for node in nodes)
 
 
+def test_sound_orientation_node_is_projected_from_robot_config():
+    robot_config = {
+        "name": "lekiwi_test",
+        "default_control_mode": "base_navigation",
+        "skill_required_control_mode": "base_navigation",
+        "control_modes": {"base_navigation": {"controllers": ["base_velocity_controller"]}},
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "hermes",
+            "skill_catalog_profile": "lekiwi_test",
+            "idle_behaviors": {
+                "sound_orientation": {
+                    "enabled": True,
+                    "trigger_phrases": ["转向我"],
+                    "deadband_deg": 20.0,
+                }
+            },
+        },
+        "navigation": {
+            "enabled": True,
+            "command_server": {"enabled": True, "action_name": "/navigation/execute"},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="base_navigation")
+    node = next(node for node in nodes if vars(node).get("_Node__node_name") == "sound_orientation_node")
+    params = _normalize_launch_param_mapping(node._Node__parameters[0])
+
+    assert "trigger_phrases" in params
+    assert params["deadband_deg"] == 20.0
+    assert _decode_launch_string(params["skill_name"]) == "nav_turn"
+    assert _decode_launch_string(params["skill_action_name"]) == "/embodied/execute_skill"
+
+
 def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
     config = load_robot_config_dict(config_path)

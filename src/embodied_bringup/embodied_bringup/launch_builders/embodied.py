@@ -343,6 +343,11 @@ def generate_embodied_nodes(
 
     logger.info("Embodied minimal closure enabled, launching task/safety/skill nodes")
 
+    idle_behaviors = embodied_config.get("idle_behaviors", {})
+    sound_orientation = idle_behaviors.get("sound_orientation", {}) if isinstance(idle_behaviors, dict) else {}
+    if not isinstance(sound_orientation, dict):
+        sound_orientation = {}
+
     nodes = [
         Node(
             package="safety_guard",
@@ -400,6 +405,36 @@ def generate_embodied_nodes(
                             robot_config.get("ros2_control", {}).get("reset_positions", {})
                         ),
                         "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
+                    }
+                ],
+            )
+        )
+    if sound_orientation.get("enabled", False):
+        nodes.append(
+            Node(
+                package="embodied_agent",
+                executable="sound_orientation_node",
+                name="sound_orientation_node",
+                output="screen",
+                parameters=[
+                    {
+                        "trigger_phrases": sound_orientation.get("trigger_phrases", ["转向我"]),
+                        "direction_topic": sound_orientation.get("direction_topic", "/voice/speech_direction"),
+                        "command_topic": sound_orientation.get("command_topic", "/voice_command"),
+                        "gateway_status_service": common_params["skill_gateway_status_service"],
+                        "skill_action_name": common_params["skill_action_name"],
+                        "skill_name": sound_orientation.get("skill_name", "nav_turn"),
+                        "direction_frame": sound_orientation.get("direction_frame", "base_link"),
+                        "deadband_deg": sound_orientation.get("deadband_deg", 15.0),
+                        "max_direction_age_sec": sound_orientation.get("max_direction_age_sec", 1.3),
+                        "direction_wait_sec": sound_orientation.get("direction_wait_sec", 0.5),
+                        "cooldown_sec": sound_orientation.get("cooldown_sec", 1.5),
+                        "max_turn_deg": sound_orientation.get("max_turn_deg", 180.0),
+                        "turn_timeout_sec": sound_orientation.get("turn_timeout_sec", 10.0),
+                        "action_acceptance_timeout_sec": sound_orientation.get("action_acceptance_timeout_sec", 2.0),
+                        "status_retry_sec": sound_orientation.get("status_retry_sec", 0.5),
+                        "reset_status_max_age_sec": sound_orientation.get("reset_status_max_age_sec", 2.0),
+                        "debug_tracing": embodied_config.get("debug_tracing", True),
                     }
                 ],
             )

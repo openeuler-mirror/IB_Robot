@@ -9,7 +9,7 @@ from typing import Any
 
 from embodied_common.canon import sha256_text, to_canonical_json
 
-_WORKFLOW_STEP_FIELDS = frozenset(
+_WORKFLOW_STEP_COMMON_FIELDS = frozenset(
     {
         "schema_version",
         "skill_name",
@@ -21,16 +21,10 @@ _WORKFLOW_STEP_FIELDS = frozenset(
         "arm_side",
         "imitation_duration_sec",
         "timeout_sec",
-        "direction",
-        "distance",
-        "degree",
-        "has_x",
-        "x",
-        "has_y",
-        "y",
-        "has_yaw",
-        "yaw",
     }
+)
+_WORKFLOW_STEP_NAVIGATION_FIELDS = frozenset(
+    {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
 )
 
 
@@ -132,9 +126,17 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         return step
     if isinstance(step, Mapping):
         values = step
-        unknown_fields = sorted(set(values) - _WORKFLOW_STEP_FIELDS)
+        try:
+            schema_version = int(values.get("schema_version", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("WorkflowStep.schema_version must be an integer") from exc
+        allowed_fields = _WORKFLOW_STEP_COMMON_FIELDS
+        if schema_version == 2:
+            allowed_fields |= _WORKFLOW_STEP_NAVIGATION_FIELDS
+        unknown_fields = set(values) - allowed_fields
         if unknown_fields:
-            raise ValueError(f"WorkflowStep contains unsupported fields: {', '.join(unknown_fields)}")
+            names = ", ".join(sorted(str(name) for name in unknown_fields))
+            raise ValueError(f"WorkflowStep contains unknown fields: {names}")
     else:
         values = {
             field: getattr(step, field, default)
@@ -161,7 +163,7 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
             )
         }
     return CanonicalWorkflowStep(
-        schema_version=int(values.get("schema_version", 0)),
+        schema_version=schema_version if isinstance(step, Mapping) else int(values.get("schema_version", 0)),
         skill_name=str(values.get("skill_name", "")),
         target_name=str(values.get("target_name", "")),
         container_name=str(values.get("container_name", "")),

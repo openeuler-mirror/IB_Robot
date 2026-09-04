@@ -16,7 +16,7 @@ The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
 `lekiwi_handeye_realsense_grasp_lidar`, `so101_rtp_distributed`, and `lekiwi_lidar`.
 The `lekiwi_handeye_realsense_grasp_lidar` profile is the unified mobile-manipulator
-profile: it exposes manipulation and navigation skills in one immutable snapshot.
+profile: it exposes manipulation, navigation, and approved social arm skills in one immutable snapshot.
 The shared stable
 implementation `so101_arm_v1` is selected by every enabled entry in both
 `so101_single_arm` and `so101_rtp_distributed`; the two profiles compile the

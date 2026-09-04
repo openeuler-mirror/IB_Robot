@@ -4,6 +4,7 @@ import pytest
 import yaml
 
 from robot_config.loader import (
+    _validate_sound_orientation_config,
     load_robot_config,
     load_robot_config_dict,
     validate_config,
@@ -100,6 +101,62 @@ def test_so101_skill_gateway_control_mode_is_global_and_safety_has_no_motion_aut
 
     typed_config = load_robot_config(config_path)
     assert not hasattr(typed_config.embodied, "motion_authorized")
+
+
+def test_lekiwi_sound_orientation_is_configured_but_default_disabled():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
+
+    sound_orientation = config["embodied"]["idle_behaviors"]["sound_orientation"]
+    assert sound_orientation["enabled"] is False
+    assert sound_orientation["skill_name"] == "nav_turn"
+    assert sound_orientation["trigger_phrases"] == ["转向我"]
+
+
+def test_sound_orientation_requires_voice_and_navigation_inputs(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    embodied = copied_config["robot"]["embodied"]
+    embodied["enabled"] = True
+    embodied["idle_behaviors"] = {"sound_orientation": {"enabled": True}}
+    copied_config["robot"]["voice_asr"]["enabled"] = False
+    copied_config["robot"]["speech_direction"]["enabled"] = False
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    errors = _validate_sound_orientation_config(copied_config["robot"])
+
+    assert any("speech_direction.enabled" in error for error in errors)
+    assert any("voice_asr.enabled" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("value", "field"),
+    [
+        ("false", "enabled"),
+        ({"enabled": True, "trigger_phrases": ["!!!"]}, "trigger_phrases"),
+        ({"enabled": True, "status_retry_sec": 0.0}, "status_retry_sec"),
+    ],
+)
+def test_sound_orientation_rejects_invalid_behavior_config(value, field):
+    config = {
+        "embodied": {
+            "enabled": True,
+            "idle_behaviors": {"sound_orientation": value if isinstance(value, dict) else {"enabled": value}},
+        },
+        "voice_asr": {"enabled": True},
+        "speech_direction": {"enabled": True},
+        "control_modes": {"base_navigation": {}},
+        "navigation": {
+            "enabled": True,
+            "command_server": {"enabled": True, "action_name": "/navigation/execute"},
+        },
+    }
+
+    errors = _validate_sound_orientation_config(config)
+
+    assert any(field in error for error in errors)
 
 
 def test_compiled_skills_match_profile_enabled_set():

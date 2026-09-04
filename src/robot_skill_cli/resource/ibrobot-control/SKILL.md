@@ -48,7 +48,7 @@ failed command never proves that a status check completed.
 For every normal natural-language motion request, use the deterministic composite entry:
 
 ```text
-robot-skill run-workflow --text TEXT --workflow-json JSON
+robot-skill run-workflow [--request-id REQUEST_ID] --text TEXT --workflow-json JSON
 ```
 
 Hermes produces the complete typed workflow once. `run-workflow` then performs discovery, catalog

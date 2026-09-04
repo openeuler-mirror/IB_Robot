@@ -713,6 +713,24 @@ def test_run_workflow_parser_accepts_one_typed_workflow():
     assert run.raw_command == "打开夹爪"
 
 
+def test_run_workflow_parser_accepts_request_id():
+    from robot_skill_cli.cli import _build_parser
+
+    run = _build_parser().parse_args(
+        [
+            "run-workflow",
+            "--request-id",
+            "request-1",
+            "--text",
+            "打开夹爪",
+            "--workflow-json",
+            '[{"schema_version":1,"skill_name":"open_gripper_skill"}]',
+        ]
+    )
+
+    assert run.request_id == "request-1"
+
+
 def test_run_workflow_delegates_lifecycle_to_controller(monkeypatch, capsys):
     from types import SimpleNamespace
 
@@ -725,7 +743,16 @@ def test_run_workflow_delegates_lifecycle_to_controller(monkeypatch, capsys):
         def __init__(self, bridge, *, timeout_policy, execution_mode):
             calls.append((bridge, timeout_policy, execution_mode))
 
-        def run(self, raw_command, workflow_steps, *, presentation_callback, authorization_callback, stop_event):
+        def run(
+            self,
+            raw_command,
+            workflow_steps,
+            *,
+            presentation_callback,
+            authorization_callback,
+            stop_event,
+            **kwargs,
+        ):
             calls.append((raw_command, workflow_steps, stop_event))
             presentation_callback({"task_id": "task-1"})
             authorization_callback({"task_id": "task-1"})
@@ -769,7 +796,16 @@ def test_run_workflow_signal_requests_controller_stop_and_restores_handlers(monk
         def request_stop(self):
             calls.append("request_stop")
 
-        def run(self, _raw_command, _workflow_steps, *, presentation_callback, authorization_callback, stop_event):
+        def run(
+            self,
+            _raw_command,
+            _workflow_steps,
+            *,
+            presentation_callback,
+            authorization_callback,
+            stop_event,
+            **kwargs,
+        ):
             calls.append(stop_event)
             installed[cli.signal.SIGINT](cli.signal.SIGINT, None)
             assert stop_event.is_set()

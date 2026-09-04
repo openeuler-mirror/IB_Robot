@@ -3,6 +3,10 @@
 `embodied_bringup` 是 Hermes-only 具身运行时的启动编排包。它消费 `robot_config`
 SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知和抓取执行服务。
 
+可选的 `sound_orientation_node` 由 `embodied.idle_behaviors.sound_orientation.enabled` 控制。它订阅最终 ASR 文本和 `SpeechDirection`，只通过 `/embodied/execute_skill` 调用 `nav_turn`；默认关闭，不进入视觉游戏的 controller-independent closure。正常自动启动 controller 时，它与 Gateway 节点共享 readiness barrier。
+
+启用前必须同时具备 `voice_asr.enabled`、`speech_direction.enabled`、`base_navigation`、导航 command server 和包含 `nav_turn` 的 catalog profile。当前 Voice ASR 与 speech direction 是两个独立采集进程，部署侧未验证同一 ReSpeaker 可并发读取时必须保持该行为关闭。
+
 ## 职责边界
 
 本包负责：
@@ -10,7 +14,9 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 - 提供 `embodied_pipeline.launch.py` 公开入口。
 - 从 `robot_config` 加载机器人配置并向下游注入参数。
 - 启动 `agent_plan_node`、`safety_guard_node` 和 `skill_executor_node`。
-- 按配置启动独立 `perception_service`、抓取执行依赖和 launch-managed HRI runtime。
+- 按配置启动低优先级 `sound_orientation_node`，但不为其提供运动旁路、排队或自动重试。
+- 按配置启动独立 `perception_service` 与抓取执行依赖。
+- 按配置启动 launch-managed HRI runtime。
 - 当 `robot.grasp_execution.enabled=true` 时，编排 Grounded-SAM2、GraspGen、抓取验证器和
   `manipulation_execution/pick_executor_node`。
 - 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为

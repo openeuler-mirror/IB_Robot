@@ -127,6 +127,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     run_workflow_parser.add_argument("--text", dest="raw_command", required=True, help="audit text for this workflow")
     run_workflow_parser.add_argument("--workflow-json", required=True)
+    run_workflow_parser.add_argument("--request-id", help="caller-owned idempotency key")
     validate_plan_parser = subparsers.add_parser("validate-plan", help="preflight an Agent plan")
     validate_plan_parser.add_argument("--plan-token", required=True)
     confirm_plan_parser = subparsers.add_parser("confirm-plan", help="confirm one exact Agent plan")
@@ -272,6 +273,20 @@ def _workflow_steps_with_schema_versions(workflow_steps: list[dict[str, Any]], c
     for step in workflow_steps:
         if not isinstance(step, dict):
             raise _CliArgumentError("each workflow step must be an object")
+        common_fields = {
+            "schema_version",
+            "skill_name",
+            "target_name",
+            "container_name",
+            "place_name",
+            "motion_direction",
+            "motion_distance",
+            "timeout_sec",
+        }
+        allowed_fields = common_fields | _NAVIGATION_WORKFLOW_FIELDS
+        unknown_fields = set(step) - allowed_fields
+        if unknown_fields:
+            raise _CliArgumentError(f"workflow step contains unknown fields: {', '.join(sorted(unknown_fields))}")
         if "schema_version" in step:
             # The Agent plan boundary compares explicit versions against its
             # snapshot. Do not rewrite a submitted mismatch at the CLI edge.
@@ -1141,16 +1156,38 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
     try:
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, _handle_signal)
-        terminal = controller.run(
-            args.raw_command,
-            workflow_steps,
-            presentation_callback=lambda presentation: print(
-                json_dumps({"event": "workflow_presentation", "data": presentation}), flush=True
+        run_kwargs = {
+            "presentation_callback": lambda presentation: print(
+                json_dumps(
+                    {
+                        "schema_version": 1,
+                        "command": "run-workflow",
+                        "event": "workflow_presentation",
+                        "task_id": presentation["task_id"],
+                        "data": presentation,
+                    }
+                ),
+                flush=True,
             ),
-            authorization_callback=_notify_authorized,
-            stop_event=interrupt_event,
+            "authorization_callback": _notify_authorized,
+            "stop_event": interrupt_event,
+        }
+        request_id = getattr(args, "request_id", None)
+        if request_id is not None:
+            run_kwargs["request_id"] = request_id
+        terminal = controller.run(args.raw_command, workflow_steps, **run_kwargs)
+        print(
+            json_dumps(
+                {
+                    "schema_version": 1,
+                    "command": "run-workflow",
+                    "event": "workflow_terminal",
+                    "task_id": terminal["task_id"],
+                    "data": terminal,
+                }
+            ),
+            flush=True,
         )
-        print(json_dumps({"event": "workflow_terminal", "data": terminal}), flush=True)
     except InteractiveControlError as exc:
         raise _CommandError(exc.code, str(exc), exit_code=_agent_error_exit_code(exc.code)) from exc
     finally:

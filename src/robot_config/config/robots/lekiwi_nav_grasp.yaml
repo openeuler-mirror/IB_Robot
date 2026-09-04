@@ -432,7 +432,7 @@ robot:
       rpc_timeout_sec: 3.0
       avoid_collisions: false
       check_orientation: false
-      worker_count: 2
+      worker_count: 1
       verification_position_tolerance_m: 0.001
       verification_orientation_tolerance_deg: 1.0
       worker_namespace_prefix: /ik_worker
@@ -1056,6 +1056,26 @@ robot:
     skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar
     debug_tracing: true
+    idle_behaviors:
+      sound_orientation:
+        # Disabled until concurrent VoiceASRNode + speech_direction_node access
+        # to the deployed ReSpeaker has been validated or a shared capture path
+        # is available. The ROS launch integration remains ready for opt-in.
+        enabled: false
+        trigger_phrases: ["转向我"]
+        direction_topic: /voice/speech_direction
+        command_topic: /voice_command
+        skill_name: nav_turn
+        direction_frame: base_link
+        deadband_deg: 15.0
+        max_direction_age_sec: 1.3
+        direction_wait_sec: 0.5
+        cooldown_sec: 1.5
+        max_turn_deg: 180.0
+        turn_timeout_sec: 10.0
+        action_acceptance_timeout_sec: 2.0
+        status_retry_sec: 0.5
+        reset_status_max_age_sec: 2.0
     task_input_topic: /voice_command
     task_command_topic: /embodied/task_command
     planned_task_topic: /embodied/planned_task
@@ -1154,9 +1174,9 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      # Device-specific serials belong in a deployment instance override.
-      # Leave the generic profile empty so other LeKiwi units can bind safely.
-      serial_number: ""
+      # Keep the validated wrist device binding until deployment overrides are
+      # implemented and included in the configuration digest.
+      serial_number: "349522071345"
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.
       initial_reset: false

@@ -24,7 +24,8 @@ def _claim_path(payload: dict[str, Any], text: str) -> Path:
     session_id = str(payload.get("session_id") or "")
     extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
     turn_id = str(extra.get("turn_id") or payload.get("turn_id") or "")
-    digest = hashlib.sha256(f"{session_id}|{turn_id}|{text}".encode()).hexdigest()
+    # Keep one bounded interim announcement per turn.
+    digest = hashlib.sha256(f"{session_id}|{turn_id}".encode()).hexdigest()
     root = Path(os.environ.get("IBROBOT_INTERIM_SPEECH_STATE", "/tmp/ibrobot-interim-speech"))
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root / digest
@@ -48,6 +49,11 @@ def handle(payload: dict[str, Any]) -> None:
     if payload.get("hook_event_name") != "on_interim_message":
         return
     text = _text(payload)
+    try:
+        max_chars = max(1, int(os.environ.get("IBROBOT_INTERIM_MAX_CHARS", "500")))
+    except ValueError:
+        max_chars = 500
+    text = text[:max_chars].rstrip()
     if not text or not sanitize_for_tts(text).strip():
         return
     speaker = os.environ.get("IBROBOT_INTERIM_SPEAKER", "")

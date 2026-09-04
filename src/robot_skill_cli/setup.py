@@ -1,4 +1,5 @@
 from glob import glob
+from pathlib import Path
 
 from setuptools import find_packages, setup
 
@@ -23,7 +24,7 @@ setup(
         ),
         (
             "share/" + package_name + "/hermes/hooks",
-            [*glob("resource/hermes/hooks/*")],
+            [path for path in glob("resource/hermes/hooks/*") if Path(path).is_file()],
         ),
     ],
     install_requires=["setuptools", "pyyaml"],

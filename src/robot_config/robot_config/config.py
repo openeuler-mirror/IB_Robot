@@ -131,6 +131,27 @@ class SkillGatewayRuntimeConfig:
 
 
 @dataclass
+class SoundOrientationConfig:
+    """Fixed-trigger idle sound-orientation behavior."""
+
+    enabled: bool = False
+    trigger_phrases: tuple[str, ...] = ("转向我",)
+    direction_topic: str = "/voice/speech_direction"
+    command_topic: str = "/voice_command"
+    skill_name: str = "nav_turn"
+    direction_frame: str = "base_link"
+    deadband_deg: float = 15.0
+    max_direction_age_sec: float = 1.3
+    direction_wait_sec: float = 0.5
+    cooldown_sec: float = 1.5
+    max_turn_deg: float = 180.0
+    turn_timeout_sec: float = 10.0
+    action_acceptance_timeout_sec: float = 2.0
+    status_retry_sec: float = 0.5
+    reset_status_max_age_sec: float = 2.0
+
+
+@dataclass
 class EmbodiedConfig:
     """Minimum embodied claw closure configuration."""
 
@@ -165,6 +186,8 @@ class EmbodiedConfig:
     perception: dict[str, Any] = field(default_factory=dict)
     visual_games: dict[str, Any] = field(default_factory=dict)
     imitate_human_motion: dict[str, Any] = field(default_factory=dict)
+    idle_behaviors: dict[str, Any] = field(default_factory=dict)
+    sound_orientation: SoundOrientationConfig = field(default_factory=SoundOrientationConfig)
     gripper_open_position: float = 1.0
     gripper_closed_position: float = 0.0
     skill_templates: dict[str, Any] = field(default_factory=dict)

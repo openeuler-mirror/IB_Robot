@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, cast
 
@@ -30,6 +31,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     SemanticMappingConfig,
     SkillGatewayRuntimeConfig,
+    SoundOrientationConfig,
     SpeechDirectionConfig,
     VoiceASRConfig,
     VoiceTTSConfig,
@@ -1439,10 +1441,104 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
         errors.extend(_validate_visual_game_services(embodied))
+        errors.extend(_validate_sound_orientation_config(robot_config))
         try:
             resolve_embodied_timeout_policy(embodied)
         except ValueError as exc:
             errors.append(str(exc))
+    return errors
+
+
+def _validate_sound_orientation_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the optional fixed-trigger sound-orientation runtime."""
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        return []
+    if not embodied.get("enabled", False):
+        return []
+    idle_behaviors = embodied.get("idle_behaviors", {})
+    if idle_behaviors is None:
+        return []
+    if not isinstance(idle_behaviors, dict):
+        return ["embodied.idle_behaviors must be a mapping"]
+    config = idle_behaviors.get("sound_orientation", {})
+    if config is None:
+        return []
+    if not isinstance(config, dict):
+        return ["embodied.idle_behaviors.sound_orientation must be a mapping"]
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        return ["embodied.idle_behaviors.sound_orientation.enabled must be a boolean"]
+    if not enabled:
+        return []
+
+    errors: list[str] = []
+    speech_direction = robot_config.get("speech_direction", {})
+    voice_asr = robot_config.get("voice_asr", {})
+    if not isinstance(speech_direction, dict) or not speech_direction.get("enabled", False):
+        errors.append("sound orientation requires speech_direction.enabled=true")
+    if not isinstance(voice_asr, dict) or not voice_asr.get("enabled", False):
+        errors.append("sound orientation requires voice_asr.enabled=true")
+    skill_name = str(config.get("skill_name", "nav_turn")).strip()
+    if skill_name != "nav_turn":
+        errors.append("embodied.idle_behaviors.sound_orientation.skill_name must be nav_turn")
+    trigger_phrases = config.get("trigger_phrases", ["转向我"])
+    if (
+        not isinstance(trigger_phrases, list)
+        or not trigger_phrases
+        or any(not isinstance(value, str) or not value.strip() for value in trigger_phrases)
+    ):
+        errors.append("embodied.idle_behaviors.sound_orientation.trigger_phrases must be a non-empty string list")
+    else:
+        normalized_phrases = []
+        for value in trigger_phrases:
+            chars = [char.casefold() for char in value if not char.isspace()]
+            while chars and unicodedata.category(chars[0]).startswith("P"):
+                chars.pop(0)
+            while chars and unicodedata.category(chars[-1]).startswith("P"):
+                chars.pop()
+            normalized_phrases.append("".join(chars))
+        if any(not phrase for phrase in normalized_phrases):
+            errors.append("embodied.idle_behaviors.sound_orientation.trigger_phrases must contain usable text")
+        if len(set(normalized_phrases)) != len(normalized_phrases):
+            errors.append("embodied.idle_behaviors.sound_orientation.trigger_phrases must be unique")
+    direction_frame = config.get("direction_frame", "base_link")
+    if not isinstance(direction_frame, str) or not direction_frame.strip():
+        errors.append("embodied.idle_behaviors.sound_orientation.direction_frame must be a non-empty string")
+    for field_name in ("direction_topic", "command_topic"):
+        value = config.get(field_name)
+        if value is not None and (
+            not isinstance(value, str) or not value.strip() or not _ROS_ABSOLUTE_NAME_PATTERN.fullmatch(value.strip())
+        ):
+            errors.append(f"embodied.idle_behaviors.sound_orientation.{field_name} must be a non-empty string")
+
+    numeric_fields = {
+        "deadband_deg": (0.0, 180.0, False),
+        "max_direction_age_sec": (0.0, None, True),
+        "direction_wait_sec": (0.0, None, False),
+        "cooldown_sec": (0.0, None, False),
+        "max_turn_deg": (0.0, None, True),
+        "turn_timeout_sec": (0.0, None, True),
+        "status_retry_sec": (0.0, None, True),
+        "action_acceptance_timeout_sec": (0.0, None, True),
+        "reset_status_max_age_sec": (0.0, None, True),
+    }
+    for field_name, (minimum, maximum, strict_minimum) in numeric_fields.items():
+        value = config.get(field_name)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+            errors.append(f"embodied.idle_behaviors.sound_orientation.{field_name} must be finite and numeric")
+            continue
+        number = float(value)
+        if (number <= minimum if strict_minimum else number < minimum) or (maximum is not None and number >= maximum):
+            errors.append(f"embodied.idle_behaviors.sound_orientation.{field_name} is outside its allowed range")
+
+    control_modes = robot_config.get("control_modes", {})
+    if not isinstance(control_modes, dict) or "base_navigation" not in control_modes:
+        errors.append("sound orientation requires control_modes.base_navigation")
+    if "navigation" in robot_config and navigation_endpoint_projection(robot_config) is None:
+        errors.append("sound orientation requires navigation.command_server.action_name")
     return errors
 
 
@@ -1855,6 +1951,28 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     direction_mapping = execution.get("relative_motion_direction_mapping", {})
     perception = data.get("perception", {})
     timeout_policy = resolve_embodied_timeout_policy(data)
+    idle_behaviors = data.get("idle_behaviors", {})
+    sound_data = idle_behaviors.get("sound_orientation", {}) if isinstance(idle_behaviors, dict) else {}
+    sound_defaults = SoundOrientationConfig()
+    sound_orientation = SoundOrientationConfig(
+        enabled=sound_data.get("enabled", sound_defaults.enabled),
+        trigger_phrases=tuple(sound_data.get("trigger_phrases", sound_defaults.trigger_phrases)),
+        direction_topic=sound_data.get("direction_topic", sound_defaults.direction_topic),
+        command_topic=sound_data.get("command_topic", sound_defaults.command_topic),
+        skill_name=sound_data.get("skill_name", sound_defaults.skill_name),
+        direction_frame=sound_data.get("direction_frame", sound_defaults.direction_frame),
+        deadband_deg=sound_data.get("deadband_deg", sound_defaults.deadband_deg),
+        max_direction_age_sec=sound_data.get("max_direction_age_sec", sound_defaults.max_direction_age_sec),
+        direction_wait_sec=sound_data.get("direction_wait_sec", sound_defaults.direction_wait_sec),
+        cooldown_sec=sound_data.get("cooldown_sec", sound_defaults.cooldown_sec),
+        max_turn_deg=sound_data.get("max_turn_deg", sound_defaults.max_turn_deg),
+        turn_timeout_sec=sound_data.get("turn_timeout_sec", sound_defaults.turn_timeout_sec),
+        action_acceptance_timeout_sec=sound_data.get(
+            "action_acceptance_timeout_sec", sound_defaults.action_acceptance_timeout_sec
+        ),
+        status_retry_sec=sound_data.get("status_retry_sec", sound_defaults.status_retry_sec),
+        reset_status_max_age_sec=sound_data.get("reset_status_max_age_sec", sound_defaults.reset_status_max_age_sec),
+    )
 
     return EmbodiedConfig(
         enabled=data.get("enabled", False),
@@ -1887,6 +2005,8 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         perception=perception,
         visual_games=data.get("visual_games", {}),
         imitate_human_motion=data.get("imitate_human_motion", {}),
+        idle_behaviors=idle_behaviors,
+        sound_orientation=sound_orientation,
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         skill_templates=data.get("skill_templates", {}),
@@ -2115,6 +2235,7 @@ def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
         return []
     perception = embodied.get("perception", {}) or {}
     errors = _validate_visual_game_policies({"embodied": embodied})
+    errors.extend(_validate_sound_orientation_config(config))
     # Service/capacity fields are independent of game policies: validate them
     # even when policies are invalid so launch-time overrides (e.g. colliding
     # start/result service names) surface in the same pass instead of at runtime.
@@ -2214,6 +2335,7 @@ def validate_config(config: RobotConfig) -> list[str]:
     )
     typed_embodied = {
         "visual_games": config.embodied.visual_games or {},
+        "idle_behaviors": config.embodied.idle_behaviors or {},
         "start_visual_game_service": config.embodied.start_visual_game_service,
         "get_visual_game_result_service": config.embodied.get_visual_game_result_service,
         "visual_game_event_topic": config.embodied.visual_game_event_topic,
@@ -2222,6 +2344,39 @@ def validate_config(config: RobotConfig) -> list[str]:
     visual_game_policy_errors = _validate_visual_game_policies({"embodied": typed_embodied})
     errors.extend(visual_game_policy_errors)
     errors.extend(_validate_visual_game_services(typed_embodied))
+    errors.extend(
+        _validate_sound_orientation_config(
+            {
+                "embodied": {
+                    "enabled": config.embodied.enabled,
+                    "idle_behaviors": {
+                        "sound_orientation": {
+                            "enabled": config.embodied.sound_orientation.enabled,
+                            "trigger_phrases": list(config.embodied.sound_orientation.trigger_phrases),
+                            "direction_topic": config.embodied.sound_orientation.direction_topic,
+                            "command_topic": config.embodied.sound_orientation.command_topic,
+                            "skill_name": config.embodied.sound_orientation.skill_name,
+                            "direction_frame": config.embodied.sound_orientation.direction_frame,
+                            "deadband_deg": config.embodied.sound_orientation.deadband_deg,
+                            "max_direction_age_sec": config.embodied.sound_orientation.max_direction_age_sec,
+                            "direction_wait_sec": config.embodied.sound_orientation.direction_wait_sec,
+                            "cooldown_sec": config.embodied.sound_orientation.cooldown_sec,
+                            "max_turn_deg": config.embodied.sound_orientation.max_turn_deg,
+                            "turn_timeout_sec": config.embodied.sound_orientation.turn_timeout_sec,
+                            "action_acceptance_timeout_sec": (
+                                config.embodied.sound_orientation.action_acceptance_timeout_sec
+                            ),
+                            "status_retry_sec": config.embodied.sound_orientation.status_retry_sec,
+                            "reset_status_max_age_sec": config.embodied.sound_orientation.reset_status_max_age_sec,
+                        }
+                    },
+                },
+                "voice_asr": {"enabled": config.voice_asr.enabled, "output_topic": config.voice_asr.output_topic},
+                "speech_direction": {"enabled": config.speech_direction.enabled},
+                "control_modes": {mode: {} for mode in config.skill_gateway.control_modes},
+            }
+        )
+    )
 
     errors.extend(validate_placement_execution_config(getattr(config, "placement_execution", None)))
 

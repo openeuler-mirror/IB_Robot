@@ -118,3 +118,8 @@ def test_workflow_v2_distinguishes_absent_coordinate_from_explicit_zero():
 def test_workflow_v1_rejects_navigation_parameters():
     with pytest.raises(ValueError, match="schema_version 2"):
         CanonicalWorkflowStep(1, "nav_straight", direction="forward", distance=1.0)
+
+
+def test_workflow_step_rejects_unknown_fields():
+    with pytest.raises(ValueError, match="unknown fields.*unexpected"):
+        normalize_workflow_steps([{"schema_version": 1, "skill_name": "open_gripper_skill", "unexpected": True}])

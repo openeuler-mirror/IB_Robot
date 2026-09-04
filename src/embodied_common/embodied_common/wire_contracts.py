@@ -33,3 +33,23 @@ def validate_public_request_wire_contracts() -> None:
                     f"public request wire contract mismatch for {type_name}: schema_version contract must include "
                     "string arm_side and float32 imitation_duration_sec"
                 )
+
+    try:
+        from ibrobot_msgs.msg import AgentPlan
+        from ibrobot_msgs.srv import ConfirmAgentPlan, PlanAgentCommand
+    except ModuleNotFoundError:
+        # Keep stale-overlay tests focused on the shared public request prefix.
+        # Full environments validate the AgentPlan execution-mode fields below.
+        return
+
+    for type_name, request_type, required_field in (
+        ("PlanAgentCommand.Request", PlanAgentCommand.Request, "execution_mode"),
+        ("ConfirmAgentPlan.Request", ConfirmAgentPlan.Request, "execution_mode"),
+        ("AgentPlan", AgentPlan, "execution_mode"),
+    ):
+        try:
+            fields = request_type.get_fields_and_field_types()
+        except (AttributeError, TypeError) as exc:
+            raise RuntimeError(f"public request wire contract mismatch for {type_name}") from exc
+        if required_field not in fields:
+            raise RuntimeError(f"public request wire contract mismatch for {type_name}: missing {required_field}")

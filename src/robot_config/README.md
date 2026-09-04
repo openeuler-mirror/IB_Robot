@@ -12,6 +12,10 @@ ros2_control 和外设的统一机器人配置系统。
 
 目标是建立机器人硬件配置的单一数据源，消除不同配置系统之间的重复。
 
+固定触发词声源转向由 `robot.embodied.idle_behaviors.sound_orientation` 管理。配置默认关闭，仅支持移动底盘的 `nav_turn`，并要求 Voice ASR、speech direction、`base_navigation` 与导航 command server 同时可用。该配置只决定是否启动 `embodied_agent/sound_orientation_node`；运动授权仍只能由 `authorize_motion` launch 参数提供。
+
+当前 `VoiceASRNode` 和 `speech_direction_node` 各自拥有音频采集，不共享设备流。生产配置不得在未验证同一麦克风并发读取前默认开启此行为。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
+
 通用机器人 profile 不固化具体设备实例的相机序列号。多设备部署应通过部署侧 instance
 override 注入序列号，避免把某一台实物设备绑定到所有同型号 profile。
 

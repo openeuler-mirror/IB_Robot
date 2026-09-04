@@ -72,3 +72,60 @@ def test_failed_speaker_start_can_be_retried(tmp_path, monkeypatch) -> None:
     speech.handle(payload)
 
     assert attempts == 2
+
+
+def test_different_partial_text_is_coalesced_per_turn(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("IBROBOT_INTERIM_SPEECH_STATE", str(tmp_path))
+    monkeypatch.setenv("IBROBOT_INTERIM_SPEAKER", "/profile/hooks/ibrobot-speak")
+    spawned = []
+
+    class _Stdin:
+        def write(self, value):
+            spawned.append(value)
+
+        def close(self):
+            pass
+
+    class _Process:
+        stdin = _Stdin()
+
+    monkeypatch.setattr(speech.subprocess, "Popen", lambda *args, **kwargs: _Process())
+    for text in ("正在观察。", "正在观察环境。", "准备执行。"):
+        speech.handle(
+            {
+                "hook_event_name": "on_interim_message",
+                "session_id": "session-1",
+                "extra": {"turn_id": "turn-1", "text": text},
+            }
+        )
+
+    assert len(spawned) == 1
+
+
+def test_interim_text_is_bounded(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("IBROBOT_INTERIM_SPEECH_STATE", str(tmp_path))
+    monkeypatch.setenv("IBROBOT_INTERIM_SPEAKER", "/profile/hooks/ibrobot-speak")
+    monkeypatch.setenv("IBROBOT_INTERIM_MAX_CHARS", "4")
+    sent = []
+
+    class _Stdin:
+        def write(self, value):
+            sent.append(value)
+
+        def close(self):
+            pass
+
+    class _Process:
+        stdin = _Stdin()
+
+    monkeypatch.setattr(speech.subprocess, "Popen", lambda *args, **kwargs: _Process())
+    speech.handle(
+        {
+            "hook_event_name": "on_interim_message",
+            "session_id": "session-1",
+            "extra": {"turn_id": "turn-1", "text": "准备执行动作。"},
+        }
+    )
+
+    assert len(sent) == 1
+    assert '"assistant_response": "准备执行"' in sent[0]

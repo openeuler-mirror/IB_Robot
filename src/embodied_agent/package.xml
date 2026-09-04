@@ -8,7 +8,9 @@
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
+  <depend>action_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>unique_identifier_msgs</depend>
   <depend>ibrobot_msgs</depend>
   <depend>embodied_common</depend>
   <depend>skill_catalog</depend>

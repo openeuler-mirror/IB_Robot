@@ -14,7 +14,7 @@
 | `hooks/ibrobot-block-raw-ros` | Hermes `pre_tool_call` hook，用 `shlex` 分词拦截裸 `ros2`/`rclpy`/`roslaunch` 调用 |
 | `hooks/ibrobot-speak` | Hermes `post_llm_call` speech hook wrapper，source `.shrc_local` 后 `exec python3 -m robot_skill_cli.hermes_tts_hook`；TTS 服务名与超时来自 `robot_config` SSOT |
 | `hooks/ibrobot-lifecycle-speech` | Hermes `pre_tool_call` / `post_tool_call` hook；只投递状态检查、规划和计划授权事件，文案生成、TTS 合成和播放均在后台执行 |
-| `hooks/ibrobot-interim-speech` | Hermes `on_interim_message` hook；加载 workspace `.shrc_local` 后异步转交当前 profile 的 TTS hook |
+| `hooks/ibrobot-interim-speech` | Hermes `on_interim_message` hook；加载 workspace `.shrc_local` 后按 turn 有界异步转交当前 profile 的 TTS hook |
 | `sync_hermes.sh` | 手动同步入口（等价于 `hermes-robot-configure`） |
 
 ## `ibrobot-perceive`（感知读取唯一入口）

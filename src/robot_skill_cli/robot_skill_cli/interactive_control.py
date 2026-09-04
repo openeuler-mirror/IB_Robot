@@ -255,13 +255,17 @@ class InteractiveController:
                     "SKILL_REFERENCE_MISSING", f"skill semantic level is not plannable: {skill_name}"
                 )
 
-    def prepare_workflow(self, raw_command: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    def prepare_workflow(
+        self, raw_command: str, steps: list[dict[str, Any]], *, request_id: str | None = None
+    ) -> dict[str, Any]:
         """Feature 3 (create + present): plan one workflow and bind the pending plan in-session."""
         if self._fresh_view is None:
             raise IllegalStateError("ILLEGAL_STATE", "discover() must run before prepare_workflow()")
         self.reject_out_of_catalog(steps)
         normalized = [step.to_dict() for step in normalize_workflow_steps(steps)]
-        request_id = self._id_factory()
+        request_id = request_id.strip() if isinstance(request_id, str) else self._id_factory()
+        if not request_id:
+            raise InteractiveControlError("SKILL_SCHEMA_INVALID", "request_id must be non-empty")
         task_id = self._id_factory()
         result = self._bridge.plan_agent_command(
             request_id=request_id,
@@ -469,6 +473,7 @@ class InteractiveController:
         raw_command: str,
         steps: list[dict[str, Any]],
         *,
+        request_id: str | None = None,
         presentation_callback: Callable[[dict[str, Any]], None],
         authorization_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: threading.Event | None = None,
@@ -514,7 +519,7 @@ class InteractiveController:
                     self._state = IDLE
                 raise
         try:
-            presentation = self.prepare_workflow(raw_command, steps)
+            presentation = self.prepare_workflow(raw_command, steps, request_id=request_id)
         except Exception:
             with self._state_lock:
                 self._clear_operation()
