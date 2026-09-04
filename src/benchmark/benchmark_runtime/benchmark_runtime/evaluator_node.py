@@ -6,6 +6,7 @@ contracts, writes canonical reports, and emits a durable terminal marker.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import json
 import platform
@@ -21,6 +22,7 @@ import rclpy
 from action_msgs.msg import GoalStatus
 from diagnostic_msgs.msg import DiagnosticStatus
 from rclpy.action import ActionClient
+from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 
@@ -176,7 +178,11 @@ def _runtime_manifest_identity(robot_config_path: str) -> dict[str, Any]:
     mode = modes.get(mode_name, {}) if isinstance(modes, dict) else {}
     inference = mode.get("inference", {}) if isinstance(mode, dict) else {}
     pipelines = inference.get("pipelines", {}) if isinstance(inference, dict) else {}
-    pipeline_id = next(iter(pipelines), None) if isinstance(pipelines, dict) and len(pipelines) == 1 else None
+    executor = mode.get("executor", {}) if isinstance(mode, dict) else {}
+    selected = executor.get("inference_pipeline") if isinstance(executor, dict) else None
+    if selected is None and isinstance(pipelines, dict) and len(pipelines) == 1:
+        selected = next(iter(pipelines))
+    pipeline_id = selected if isinstance(selected, str) and selected in pipelines else None
     pipeline = pipelines.get(pipeline_id, {}) if pipeline_id is not None else {}
     model_path = pipeline.get("model_path") if isinstance(pipeline, dict) else None
     deployment = pipeline.get("deployment") if isinstance(pipeline, dict) else None
@@ -297,6 +303,8 @@ class BenchmarkEvaluatorNode(Node):
         self._failed = False
         self._production_ready = False
         self._completion_logged = False
+        self._terminal_requested = False
+        self._terminal_exit_code = 0
         self._run_id = ""
         self._last_readiness_log_monotonic = float("-inf")
         self._canonical_writer: CanonicalReportWriter | None = None
@@ -1207,6 +1215,8 @@ class BenchmarkEvaluatorNode(Node):
             return
         self._failed = True
         self._abort_canonical(message)
+        self._terminal_exit_code = 1
+        self._terminal_requested = True
         self.get_logger().error(f"{ERROR_TAG} {message}")
 
     @property
@@ -1214,18 +1224,29 @@ class BenchmarkEvaluatorNode(Node):
         return self._supervisor is not None and self._supervisor.completed
 
     def _announce_completed_once(self) -> None:
-        """Emit the terminal user marker after canonical durability is established."""
+        """Emit the terminal marker only after the evaluator result is durable."""
+        if self._completion_logged:
+            return
         writer = self._canonical_writer
         status = self._canonical_final_status
-        if self._completion_logged or writer is None or not self._canonical_finalized or status is None:
-            return
+        if writer is not None:
+            if not self._canonical_finalized or status is None:
+                return
+            run_root = writer.run_root.resolve()
+            summary_path = writer.summary_path.resolve()
+            artifact_message = f"run_root={run_root} summary={summary_path}"
+        else:
+            # Canonical output is optional. Native/provider finalization still
+            # makes the evaluator's terminal state durable when it is disabled.
+            status = "complete"
+            artifact_message = "canonical_output=disabled"
         tag = EVALUATION_COMPLETE_TAG if status == "complete" else EVALUATION_FINISHED_TAG
-        run_root = writer.run_root.resolve()
-        summary_path = writer.summary_path.resolve()
         self._completion_logged = True
-        self.get_logger().info(
-            f"{tag} status={status} run_id={self._run_id} run_root={run_root} summary={summary_path}"
-        )
+        self.get_logger().info(f"{tag} status={status} run_id={self._run_id} {artifact_message}")
+        # The launch layer observes this clean process exit and shuts down the
+        # Benchmark evaluation graph after the durable terminal marker.
+        self._terminal_requested = True
+        self._terminal_exit_code = 0
 
     def destroy_node(self) -> bool:
         """Persist an interrupted canonical run without changing completed output."""
@@ -1237,25 +1258,35 @@ class BenchmarkEvaluatorNode(Node):
 def main(argv: list[str] | None = None) -> None:
     rclpy.init(args=argv)
     node = BenchmarkEvaluatorNode()
+    executor = SingleThreadedExecutor()
+    exit_code = 0
     try:
         if bool(node.get_parameter("scaffold_mode").value):
             node.announce_ready()
         else:
             node.start_production()
-        rclpy.spin(node)
+        executor.add_node(node)
+        while rclpy.ok() and not node._terminal_requested:
+            try:
+                executor.spin_once(timeout_sec=0.1)
+            except ExternalShutdownException:
+                break
+        exit_code = node._terminal_exit_code
     except (ScaffoldValidationError, EvaluatorStartupError):
-        node.destroy_node()
-        rclpy.shutdown()
-        sys.exit(1)
+        exit_code = 1
     except KeyboardInterrupt:
-        pass
+        exit_code = 130
     finally:
         # ROS SIGINT may mark the context not-ok before spin returns. Canonical
         # interruption durability still belongs to destroy_node(), so invoke it
         # unconditionally and only guard the subsequent global shutdown call.
+        with contextlib.suppress(Exception):
+            executor.remove_node(node)
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

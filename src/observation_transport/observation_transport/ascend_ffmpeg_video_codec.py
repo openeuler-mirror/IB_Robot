@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 
 import numpy as np
 
+from observation_transport.rtp_sender import H264Depacketizer, RtpPacket
 from observation_transport.video_codec import (
     CodecCapabilities,
     CodecLifecycleState,
@@ -31,7 +32,6 @@ from observation_transport.video_codec import (
     VideoEncoder,
     VideoFrame,
 )
-from observation_transport.rtp_sender import H264Depacketizer, RtpPacket
 from tensormsg.converter import nv12_to_hwc_uint8
 
 _BACKEND = "ascend"

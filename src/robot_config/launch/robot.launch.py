@@ -96,7 +96,12 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
-from robot_config.inference_config import scheduler_enabled_from_raw_config
+from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
+from robot_config.inference_config import (
+    InferenceConfigError,
+    parse_inference_config,
+    scheduler_enabled_from_raw_config,
+)
 
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.benchmark import generate_benchmark_nodes
@@ -168,7 +173,11 @@ def load_robot_config(robot_config_name, config_path_override=None, nav_stage=""
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
 
-    robot_config = load_robot_config_dict(config_path, nav_stage=nav_stage)
+    robot_config = load_robot_config_dict(
+        config_path,
+        nav_stage=nav_stage,
+        materialize_benchmark_transport=False,
+    )
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
 
@@ -191,6 +200,69 @@ def _apply_voice_asr_cli_overrides(context, robot_config: dict) -> None:
         voice_asr_config["realtime_pre_roll_seconds"] = float(pre_roll_override)
 
     robot_config["voice_asr"] = voice_asr_config
+
+
+def _validate_benchmark_inference_closure(
+    robot_config: dict,
+    *,
+    control_mode: str,
+    with_inference: bool,
+) -> None:
+    """Fail fast when Benchmark evaluation cannot reach the policy/action path."""
+    benchmark = robot_config.get("benchmark", {})
+    evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark, dict) else {}
+    if not isinstance(evaluation, dict) or not bool(evaluation.get("enabled", False)):
+        return
+    if not with_inference:
+        raise ValueError("benchmark evaluation requires with_inference:=true")
+
+    mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
+    if not isinstance(mode_config, dict):
+        raise ValueError(f"benchmark evaluation control mode {control_mode!r} is not configured")
+    executor = mode_config.get("executor", {})
+    if not isinstance(executor, dict) or executor.get("type") != "benchmark":
+        raise ValueError("benchmark evaluation requires control_modes.<mode>.executor.type=benchmark")
+    dispatch = mode_config.get("dispatch", {}) or {}
+    if not isinstance(dispatch, dict) or dispatch.get("scheduler", "continuous") != "wait_for_feedback":
+        raise ValueError("benchmark evaluation requires dispatch.scheduler=wait_for_feedback")
+
+    try:
+        inference = parse_inference_config(robot_config, control_mode)
+    except InferenceConfigError as exc:
+        raise ValueError(f"benchmark evaluation inference configuration is invalid: {exc}") from exc
+    if not inference.enabled or not inference.pipelines:
+        raise ValueError("benchmark evaluation requires an enabled inference pipeline")
+    selected = executor.get("inference_pipeline")
+    if selected is None:
+        if len(inference.pipelines) != 1:
+            raise ValueError("benchmark evaluation requires executor.inference_pipeline when multiple pipelines exist")
+        selected = next(iter(inference.pipelines))
+    if not isinstance(selected, str) or selected not in inference.pipelines:
+        raise ValueError(f"benchmark evaluation selects unknown inference pipeline {selected!r}")
+    pipeline = inference.pipelines[selected]
+    if pipeline.execution_mode not in {"monolithic", "distributed"}:
+        raise ValueError(f"benchmark evaluation selected pipeline {selected!r} has invalid execution mode")
+    transport = pipeline.transport
+    required_endpoints = {
+        "action_server": transport.action_server,
+        "reset_service": transport.reset_service,
+        "health_topic": transport.health_topic,
+    }
+    if pipeline.execution_mode == "distributed":
+        required_endpoints.update(
+            {
+                "request_topic": transport.request_topic,
+                "result_topic": transport.result_topic,
+                "heartbeat_topic": transport.heartbeat_topic,
+                "video_descriptor_topic": transport.video_descriptor_topic,
+                "video_status_topic": transport.video_status_topic,
+            }
+        )
+    missing = sorted(name for name, value in required_endpoints.items() if not isinstance(value, str) or not value)
+    if missing:
+        raise ValueError(
+            f"benchmark evaluation selected pipeline {selected!r} is missing required endpoints: {missing}"
+        )
 
 
 def _apply_inference_cli_overrides(context, robot_config: dict, control_mode: str) -> None:
@@ -380,26 +452,16 @@ def launch_setup(context, *args, **kwargs):
             robot_config_share = str(Path(__file__).parent.parent)
         robot_config["_config_path"] = str(Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml")
 
-    # An omitted use_sim launch argument follows the explicit runtime target.
-    # This keeps the formal benchmark command SSOT-only while preserving
-    # fail-fast behavior for an explicitly conflicting use_sim:=false.
-    if use_sim_str == "":
-        runtime_section = robot_config.get("runtime", {})
-        configured_target = runtime_section.get("target", "") if isinstance(runtime_section, dict) else ""
-        effective_target = runtime_target_override or str(configured_target).strip().lower()
-        use_sim = effective_target in {"benchmark", "simulation"}
-        logger.info(f"Inferred use_sim={use_sim} from runtime target {effective_target or 'hardware-default'}")
-    else:
-        use_sim = parse_bool(use_sim_str, default=False)
-
     # ========== 2.5 Resolve runtime target (SSOT) ==========
-    # runtime.target decides which runtime carries the embodiment. use_sim only
-    # marks whether the embodiment is virtual; it must NOT be reused to pick the
-    # world provider. benchmark + use_sim=true stays BENCHMARK and never enters
-    # the SimBackendAdapter registry.
-    runtime_target = resolve_runtime_target(robot_config, runtime_target_override, use_sim)
+    # resolve_runtime_target is the single authority for the runtime target.
+    # An omitted use_sim argument is represented by None; the resolved target
+    # then determines the virtual/hardware embodiment used by the launch plan.
+    requested_use_sim = None if use_sim_str == "" else parse_bool(use_sim_str, default=False)
+    runtime_target = resolve_runtime_target(robot_config, runtime_target_override, requested_use_sim)
+    use_sim = runtime_target is not RuntimeTarget.HARDWARE
     is_benchmark = runtime_target is RuntimeTarget.BENCHMARK
     logger.info(f"Runtime target: {runtime_target}")
+    logger.info(f"Effective use_sim: {use_sim}")
     if is_benchmark:
         print("[IBROBOT_BENCHMARK][RUNTIME_TARGET] benchmark")
         print("[IBROBOT_BENCHMARK][SKIP] ros2_control")
@@ -487,6 +549,16 @@ def launch_setup(context, *args, **kwargs):
 
     logger.info(f"Final with_inference={with_inference}")
     scheduler_enabled = with_inference and scheduler_enabled_from_raw_config(robot_config, active_control_mode)
+
+    # Benchmark-specific transport is derived only after all launch overlays and
+    # the effective runtime target are known. The generic loader stays neutral.
+    if is_benchmark:
+        materialize_benchmark_observation_transport(robot_config)
+        _validate_benchmark_inference_closure(
+            robot_config,
+            control_mode=active_control_mode,
+            with_inference=with_inference,
+        )
 
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
@@ -845,6 +917,7 @@ def launch_setup(context, *args, **kwargs):
                 active_control_mode,
                 use_sim,
                 use_sim_time=node_use_sim_time,
+                runtime_target=runtime_target,
             )
             if controller_ready_barrier is not None:
                 logger.info("Deferring execution nodes until required controllers are active...")

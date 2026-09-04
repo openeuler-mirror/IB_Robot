@@ -1555,18 +1555,22 @@ def load_robot_config_dict(
     config_path: str | Path | None = None,
     *,
     nav_stage: str = "",
+    materialize_benchmark_transport: bool | None = None,
 ) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
     This is the canonical loader for launch/builders/runtime consumers. It preserves
     the full YAML schema under ``robot`` and annotates the resolved source path for
-    downstream users that need provenance.
+    downstream users that need provenance. Benchmark-specific observation
+    transport materialization is opt-in; launch orchestration performs it only
+    after all launch overrides and the effective runtime target are resolved.
     """
     resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(
         resolve_robot_config_path(config_path=config_path)
     )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
-    materialize_benchmark_observation_transport(robot_config)
+    if materialize_benchmark_transport is True:
+        materialize_benchmark_observation_transport(robot_config)
     mount_file = robot_config.get("mid360_mount_file")
     if mount_file:
         mount_path = Path(resolve_ros_path(mount_file)).expanduser()

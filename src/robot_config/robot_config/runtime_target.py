@@ -90,7 +90,7 @@ def _validate_benchmark_fields(robot_config: Mapping[str, Any]) -> None:
 def resolve_runtime_target(
     robot_config: Mapping[str, Any],
     runtime_target_override: str,
-    use_sim: bool,
+    use_sim: bool | None,
 ) -> RuntimeTarget:
     """Resolve the runtime target from SSOT, launch override and use_sim.
 
@@ -100,31 +100,29 @@ def resolve_runtime_target(
         runtime_target_override: The ``runtime_target`` launch argument. An
             empty string means "no override; use SSOT or historical fallback".
         use_sim: Whether the current embodiment is virtual (``true``) or real
-            (``false``). It is *not* the runtime target; it only marks the
-            embodiment and constrains consistency for explicit targets.
+            (``false``). ``None`` means the launch argument was omitted; in
+            that case the resolved target determines the embodiment. It is not
+            the runtime target; it only constrains consistency when explicit.
     """
 
     override = _normalize_target(runtime_target_override)
     target_str = _resolve_explicit_target(robot_config, override)
+    explicit_target = bool(target_str)
     if not target_str:
-        if use_sim:
-            target_str = RuntimeTarget.SIMULATION.value
-        else:
-            target_str = RuntimeTarget.HARDWARE.value
+        target_str = RuntimeTarget.SIMULATION.value if use_sim is True else RuntimeTarget.HARDWARE.value
 
     if target_str not in _VALID_TARGETS:
         raise RuntimeTargetError(f"Unknown runtime target: {target_str!r}")
 
     target = RuntimeTarget(target_str)
 
-    # Consistency between explicit target and use_sim. The historical fallback
-    # (use_sim -> simulation) and the default (hardware) are consistent by
-    # construction, so the check only ever fires for explicit targets.
-    if target is RuntimeTarget.HARDWARE:
-        if use_sim:
+    # Consistency between an explicit target and use_sim. When the target is
+    # inferred from use_sim (or use_sim was omitted), there is no conflict to
+    # validate; the resolved target is the single source of truth for launch.
+    if explicit_target and use_sim is not None:
+        if target is RuntimeTarget.HARDWARE and use_sim:
             raise RuntimeTargetError("runtime target 'hardware' requires use_sim=false but use_sim=true")
-    else:  # BENCHMARK or SIMULATION
-        if not use_sim:
+        if target is not RuntimeTarget.HARDWARE and not use_sim:
             source = "override" if override else "SSOT"
             raise RuntimeTargetError(
                 f"runtime target {target.value!r} (from {source}) requires use_sim=true but use_sim=false"

@@ -19,6 +19,7 @@ import rclpy
 import rclpy.action
 import torch
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
+from observation_transport.frame_ingress import StreamSessionView
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -92,7 +93,6 @@ from inference_service.scheduler.ledger import (
 from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from inference_service.unified_runtime import RegistrySet, RuntimeProviders
-from observation_transport.frame_ingress import StreamSessionView
 from robot_config.contract_utils import (
     SpecView,
     StreamBuffer,
@@ -342,6 +342,10 @@ class _ExternalVideoProducerView:
         return ()
 
     def diagnostic_snapshots(self) -> tuple[()]:
+        return ()
+
+    def sender_diagnostics(self) -> tuple[()]:
+        """External producers own sender diagnostics and publish their own status."""
         return ()
 
 

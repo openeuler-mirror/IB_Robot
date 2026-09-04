@@ -14,6 +14,7 @@ from robot_config.inference_config import (
     parse_inference_config,
 )
 from robot_config.logger_utils import get_colored_logger
+from robot_config.runtime_target import RuntimeTarget
 from robot_config.utils import parse_bool, prepare_lerobot_env
 
 logger = get_colored_logger("robot_config.execution")
@@ -25,15 +26,41 @@ def _resolve_use_sim_time(use_sim: object, use_sim_time: object | None = None) -
     return parse_bool(use_sim_time, default=False)
 
 
-def _benchmark_external_video_producer(robot_config: dict, pipeline: InferencePipelineConfig) -> bool:
+_LEGACY_EXECUTOR_TYPE_ALIASES = {"action": "topic"}
+
+
+def _resolve_executor_type(executor_type: object) -> tuple[object, bool]:
+    """Resolve legacy executor spellings at the robot_config launch boundary.
+
+    ``action`` was the historical name for the topic-publishing executor.
+    Keep that compatibility in the configuration layer so the executor
+    registry remains an exact canonical-type registry with no aliases or
+    fallback behavior.
+
+    Returns:
+        The canonical executor type and whether a legacy spelling was used.
+        The flag lets the launch builder preserve the old action parameters.
+    """
+    if not isinstance(executor_type, str) or not executor_type.strip():
+        return executor_type, False
+    canonical_type = _LEGACY_EXECUTOR_TYPE_ALIASES.get(executor_type)
+    if canonical_type is None:
+        return executor_type, False
+    logger.warning(f"Legacy executor.type={executor_type!r} is mapped to {canonical_type!r} for the dispatcher")
+    return canonical_type, True
+
+
+def _benchmark_external_video_producer(
+    runtime_target: RuntimeTarget,
+    pipeline: InferencePipelineConfig,
+) -> bool:
     # Benchmark distributed pipelines use the same loopback cloud role in both
     # DDS and RTP modes.  Keeping the inference topology stable makes the
     # user-facing observation_transport.mode switch change only observation
     # delivery instead of also adding/removing an inference process.
     if pipeline.execution_mode != "distributed":
         return False
-    runtime = robot_config.get("runtime", {}) or {}
-    return runtime.get("target") == "benchmark"
+    return runtime_target is RuntimeTarget.BENCHMARK
 
 
 def _attention_viz_request(inference_config: dict) -> tuple[bool, str, dict]:
@@ -343,6 +370,7 @@ def generate_inference_node(
     control_mode: str,
     use_sim: object = False,
     use_sim_time: object | None = None,
+    runtime_target: RuntimeTarget = RuntimeTarget.HARDWARE,
 ) -> list[Node]:
     """Create one unified local or distributed-edge process per pipeline."""
 
@@ -380,8 +408,9 @@ def generate_inference_node(
             "heartbeat_topic": transport.heartbeat_topic or "",
             "video_descriptor_topic": transport.video_descriptor_topic or "",
             "video_status_topic": transport.video_status_topic or "",
-            "external_video_producer": _benchmark_external_video_producer(robot_config, pipeline),
         }
+        if runtime_target is RuntimeTarget.BENCHMARK:
+            parameters["external_video_producer"] = _benchmark_external_video_producer(runtime_target, pipeline)
         # Scheduled-path endpoints are passed to the pipeline node only
         # when the scheduler is enabled; the node registers the scheduled
         # action servers + serving status iff scheduler_enabled=true.
@@ -416,7 +445,7 @@ def generate_inference_node(
                 output="screen",
             )
         )
-        if _benchmark_external_video_producer(robot_config, pipeline):
+        if _benchmark_external_video_producer(runtime_target, pipeline):
             nodes.append(
                 Node(
                     package="inference_service",
@@ -462,11 +491,10 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
     executor_config = mode_config.get("executor", {}) or {}
     robot_joints = robot_config.get("joints", {})
 
-    # production benchmark wiring: read dispatch section (scheduler/timeout) and executor type, then
-    # apply the generic pairing guard. The guard only knows the stable
-    # generic values; unknown strings pass through to the dispatcher's own
-    # registry fail-fast. Legacy 'action' string is preserved verbatim.
-    executor_type = executor_config.get("type", "topic")
+    # Resolve the historical ``action`` spelling at the launch boundary before
+    # validating the executor/scheduler pairing and constructing the node.
+    raw_executor_type = executor_config.get("type", "topic")
+    executor_type, legacy_action = _resolve_executor_type(raw_executor_type)
     scheduler_mode, execution_timeout_sec = _resolve_dispatch_section(mode_config)
     _validate_executor_scheduler_pairing(executor_type, scheduler_mode)
     _validate_executor_no_routing_keys(executor_config)
@@ -494,9 +522,6 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         joint_names = None
 
     dispatcher_parameters: dict[str, object] = {
-        "enable_dual_mode": executor_config.get("type", "topic") == "topic",
-        "executor_type": executor_config.get("type", "topic"),
-        "executor_mode": executor_config.get("mode", control_mode),
         "robot_name": robot_config.get("name", "so101"),
         "queue_size": executor_config.get("queue_size", 100),
         "watermark_threshold": executor_config.get("watermark_threshold", 20),
@@ -518,7 +543,6 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         "stale_obs_threshold_ms": 500,
         "exhaustion_timeout": 2.0,
         "joint_state_topic": "/joint_states",
-        "dispatch_action_topic": "/action_dispatch/dispatch_action",
         "robot_config_path": str(robot_config_path),
         "inference_action_server": pipeline.transport.action_server,
         "inference_reset_service": pipeline.transport.reset_service,
@@ -527,11 +551,32 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         "inference_prompt": executor_config.get("inference_prompt", ""),
         "navigation_mode": executor_config.get("navigation_mode", False),
         "use_sim_time": parse_bool(use_sim, default=False),
-        # production benchmark wiring: dispatch section passthrough.
-        "scheduler_mode": scheduler_mode,
-        "execution_timeout_sec": execution_timeout_sec,
-        "benchmark_step_service": benchmark_step_service,
+        # Both modes use the same dispatcher node, but their last-mile
+        # channels are intentionally disjoint: benchmark submits to
+        # StepBenchmark, while the native path publishes action topics.
+        "executor_mode": executor_config.get("mode", control_mode),
     }
+    if executor_type == "benchmark":
+        # Benchmark actions leave through StepBenchmark; native action-topic
+        # parameters are intentionally not supplied in this mode.
+        dispatcher_parameters.update(
+            {
+                "enable_dual_mode": False,
+                "executor_type": executor_type,
+                "scheduler_mode": scheduler_mode,
+                "execution_timeout_sec": execution_timeout_sec,
+                "benchmark_step_service": benchmark_step_service,
+            }
+        )
+    else:
+        # Native topic/action configurations retain their existing parameters
+        # and action-topic output path, including legacy ``action`` configs.
+        dispatcher_parameters.update(
+            {
+                "enable_dual_mode": executor_type == "topic" and not legacy_action,
+                "dispatch_action_topic": "/action_dispatch/dispatch_action",
+            }
+        )
     if joint_names is not None:
         dispatcher_parameters["joint_names"] = joint_names
 
@@ -579,11 +624,35 @@ def _scheduled_process_exit_shutdown_factory(node: object):
     return _on_exit
 
 
+def _benchmark_evaluation_enabled(robot_config: dict) -> bool:
+    benchmark = robot_config.get("benchmark", {})
+    evaluation = benchmark.get("evaluation", {}) if isinstance(benchmark, dict) else {}
+    return isinstance(evaluation, dict) and bool(evaluation.get("enabled", False))
+
+
+def _benchmark_process_exit_shutdown_factory(node: object):
+    """Build a Benchmark-only handler for the legacy execution topology."""
+    from launch.actions import EmitEvent
+    from launch.events import Shutdown
+
+    def _on_exit(event, context) -> object:
+        if context.is_shutdown:
+            return None
+        role = getattr(node, "node_executable", "unknown")
+        returncode = event.returncode
+        reason = f"benchmark required process {role!r} exited with return code {returncode}"
+        logger.error(reason)
+        return EmitEvent(event=Shutdown(reason=reason))
+
+    return _on_exit
+
+
 def generate_execution_nodes(
     robot_config: dict,
     control_mode: str = "model_inference",
     use_sim: object = False,
     use_sim_time: object | None = None,
+    runtime_target: RuntimeTarget = RuntimeTarget.HARDWARE,
 ) -> list:
     """Generate the execution subgraph for one control mode.
 
@@ -604,26 +673,38 @@ def generate_execution_nodes(
 
     # scheduler.enable=true selects the scheduled topology.
     if scheduler is not None and scheduler.enable:
-        inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time)
+        inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
         scheduler_node = generate_global_inference_scheduler_node(
             robot_config, control_mode, scheduler, _resolve_use_sim_time(use_sim, use_sim_time)
         )
         scheduled_dispatcher = generate_scheduled_action_dispatcher_node(
             robot_config, control_mode, scheduler, _resolve_use_sim_time(use_sim, use_sim_time)
         )
-        required_pipeline_nodes = [
-            node
-            for node, pipeline in zip(inference_nodes, inference.pipelines.values(), strict=True)
-            if pipeline.required
-        ]
-        # Optional pipelines may disappear without killing required serving.
-        # Global readiness/routing already excludes their stale or missing status.
-        required_nodes = [*required_pipeline_nodes, scheduler_node, scheduled_dispatcher]
+        benchmark_lifecycle = runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config)
+        if benchmark_lifecycle:
+            # Benchmark distributed inference may add a separate loopback cloud
+            # process for each pipeline. All of its execution nodes are required
+            # for the evaluation/action closure.
+            required_nodes = [*inference_nodes, scheduler_node, scheduled_dispatcher]
+        else:
+            required_pipeline_nodes = [
+                node
+                for node, pipeline in zip(inference_nodes, inference.pipelines.values(), strict=True)
+                if pipeline.required
+            ]
+            # Optional pipelines may disappear without killing required serving.
+            # Global readiness/routing already excludes their stale or missing status.
+            required_nodes = [*required_pipeline_nodes, scheduler_node, scheduled_dispatcher]
+        exit_handler_factory = (
+            _benchmark_process_exit_shutdown_factory
+            if benchmark_lifecycle
+            else _scheduled_process_exit_shutdown_factory
+        )
         exit_handlers = [
             RegisterEventHandler(
                 event_handler=OnProcessExit(
                     target_action=node,
-                    on_exit=_scheduled_process_exit_shutdown_factory(node),
+                    on_exit=exit_handler_factory(node),
                 )
             )
             for node in required_nodes
@@ -631,13 +712,28 @@ def generate_execution_nodes(
         return [*inference_nodes, scheduler_node, scheduled_dispatcher, *exit_handlers]
 
     # False or absent selects the unchanged legacy behavior.
-    inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time)
+    inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
     dispatcher = generate_action_dispatcher_node(
         robot_config,
         control_mode,
         _resolve_use_sim_time(use_sim, use_sim_time),
     )
-    return [*inference_nodes, dispatcher]
+    nodes = [*inference_nodes, dispatcher]
+    if runtime_target is RuntimeTarget.BENCHMARK and _benchmark_evaluation_enabled(robot_config):
+        # The benchmark configuration uses the legacy dispatcher topology
+        # (dispatch.scheduler is a benchmark contract, not inference.scheduler).
+        # Add the same required-process policy without changing native launches.
+        handlers = [
+            RegisterEventHandler(
+                event_handler=OnProcessExit(
+                    target_action=node,
+                    on_exit=_benchmark_process_exit_shutdown_factory(node),
+                )
+            )
+            for node in nodes
+        ]
+        return [*nodes, *handlers]
+    return nodes
 
 
 def generate_global_inference_scheduler_node(

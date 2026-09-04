@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -400,3 +403,260 @@ def validate_robot_config_observation_transports(robot_config: Mapping[str, Any]
         observations,
         distributed_enabled=robot_config_has_distributed_pipeline(robot_config),
     )
+
+
+# Benchmark transport projection support. The compiler below is generic: it
+# accepts a mode and an optional RTP profile, then uses the same parser,
+# resolver, validator and fingerprinting used by all robot-config consumers.
+# Benchmark code only selects the profile and delegates here.
+_COMPILE_MODE_VALUES = frozenset({"dds", "rtp"})
+_COMPILE_RTP_FIELDS = frozenset(
+    {
+        "endpoint_host",
+        "base_port",
+        "port_stride",
+        "codec",
+        "encoder_backend",
+        "decoder_backend",
+        "h264",
+        "media",
+        "buffer",
+        "readiness",
+        "security",
+        "streams",
+    }
+)
+_COMPILE_STREAM_FIELDS = frozenset(
+    {
+        "stream_id",
+        "endpoint",
+        "codec",
+        "encoder_backend",
+        "decoder_backend",
+        "h264",
+        "media",
+        "buffer",
+        "readiness",
+        "security",
+    }
+)
+
+
+class ObservationTransportCompileError(ValueError):
+    """Raised when a generic observation transport profile cannot be compiled."""
+
+
+def materialize_observation_transports(
+    image_observations: list[dict[str, Any]],
+    mode: str,
+    *,
+    rtp: Mapping[str, Any] | None = None,
+    rate_hz: float = 20.0,
+) -> None:
+    """Compile one transport selection into raw image observations.
+
+    Product-level callers may own a mode selector, but all transport schema,
+    defaults, parsing, resolution, validation and fingerprinting stay in this
+    generic module.
+    """
+    if mode not in _COMPILE_MODE_VALUES:
+        raise ObservationTransportCompileError("transport mode must be exactly 'dds' or 'rtp'")
+    if not image_observations:
+        raise ObservationTransportCompileError("at least one image observation is required")
+    if not isinstance(rate_hz, int | float) or isinstance(rate_hz, bool) or not math.isfinite(float(rate_hz)):
+        raise ObservationTransportCompileError("contract.rate_hz must be a finite positive number")
+    if float(rate_hz) <= 0:
+        raise ObservationTransportCompileError("contract.rate_hz must be a finite positive number")
+    if any("transport" in item for item in image_observations):
+        raise ObservationTransportCompileError("transport declarations must be absent before materialization")
+
+    if mode == "dds":
+        if rtp is not None:
+            raise ObservationTransportCompileError("DDS transport cannot define an RTP profile")
+        for item in image_observations:
+            item["transport"] = {"mode": "dds"}
+        return
+
+    profile = _compile_mapping(rtp or {}, "rtp profile")
+    _compile_check_fields(profile, _COMPILE_RTP_FIELDS, "rtp profile")
+    global_endpoint_host = _compile_exact_string(profile.get("endpoint_host", "127.0.0.1"), "rtp.endpoint_host")
+    base_port = _compile_exact_int(profile.get("base_port", 55000), "rtp.base_port", minimum=1, maximum=65535)
+    port_stride = _compile_exact_int(profile.get("port_stride", 2), "rtp.port_stride", minimum=1, maximum=65535)
+    global_codec = _compile_exact_string(profile.get("codec", "h264"), "rtp.codec").lower()
+    global_encoder = _compile_exact_string(profile.get("encoder_backend", "auto"), "rtp.encoder_backend").lower()
+    global_decoder = _compile_exact_string(profile.get("decoder_backend", "auto"), "rtp.decoder_backend").lower()
+    global_security = _compile_exact_string(profile.get("security", "none"), "rtp.security").lower()
+    global_h264 = _compile_profile_section(profile.get("h264"), "rtp.h264", {"profile", "bitrate_bps", "gop_frames"})
+    global_media = _compile_profile_section(
+        profile.get("media"),
+        "rtp.media",
+        {"width", "height", "frame_rate_hz", "pixel_format", "color_space", "color_range"},
+    )
+    global_buffer = _compile_profile_section(
+        profile.get("buffer"),
+        "rtp.buffer",
+        {"sender_queue_frames", "receiver_queue_packets", "decoded_frame_capacity", "retention_ms"},
+    )
+    global_readiness = _compile_profile_section(
+        profile.get("readiness"),
+        "rtp.readiness",
+        {"keyframe_timeout_ms", "timestamp_mapping_max_age_ms", "max_inter_camera_skew_ms"},
+    )
+    streams = _compile_mapping(profile.get("streams", {}), "rtp.streams")
+
+    known_keys = {str(item.get("key")) for item in image_observations}
+    unknown = sorted(set(streams) - known_keys)
+    if unknown:
+        raise ObservationTransportCompileError(f"RTP stream overrides reference unknown image observations: {unknown}")
+
+    for index, observation in enumerate(image_observations):
+        key = _compile_exact_string(observation.get("key"), f"image observation {index}.key")
+        image = _compile_mapping(observation.get("image"), f"contract observation {key}.image")
+        resize = image.get("resize")
+        if not isinstance(resize, list | tuple) or len(resize) != 2:
+            raise ObservationTransportCompileError(
+                f"RTP image observation {key!r} requires image.resize [height, width]"
+            )
+        image_height = _compile_exact_int(resize[0], f"{key}.image.resize[0]", minimum=1)
+        image_width = _compile_exact_int(resize[1], f"{key}.image.resize[1]", minimum=1)
+        override = _compile_mapping(streams.get(key, {}), f"rtp.streams.{key}")
+        _compile_check_fields(override, _COMPILE_STREAM_FIELDS, f"rtp.streams.{key}")
+        endpoint_override = _compile_profile_section(
+            override.get("endpoint"), f"rtp.streams.{key}.endpoint", {"host", "port"}
+        )
+        stream_h264 = _compile_merged_section(
+            global_h264, override.get("h264"), f"rtp.streams.{key}.h264", {"profile", "bitrate_bps", "gop_frames"}
+        )
+        stream_media = _compile_merged_section(
+            global_media,
+            override.get("media"),
+            f"rtp.streams.{key}.media",
+            {"width", "height", "frame_rate_hz", "pixel_format", "color_space", "color_range"},
+        )
+        stream_buffer = _compile_merged_section(
+            global_buffer,
+            override.get("buffer"),
+            f"rtp.streams.{key}.buffer",
+            {"sender_queue_frames", "receiver_queue_packets", "decoded_frame_capacity", "retention_ms"},
+        )
+        stream_readiness = _compile_merged_section(
+            global_readiness,
+            override.get("readiness"),
+            f"rtp.streams.{key}.readiness",
+            {"keyframe_timeout_ms", "timestamp_mapping_max_age_ms", "max_inter_camera_skew_ms"},
+        )
+        stream_id = _compile_exact_string(
+            override.get("stream_id", _compile_default_stream_id(key)), f"rtp.streams.{key}.stream_id"
+        )
+        endpoint_host = _compile_exact_string(
+            endpoint_override.get("host", global_endpoint_host), f"rtp.streams.{key}.endpoint.host"
+        )
+        endpoint_port = _compile_exact_int(
+            endpoint_override.get("port", base_port + index * port_stride),
+            f"rtp.streams.{key}.endpoint.port",
+            minimum=1,
+            maximum=65535,
+        )
+
+        raw_transport = {
+            "mode": "rtp",
+            "stream_id": stream_id,
+            "endpoint": {"host": endpoint_host, "port": endpoint_port},
+            "codec": override.get("codec", global_codec),
+            "encoder_backend": override.get("encoder_backend", global_encoder),
+            "decoder_backend": override.get("decoder_backend", global_decoder),
+            "h264": stream_h264,
+            "media": stream_media,
+            "buffer": stream_buffer,
+            "readiness": stream_readiness,
+            "security": override.get("security", global_security),
+        }
+        try:
+            parsed = parse_observation_transport(raw_transport)
+            resolved = resolve_observation_transport(parsed, image=image, camera_fps=float(rate_hz))
+        except (TypeError, ValueError) as exc:
+            raise ObservationTransportCompileError(f"RTP stream {key!r}: {exc}") from exc
+        assert resolved is not None
+        if resolved.mode != "rtp" or resolved.media is None:
+            raise ObservationTransportCompileError(f"RTP stream {key!r} did not resolve to RTP media")
+        if (resolved.media.height, resolved.media.width) != (image_height, image_width):
+            raise ObservationTransportCompileError(
+                f"RTP stream {key!r} media dimensions {resolved.media.height}x{resolved.media.width} "
+                f"must match image.resize {image_height}x{image_width}"
+            )
+        observation["transport"] = observation_transport_to_dict(resolved)
+
+
+def observation_transport_fingerprint(
+    robot_config: Mapping[str, Any],
+    mode: str,
+    pipeline_id: str,
+) -> str:
+    """Hash the final contract and selected pipeline topology deterministically."""
+    contract = copy.deepcopy(robot_config.get("contract", {}))
+    control_mode = str(robot_config.get("default_control_mode", "model_inference"))
+    control_modes = robot_config.get("control_modes", {})
+    mode_config = control_modes.get(control_mode, {}) if isinstance(control_modes, Mapping) else {}
+    inference = mode_config.get("inference", {}) if isinstance(mode_config, Mapping) else {}
+    pipelines = inference.get("pipelines", {}) if isinstance(inference, Mapping) else {}
+    pipeline = pipelines.get(pipeline_id, {}) if isinstance(pipelines, Mapping) else {}
+    payload = {
+        "schema_version": 1,
+        "mode": mode,
+        "pipeline_id": pipeline_id,
+        "execution_mode": pipeline.get("execution_mode") if isinstance(pipeline, Mapping) else None,
+        "contract": contract,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _compile_mapping(value: Any, path: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ObservationTransportCompileError(f"{path} must be a mapping")
+    return value
+
+
+def _compile_check_fields(value: Mapping[str, Any], allowed: set[str] | frozenset[str], path: str) -> None:
+    unknown = sorted(set(value) - set(allowed))
+    if unknown:
+        raise ObservationTransportCompileError(f"{path} contains unsupported fields: {', '.join(unknown)}")
+
+
+def _compile_profile_section(value: Any, path: str, allowed: set[str]) -> dict[str, Any]:
+    if value is None:
+        return {}
+    result = dict(_compile_mapping(value, path))
+    _compile_check_fields(result, allowed, path)
+    return result
+
+
+def _compile_merged_section(base: Mapping[str, Any], value: Any, path: str, allowed: set[str]) -> dict[str, Any]:
+    result = dict(base)
+    result.update(_compile_profile_section(value, path, allowed))
+    return result
+
+
+def _compile_exact_string(value: Any, path: str) -> str:
+    if not isinstance(value, str) or not value or value.strip() != value:
+        raise ObservationTransportCompileError(f"{path} must be an exact non-empty string")
+    return value
+
+
+def _compile_exact_int(value: Any, path: str, *, minimum: int, maximum: int | None = None) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ObservationTransportCompileError(f"{path} must be an integer")
+    if value < minimum or (maximum is not None and value > maximum):
+        bounds = f"{minimum}..{maximum}" if maximum is not None else f">= {minimum}"
+        raise ObservationTransportCompileError(f"{path} must be in {bounds}")
+    return value
+
+
+def _compile_default_stream_id(key: str) -> str:
+    token = re.sub(r"[^a-z0-9_-]+", "_", key.lower()).strip("_-")
+    if not token or not token[0].isalpha():
+        token = f"stream_{token}"
+    if len(token) <= 63:
+        return token
+    suffix = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    return f"{token[:54]}_{suffix}"

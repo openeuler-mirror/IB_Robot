@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from inference_service.h264_stream_recorder import H264StreamRecorder
 
-from inference_service.observation_sync import ObservationSynchronizationError, RtpTimestampMapper
 from observation_transport.rtp_sender import (
     DatagramReceiver,
     DatagramSender,
@@ -29,6 +28,8 @@ from observation_transport.rtp_sender import (
     split_annex_b,
 )
 from observation_transport.video_codec import EncodedPacket, VideoCodecError, VideoDecoder, VideoFrame
+
+from inference_service.observation_sync import ObservationSynchronizationError, RtpTimestampMapper
 from robot_config.contract_utils import StreamBuffer
 
 _RTP_HEADER_SIZE = 12
@@ -334,9 +335,7 @@ class H264RtpReceiver:
                 self._state = StreamLifecycleState.WAITING_FOR_KEYFRAME
             decoder_metrics = self.decoder.metrics
             last_capture_timestamp_ns = (
-                received_frames[-1].capture_timestamp_ns
-                if received_frames
-                else self._metrics.last_capture_timestamp_ns
+                received_frames[-1].capture_timestamp_ns if received_frames else self._metrics.last_capture_timestamp_ns
             )
             self._metrics = replace(
                 self._metrics,

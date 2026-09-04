@@ -488,11 +488,19 @@ def resolve_model_config_path(robot: Mapping[str, Any]) -> Path:
     mode = modes.get(control_mode) if isinstance(modes, Mapping) else None
     inference = mode.get("inference") if isinstance(mode, Mapping) else None
     pipelines = inference.get("pipelines") if isinstance(inference, Mapping) else None
-    if not isinstance(pipelines, Mapping) or len(pipelines) != 1:
-        raise IODescriptorError("benchmark evaluation requires exactly one inference pipeline")
-    pipeline = next(iter(pipelines.values()))
+    if not isinstance(pipelines, Mapping) or not pipelines:
+        raise IODescriptorError("benchmark evaluation requires at least one inference pipeline")
+    executor = mode.get("executor", {}) if isinstance(mode, Mapping) else {}
+    selected = executor.get("inference_pipeline") if isinstance(executor, Mapping) else None
+    if selected is None:
+        if len(pipelines) != 1:
+            raise IODescriptorError("benchmark executor must select one inference pipeline")
+        selected = next(iter(pipelines))
+    if not isinstance(selected, str) or not selected:
+        raise IODescriptorError("benchmark executor.inference_pipeline must select one pipeline")
+    pipeline = pipelines.get(selected)
     if not isinstance(pipeline, Mapping):
-        raise IODescriptorError("inference pipeline must be a mapping")
+        raise IODescriptorError(f"benchmark executor selects unknown pipeline {selected!r}")
     model_path = pipeline.get("model_path")
     if not isinstance(model_path, str) or not model_path.strip():
         raise IODescriptorError("inference pipeline model_path is required")

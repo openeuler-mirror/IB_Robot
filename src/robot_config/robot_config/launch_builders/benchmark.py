@@ -21,12 +21,16 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from launch.actions import EmitEvent, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.benchmark_endpoints import (
     BenchmarkEndpointError,
     resolve_benchmark_endpoints,
 )
+from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
 from robot_config.contract_utils import contract_fingerprint, iter_specs
 from robot_config.inference_config import (
     InferenceConfigError,
@@ -34,13 +38,47 @@ from robot_config.inference_config import (
 )
 from robot_config.loader import build_contract_from_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
-from robot_config.observation_transport import effective_observation_transport
+from robot_config.observation_transport import (
+    effective_observation_transport,
+    validate_robot_config_observation_transports,
+)
 
 logger = get_colored_logger("robot_config.benchmark")
 
 
 class BenchmarkLaunchError(RuntimeError):
     """Raised when the benchmark nodes cannot be built from SSOT."""
+
+
+def _benchmark_process_exit_handler(role: str):
+    """Shut down the benchmark evaluation graph when a required node exits."""
+
+    def _on_exit(event, context):
+        if context.is_shutdown:
+            return None
+        returncode = event.returncode
+        if role == "evaluator" and returncode == 0:
+            reason = "benchmark evaluation completed"
+            logger.info(reason)
+            return EmitEvent(event=Shutdown(reason=reason))
+        reason = f"benchmark required process {role!r} exited with return code {returncode}"
+        logger.error(reason)
+        return EmitEvent(event=Shutdown(reason=reason))
+
+    return _on_exit
+
+
+def _with_benchmark_lifecycle(node: Node, role: str) -> list:
+    """Return one required Benchmark node and its narrowly scoped exit handler."""
+    return [
+        node,
+        RegisterEventHandler(
+            event_handler=OnProcessExit(
+                target_action=node,
+                on_exit=_benchmark_process_exit_handler(role),
+            )
+        ),
+    ]
 
 
 def _require_non_empty(value: Any, label: str) -> str:
@@ -179,13 +217,11 @@ def _prepare_run_identity(
     return run_id
 
 
-def _resolve_benchmark_endpoints(robot_config: dict) -> tuple[str, str, str, str, str, str]:
-    """Resolve all benchmark endpoint names from the SSOT.
+def _resolve_benchmark_endpoints(robot_config: dict) -> tuple[str, str, str, str, str]:
+    """Resolve the benchmark namespace and service endpoints from the SSOT.
 
-    Returns (namespace, reset_service, step_service, plan_service,
-    finalize_service, status_topic). The plan and finalize services are
-    derived from the benchmark namespace for plan and finalization services.
-    GetBenchmarkPlan and FinalizeBenchmarkScope wires.
+    Plan and finalization services are derived from the benchmark namespace;
+    there is intentionally no synthetic status topic without a real owner.
     """
     try:
         endpoints = resolve_benchmark_endpoints(robot_config)
@@ -200,7 +236,6 @@ def _resolve_benchmark_endpoints(robot_config: dict) -> tuple[str, str, str, str
         endpoints.step_service,
         plan_service,
         finalize_service,
-        endpoints.status_topic,
     )
 
 
@@ -242,7 +277,7 @@ def _resolve_evaluator_endpoints(robot_config: dict) -> dict[str, str]:
         inference_health = ""
     else:
         if inference.enabled and inference.pipelines:
-            pipeline = next(iter(inference.pipelines.values()))
+            _, pipeline = _selected_benchmark_pipeline(robot_config)
             inference_health = pipeline.transport.health_topic
         else:
             inference_health = ""
@@ -264,9 +299,11 @@ def _selected_benchmark_pipeline(robot_config: dict):
     if selected is None:
         if len(inference.pipelines) != 1:
             raise BenchmarkLaunchError("benchmark executor must select one inference pipeline")
-        return next(iter(inference.pipelines.values()))
+        selected = next(iter(inference.pipelines))
+    if not isinstance(selected, str) or not selected:
+        raise BenchmarkLaunchError("benchmark executor.inference_pipeline must select one pipeline")
     try:
-        return inference.pipelines[selected]
+        return selected, inference.pipelines[selected]
     except KeyError as exc:
         raise BenchmarkLaunchError(f"benchmark executor selects unknown pipeline {selected!r}") from exc
 
@@ -309,7 +346,7 @@ def _frame_ingress_parameters(robot_config: dict, benchmark: dict) -> dict[str, 
             }
         )
     enabled = bool(streams)
-    pipeline = _selected_benchmark_pipeline(robot_config) if enabled else None
+    _, pipeline = _selected_benchmark_pipeline(robot_config) if enabled else (None, None)
     if pipeline is not None and pipeline.execution_mode != "distributed":
         raise BenchmarkLaunchError("benchmark RTP routes require execution_mode=distributed")
     evaluation = benchmark.get("evaluation", {}) or {}
@@ -393,7 +430,7 @@ def _build_evaluator_node(
     )
 
 
-def generate_benchmark_nodes(robot_config: dict) -> list[Node]:
+def generate_benchmark_nodes(robot_config: dict) -> list:
     """Build production benchmark nodes from the robot configuration.
 
     The builder references benchmark packages by ROS package/executable name
@@ -414,13 +451,23 @@ def generate_benchmark_nodes(robot_config: dict) -> list[Node]:
         raise BenchmarkLaunchError("benchmark.evaluation must be a mapping when present")
     evaluation_enabled = bool(evaluation_section.get("enabled", False))
 
+    # This is the sole benchmark transport materialization boundary. The
+    # generic launch path only resolves the runtime target; every benchmark
+    # node below consumes the resulting contract transport values.
+    try:
+        materialize_benchmark_observation_transport(robot_config)
+        transport_errors = validate_robot_config_observation_transports(robot_config)
+    except (TypeError, ValueError) as exc:
+        raise BenchmarkLaunchError(f"invalid benchmark observation transport: {exc}") from exc
+    if transport_errors:
+        raise BenchmarkLaunchError("invalid benchmark observation transport:\n- " + "\n- ".join(transport_errors))
+
     (
         namespace,
         reset_service,
         step_service,
         plan_service,
         finalize_service,
-        status_topic,
     ) = _resolve_benchmark_endpoints(robot_config)
 
     evaluator_action_endpoints = _resolve_evaluator_endpoints(robot_config)
@@ -445,7 +492,6 @@ def generate_benchmark_nodes(robot_config: dict) -> list[Node]:
         "benchmark_step_service": step_service,
         "benchmark_plan_service": plan_service,
         "benchmark_finalize_service": finalize_service,
-        "benchmark_status_topic": status_topic,
         "prepare_policy_episode_service": evaluator_action_endpoints["prepare_policy_episode_service"],
         "run_policy_action_server": evaluator_action_endpoints["run_policy_action_server"],
         "inference_health_topic": evaluator_action_endpoints["inference_health_topic"],
@@ -457,4 +503,7 @@ def generate_benchmark_nodes(robot_config: dict) -> list[Node]:
         endpoint_params=endpoint_params,
     )
     logger.info("benchmark evaluation enabled: launching environment and evaluator nodes")
-    return [environment_node, evaluator_node]
+    return [
+        *_with_benchmark_lifecycle(environment_node, "environment"),
+        *_with_benchmark_lifecycle(evaluator_node, "evaluator"),
+    ]

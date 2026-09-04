@@ -45,7 +45,6 @@ class BenchmarkEndpoints:
     namespace: str
     reset_service: str
     step_service: str
-    status_topic: str
 
 
 _INSTANCE_ID_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -143,8 +142,8 @@ def resolve_benchmark_endpoints(
             non-empty ``type`` and ``adapter`` strings.
 
     Returns:
-        A frozen ``BenchmarkEndpoints`` with namespace, reset service, step
-        service and status topic derived from ``instance_id``.
+        A frozen ``BenchmarkEndpoints`` with namespace, reset service and
+        step service derived from ``instance_id``.
 
     Raises:
         BenchmarkEndpointError: For any malformed configuration. The resolver
@@ -169,5 +168,4 @@ def resolve_benchmark_endpoints(
         namespace=namespace,
         reset_service=f"{namespace}/reset",
         step_service=f"{namespace}/step",
-        status_topic=f"{namespace}/status",
     )

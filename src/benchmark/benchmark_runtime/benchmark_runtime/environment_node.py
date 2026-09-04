@@ -64,7 +64,7 @@ from benchmark_runtime.registry import (
     BenchmarkRegistryError,
     load_plugin,
 )
-from observation_transport.managed_frame_ingress import create_managed_frame_ingress
+from observation_transport import create_managed_frame_ingress
 
 READY_TAG = "[IBROBOT_BENCHMARK][ENVIRONMENT_NODE_READY]"
 PRODUCTION_READY_TAG = "[IBROBOT_BENCHMARK][ENVIRONMENT_NODE_PRODUCTION_READY]"

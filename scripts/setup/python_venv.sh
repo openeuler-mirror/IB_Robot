@@ -466,7 +466,7 @@ EOF
     if [[ "${full_profile}" != true ]]; then
         log_info "Skipping grasp dependencies (inference profile)."
     elif [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true ]]; then
-        log_info "Skipping GraspGen/manipulation dependencies for Benchmark setup."
+        log_info "Skipping GraspGen/manipulation dependencies for Benchmark-only setup."
     elif [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
     else
@@ -533,7 +533,7 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${full_profile}" == true && "${INSTALL_BENCHMARK_DEPS:-false}" != true && "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
+    if [[ "${INSTALL_BENCHMARK_DEPS:-false}" != true && "${full_profile}" == true && "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import importlib
 

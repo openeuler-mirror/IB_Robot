@@ -19,6 +19,11 @@ from observation_transport.direct_frame import (
     StreamSessionView,
     create_frame_ingress,
 )
+from observation_transport.managed_frame_ingress import (
+    ManagedFrameIngress,
+    ManagedFrameIngressConfig,
+    create_managed_frame_ingress,
+)
 
 __all__ = [
     "DirectFrameProducer",
@@ -38,4 +43,7 @@ __all__ = [
     "QueuePolicy",
     "StreamSessionView",
     "create_frame_ingress",
+    "ManagedFrameIngress",
+    "ManagedFrameIngressConfig",
+    "create_managed_frame_ingress",
 ]
