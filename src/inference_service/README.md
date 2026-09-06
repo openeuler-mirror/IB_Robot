@@ -246,7 +246,11 @@ priority，不要求 fallback 或其他 pipeline 支持多优先级。
 模式和其他会影响时延的配置。profile entry 使用独立的 `hardware_fingerprint` 与其匹配，不能再用 `ascend:0`
 这类资源互斥 ID 代替标定环境身份。
 
-分布式推理继续使用原 protocol v2 和原 topic，不参与 scheduler、product session 或优先级抢占。
+分布式推理使用 distributed protocol v6 和原 topic，不参与 scheduler、product session 或优先级抢占。
+v6 在 `DistributedInferenceResult` 及两个 `DispatchInfer` action 中新增 `execution_horizon` 字段；
+这不是 ROS 二进制兼容变更，升级时 edge、cloud 与所有 action client 必须一起重新生成、构建并
+协调部署，握手阶段会直接拒绝旧版本 peer（详见
+[ibrobot_msgs README](../ibrobot_msgs/README.md)）。
 `scheduler.enable=true` 与 `execution_mode: distributed` 的组合会在 `robot_config` 校验阶段被拒绝。
 
 ## Robot 配置
@@ -274,6 +278,64 @@ control_modes:
 ```bash
 source .shrc_local
 ```
+
+### AutoHorizon runtime options（native Torch PI0.5）
+
+pipeline 的 `runtime_options` 支持以下 AutoHorizon 选项（默认值即论文复现值）：
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `auto_horizon_enabled` | `false` | 开启 action-expert self-attention 采集并估计 `execution_horizon` |
+| `auto_horizon_sampling_step` | `3` | 在第几个 denoising step 采集 attention 权重 |
+| `auto_horizon_hold_threshold` | `0.3` | soft-pointer 停止增量阈值 |
+| `auto_horizon_entropy_quantile` | `0.9` | 低熵（可靠）行的分位数阈值 |
+| `auto_horizon_run_length` | `1` | 判定停止所需的连续 hold 长度 |
+
+约束与生效语义：
+
+- 仅支持 native Torch `pi05` 策略和 `predict_action_chunk` action method；在其他
+  policy family 或 action method 上启用会在 session 加载/执行阶段 fail closed，
+  不会静默忽略。
+- 采集器通过 forward hook 在指定 denoising step 对 action expert 各层做
+  GPU→CPU 权重拷贝并在 CPU 上估计，属于模型执行路径的一部分；开启后推理时延
+  profile 必须重新标定（见下）。
+- 找不到 action-expert `self_attn` 模块（例如 lerobot 升级改动模块路径）或
+  `auto_horizon_sampling_step` 超过策略 `num_inference_steps` 时，session 加载阶段
+  fail closed 报错——显式开启却无法生效属于配置/环境错误；推理过程中的偶发异常
+  （如某步权重非有限）仍安全回退为 `execution_horizon=0`，即完整 chunk；
+  edge/dispatcher 侧不重算 attention。
+- 选项在 session 加载时生效，修改后需重启 pipeline 进程，不支持运行中切换。
+- **profile 标定身份**：`robot_config` 把规范化后的有效 runtime options 计入
+  `profile_compatibility_fingerprint`。scheduler 启用时，任何影响时延的选项变化
+  （含开启/关闭 `auto_horizon_enabled` 或调整采集参数）都会使旧离线 profile 失配并被
+  fail-closed 丢弃，priority-0 准入在重新标定前返回 `no_feasible_deadline`。显式写出
+  默认值与省略该选项身份相同，不触发重新标定。
+- **升级注意**：本版本首次把 runtime options 计入 `profile_compatibility_fingerprint`，
+  因此即使不修改任何配置，升级前标定的离线 profile 也会全部失配并被 fail-closed 丢弃；
+  启用 scheduler 的部署升级后必须对每个 pipeline 重新标定生成新 profile，否则 priority-0
+  准入返回 `no_feasible_deadline`。
+
+分布式 pipeline 中 policy 在 cloud 侧执行，attention 采集也发生在 cloud。独立启动的
+cloud 使用 `cloud_inference.launch.py` 的 `runtime_options_json` launch 参数（默认
+`{}`），不会继承 edge YAML 的 `runtime_options`：只修改 edge YAML 不会开启 cloud 采集，
+系统仍可正常握手但结果始终回退 `execution_horizon=0`。启用时必须向 cloud launch 传入
+相同选项（`robot_config_path` 为必填参数，也用于构建视频流契约），例如：
+
+```bash
+ros2 launch inference_service cloud_inference.launch.py \
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=torch-cuda \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    runtime_options_json:='{"auto_horizon_enabled": true}'
+```
+
+端侧 dispatcher 需同时选择 `dispatch.chunking: auto_horizon` 才会消费分布式结果中的
+`execution_horizon`（两段配置缺一不可，见 action_dispatch README「AutoHorizon 集成边界」）。
+端侧 bundle 校验要求 `model_path` 指向一个完整可读的 bundle（含 manifest 引用的
+state_file；权重文件可省略——推理不发生在端侧）。已在 edge（aarch64）+ cloud（CUDA）
+双机拓扑实测：分布式往返约 216 ms（含 cloud 端 pi05 CUDA 推理），截断后的
+`execution_horizon` 随请求自适应变化并被端侧 dispatcher 正常消费。
 
 多模型通过多个独立 pipeline 配置：
 
@@ -441,7 +503,8 @@ source .shrc_local
 ros2 launch inference_service cloud_inference.launch.py \
     pipeline_id:=policy \
     model_path:=/absolute/path/to/policy_bundle \
-    deployment:=cuda
+    deployment:=cuda \
+    robot_config_path:="$WORKSPACE/src/robot_config/config/robots/so101_single_arm.yaml"
 ```
 
 单独调试 distributed Edge 时也可直接使用：

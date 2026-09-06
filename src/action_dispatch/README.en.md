@@ -139,7 +139,7 @@ contracts:
 |-------|--------|------|-----------|
 | Session lifecycle | per-node lifecycle state machines | session open/close, retry, result dedup, safe-stop, fail-and-close; gates per-tick dispatch | chunk algorithms, blending weights |
 | Per-tick scheduler | `schedulers/` (registry + `continuous` / `wait_for_feedback`) | per-tick inference-request and action-submission decisions (`should_replenish_plan` is the shared watermark rule) | lifecycle state, chunk contents |
-| Chunk planning | `chunk_planning.py` (`FullChunkPlanner`) | describes original-chunk interval `[start, stop)` and optional replenishment watermark | mutating the accepted plan, publishing, requesting inference |
+| Chunk planning | `chunk_planning.py` (`FullChunkPlanner` / `AutoHorizonPlanner`) | describes original-chunk interval `[start, stop)` and optional replenishment watermark (AutoHorizon truncates at the result-level `execution_horizon` and drops the watermark to 0) | mutating the accepted plan, publishing, requesting inference |
 | Active plan | `active_plan.py` (`ActivePlan`) | atomically owns accepted storage, source, position, watermark and revision; direct consumption or reservation/commit; hold/empty selection | ROS I/O, episode/session transitions |
 | Action blending | `temporal_smoother.py` | prepares overlapping weighted actions/counts before committing references; existing coefficient semantics | inference timing, session state |
 | Executor | `executors/` (registry + `topic` / `benchmark`) | the final output channel | any scheduling decision |
@@ -153,6 +153,10 @@ feedback commits once. It does not use continuous direct consumption.
 | Legacy continuous | `topic` / `continuous` | queue with `none`; existing smoother manager with `temporal_ensemble` or disabled passthrough | queue keeps newest actions within capacity; direct logical consumption |
 | Legacy benchmark | `benchmark` / `wait_for_feedback` | same queue/manager choices | same queue clipping; revision-bound reservation and feedback commit |
 | Scheduled | `topic` / `continuous` only | queue with `none`; separate smoother with `temporal_ensemble` | queue overflow rejects, safe-stops and closes; direct logical consumption |
+
+The `auto_horizon` chunking strategy is available only with the `topic` executor;
+`benchmark` + `auto_horizon` is rejected by the SSOT (benchmark episodes execute
+full chunks).
 
 Smoother storage does not inherit deque capacity limits. Legacy toggles retain an
 existing manager and its plan; a node without a manager cannot enable one via the
@@ -170,21 +174,24 @@ scheduled stop/safe-stop/close/restart clear both stores, including inactive met
 | queue clipping, accepted source interval, revision and watermark | active-plan owner (path-selected overflow policy) |
 | capacity overflow as failure (`ValueError` -> safe-stop + session close), `(session_id, generation, request_id)` result dedup | scheduled path |
 | session state machine (WAITING_READY/.../FAILED) and retries | scheduled path (not moved into `DispatchScheduler`) |
-| watermark replenishment rule | shared (`schedulers.continuous.should_replenish_plan`) |
+| watermark replenishment rule | shared (`schedulers.continuous.should_replenish_plan`; the configured watermark by default, or the plan-level threshold carried by an auto_horizon plan) |
 
-### Extension points (follow-up changes)
+### Extension points
 
-- **#401 AutoHorizon**: `executed_during_inference` is the original-chunk start;
-  `execution_horizon` is the exclusive stop, not a count after skipping.
-  `replenishment_watermark=None` uses the configured default; zero means replenish when empty.
-  Both stores apply the interval once. Attention estimation, model capability checks and runtime options are not implemented.
-- **#411 RTC**: `PlanSource` records request and applicable generation/session IDs.
+- **AutoHorizon (supported)**: attention estimation and model capability checks live in
+  `inference_service` (native Torch PI0.5 + `predict_action_chunk`); results reach the
+  dispatcher via `execution_horizon`. `executed_during_inference` is the original-chunk start
+  (auto_horizon collapses it to `[H, H)` when the whole prefix expired); `execution_horizon`
+  is the exclusive stop, not a count after skipping. `replenishment_watermark=None` uses the
+  configured default; zero means replenish when empty. Both stores apply the interval once.
+  Runtime options participate in the profile-compatibility identity (see the inference_service
+  README). The benchmark combination is rejected by the SSOT.
+- **RTC (planned extension, strategy name not yet open)**: `PlanSource` records request and applicable generation/session IDs.
   Direct single-source `PlanSnapshot.next_position` includes skipped/clipped prefixes.
   Revision only invalidates local reservations. Ensemble has no exact single-source coordinate;
   latest source is diagnostic. Local acceptance/topic progress is neither physical completion nor remote cache acknowledgment.
   Cross-request cache identity, routing/failure reconciliation, coordinate transforms/relative-action re-anchoring
-  and wire forwarding remain gaps. Neither AutoHorizon nor RTC is a production strategy name;
-  follow-up PRs must independently rebase and verify node wiring and protocol behavior.
+  and wire forwarding remain gaps.
 
 ## Installation
 
@@ -218,10 +225,25 @@ resolver, with entrypoint-specific capability checks:
 In robot YAML, `executor`, `dispatch` and `inference` are siblings under `robot.control_modes.<mode>`.
 See the [robot_config dispatch strategy SSOT](../robot_config/README.md#动作分发策略-ssot) for the schema.
 
+```yaml
+control_modes:
+  model_inference:
+    executor:
+      type: topic                 # topic | benchmark
+    dispatch:
+      scheduler: continuous       # continuous | wait_for_feedback
+      chunking: full_chunk        # full_chunk (default) | auto_horizon
+      blending: none              # none | temporal_ensemble
+```
+
 - Legacy legal pairings: `topic`+`continuous`, `benchmark`+`wait_for_feedback`.
   Scheduled accepts only `topic`+`continuous`; explicit unsupported selections
   are rejected, not discarded. The historical executor `action` alias is mapped
   to `topic` only at the robot_config launch boundary, not direct node startup.
+- `dispatch.chunking: auto_horizon` requires the `topic` executor; the
+  `benchmark`+`auto_horizon` combination is rejected by the shared SSOT
+  (benchmark episodes execute full chunks), both at launch time and at node
+  init.
 - **Breaking interface change:** `temporal_smoothing_enabled` is removed, with
   no alias or compatibility path. Old robot YAML and direct ROS overrides
   (constructor, CLI or parameter file) are rejected even when consistent.
@@ -241,6 +263,86 @@ See the [robot_config dispatch strategy SSOT](../robot_config/README.md#动作�
   aborts as inference-failed before successful startup; scheduled safe-stops and
   closes. A valid nonempty chunk with an empty selected interval clears executable
   storage. Rejected replacements cannot change the accepted watermark.
+- `~/toggle_smoothing` stays `std_srvs/srv/Empty` on both nodes. Validation occurs
+  before mutation; rejection is logged (Empty has no error field). Both expose
+  `~/start_evaluate`, `~/stop_evaluate`, `~/get_status` as `std_srvs/srv/Trigger`.
+  Legacy has `~/reset` (`Empty`); scheduled has `~/restart_session` (`Trigger`),
+  not the legacy reset service. Service calls can change robot state.
+
+### AutoHorizon integration boundary (`chunking: auto_horizon`)
+
+AutoHorizon attention analysis belongs in `inference_service`, where the policy can access
+action self-attention. The inference result carries an explicit `execution_horizon`; the
+dispatcher-side `AutoHorizonPlanner` consumes that field: it truncates the executable plan
+and lowers that plan's replenishment threshold to 0 (re-request inference once the prefix
+is consumed instead of watermark prefetching). The dispatcher validates and executes the
+prefix while retaining queue alignment, smoothing, and safe-stop responsibilities; it never
+re-runs the model or infers attention from action values.
+
+- With `dispatch.chunking: full_chunk` (default) the result-level
+  `execution_horizon` is ignored and full-chunk + watermark behavior is kept;
+  a missing or zero value also falls back to the full chunk under auto_horizon.
+- The `benchmark` + `auto_horizon` combination is rejected by the shared SSOT
+  (see the strategy matrix above): benchmark episodes must execute complete
+  chunks, otherwise the evaluated action sequences and inference cadence would
+  be truncated. There is no silent "accept but ignore the field" exception.
+- The plan-level replenishment threshold is fixed at 0 as a direct mapping of the
+  paper's synchronous evaluation semantics (`sample -> execute H steps -> sample`):
+  the next inference is requested only after the prefix has been fully executed, so
+  the robot holds for one full inference latency between prefixes (visible as a
+  sustained `queue_size 0` in the mock e2e). The smaller H is, the larger the idle
+  share. The current implementation intentionally does not prefetch in order to stay
+  faithful to the paper; just-in-time prefetching (threshold
+  `max(0, min(H-1, prefetch_ticks))`, reusing the existing `[H, H)` expiry
+  normalization) is a recorded follow-up direction and is not implemented yet.
+- A fully expired prefix that can appear after watermark prefetch (actions
+  consumed during inference >= horizon, S >= H) is not an invalid chunk: the
+  planner normalizes it to the legal empty interval `[H, H)` carrying
+  watermark 0. The owner atomically accepts the empty plan (clearing the old
+  one) and the scheduler re-requests inference on the next tick; the scheduled
+  path does not safe-stop and the legacy path does not reject the result.
+- Plan-level watermark cleanup semantics differ per product: the legacy
+  `~/reset` and benchmark episode cleanup (prepare/end) clear the plan and its
+  plan-level threshold, returning to the configured watermark; legacy
+  continuous stop/start (pause/resume) keeps the active plan and its
+  plan-level threshold and only invalidates in-flight requests; scheduled
+  stop/safe-stop/close/restart clear both stores and return to the configured
+  watermark.
+
+Enabling the native Torch PI0.5 experiment requires **both configuration parts to be
+active** — the dispatcher side selects the strategy, the serving side turns on
+collection and estimation:
+
+```yaml
+# (1) dispatcher side (robot YAML control_modes.<mode>.dispatch):
+#     consume the result-level execution_horizon and truncate the executable plan
+dispatch:
+  scheduler: continuous
+  chunking: auto_horizon        # topic executor only; the benchmark combination is rejected by the SSOT
+  blending: none
+
+# (2) serving side (the inference pipeline's runtime_options):
+#     enable action-expert attention collection and horizon estimation
+runtime_options:
+  auto_horizon_enabled: true
+  auto_horizon_sampling_step: 3
+  auto_horizon_hold_threshold: 0.3
+  auto_horizon_entropy_quantile: 0.9
+  auto_horizon_run_length: 1
+```
+
+With (1) but not (2) the result carries no effective horizon (equivalent to
+`full_chunk` behavior); with (2) but not (1) the `full_chunk` strategy ignores the
+field. Both together form the end-to-end loop (option semantics and defaults see the
+[inference_service README](../inference_service/README.md)).
+
+The experiment forces the action expert to eager attention and samples weights at the
+configured denoising step. Missing action-expert `self_attn` modules (for example after a
+lerobot upgrade moved module paths) or a `sampling_step` beyond `num_inference_steps` fail
+closed at session load; transient inference-time anomalies (a non-finite weight, for
+instance) still fall back to `execution_horizon=0`, i.e. the full chunk. Option ranges, load timing, the profile
+identity coupling and the distributed cloud-side configuration location are documented
+in the [inference_service README](../inference_service/README.md).
 
 ### Parameters
 

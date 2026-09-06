@@ -27,6 +27,7 @@ from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from inference_service.scheduler.work_classes import WorkClass, work_class_name
 from robot_config.contract_utils import ActionSpec, Contract, ObservationSpec, iter_specs
+from robot_config.inference_runtime_options import effective_latency_runtime_options
 
 SESSION_ID = "00112233-4455-4677-8899-aabbccddeeff"
 REQUEST_ID = "11112233-4455-4677-8899-aabbccddeeff"
@@ -940,6 +941,85 @@ def test_scheduled_pipeline_executor_scales_with_public_capacity():
     )
 
     assert pipeline_policy_module._pipeline_executor_threads(config) == 16
+
+
+def _runtime_policy_node(runtime_options_json: str) -> PipelinePolicyNode:
+    node = object.__new__(PipelinePolicyNode)
+    node._config = SimpleNamespace(
+        pipeline_id="policy",
+        execution_mode="monolithic",
+        hardware_resource_id="ascend:0",
+        public_capacity_json='{"session_control": {"max_in_flight": 1}}',
+        runtime_options_json=runtime_options_json,
+        scheduled_open_session="/inference/policy/session/open",
+        scheduled_dispatch="/inference/policy/scheduled_dispatch",
+        scheduled_close_session="/inference/policy/session/close",
+        scheduled_serving_status="/inference/policy/serving_status",
+        health_topic="/inference/policy/health",
+    )
+    node._manifest = SimpleNamespace(fingerprint="d" * 64)
+    return node
+
+
+def _runtime_policy(runtime_options: dict) -> dict:
+    return {
+        "pipeline_id": "policy",
+        "execution_mode": "monolithic",
+        "hardware_resource_id": "ascend:0",
+        "deployment_fingerprint": "d" * 64,
+        "public_capacity": {"session_control": {"max_in_flight": 1}},
+        "runtime_options": effective_latency_runtime_options(runtime_options),
+        "transport": {
+            "open_session": "/inference/policy/session/open",
+            "dispatch": "/inference/policy/scheduled_dispatch",
+            "close_session": "/inference/policy/session/close",
+            "serving_status": "/inference/policy/serving_status",
+            "health_topic": "/inference/policy/health",
+        },
+    }
+
+
+def test_scheduled_runtime_policy_rejects_node_side_runtime_option_override():
+    """SSOT unchanged, only the node parameter enables collection: refuse startup.
+
+    The runtime policy (and the latency profiles calibrated against it) is
+    declared in the SSOT; a runtime_options_json override that changes the
+    actually-executed options must not silently serve under that identity.
+    """
+    node = _runtime_policy_node('{"auto_horizon_enabled": true}')
+    policy = _runtime_policy({})  # SSOT declares collection disabled
+
+    with pytest.raises(RuntimeError, match="runtime_options mismatch"):
+        PipelinePolicyNode._validate_runtime_policy(node, policy)
+
+
+def test_scheduled_runtime_policy_accepts_matching_and_normalized_options():
+    node = _runtime_policy_node('{"auto_horizon_enabled": true, "auto_horizon_sampling_step": 5}')
+    policy = _runtime_policy({"auto_horizon_enabled": True, "auto_horizon_sampling_step": 5})
+    PipelinePolicyNode._validate_runtime_policy(node, policy)
+
+    # Explicit effective defaults stay identical to the omitted form.
+    default_node = _runtime_policy_node("{}")
+    explicit = _runtime_policy(
+        {
+            "model_dtype": "native",
+            "auto_horizon_enabled": False,
+            "auto_horizon_hold_threshold": 0.3,
+            "auto_horizon_entropy_quantile": 0.9,
+            "auto_horizon_run_length": 1,
+            "auto_horizon_sampling_step": 3,
+        }
+    )
+    PipelinePolicyNode._validate_runtime_policy(default_node, explicit)
+
+
+def test_scheduled_runtime_policy_rejects_policy_without_options_identity():
+    node = _runtime_policy_node("{}")
+    policy = _runtime_policy({})
+    del policy["runtime_options"]
+
+    with pytest.raises(RuntimeError, match="runtime_options mismatch"):
+        PipelinePolicyNode._validate_runtime_policy(node, policy)
 
 
 def test_scheduled_close_drain_acquires_every_execution_slot_before_reset():

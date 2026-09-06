@@ -5,11 +5,13 @@ from __future__ import annotations
 import gc
 import importlib
 import inspect
+import math
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, suppress
 from typing import Any
 
 from inference_manifest import TorchRuntimeProfile
+from inference_service.auto_horizon_runtime import build_action_attention_collector
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.lerobot_assets import (
@@ -19,10 +21,16 @@ from inference_service.lerobot_assets import (
 )
 from inference_service.model_sessions.base import ModelSession
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
+from robot_config.inference_runtime_options import (
+    AUTO_HORIZON_RUNTIME_OPTION_DEFAULTS,
+    TORCH_RUNTIME_MODEL_DTYPE_DEFAULT,
+)
 
 _ACTION_METHODS = frozenset({"predict_action_chunk", "select_action"})
 _NOISE_KEYS = ("_noise", "action.noise", "noise")
 _MODEL_DTYPES = {"native": None, "fp16": "half", "bf16": "bfloat16", "fp32": "float"}
+# Same option set as the profile-compatibility identity in robot_config.
+_AUTO_HORIZON_OPTIONS = frozenset(AUTO_HORIZON_RUNTIME_OPTION_DEFAULTS)
 
 
 class LeRobotTorchModelSession(ModelSession):
@@ -60,6 +68,7 @@ class LeRobotTorchModelSession(ModelSession):
         self._postprocessor: Any | None = None
         self._model_dtype = "native"
         self._last_metadata: dict[str, object] = {}
+        self._attention_collector = None
 
     @property
     def policy(self) -> Any | None:
@@ -159,6 +168,11 @@ class LeRobotTorchModelSession(ModelSession):
             local_files_only=True,
             strict=True,
         )
+        if context.runtime_options.get("auto_horizon_enabled", False) and context.model_type != "pi05":
+            raise BackendLoadError(
+                "AutoHorizon currently supports native Torch PI0.5 policies only",
+                code="unsupported_auto_horizon_policy",
+            )
 
         self._torch = torch_module
         self._device = device
@@ -172,6 +186,10 @@ class LeRobotTorchModelSession(ModelSession):
         evaluated = policy.eval()
         if evaluated is not None:
             self._policy = policy = evaluated
+        try:
+            self._attention_collector = build_action_attention_collector(policy, context.runtime_options)
+        except (TypeError, ValueError) as exc:
+            raise BackendLoadError(f"unable to enable AutoHorizon: {exc}", code="auto_horizon_setup_failed") from exc
         preprocessor_overrides: dict[str, dict[str, object]] = {"device_processor": {"device": str(device)}}
         if tokenizer_path is not None:
             preprocessor_overrides["tokenizer_processor"] = {"tokenizer_name": tokenizer_path}
@@ -213,6 +231,11 @@ class LeRobotTorchModelSession(ModelSession):
             raise BackendInferenceError(
                 f"unsupported native action method {action_method!r}", code="invalid_action_method"
             )
+        if self._attention_collector is not None and action_method != "predict_action_chunk":
+            raise BackendInferenceError(
+                "AutoHorizon requires predict_action_chunk",
+                code="unsupported_auto_horizon_action_method",
+            )
         callback = getattr(policy, action_method, None)
         if not callable(callback):
             raise BackendInferenceError(
@@ -223,9 +246,12 @@ class LeRobotTorchModelSession(ModelSession):
         if noise is not None and self._accepts_keyword(callback, "noise"):
             kwargs["noise"] = self._place_noise(noise)
         inference_mode = getattr(torch_module, "inference_mode", None)
+        if self._attention_collector is not None:
+            self._attention_collector.begin()
         with inference_mode() if callable(inference_mode) else nullcontext():
             action = callback(batch, **kwargs)
         action = self._remove_batch_dimension(action)
+        attention_metadata = self._attention_collector.estimate() if self._attention_collector is not None else {}
         self._last_metadata = {
             "request_id": context.request_id,
             "policy_type": self._require_context().model_type,
@@ -233,6 +259,7 @@ class LeRobotTorchModelSession(ModelSession):
             "action_method": action_method,
             "external_noise": noise is not None and "noise" in kwargs,
             "model_dtype": self._model_dtype,
+            **attention_metadata,
         }
         return {"action": action}
 
@@ -255,12 +282,15 @@ class LeRobotTorchModelSession(ModelSession):
     def _release(self) -> None:
         torch_module = self._torch
         device_name = self._configured_device_name
+        if self._attention_collector is not None:
+            self._attention_collector.close()
         self._policy = None
         self._policy_config = None
         self._preprocessor = None
         self._postprocessor = None
         self._device = None
         self._torch = None
+        self._attention_collector = None
         self._last_metadata = {}
         gc.collect()
         cache_owner = getattr(torch_module, device_name, None) if torch_module is not None else None
@@ -305,15 +335,28 @@ class LeRobotTorchModelSession(ModelSession):
 
     @staticmethod
     def validate_runtime_options(options: Mapping[str, object]) -> str:
-        unknown = sorted(set(options) - {"model_dtype"})
+        unknown = sorted(set(options) - ({"model_dtype"} | _AUTO_HORIZON_OPTIONS))
         if unknown:
             raise BackendLoadError(f"unknown Torch runtime options: {unknown}", code="invalid_runtime_options")
-        model_dtype = options.get("model_dtype", "native")
+        model_dtype = options.get("model_dtype", TORCH_RUNTIME_MODEL_DTYPE_DEFAULT)
         if not isinstance(model_dtype, str) or model_dtype not in _MODEL_DTYPES:
             raise BackendLoadError(
                 f"unsupported Torch model_dtype {model_dtype!r}; expected one of {sorted(_MODEL_DTYPES)}",
                 code="invalid_runtime_options",
             )
+        enabled = options.get("auto_horizon_enabled", AUTO_HORIZON_RUNTIME_OPTION_DEFAULTS["auto_horizon_enabled"])
+        if type(enabled) is not bool:
+            raise BackendLoadError("auto_horizon_enabled must be a boolean", code="invalid_runtime_options")
+        for name in ("auto_horizon_hold_threshold", "auto_horizon_entropy_quantile"):
+            value = options.get(name, AUTO_HORIZON_RUNTIME_OPTION_DEFAULTS[name])
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+                raise BackendLoadError(f"{name} must be a finite number", code="invalid_runtime_options")
+            if not 0.0 <= float(value) <= 1.0:
+                raise BackendLoadError(f"{name} must be between 0 and 1", code="invalid_runtime_options")
+        for name in ("auto_horizon_run_length", "auto_horizon_sampling_step"):
+            value = options.get(name, AUTO_HORIZON_RUNTIME_OPTION_DEFAULTS[name])
+            if type(value) is not int or value < 1:
+                raise BackendLoadError(f"{name} must be positive", code="invalid_runtime_options")
         return model_dtype
 
     @staticmethod

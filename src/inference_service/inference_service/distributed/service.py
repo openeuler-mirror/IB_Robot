@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, replace
 
 from inference_service.distributed.runtime import CloudBackendRuntime
@@ -160,6 +161,13 @@ class DistributedCloudService:
                     )
                     action = pipeline_result.action
                     chunk_size = pipeline_result.actual_chunk_size
+                    metadata = getattr(pipeline_result, "metadata", {})
+                    raw_horizon = metadata.get("execution_horizon", 0) if isinstance(metadata, Mapping) else 0
+                    if isinstance(raw_horizon, bool) or not isinstance(raw_horizon, int):
+                        raise ValueError("pipeline execution_horizon must be an integer")
+                    execution_horizon = raw_horizon
+                    if execution_horizon < 0 or execution_horizon > chunk_size:
+                        raise ValueError("pipeline execution_horizon is outside the action chunk")
                     latency_ms = pipeline_result.backend_latency_ms
                     inference_end_monotonic_ns = time.monotonic_ns()
                     transport_streams = self._transport_performance()
@@ -172,11 +180,13 @@ class DistributedCloudService:
                     # handled exclusively by observe_edge()/rollover.
                     action = None
                     chunk_size = 0
+                    execution_horizon = 0
                     latency_ms = 0.0
                 elif request.operation is Operation.CANCEL:
                     self.runtime.cancel(request.target_request_id, deadline=request.deadline)
                     action = None
                     chunk_size = 0
+                    execution_horizon = 0
                     latency_ms = 0.0
                 else:
                     raise ValueError(f"unsupported distributed operation {request.operation!r}")
@@ -222,6 +232,7 @@ class DistributedCloudService:
             success=True,
             action=action,
             actual_chunk_size=chunk_size,
+            execution_horizon=execution_horizon,
             backend_latency_ms=latency_ms,
             performance=self._performance_payload(
                 request_start_monotonic_ns=request_start_monotonic_ns,

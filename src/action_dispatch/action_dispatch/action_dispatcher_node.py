@@ -40,7 +40,7 @@ from robot_config.dispatch_strategies import resolve_dispatch_strategies
 from robot_config.tracing_utils import create_trace_logger
 from tensormsg.converter import TensorMsgConverter
 
-from .action_chunk import normalize_action_chunk
+from .action_chunk import normalize_action_chunk, validate_execution_horizon
 from .active_plan import ActivePlan, PlanSource
 from .chunk_planning import create_chunk_planner
 from .episode import (
@@ -483,6 +483,9 @@ class ActionDispatcherNode(Node):
 
         # A. Trigger Inference if queue is low (shared watermark rule; the
         # legacy policy-reset gate stays a legacy-owned inference gate).
+        # An adaptive-horizon plan carries its own replenishment watermark
+        # (0: re-request once the prefix is consumed) inside the ActivePlan
+        # snapshot instead of prefetching.
         if should_replenish_plan(
             q_size,
             plan.watermark,
@@ -1085,7 +1088,16 @@ class ActionDispatcherNode(Node):
         try:
             action_tensor, actions = decoded
             executed = max(0, self._plan_length_at_inference_start - self._active_plan.snapshot().remaining)
-            candidate = self._chunk_planner.plan(actions, actions_executed=executed)
+            # The result-level execution prefix is chunk-planning input:
+            # the auto_horizon strategy truncates the executable plan and
+            # switches to consume-then-replan replenishment (ActivePlan
+            # applies the candidate's start/stop/watermark transactionally);
+            # full_chunk ignores it.
+            candidate = self._chunk_planner.plan(
+                actions,
+                actions_executed=executed,
+                execution_horizon=validate_execution_horizon(int(result.execution_horizon), len(actions)),
+            )
             dimension = sum(len(spec.names) for spec in self._action_specs) or None
             plan = self._active_plan.accept(
                 candidate,

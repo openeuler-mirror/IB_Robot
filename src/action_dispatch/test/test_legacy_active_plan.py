@@ -83,7 +83,13 @@ def make_node(*, smoothing=False, benchmark=False):
 def deliver(node, monkeypatch, payload, *, request="request"):
     node._inflight_request_id = request
     node._inference_in_progress = True
-    result = SimpleNamespace(success=True, action_chunk=payload, inference_latency_ms=1, backend_latency_ms=1)
+    result = SimpleNamespace(
+        success=True,
+        action_chunk=payload,
+        inference_latency_ms=1,
+        backend_latency_ms=1,
+        execution_horizon=0,
+    )
     future = Future()
     future.set_result(SimpleNamespace(result=result))
     monkeypatch.setattr("action_dispatch.action_dispatcher_node.TensorMsgConverter.from_variant", lambda value: value)

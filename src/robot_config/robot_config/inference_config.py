@@ -24,6 +24,8 @@ from inference_manifest import (
     resolve_bundle_file,
 )
 
+from .inference_runtime_options import effective_latency_runtime_options
+
 PIPELINE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _INT32_MAX = 2_147_483_647
 
@@ -490,12 +492,14 @@ def _parse_pipeline(
             hardware_resource_id=hardware_resource_id,
             hardware_profile_fingerprint=hardware_profile_fingerprint,
             deployment_fingerprint=validated_manifest.fingerprint,
+            runtime_options=runtime_options,
         )
         runtime_policy_fingerprint = _sha256_hex(runtime_policy_json)
         profile_compatibility_fingerprint = _sha256_hex(
             _build_profile_compatibility_json(
                 execution_mode=execution_mode,
                 public_capacity=public_capacity,
+                runtime_options=runtime_options,
             )
         )
     return InferencePipelineConfig(
@@ -887,11 +891,16 @@ def _build_runtime_policy_json(
     hardware_resource_id: str,
     hardware_profile_fingerprint: str,
     deployment_fingerprint: str,
+    runtime_options: Mapping[str, object],
 ) -> str:
     """Canonical JSON of the per-pipeline runtime policy, hashed into the fingerprint.
 
-    Covers session/ingress limits and transport identity. Profile evidence has
-    its own digest and lifecycle, so it must not participate in this fingerprint.
+    Covers session/ingress limits, transport identity, and the normalized
+    effective runtime options. Runtime options change model execution latency,
+    so the pipeline node validates its actually-executed options against this
+    identity at startup and refuses to serve under a policy declared with
+    different options. Profile evidence has its own digest and lifecycle, so
+    it must not participate in this fingerprint.
     """
     public_capacity_payload = {
         wc.work_class: {
@@ -917,6 +926,7 @@ def _build_runtime_policy_json(
         "deployment_fingerprint": deployment_fingerprint,
         "transport": transport_payload,
         "public_capacity": public_capacity_payload,
+        "runtime_options": effective_latency_runtime_options(runtime_options),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -925,13 +935,17 @@ def _build_profile_compatibility_json(
     *,
     execution_mode: str,
     public_capacity: Mapping[str, InferenceWorkCapacityConfig],
+    runtime_options: Mapping[str, object],
 ) -> str:
     """Canonical timing-policy identity used by offline p99 profiles.
 
     Endpoint names, routing membership, and required/optional status do not
     affect measured closure latency and therefore intentionally stay out of
     this fingerprint. Deployment and hardware identities remain separate
-    mandatory fields in each profile entry.
+    mandatory fields in each profile entry. Runtime options change model
+    execution latency (for example AutoHorizon attention collection), so
+    their normalized effective values participate: profiles calibrated
+    under different options are rejected instead of reused.
     """
 
     payload = {
@@ -940,6 +954,7 @@ def _build_profile_compatibility_json(
             capacity.work_class: {"max_in_flight": capacity.max_in_flight}
             for capacity in sorted(public_capacity.values(), key=lambda item: item.work_class)
         },
+        "runtime_options": effective_latency_runtime_options(runtime_options),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 

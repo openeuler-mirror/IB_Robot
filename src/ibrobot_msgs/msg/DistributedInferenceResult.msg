@@ -15,6 +15,7 @@ bool success
 InferenceError error
 VariantsList action_chunk
 uint32 actual_chunk_size
+uint32 execution_horizon
 float64 backend_latency_ms
 string performance_json
 bool backend_ready

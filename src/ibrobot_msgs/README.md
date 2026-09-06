@@ -637,6 +637,14 @@ MoveIt 任务步骤执行接口，由 `task_executor_node` 提供，路径 `/tas
 
 推理派发动作接口，兼容 OpenClaw 社交控制链路。
 
+成功结果中的 `execution_horizon` 是策略在本次 action chunk 上选择的可执行 prefix；值为
+`0` 表示执行完整 `chunk_size`。该字段由推理策略产生，dispatcher 只负责校验和执行。
+
+`DispatchInfer`、`ScheduledDispatchInfer` 与 `DistributedInferenceResult` 在 protocol v6
+同步新增该字段：三者不是 ROS 二进制兼容的接口变更，升级时必须全链路重新生成、重新构建并
+协调部署（edge、cloud 与所有 action client 一起更新）。distributed 握手会拒绝仍在 v5 的
+peer；如需混跑新旧版本，须使用版本化接口或桥接，`0` 默认值与 `getattr` 缺省不提供兼容性。
+
 ### `RecordEpisode.action`
 
 Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
@@ -937,9 +945,9 @@ launch graph 同时对产品调用方暴露：
 fingerprint、运行时硬件资源、hardware priority levels 和公开容量。它不替代
 `InferencePipelineStatus`；后者只负责 distributed edge/cloud transport handshake。
 
-原有 `DistributedInferenceRequest`、`DistributedInferenceResult`、`InferencePipelineStatus` 保持 protocol v2
-字段和 topic 不变。分布式推理当前不接入 scheduled product session 或优先级抢占；Open、ScheduledDispatch 和
-Close 接口只用于 monolithic pipeline。
+`DistributedInferenceRequest`、`DistributedInferenceResult`、`InferencePipelineStatus` 使用 distributed
+protocol v6（结果新增 `execution_horizon` 字段），topic 不变。分布式推理当前不接入 scheduled product
+session 或优先级抢占；Open、ScheduledDispatch 和 Close 接口只用于 monolithic pipeline。
 
 ## 5. 许可证
 

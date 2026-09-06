@@ -12,6 +12,7 @@ builtin_interfaces/Time deadline         # Absolute UTC deadline; zero uses pipe
 # Result: Action chunk from model
 VariantsList action_chunk               # Action sequence from model
 int32 chunk_size                        # Number of actions returned
+int32 execution_horizon                  # Optional executable prefix; zero means full chunk
 bool success                            # Inference success
 string message                          # Error message if failed
 float64 inference_latency_ms            # Time from goal receipt to result

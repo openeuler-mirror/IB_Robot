@@ -13,7 +13,12 @@ from types import MappingProxyType
 
 from inference_manifest import PolicyMetadata, ValidatedManifest
 
-PROTOCOL_VERSION = 5
+# v6: DistributedInferenceResult, DispatchInfer and ScheduledDispatchInfer add
+# the result-level ``execution_horizon`` field. ROS interface definitions are
+# not wire-compatible across this boundary, so every edge/cloud deployment and
+# all three regenerated interfaces must move together; peers still on v5 are
+# rejected during the heartbeat identity handshake.
+PROTOCOL_VERSION = 6
 
 
 class UnsupportedDistributedRuntimeError(ValueError):
@@ -223,12 +228,19 @@ class DistributedResult:
     backend_state: str = ""
     target_request_id: str = ""
     error: StructuredError | None = None
+    execution_horizon: int = 0
 
     def __post_init__(self) -> None:
         if not self.pipeline_id or not self.request_id or not self.deployment_fingerprint:
             raise ValueError("result pipeline, request, and deployment identity must be non-empty")
         if self.session_generation < 0:
             raise ValueError("session_generation cannot be negative")
+        if (
+            isinstance(self.actual_chunk_size, bool)
+            or not isinstance(self.actual_chunk_size, int)
+            or self.actual_chunk_size < 0
+        ):
+            raise ValueError("actual_chunk_size must be a non-negative integer")
         if not math.isfinite(self.backend_latency_ms) or self.backend_latency_ms < 0:
             raise ValueError("backend_latency_ms must be finite and non-negative")
         object.__setattr__(self, "performance", _immutable_mapping(self.performance))
@@ -241,8 +253,15 @@ class DistributedResult:
         if self.operation is Operation.INFER and self.success:
             if self.action is None or self.actual_chunk_size < 1:
                 raise ValueError("successful inference results require an action and actual chunk size")
-        elif self.actual_chunk_size != 0:
-            raise ValueError("non-inference or failed results must report actual_chunk_size zero")
+            if (
+                isinstance(self.execution_horizon, bool)
+                or not isinstance(self.execution_horizon, int)
+                or self.execution_horizon < 0
+                or self.execution_horizon > self.actual_chunk_size
+            ):
+                raise ValueError("execution_horizon must be zero or within actual_chunk_size")
+        elif self.actual_chunk_size != 0 or self.execution_horizon != 0:
+            raise ValueError("non-inference or failed results must report zero chunk and execution horizon")
 
 
 def summarize_policy(policy: PolicyMetadata) -> PolicySummary:

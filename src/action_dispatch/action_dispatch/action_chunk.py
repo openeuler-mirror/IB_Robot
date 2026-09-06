@@ -51,4 +51,28 @@ def validate_action_chunk(
     return NormalizedActionChunk(tensor=tensor, array=array)
 
 
-__all__ = ["NormalizedActionChunk", "normalize_action_chunk", "validate_action_chunk"]
+def validate_execution_horizon(execution_horizon: int | None, chunk_size: int) -> int | None:
+    """Validate an optional result-level execution prefix.
+
+    Zero and ``None`` mean that the complete predicted chunk is executable.
+    """
+
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive when validating execution horizon")
+    if execution_horizon is None:
+        return None
+    if isinstance(execution_horizon, bool) or not isinstance(execution_horizon, int):
+        raise ValueError("execution_horizon must be an integer")
+    if execution_horizon == 0:
+        return None
+    if execution_horizon < 1 or execution_horizon > chunk_size:
+        raise ValueError(f"execution_horizon={execution_horizon} must be between 1 and {chunk_size}")
+    return execution_horizon
+
+
+__all__ = [
+    "NormalizedActionChunk",
+    "normalize_action_chunk",
+    "validate_execution_horizon",
+    "validate_action_chunk",
+]

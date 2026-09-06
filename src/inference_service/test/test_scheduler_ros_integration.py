@@ -30,6 +30,7 @@ from inference_service.backends import BackendCapabilities
 from inference_service.global_inference_scheduler_node import GlobalInferenceSchedulerNode
 from inference_service.pipeline_policy_node import PipelineNodeConfig, PipelinePolicyNode
 from robot_config.contract_utils import ActionSpec, Contract, ObservationSpec, iter_specs
+from robot_config.inference_runtime_options import effective_latency_runtime_options
 
 
 def _wait_future(future, timeout: float = 5.0):
@@ -635,6 +636,7 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeyp
         "hardware_resource_id": "ascend:0",
         "deployment_fingerprint": manifest.fingerprint,
         "public_capacity": capacity,
+        "runtime_options": effective_latency_runtime_options({}),
         "transport": {
             "open_session": endpoints["open"],
             "dispatch": endpoints["dispatch"],

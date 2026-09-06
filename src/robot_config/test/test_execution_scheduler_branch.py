@@ -551,3 +551,20 @@ def test_scheduled_rejects_unsupported_explicit_selection(tmp_path, executor, sc
     mode["dispatch"] = {"scheduler": scheduler}
     with pytest.raises(DispatchStrategyError, match="scheduled entrypoint requires"):
         generate_execution_nodes(config, "model_inference")
+
+
+def test_launch_rejects_benchmark_auto_horizon_combination(strategy_launch_config):
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    mode["executor"]["type"] = "benchmark"
+    mode["dispatch"] = {"scheduler": "wait_for_feedback", "chunking": "auto_horizon"}
+    with pytest.raises(DispatchStrategyError, match="requires executor type 'topic'"):
+        generate_execution_nodes(strategy_launch_config, "model_inference")
+
+
+def test_launch_accepts_auto_horizon_for_topic_executor(tmp_path):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    config["control_modes"]["model_inference"]["dispatch"] = {"chunking": "auto_horizon"}
+    nodes = _nodes(generate_execution_nodes(config, "model_inference"))
+    dispatcher = next(node for node in nodes if "action_dispatcher_node" in node.node_executable)
+    assert _node_parameters(dispatcher)["chunking_strategy"] == "auto_horizon"

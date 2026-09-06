@@ -130,7 +130,7 @@ action_dispatch 的职责划分为六个边界，legacy
 |----|------|------|--------|
 | Session lifecycle | 节点生命周期状态机 | 会话 open/close、retry、结果去重、safe-stop、fail-and-close；放行 per-tick 调度 | chunk 算法、融合权重 |
 | Per-tick scheduler | `schedulers/`（registry + `continuous` / `wait_for_feedback`） | 每个 tick 是否请求推理、是否提交动作（`should_replenish_plan` 为共享水位线规则） | 生命周期状态、chunk 内容 |
-| Chunk planning | `chunk_planning.py`（`FullChunkPlanner`） | 描述原始 chunk 的 `[start, stop)` 区间及可选补货阈值 | 修改活动计划、发布动作、请求推理 |
+| Chunk planning | `chunk_planning.py`（`FullChunkPlanner` / `AutoHorizonPlanner`） | 描述原始 chunk 的 `[start, stop)` 区间及可选补货阈值（AutoHorizon 按 result 级 `execution_horizon` 截断并置 0 补货） | 修改活动计划、发布动作、请求推理 |
 | Active plan | `active_plan.py`（`ActivePlan`） | 原子持有动作、来源、位置、水位线及 revision；直接消费或 reservation/commit；选择 hold/empty | ROS I/O、episode/session 迁移 |
 | Action blending | `temporal_smoother.py` | 先准备重叠加权动作及 counts 再提交引用，保持既有系数语义 | 推理时机、会话状态 |
 | Executor | `executors/`（registry + `topic` / `benchmark`） | 最终输出通道 | 任何调度决策 |
@@ -143,6 +143,9 @@ action_dispatch 的职责划分为六个边界，legacy
 | Legacy continuous | `topic` / `continuous` | `none` 使用 queue；已有 smoother manager 支持 `temporal_ensemble` 或关闭融合后的透传 | queue 保留容量内最新动作；逻辑直接消费 |
 | Legacy benchmark | `benchmark` / `wait_for_feedback` | 同上 | 同样的 queue 裁剪；带 revision 的 reservation 和反馈提交 |
 | Scheduled | 仅 `topic` / `continuous` | `none` 使用 queue；`temporal_ensemble` 使用独立 smoother | queue 超容拒绝并 safe-stop/close；逻辑直接消费 |
+
+`auto_horizon` chunking 仅在 `topic` executor 下可用；`benchmark + auto_horizon` 由 SSOT
+拒绝（benchmark episode 执行完整 chunk）。
 
 smoother 不继承 deque 容量限制。legacy toggle 保留已有 manager 及计划；没有 manager
 的节点不能通过 toggle 创建它。scheduled toggle 保留非活动 queue 及其元数据，关闭
@@ -158,18 +161,21 @@ smoother 不继承 deque 容量限制。legacy toggle 保留已有 manager 及�
 | queue 裁剪、已接纳来源区间、revision 和水位线 | active-plan owner（由产品选择超容策略） |
 | 超容即失败（`ValueError` → safe-stop + session close）、`(session_id, generation, request_id)` 结果去重 | scheduled 路径 |
 | session 状态机（WAITING_READY/…/FAILED）与重试 | scheduled 路径（不迁入 `DispatchScheduler`） |
-| 水位线补货规则 | 共享（`schedulers.continuous.should_replenish_plan`） |
+| 水位线补货规则 | 共享（`schedulers.continuous.should_replenish_plan`；默认用配置水位线，auto_horizon 计划携带自己的补货阈值） |
 
-### 扩展点（后续 change）
+### 扩展点
 
-- **#401 AutoHorizon**：`executed_during_inference` 为原始 chunk 起点，`execution_horizon` 为排他的终点，
-  不是 skip 后的长度。`replenishment_watermark=None` 使用配置默认，0 表示耗尽才补货；
-  两种存储只应用一次区间。attention 估计、模型能力校验及 runtime options 联动未实现。
-- **#411 RTC**：`PlanSource` 记录 request 及适用的 generation/session 身份；直接单源计划的
+- **AutoHorizon（已支持）**：attention 估计与模型能力校验位于 `inference_service`
+  （native Torch PI0.5 + `predict_action_chunk`），结果通过 `execution_horizon` 传入
+  dispatcher。`executed_during_inference` 为原始 chunk 起点（auto_horizon 在 prefix 全部
+  过期时收敛到 `[H,H)`），`execution_horizon` 为排他的终点，不是 skip 后的长度。
+  `replenishment_watermark=None` 使用配置默认，0 表示耗尽才补货；两种存储只应用一次区间。
+  runtime options 参与 profile 兼容性身份（见 inference_service README）。`benchmark`
+  组合由 SSOT 拒绝。
+- **RTC（规划中的扩展点，配置名未开放）**：`PlanSource` 记录 request 及适用的 generation/session 身份；直接单源计划的
   `PlanSnapshot.next_position` 包括 skip 和容量丢弃前缀。revision 只用于本地 reservation 失效。
   ensemble 没有精确单源坐标，最近来源仅用于诊断；本地接纳/topic 进度不是物理完成或远端缓存确认。
   跨请求缓存身份、路由/失败协调、坐标变换/相对动作重锚定及 wire 转发仍需补齐。
-  AutoHorizon/RTC 均不是当前生产策略名；后续 PR 须独立重放并验证节点接线和协议。
 
 ## 安装
 
@@ -201,9 +207,22 @@ dispatcher 节点（init 期防御性校验）共用同一解析器，并校验�
 机器人 YAML 中 `executor`、`dispatch`、`inference` 同属 `robot.control_modes.<mode>`。
 完整 schema 见 [robot_config 的动作分发策略 SSOT](../robot_config/README.md#动作分发策略-ssot)。
 
+```yaml
+control_modes:
+  model_inference:
+    executor:
+      type: topic                 # topic | benchmark
+    dispatch:
+      scheduler: continuous       # continuous | wait_for_feedback
+      chunking: full_chunk        # full_chunk（默认）| auto_horizon
+      blending: none              # none | temporal_ensemble
+```
+
 - legacy 合法配对：`topic`+`continuous`、`benchmark`+`wait_for_feedback`。
   scheduled 仅支持 `topic`+`continuous`，显式不支持的选择报错而非丢弃。
   历史 executor `action` 仅在 robot_config launch 边界映射为 `topic`，直接节点入口不接受该别名。
+- `dispatch.chunking: auto_horizon` 要求 executor 为 `topic`；`benchmark`+`auto_horizon`
+  在共享 SSOT 报错（benchmark episode 执行完整 chunk），launch 期与节点 init 期都会拒绝。
 - **破坏性接口变更**：删除 `temporal_smoothing_enabled`，不提供别名或兼容路径。
   旧机器人 YAML 和直接 ROS override（构造参数、CLI、参数文件）即使值一致也会报错。
   原 false 迁移为 `dispatch.blending: none`，原 true 迁移为 `temporal_ensemble`；
@@ -218,6 +237,69 @@ dispatcher 节点（init 期防御性校验）共用同一解析器，并校验�
 - 有意拒绝变化：错误形状、原始空 chunk、非有限动作不接纳；legacy continuous
   保留旧计划并记录拒绝，benchmark 在成功启动前以 inference-failed 终止，scheduled
   safe-stop/close。合法非空 chunk 的空选择区间会清空可执行存储。拒绝替换不改变已接纳水位线。
+- 两节点 `~/toggle_smoothing` 保持 `std_srvs/srv/Empty`，先校验再修改；拒绝通过日志
+  诊断，Empty 无错误字段。两者均提供 `~/start_evaluate`、`~/stop_evaluate`、
+  `~/get_status`（`std_srvs/srv/Trigger`）。legacy 另有 `~/reset`（`Empty`）；
+  scheduled 另有 `~/restart_session`（`Trigger`），没有 legacy reset 服务。服务调用可能改变机器人状态。
+
+### AutoHorizon 集成边界（`chunking: auto_horizon`）
+
+论文 AutoHorizon 的 attention 分析位于 `inference_service`，因为只有 policy 能访问 action
+self-attention。推理结果通过 `execution_horizon` 显式声明可执行 prefix；dispatcher 侧由
+`AutoHorizonPlanner` 消费该字段：截断可执行计划，并把该计划的补货阈值降为 0（prefix
+消费完后立即重新请求推理，不做 watermark 预取）。dispatcher 只校验边界、执行 prefix，
+并继续负责队列对齐、平滑和安全停止，不自行重跑模型或从动作数值反推 attention。
+
+- `dispatch.chunking: full_chunk`（默认）时忽略结果中的 `execution_horizon`，保持完整
+  chunk + watermark 行为；没有该字段或值为 0 时 auto_horizon 也安全回退为完整 chunk。
+- benchmark 与 `auto_horizon` 的组合由共享 SSOT 直接拒绝（见上文「调度策略分层与
+  组合校验」）：benchmark episode 必须执行完整 chunk，否则评估的动作序列和推理间隔会被
+  截断；不允许“接受组合但不消费字段”的静默例外。
+- 计划级补货阈值固定为 0 是对论文同步评测语义（`sample → execute H 步 → sample`）的直接
+  映射：每个 prefix 执行完毕后才基于最新观测请求下一次推理，因此 prefix 之间会 hold 一整个
+  推理时延（mock e2e 中表现为 `queue_size 0` 保持）。H 越小，空窗占比越高。当前实现有意
+  不做预取以保持与论文一致；just-in-time 预取（阈值取 `max(0, min(H-1, prefetch_ticks))`，
+  复用已有的 `[H,H)` 过期归一化）是已记录的后续改进方向，当前版本暂未实现。
+- watermark 预取后可能出现的已过期 prefix（推理期间已消费步数 ≥ horizon，S ≥ H）不是
+  非法 chunk：planner 将其规范化为合法空区间 `[H,H)` 并携带补货阈值 0，owner 原子接纳
+  空计划（清空旧计划），scheduler 在下一个 tick 重新请求推理。scheduled 路径不会因此
+  safe-stop，legacy 路径也不会拒绝并保留旧计划。
+- 计划级补货阈值的清理语义按产品区分：legacy `~/reset` 与 benchmark episode 清理
+  （prepare/end）会清除计划及计划级阈值，回到配置水位线；legacy continuous 的
+  stop/start（暂停/恢复）保留活动计划及其计划级阈值，仅使 in-flight 请求失效；
+  scheduled 的 stop/safe-stop/close/restart 清理两个 store 并回到配置水位线。
+
+启用 native Torch PI0.5 复现需要**两段配置同时生效**——dispatcher 侧选择策略，服务侧
+开启采集与估计，缺一不可：
+
+```yaml
+# ① dispatcher 侧（robot YAML 的 control_modes.<mode>.dispatch）：
+#    消费结果级 execution_horizon，截断可执行计划
+dispatch:
+  scheduler: continuous
+  chunking: auto_horizon        # 仅 topic executor；benchmark 组合由 SSOT 拒绝
+  blending: none
+
+# ② 服务侧（对应 inference pipeline 的 runtime_options）：
+#    开启 action-expert attention 采集与 horizon 估计
+runtime_options:
+  auto_horizon_enabled: true
+  auto_horizon_sampling_step: 3
+  auto_horizon_hold_threshold: 0.3
+  auto_horizon_entropy_quantile: 0.9
+  auto_horizon_run_length: 1
+```
+
+只配 ① 不配 ② 时结果不含有效 horizon（等效 `full_chunk` 行为）；只配 ② 不配 ① 时
+`full_chunk` 策略忽略该字段。两者同时配置即形成端到端闭环（选项语义与默认值见
+[inference_service README](../inference_service/README.md)）。
+
+该实验会强制 action expert 使用 eager attention，并在指定 denoising step 采集权重；
+找不到 action-expert `self_attn` 模块（如 lerobot 升级改动模块路径）或 `sampling_step`
+超过 `num_inference_steps` 时在 session 加载阶段报错（fail closed）；推理过程中的偶发
+异常（如某步权重非有限）仍回退为 `execution_horizon=0`，即完整 chunk。runtime options 的取值
+范围、加载时机、profile 标定身份联动以及分布式 cloud 侧的配置位置见
+[inference_service README](../inference_service/README.md)。
 
 ### 参数配置
 

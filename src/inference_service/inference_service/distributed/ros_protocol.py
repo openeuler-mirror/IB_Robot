@@ -196,6 +196,7 @@ def result_to_message(result: DistributedResult) -> DistributedInferenceResult:
         TensorMsgConverter.to_variant({"action": result.action}) if result.action is not None else VariantsList()
     )
     message.actual_chunk_size = result.actual_chunk_size
+    message.execution_horizon = result.execution_horizon
     message.backend_latency_ms = result.backend_latency_ms
     message.performance_json = json.dumps(dict(result.performance), sort_keys=True, separators=(",", ":"))
     message.backend_ready = result.backend_ready
@@ -223,6 +224,7 @@ def result_from_message(message: DistributedInferenceResult) -> DistributedResul
         success=message.success,
         action=decoded.get("action"),
         actual_chunk_size=message.actual_chunk_size,
+        execution_horizon=message.execution_horizon,
         backend_latency_ms=message.backend_latency_ms,
         performance=performance,
         backend_ready=message.backend_ready,

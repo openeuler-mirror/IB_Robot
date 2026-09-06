@@ -35,7 +35,9 @@ from inference_service.distributed.ros_protocol import (
 
 
 def test_protocol_version_is_bumped_for_video_stream_contract():
-    assert PROTOCOL_VERSION == 3
+    # v6 adds the result-level execution_horizon to the distributed wire
+    # contract; the video stream transport shares the same protocol version.
+    assert PROTOCOL_VERSION == 6
 
 
 def test_video_descriptor_and_status_ros_messages_round_trip():

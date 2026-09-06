@@ -44,10 +44,33 @@ def test_illegal_pairings_fail_fast(executor_type, scheduler_mode, message):
 
 def test_chunking_strategy_exact_match():
     validate_chunking_strategy(DEFAULT_CHUNKING)
+    validate_chunking_strategy("auto_horizon")
     with pytest.raises(DispatchStrategyError, match="unknown chunking strategy"):
-        validate_chunking_strategy("auto_horizon")
+        validate_chunking_strategy("rtc")
     with pytest.raises(DispatchStrategyError, match="unknown chunking strategy"):
         validate_chunking_strategy("FULL_CHUNK")
+
+
+def test_auto_horizon_requires_topic_executor():
+    selection = resolve_dispatch_strategies(
+        executor_type="topic",
+        scheduler_mode="continuous",
+        chunking="auto_horizon",
+    )
+    assert selection.chunking == "auto_horizon"
+
+    with pytest.raises(DispatchStrategyError, match="requires executor type 'topic'"):
+        resolve_dispatch_strategies(
+            executor_type="benchmark",
+            scheduler_mode="wait_for_feedback",
+            chunking="auto_horizon",
+        )
+    with pytest.raises(DispatchStrategyError, match="requires executor type 'topic'"):
+        validate_dispatch_strategies(
+            executor_type="benchmark",
+            scheduler_mode="wait_for_feedback",
+            chunking="auto_horizon",
+        )
 
 
 def test_blending_strategy_exact_match():

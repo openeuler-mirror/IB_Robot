@@ -12,7 +12,8 @@ Strategy layers (see the action_dispatch package documentation):
 - ``scheduler`` — when inference may be requested and actions submitted
   (``continuous`` / ``wait_for_feedback``).
 - ``chunking``  — how an inference chunk enters the executable plan
-  (``full_chunk``).
+  (``full_chunk`` / ``auto_horizon``; ``auto_horizon`` requires the
+  ``topic`` executor and is rejected for benchmark episodes).
 - ``blending``  — how candidates become one action per tick
   (``none`` / ``temporal_ensemble``).
 
@@ -25,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 SUPPORTED_SCHEDULERS = ("continuous", "wait_for_feedback")
-SUPPORTED_CHUNKING_STRATEGIES = ("full_chunk",)
+SUPPORTED_CHUNKING_STRATEGIES = ("full_chunk", "auto_horizon")
 SUPPORTED_BLENDING_STRATEGIES = ("none", "temporal_ensemble")
 
 DEFAULT_SCHEDULER = "continuous"
@@ -84,6 +85,16 @@ def resolve_dispatch_strategies(
         )
     validate_executor_scheduler_pairing(executor, scheduler)
     chunking = _resolve_name(chunking, DEFAULT_CHUNKING, SUPPORTED_CHUNKING_STRATEGIES, "chunking strategy")
+    if chunking == "auto_horizon" and executor != "topic":
+        # Benchmark episodes measure full-chunk policies against recorded
+        # action sequences; consuming a result-level prefix there would
+        # silently change the evaluated trajectories. Reject the
+        # combination in the shared SSOT instead of ignoring the field
+        # per path.
+        raise DispatchStrategyError(
+            f"chunking strategy 'auto_horizon' requires executor type 'topic' "
+            f"(benchmark executes full chunks); got executor_type={executor!r}"
+        )
     blending = _resolve_name(blending, "none", SUPPORTED_BLENDING_STRATEGIES, "blending strategy")
     return DispatchStrategySelection(executor, scheduler, chunking, blending)
 

@@ -39,7 +39,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Int32
 from std_srvs.srv import Empty, Trigger
 
-from action_dispatch.action_chunk import validate_action_chunk
+from action_dispatch.action_chunk import validate_action_chunk, validate_execution_horizon
 from action_dispatch.active_plan import ActivePlan, PlanSource
 from action_dispatch.chunk_planning import create_chunk_planner
 from action_dispatch.safe_stop import (
@@ -621,6 +621,9 @@ class ScheduledActionDispatcherNode(Node):
         self._queue_size_pub.publish(Int32(data=q_size))
         # Watermark replenishment via the shared continuous per-tick rule. The
         # scheduled path has no policy-reset gate, so that flag stays False.
+        # An adaptive-horizon plan carries its own replenishment watermark
+        # (0: re-request once the prefix is consumed) inside the ActivePlan
+        # snapshot instead of prefetching.
         if replenish:
             self._request_dispatch()
         # execute one action per tick
@@ -784,7 +787,12 @@ class ScheduledActionDispatcherNode(Node):
         failure_reason = ""
         if result.success:
             try:
-                self._enqueue_chunk(result.action_chunk, reported_chunk_size=int(result.chunk_size), source=source)
+                self._enqueue_chunk(
+                    result.action_chunk,
+                    reported_chunk_size=int(result.chunk_size),
+                    source=source,
+                    execution_horizon=int(result.execution_horizon),
+                )
             except (TypeError, ValueError, RuntimeError, MemoryError) as exc:
                 self.get_logger().error(f"invalid scheduled action chunk: {exc}")
                 failure_reason = "invalid scheduled action chunk"
@@ -854,7 +862,9 @@ class ScheduledActionDispatcherNode(Node):
             with self._state_lock:
                 self._failure_handling = False
 
-    def _enqueue_chunk(self, action_chunk_msg, *, reported_chunk_size: int, source: PlanSource) -> None:
+    def _enqueue_chunk(
+        self, action_chunk_msg, *, reported_chunk_size: int, source: PlanSource, execution_horizon: int = 0
+    ) -> None:
         from tensormsg.converter import TensorMsgConverter
 
         decoded = TensorMsgConverter.from_variant(action_chunk_msg)
@@ -873,7 +883,16 @@ class ScheduledActionDispatcherNode(Node):
             ):
                 return
             actions_executed = max(0, self._plan_length_at_inference_start - self._current_plan_length_locked())
-            chunk_plan = self._chunk_planner.plan(action_np, actions_executed=actions_executed)
+            # The result-level execution prefix is chunk-planning input: the
+            # auto_horizon strategy truncates the executable plan and switches
+            # to consume-then-replan replenishment (ActivePlan applies the
+            # candidate's start/stop/watermark transactionally); full_chunk
+            # ignores it.
+            chunk_plan = self._chunk_planner.plan(
+                action_np,
+                actions_executed=actions_executed,
+                execution_horizon=validate_execution_horizon(execution_horizon, len(action_np)),
+            )
             self._active_plan.accept(chunk_plan, source, action_dimension=self._safe_stop_plan.total_positions)
             self._received_results.add(key)
             self._clear_inflight_locked()

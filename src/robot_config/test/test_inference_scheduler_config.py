@@ -507,6 +507,167 @@ def test_profile_compatibility_fingerprint_ignores_endpoint_names_but_tracks_cap
     assert capacity.profile_compatibility_fingerprint != base.profile_compatibility_fingerprint
 
 
+def test_profile_compatibility_fingerprint_tracks_runtime_options(tmp_path: Path) -> None:
+    """Latency-relevant runtime options participate in the profile identity.
+
+    Enabling AutoHorizon attention collection changes the Torch execution
+    path (per-layer GPU->CPU attention copies), so profiles calibrated with
+    collection disabled must not be reused.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    base_pipeline = _pipeline(bundle, profile=profile)
+    base = parse_inference_config(
+        _robot_config({"policy": base_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+
+    enabled_pipeline = _pipeline(bundle, profile=profile)
+    enabled_pipeline["runtime_options"] = {"auto_horizon_enabled": True}
+    enabled = parse_inference_config(
+        _robot_config({"policy": enabled_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+    assert enabled.profile_compatibility_fingerprint != base.profile_compatibility_fingerprint
+
+    tuned_pipeline = _pipeline(bundle, profile=profile)
+    tuned_pipeline["runtime_options"] = {"auto_horizon_enabled": True, "auto_horizon_sampling_step": 5}
+    tuned = parse_inference_config(
+        _robot_config({"policy": tuned_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+    assert tuned.profile_compatibility_fingerprint != enabled.profile_compatibility_fingerprint
+
+    # Spelling out the effective defaults keeps the identity of the omitted
+    # form: identical execution configuration, identical calibration scope.
+    explicit_pipeline = _pipeline(bundle, profile=profile)
+    explicit_pipeline["runtime_options"] = {
+        "model_dtype": "native",
+        "auto_horizon_enabled": False,
+        "auto_horizon_hold_threshold": 0.3,
+        "auto_horizon_entropy_quantile": 0.9,
+        "auto_horizon_run_length": 1,
+        "auto_horizon_sampling_step": 3,
+    }
+    explicit = parse_inference_config(
+        _robot_config({"policy": explicit_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+    assert explicit.profile_compatibility_fingerprint == base.profile_compatibility_fingerprint
+
+
+def test_runtime_policy_fingerprint_tracks_runtime_options(tmp_path: Path) -> None:
+    """The runtime-policy identity covers the normalized effective options.
+
+    The pipeline node validates its actually-executed runtime options against
+    this identity, so a node parameter override without an SSOT update is
+    rejected at startup instead of serving under a stale policy identity.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    base = parse_inference_config(
+        _robot_config({"policy": _pipeline(bundle, profile=profile)}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+
+    enabled_pipeline = _pipeline(bundle, profile=profile)
+    enabled_pipeline["runtime_options"] = {"auto_horizon_enabled": True}
+    enabled = parse_inference_config(
+        _robot_config({"policy": enabled_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+    assert enabled.runtime_policy_fingerprint != base.runtime_policy_fingerprint
+
+    # Explicitly spelled-out effective defaults keep the omitted-form identity.
+    explicit_pipeline = _pipeline(bundle, profile=profile)
+    explicit_pipeline["runtime_options"] = {
+        "model_dtype": "native",
+        "auto_horizon_enabled": False,
+        "auto_horizon_hold_threshold": 0.3,
+        "auto_horizon_entropy_quantile": 0.9,
+        "auto_horizon_run_length": 1,
+        "auto_horizon_sampling_step": 3,
+    }
+    explicit = parse_inference_config(
+        _robot_config({"policy": explicit_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+    assert explicit.runtime_policy_fingerprint == base.runtime_policy_fingerprint
+    assert (
+        json.loads(explicit.runtime_policy_json or "")["runtime_options"]
+        == json.loads(base.runtime_policy_json or "")["runtime_options"]
+    )
+
+
+def test_profile_registry_rejects_profiles_calibrated_with_other_runtime_options(tmp_path: Path) -> None:
+    """Toggling the collection switch invalidates previously valid profiles.
+
+    Priority-0 admission must fail closed (no p99 estimate) instead of
+    reusing measurements taken with a different execution configuration.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    calibrated_pipeline = _pipeline(bundle, profile=profile)
+    calibrated = parse_inference_config(
+        _robot_config({"policy": calibrated_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+
+    now_ns = time.time_ns()
+    _write_json(
+        profile,
+        {
+            "closure_profiles": [
+                {
+                    "deployment_fingerprint": calibrated.validated_manifest.fingerprint,
+                    "hardware_fingerprint": calibrated.hardware_profile_fingerprint,
+                    "profile_compatibility_fingerprint": calibrated.profile_compatibility_fingerprint,
+                    "scope": "global_proxy",
+                    "work_class": 2,
+                    "closure_key": "full_infer",
+                    "hardware_priority": 0,
+                    "input_contract_fingerprint": "c" * 64,
+                    "prompt_bytes_max": 4096,
+                    "goal_acceptance_p999_ms": 1.0,
+                    "latency_p99_ms": 50.0,
+                    "profiled_at_ns": now_ns,
+                    "sample_count": 10000,
+                }
+            ]
+        },
+    )
+
+    reconfigured_pipeline = _pipeline(bundle, profile=profile)
+    reconfigured_pipeline["runtime_options"] = {"auto_horizon_enabled": True}
+    reconfigured = parse_inference_config(
+        _robot_config({"policy": reconfigured_pipeline}, scheduler=_scheduler_block()),
+        "model_inference",
+    ).pipelines["policy"]
+
+    registry = ProfileRegistry(
+        profile_path=str(reconfigured.profile_path),
+        profile_min_samples=10000,
+        profile_max_age_days=30,
+        deployment_fingerprint=reconfigured.validated_manifest.fingerprint,
+        hardware_fingerprint=str(reconfigured.hardware_profile_fingerprint),
+        profile_compatibility_fingerprint=str(reconfigured.profile_compatibility_fingerprint),
+        now_ns=lambda: now_ns,
+    )
+    registry.load()
+
+    assert registry.profile_count == 0
+    assert (
+        registry.closure_p99_ms(
+            work_class=2,
+            closure_key="full_infer",
+            hardware_priority=0,
+            input_contract_fingerprint="c" * 64,
+            prompt_bytes=0,
+        )
+        is None
+    )
+
+
 def test_config_identity_loads_matching_open_and_dispatch_profiles(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     profile = _profile_file(tmp_path)

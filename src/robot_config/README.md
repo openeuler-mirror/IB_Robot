@@ -740,7 +740,7 @@ robot:
 |----------------------------|--------|-----------------|
 | `executor.type` | `topic` | `executor_type`，输出通道 |
 | `dispatch.scheduler` | `continuous` | `scheduler_mode`，逐 tick 调度；另支持 `wait_for_feedback` |
-| `dispatch.chunking` | `full_chunk` | `chunking_strategy`，目前唯一的 chunk 选择策略 |
+| `dispatch.chunking` | `full_chunk` | `chunking_strategy`，支持 `full_chunk` / `auto_horizon` |
 | `dispatch.blending` | `none` | `blending_strategy`，另支持 `temporal_ensemble` |
 | `executor.watermark_threshold` | `20` | 剩余动作数的补货阈值，0 表示耗尽后补货；不改变 blending 选择 |
 | `executor.queue_size` | `100` | queue 容量，不限制 smoother 存储 |
@@ -748,6 +748,14 @@ robot:
 | `executor.chunk_size` | `100` | smoother 权重表大小，不控制模型实际返回步数 |
 | `executor.temporal_ensemble_coeff` | `0.01` | 指数融合系数 |
 | `executor.smoothing_device` | `''` | smoother 设备，空值使用输入 tensor 设备（NumPy 为 CPU） |
+
+入口与策略组合矩阵：
+
+| 入口 | executor.type / dispatch.scheduler | dispatch.chunking | dispatch.blending / 存储 |
+|------|------------------------------------|-------------------|-------------------------|
+| legacy continuous | `topic` / `continuous` | `full_chunk` 或 `auto_horizon` | `none` queue 或已有 manager 透传；`temporal_ensemble` smoother |
+| legacy benchmark | `benchmark` / `wait_for_feedback` | 仅 `full_chunk`（`auto_horizon` 组合报错） | 同上，消费等待匹配反馈提交 |
+| scheduled | 仅 `topic` / `continuous` | `full_chunk` 或 `auto_horizon` | `none` queue；`temporal_ensemble` 独立 smoother |
 
 - 策略字段缺失、null 或空字符串采用默认：executor 为 `topic`，scheduler 为
   `continuous`，chunking 为 `full_chunk`，blending 为 `none`。
@@ -759,7 +767,19 @@ robot:
 - 历史 `executor.type: action` 仅由 launch 边界映射为 `topic`。直接节点参数
   `executor_type` 不接受此别名。ROS 参数类型约束仍适用，YAML null 默认语义不适用于 ROS CLI override。
 - `inference.scheduler.enable` 选择产品入口，不等同于 `dispatch.scheduler`。
-  scheduled 显式选择 benchmark 或 wait_for_feedback 会报错；AutoHorizon/RTC 也不是当前支持的策略名。
+  scheduled 显式选择 benchmark 或 wait_for_feedback 会报错，不再静默忽略。
+- 两节点的 `~/toggle_smoothing`（Empty）先校验有效组合，拒绝时保留配置及计划并记日志，
+  不伪造响应错误字段；start/stop/get_status 为 Trigger。legacy reset 为 Empty，scheduled
+  restart_session 为 Trigger。合法 toggle 不代表跨 store 动作迁移，详见 action_dispatch 矩阵。
+- 非法/非有限 chunk 的受控拒绝是有意行为修正：legacy continuous 保留旧计划，benchmark
+  inference-failed，scheduled safe-stop/close。queue 超容仍分别为 legacy 保留最新动作、
+  scheduled 失败关闭；smoother 不受 queue 容量约束。
+- AutoHorizon 已开放 `dispatch.chunking: auto_horizon`（仅 `topic` executor；
+  `benchmark` 组合报错），端到端两段配置示例见 action_dispatch README
+  「AutoHorizon 集成边界」；attention 估计与 runtime options 归 inference_service
+  （见其 README）。RTC 配置名尚未开放，远端缓存确认和相对动作重锚定也未实现。
+  runtime options 会参与 profile 兼容性指纹，开关变化需要重新标定。ensemble 没有精确
+  单源坐标，本地 revision/接纳身份不能作为 RTC 远端确认。
 
 耗尽后补货与异步提前补货的完整解释统一放在
 [推理补货与融合配置示例](../action_dispatch/README.md#推理补货与融合配置示例)

@@ -32,7 +32,24 @@ def ros_context():
 
 def test_legacy_node_init_rejects_unknown_chunking_strategy(ros_context):
     with pytest.raises(DispatchStrategyError, match="unknown chunking strategy"):
-        ActionDispatcherNode(parameter_overrides=_overrides(chunking_strategy="auto_horizon"))
+        ActionDispatcherNode(parameter_overrides=_overrides(chunking_strategy="adaptive"))
+
+
+def test_legacy_node_init_rejects_benchmark_auto_horizon_combination(ros_context):
+    """Benchmark episodes execute full chunks; the SSOT rejects the pairing."""
+    with pytest.raises(DispatchStrategyError, match="requires executor type 'topic'"):
+        ActionDispatcherNode(
+            parameter_overrides=_overrides(
+                executor_type="benchmark",
+                scheduler_mode="wait_for_feedback",
+                chunking_strategy="auto_horizon",
+            )
+        )
+
+
+def test_legacy_node_init_accepts_auto_horizon_for_topic_executor(ros_context):
+    node = ActionDispatcherNode(parameter_overrides=_overrides(chunking_strategy="auto_horizon"))
+    assert node._chunking_strategy == "auto_horizon"
 
 
 def test_legacy_node_init_rejects_removed_smoothing_flag(ros_context):
@@ -47,7 +64,7 @@ def test_legacy_node_init_rejects_removed_smoothing_flag(ros_context):
 
 def test_scheduled_node_init_rejects_unknown_chunking_strategy(ros_context):
     with pytest.raises(DispatchStrategyError, match="unknown chunking strategy"):
-        ScheduledActionDispatcherNode(parameter_overrides=_overrides(chunking_strategy="auto_horizon"))
+        ScheduledActionDispatcherNode(parameter_overrides=_overrides(chunking_strategy="adaptive"))
 
 
 def test_scheduled_node_init_rejects_removed_smoothing_flag(ros_context):

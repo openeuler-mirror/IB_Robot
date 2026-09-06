@@ -21,6 +21,7 @@ int32 priority
 # Result
 ibrobot_msgs/VariantsList action_chunk
 int32 chunk_size
+int32 execution_horizon                  # Optional executable prefix; zero means full chunk
 bool success
 float64 inference_latency_ms
 string<=63 pipeline_id

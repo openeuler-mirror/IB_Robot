@@ -9,6 +9,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +20,6 @@ import rclpy
 import rclpy.action
 import torch
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
-from observation_transport.frame_ingress import StreamSessionView
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -93,6 +93,7 @@ from inference_service.scheduler.ledger import (
 from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from inference_service.unified_runtime import RegistrySet, RuntimeProviders
+from observation_transport.frame_ingress import StreamSessionView
 from robot_config.contract_utils import (
     SpecView,
     StreamBuffer,
@@ -102,6 +103,7 @@ from robot_config.contract_utils import (
     qos_profile_from_dict,
     stamp_from_header_ns,
 )
+from robot_config.inference_runtime_options import effective_latency_runtime_options
 from robot_config.utils import (
     build_joint_conversion_table,
     build_joint_conversion_table_from_urdf,
@@ -347,6 +349,14 @@ class _ExternalVideoProducerView:
     def sender_diagnostics(self) -> tuple[()]:
         """External producers own sender diagnostics and publish their own status."""
         return ()
+
+
+def _execution_horizon_from_metadata(metadata: object, chunk_size: int) -> int:
+    """Validate the optional policy-selected prefix before publishing a result."""
+    value = metadata.get("execution_horizon", 0) if isinstance(metadata, Mapping) else 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > chunk_size:
+        raise ValueError(f"execution_horizon={value!r} is outside chunk_size={chunk_size}")
+    return value
 
 
 class PipelinePolicyNode(Node):
@@ -603,6 +613,25 @@ class PipelinePolicyNode(Node):
         for field_name, expected in expected_transport.items():
             if transport.get(field_name) != expected:
                 raise RuntimeError(f"scheduled runtime policy transport.{field_name} mismatch")
+        # The runtime policy carries the normalized effective runtime options
+        # declared in the SSOT; latency profiles are calibrated against that
+        # execution configuration. A node parameter override that changes the
+        # actually-executed options (e.g. enabling AutoHorizon attention
+        # collection via runtime_options_json alone) would silently decouple
+        # measurement identity from execution, so it fails startup instead.
+        try:
+            actual_options = json.loads(self._config.runtime_options_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"pipeline {self._config.pipeline_id!r} runtime_options_json is invalid: {exc}") from exc
+        if not isinstance(actual_options, dict):
+            raise RuntimeError(f"pipeline {self._config.pipeline_id!r} runtime_options_json must decode to an object")
+        if policy.get("runtime_options") != effective_latency_runtime_options(actual_options):
+            raise RuntimeError(
+                "scheduled runtime policy runtime_options mismatch: the node would execute "
+                "different runtime options than its SSOT-declared policy; update "
+                "control_modes.<mode>.inference.pipelines.<id>.runtime_options in the robot "
+                "configuration instead of overriding the runtime_options_json parameter"
+            )
 
     def _load_contract(self, robot_config_path: str) -> None:
         config_path = Path(robot_config_path)
@@ -1172,6 +1201,7 @@ class PipelinePolicyNode(Node):
             raw_action = result.action
             chunk_size = result.actual_chunk_size
             inference_end_monotonic_ns = time.monotonic_ns()
+            execution_horizon = _execution_horizon_from_metadata(result.metadata, chunk_size)
             backend_latency_ms = result.backend_latency_ms
             total_latency_ms = result.total_latency_ms
             service_performance = {
@@ -1219,6 +1249,7 @@ class PipelinePolicyNode(Node):
                 )
                 self._raise_if_deadline_expired(deadline, request_id)
                 chunk_size = distributed_result.actual_chunk_size
+                execution_horizon = int(distributed_result.execution_horizon)
                 backend_latency_ms = distributed_result.backend_latency_ms
                 total_latency_ms = (time.perf_counter() - total_start) * 1000.0
                 service_performance = dict(distributed_result.performance)
@@ -1236,6 +1267,7 @@ class PipelinePolicyNode(Node):
         response = DispatchInfer.Result()
         response.action_chunk = action_message
         response.chunk_size = chunk_size
+        response.execution_horizon = execution_horizon
         response.success = True
         response.message = "OK"
         response.inference_latency_ms = total_latency_ms
@@ -1955,6 +1987,7 @@ class PipelinePolicyNode(Node):
             action = self._lerobot_to_rad(raw_action)
             result.action_chunk = TensorMsgConverter.to_variant({"action": action})
             result.chunk_size = chunk_size
+            result.execution_horizon = _execution_horizon_from_metadata(backend_result.metadata, chunk_size)
             result.success = True
             result.inference_latency_ms = total_latency_ms
             result.backend_latency_ms = backend_latency_ms

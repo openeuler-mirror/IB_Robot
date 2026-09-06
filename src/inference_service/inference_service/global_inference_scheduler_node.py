@@ -661,6 +661,11 @@ class GlobalInferenceSchedulerNode(Node):
                 deployment_fingerprint=candidate.deployment_fingerprint,
                 runtime_policy_fingerprint=candidate.runtime_policy_fingerprint,
             )
+            if result.success:
+                chunk_size = int(result.chunk_size)
+                execution_horizon = int(getattr(result, "execution_horizon", 0))
+                if chunk_size < 1 or execution_horizon < 0 or execution_horizon > chunk_size:
+                    return "execution_horizon_invalid"
         elif action == "close":
             expected["pipeline_id"] = candidate.pipeline_id
             if int(result.outcome.value) == InferenceOutcome.COMPLETED:

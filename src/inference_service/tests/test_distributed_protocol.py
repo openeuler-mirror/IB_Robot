@@ -35,7 +35,7 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
 )
-from inference_service.distributed.types import structured_error_from_exception
+from inference_service.distributed.types import PROTOCOL_VERSION, structured_error_from_exception
 from inference_service.pipeline import PipelineState
 from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
@@ -111,6 +111,7 @@ def test_matching_handshake_gates_requests_and_routes_result(tmp_path):
         success=True,
         action=np.zeros((2, 6), dtype=np.float32),
         actual_chunk_size=2,
+        execution_horizon=1,
         backend_latency_ms=1.5,
         backend_ready=True,
         backend_state="ready",
@@ -839,6 +840,7 @@ def test_ros_protocol_round_trips_status_request_and_result(tmp_path):
     assert decoded_request.stream_references == request.stream_references
     decoded_result = result_from_message(result_to_message(result))
     assert decoded_result.actual_chunk_size == result.actual_chunk_size
+    assert decoded_result.execution_horizon == result.execution_horizon
     assert np.array_equal(decoded_result.action, result.action)
 
 
@@ -888,14 +890,43 @@ def test_request_decoder_rejects_old_protocol_and_malformed_stream_arrays(tmp_pa
         stream_references=(StreamReference("observation.images.top", "top"),),
     )
     message = request_to_message(request)
-    message.protocol_version = 2
-    with pytest.raises(ValueError, match="expected 3"):
+    message.protocol_version = PROTOCOL_VERSION - 1
+    with pytest.raises(ValueError, match=f"expected {PROTOCOL_VERSION}"):
         request_from_message(message)
 
-    message.protocol_version = 3
+    message.protocol_version = PROTOCOL_VERSION
     message.stream_ids = []
     with pytest.raises(ValueError, match="equal length"):
         request_from_message(message)
+
+
+def test_handshake_rejects_peer_from_previous_protocol_version(tmp_path):
+    """A v(N-1) peer must fail the identity handshake, not enter READY.
+
+    The result/action IDL gained ``execution_horizon`` in protocol v6, so a
+    mixed-version deployment could otherwise pass the heartbeat identity
+    check and then fail (or silently misdecode) on result exchange.
+    """
+    identity = _identity(tmp_path / "bundle")
+    edge = EdgeSession(identity)
+    edge.start()
+    old_peer = replace(identity, protocol_version=PROTOCOL_VERSION - 1)
+    status = PipelineStatus(
+        role=PeerRole.CLOUD,
+        identity=old_peer,
+        sequence=1,
+        session_id="session",
+        session_generation=1,
+        ready=True,
+        runtime_state="ready",
+    )
+
+    update = edge.observe_cloud(status)
+
+    assert update.error is not None
+    assert update.error.code == "protocol_version_mismatch"
+    assert update.error.details["remote"] == PROTOCOL_VERSION - 1
+    assert edge.state is PipelineState.HANDSHAKING
 
 
 def test_decode_failure_uses_cloud_identity_and_unknown_operation(tmp_path):

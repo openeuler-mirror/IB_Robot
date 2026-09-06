@@ -20,6 +20,8 @@ from robot_config.dispatch_strategies import (
     SUPPORTED_CHUNKING_STRATEGIES as SUPPORTED_CHUNKING,
 )
 
+from .action_chunk import validate_execution_horizon
+
 
 @dataclass(frozen=True, slots=True)
 class ChunkPlan:
@@ -28,10 +30,17 @@ class ChunkPlan:
     Attributes:
         actions: The accepted action chunk, shape ``[steps, action_dim]``.
         executed_during_inference: Actions of this chunk already consumed
-            while the inference request was in flight (alignment skip).
-        execution_horizon: Reserved extension point for adaptive execution
-            horizons (AutoHorizon). ``None`` keeps the full remaining chunk,
-            which is the watermark-compatible behavior.
+            while the inference request was in flight (alignment skip);
+            adaptive-horizon plans clamp it to the horizon when the whole
+            prefix expired, selecting the empty interval ``[H, H)``.
+        execution_horizon: Executable prefix selected by an adaptive
+            execution horizon (AutoHorizon). ``None`` keeps the full
+            remaining chunk, which is the watermark-compatible behavior.
+        replenishment_watermark: Plan-level replenishment threshold the
+            per-tick scheduler should use while this plan is active.
+            ``None`` keeps the configured watermark; an adaptive-horizon
+            plan carries ``0`` so inference is re-requested once the prefix
+            is consumed instead of watermark prefetching.
     """
 
     actions: np.ndarray
@@ -87,8 +96,20 @@ class ChunkPlanner(ABC):
     """
 
     @abstractmethod
-    def plan(self, actions: np.ndarray, *, actions_executed: int) -> ChunkPlan:
-        """Plan the executable update for an accepted inference chunk."""
+    def plan(
+        self,
+        actions: np.ndarray,
+        *,
+        actions_executed: int,
+        execution_horizon: int | None = None,
+    ) -> ChunkPlan:
+        """Plan the executable update for an accepted inference chunk.
+
+        ``execution_horizon`` is the optional result-level executable prefix
+        (0/``None`` = full chunk). Whether a strategy honors it is part of
+        the strategy contract: ``full_chunk`` ignores it, ``auto_horizon``
+        truncates the plan and switches to consume-then-replan replenishment.
+        """
 
     @property
     @abstractmethod
@@ -101,11 +122,19 @@ class FullChunkPlanner(ChunkPlanner):
 
     Accepts the whole chunk and only aligns it with the actions consumed
     during inference; the plan is then replenished by the watermark rule
-    owned by the per-tick scheduler. This preserves the pre-strategy
-    behavior of both dispatcher paths byte-for-byte.
+    owned by the per-tick scheduler. Result-level execution horizons are
+    ignored: with ``full_chunk`` the dispatcher executes complete chunks
+    regardless of any prefix the inference side may report. This preserves
+    the pre-strategy behavior of both dispatcher paths byte-for-byte.
     """
 
-    def plan(self, actions: np.ndarray, *, actions_executed: int) -> ChunkPlan:
+    def plan(
+        self,
+        actions: np.ndarray,
+        *,
+        actions_executed: int,
+        execution_horizon: int | None = None,
+    ) -> ChunkPlan:
         if actions.ndim != 2:
             raise ValueError(f"actions must have rank 2, got shape {actions.shape}")
         skipped = max(0, min(int(actions_executed), actions.shape[0]))
@@ -116,14 +145,65 @@ class FullChunkPlanner(ChunkPlanner):
         return "full_chunk"
 
 
+class AutoHorizonPlanner(ChunkPlanner):
+    """Adaptive execution-horizon planning (AutoHorizon).
+
+    Consumes the result-level ``execution_horizon`` reported by the
+    inference side: the executable plan is truncated to the horizon prefix
+    and the plan's replenishment watermark drops to 0, so the dispatcher
+    re-requests inference as soon as the prefix is consumed instead of
+    watermark prefetching. A missing or zero horizon safely falls back to
+    the full chunk with the configured watermark.
+
+    A prefix that fully expired while the request was in flight
+    (``actions_executed >= horizon``) is not an invalid chunk: the result
+    is legal, only its executable prefix is stale. The planner normalizes
+    it to the legal empty interval ``[horizon, horizon)`` with watermark
+    0, the owner atomically accepts the empty plan (clearing the previous
+    one), and the scheduler re-requests inference on the next tick.
+    """
+
+    def plan(
+        self,
+        actions: np.ndarray,
+        *,
+        actions_executed: int,
+        execution_horizon: int | None = None,
+    ) -> ChunkPlan:
+        if actions.ndim != 2:
+            raise ValueError(f"actions must have rank 2, got shape {actions.shape}")
+        skipped = max(0, min(int(actions_executed), actions.shape[0]))
+        horizon = validate_execution_horizon(execution_horizon, actions.shape[0])
+        if horizon is None:
+            return validate_chunk_plan(ChunkPlan(actions=actions, executed_during_inference=skipped))
+        return validate_chunk_plan(
+            ChunkPlan(
+                actions=actions,
+                executed_during_inference=min(skipped, horizon),
+                execution_horizon=horizon,
+                replenishment_watermark=0,
+            )
+        )
+
+    def reset(self) -> None:
+        return
+
+    @property
+    def chunking_strategy(self) -> str:
+        return "auto_horizon"
+
+
 def create_chunk_planner(chunking: str) -> ChunkPlanner:
     """Exact-name factory for chunk-planning strategies (no aliases)."""
     if chunking == "full_chunk":
         return FullChunkPlanner()
+    if chunking == "auto_horizon":
+        return AutoHorizonPlanner()
     raise ValueError(f"unknown chunking strategy {chunking!r}; expected one of {SUPPORTED_CHUNKING}")
 
 
 __all__ = [
+    "AutoHorizonPlanner",
     "ChunkPlan",
     "ChunkPlanner",
     "FullChunkPlanner",

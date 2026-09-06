@@ -68,6 +68,7 @@ def _result(node, actions):
         success=True,
         chunk_size=len(actions),
         action_chunk=TensorMsgConverter.to_variant({"action": actions}),
+        execution_horizon=0,
     )
 
 
@@ -210,6 +211,82 @@ def test_enqueue_chunk_skips_actions_executed_during_inference():
     assert node._active_plan.snapshot().next_position == 2
     np.testing.assert_array_equal(node._active_plan.take_action().action, [4, 5])
     np.testing.assert_array_equal(node._active_plan.take_action().action, [6, 7])
+
+
+def test_enqueue_chunk_applies_policy_execution_horizon():
+    node = _plan_node()
+    node._chunk_planner = create_chunk_planner("auto_horizon")
+    result = _result(node, np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]))
+    result.execution_horizon = 2
+
+    node._on_dispatch_result(result)
+
+    snapshot = node._active_plan.snapshot()
+    # The auto_horizon strategy truncates the executable plan to the horizon
+    # prefix and drops the plan watermark to 0 (consume-then-replan).
+    assert snapshot.remaining == 2
+    assert snapshot.watermark == 0
+    assert np.array_equal(np.asarray(list(node._queue_plan._queue)), np.asarray([[0.0, 1.0], [2.0, 3.0]]))
+
+
+def test_enqueue_chunk_full_chunk_strategy_ignores_execution_horizon():
+    node = _plan_node()
+    node._chunk_planner = create_chunk_planner("full_chunk")
+    result = _result(node, np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]))
+    result.execution_horizon = 2
+
+    node._on_dispatch_result(result)
+
+    snapshot = node._active_plan.snapshot()
+    # full_chunk keeps the complete chunk and the configured watermark behavior.
+    assert snapshot.remaining == 4
+    assert snapshot.watermark == node._watermark
+    assert np.array_equal(
+        np.asarray(list(node._queue_plan._queue)),
+        np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]),
+    )
+
+
+def test_enqueue_chunk_accepts_expired_horizon_as_empty_plan():
+    """A fully expired prefix (S > H) is accepted, not treated as invalid.
+
+    Watermark prefetch after a horizon=0 fallback can consume more actions
+    than the next result's prefix. The scheduled path must accept the
+    normalized empty plan (clearing the old one) instead of failing the
+    result and safe-stopping the session.
+    """
+    node = _plan_node()
+    node._chunk_planner = create_chunk_planner("auto_horizon")
+    node._active_plan.accept(ChunkPlan(np.zeros((1, 2))), _source(node))
+    node._plan_length_at_inference_start = 4  # 3 consumed + 1 remaining -> S=3
+    result = _result(node, np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]))
+    result.execution_horizon = 2  # H=2 < S=3: fully expired prefix
+
+    node._on_dispatch_result(result)
+
+    snapshot = node._active_plan.snapshot()
+    assert snapshot.remaining == 0
+    assert snapshot.watermark == 0
+    assert node._inflight_request_id == ""
+    assert node._pending_failure is None
+    # The shared watermark rule replenishes immediately on the next tick.
+    assert ScheduledActionDispatcherNode._current_plan_length_locked(node) <= snapshot.watermark
+
+
+def test_enqueue_chunk_expired_horizon_with_smoother_accepts_empty_plan():
+    node = _plan_node(smoothing=True)
+    node._chunk_planner = create_chunk_planner("auto_horizon")
+    node._active_plan.accept(ChunkPlan(np.zeros((1, 2))), _source(node))
+    node._plan_length_at_inference_start = 4
+    result = _result(node, np.asarray([[0.0, 1.0], [2.0, 3.0], [4.0, 5.0], [6.0, 7.0]]))
+    result.execution_horizon = 2
+
+    node._on_dispatch_result(result)
+
+    snapshot = node._active_plan.snapshot()
+    assert snapshot.remaining == 0
+    assert snapshot.watermark == 0
+    assert node._pending_failure is None
 
 
 def test_enqueue_chunk_rejects_overflow_without_truncating_actions():
@@ -537,7 +614,7 @@ def test_selected_interval_and_zero_watermark_drive_consumption(smoothing):
     node = _plan_node(smoothing=smoothing)
     node._plan_length_at_inference_start = 2
 
-    def plan(actions, *, actions_executed):
+    def plan(actions, *, actions_executed, execution_horizon=None):
         assert node._state_lock._is_owned()
         assert actions_executed == 2
         return ChunkPlan(actions, executed_during_inference=2, execution_horizon=5, replenishment_watermark=0)
@@ -760,7 +837,7 @@ def test_retry_timer_cannot_replace_a_new_request_or_reopen_closed_session(state
         ({"executor_type": "benchmark"}, None, "scheduled entrypoint"),
         ({"scheduler_mode": "wait_for_feedback"}, None, "scheduled entrypoint"),
         ({"executor_type": "benchmark", "scheduler_mode": "wait_for_feedback"}, None, "scheduled entrypoint"),
-        ({"chunking_strategy": "auto_horizon"}, None, "unknown chunking"),
+        ({"chunking_strategy": "adaptive"}, None, "unknown chunking"),
         ({"blending_strategy": "rtc"}, None, "unknown blending"),
         ({"temporal_smoothing_enabled": "false"}, None, "removed"),
         ({"temporal_smoothing_enabled": 0}, None, "removed"),
