@@ -211,7 +211,7 @@ def test_repository_aliases_and_runtime_directories():
     assert dm.runtime_directory("fullsubnet", "fullsubnet") == "voice_asr"
     assert (
         dm.runtime_directory("grounding_dino_swint_seq8_1280x720", "grounding_dino_swint_seq8_1280x720")
-        == "grounded_sam2_swint_ogc"
+        == "grounding_dino_swint_seq8_1280x720"
     )
     assert dm.resolve_names("all", ["pi05", "zipvoice"]) == ["pi05", "zipvoice"]
 

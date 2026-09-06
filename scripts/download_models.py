@@ -77,7 +77,7 @@ RUNTIME_DIRECTORIES = {
     "IB_Robot_ACT_banana_pick_distill": "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
     "fullsubnet": "voice_asr",
     "graspgen": "graspgen",
-    "grounding_dino_swint_seq8_1280x720": "grounded_sam2_swint_ogc",
+    "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
 }
 LEGACY_REPOSITORIES = {
     "IB_Robot_ACT_banana_pick": "IB_Robot_ACT_banana_pick",
