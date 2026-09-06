@@ -46,6 +46,8 @@ def test_production_session_builders_use_v3_keys() -> None:
         assert SessionBuilderKey("tensor_model", "fullsubnet", "enhance", "ascend") in keys
         assert SessionBuilderKey("tensor_model", "silero_vad", "vad", "ascend") in keys
         assert SessionBuilderKey("tensor_model", "graspgen", "generate_grasps", "ascend") in keys
+        assert SessionBuilderKey("tensor_model", "fullsubnet", "enhance", "onnx") in keys
+        assert SessionBuilderKey("tensor_model", "silero_vad", "vad", "onnx") in keys
         assert not any(key.interface in {"perception", "generic"} for key in keys)
     finally:
         dependencies.providers.close()
@@ -67,6 +69,14 @@ def test_backend_descriptors_publish_concrete_tensor_model_evidence() -> None:
     assert ("tensor_model", "fullsubnet", "enhance") in _STATIC_BACKEND_REGISTRY.descriptor(
         "ascend"
     ).supported_identities
+    assert ("tensor_model", "silero_vad", "vad") in _STATIC_BACKEND_REGISTRY.descriptor("onnx").supported_identities
+    assert ("tensor_model", "speech_direction", "enhance_and_vad") in _STATIC_BACKEND_REGISTRY.descriptor(
+        "onnx"
+    ).supported_identities
+
+    onnx_evidence = _STATIC_BACKEND_REGISTRY.descriptor("onnx").conformance_evidence
+    assert any(item.session_type == "OnnxRuntimeModelSession" for item in onnx_evidence)
+    assert all(item.target_runtimes == frozenset({"onnx"}) for item in onnx_evidence)
 
     torch_evidence = _STATIC_BACKEND_REGISTRY.descriptor("torch").conformance_evidence
     assert any(

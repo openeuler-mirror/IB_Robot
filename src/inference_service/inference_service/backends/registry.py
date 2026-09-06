@@ -18,6 +18,7 @@ from inference_manifest import (
     Deployment,
     HisiliconRuntimeProfile,
     HMMRuntimeProfile,
+    ONNXRuntimeProfile,
     RKNNRuntimeProfile,
     RoleRuntimeProfile,
     TorchRuntimeProfile,
@@ -25,7 +26,7 @@ from inference_manifest import (
 from inference_service.backends.errors import BackendCompatibilityError, BackendRegistryError
 from inference_service.backends.types import RuntimeContext
 
-CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
+CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm", "onnx")
 VALID_INTERFACES = frozenset({"policy", "tensor_model"})
 POLICY_MODEL_TYPES = frozenset({"act", "diffusion", "pi05", "smolvla"})
 
@@ -472,6 +473,20 @@ def _validate_hmm(deployment: Deployment) -> str | None:
     return None
 
 
+def _validate_onnx(deployment: Deployment) -> str | None:
+    if _target(deployment) is None:
+        return "onnx requires a compiled deployment"
+    for target in _targets(deployment):
+        if getattr(target, "runtime", None) != "onnx":
+            return "target.runtime must be exactly 'onnx'"
+    execution = getattr(deployment, "execution", ())
+    artifacts = getattr(deployment, "artifacts", {})
+    invalid_formats = sorted({artifacts[role].format for role in execution if role in artifacts} - {"onnx"})
+    if invalid_formats:
+        return f"onnx execution artifacts must use format 'onnx', got {invalid_formats}"
+    return None
+
+
 def _identities(*values: tuple[str, str, str]) -> frozenset[IdentityKey]:
     return frozenset(_canonical_identity(*value) for value in values)
 
@@ -519,6 +534,13 @@ _TENSOR_ASCEND = (
     ("tensor_model", "zipvoice", "synthesize"),
     ("tensor_model", "fullsubnet", "enhance"),
     ("tensor_model", "silero_vad", "vad"),
+)
+# ONNX Runtime hosts the audio families on Ubuntu hosts where neither Torch
+# nor an Ascend ACL runtime is available for the published graphs.
+_TENSOR_ONNX = (
+    ("tensor_model", "fullsubnet", "enhance"),
+    ("tensor_model", "silero_vad", "vad"),
+    ("tensor_model", "speech_direction", "enhance_and_vad"),
 )
 
 
@@ -602,6 +624,19 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
                 target_socs=frozenset({"xh2", "lq50", "m50"}),
             ),
             target_validator=_validate_hmm,
+        ),
+        "onnx": BackendDescriptor(
+            name="onnx",
+            supported_identities=_identities(*_TENSOR_ONNX),
+            profile_types=frozenset({ONNXRuntimeProfile}),
+            conformance_evidence=_evidence(
+                *_TENSOR_ONNX,
+                session_type="OnnxRuntimeModelSession",
+                profile_type=ONNXRuntimeProfile,
+                target_runtimes=frozenset({"onnx"}),
+                devices=frozenset({"cpu", "cuda"}),
+            ),
+            target_validator=_validate_onnx,
         ),
     }
 )
