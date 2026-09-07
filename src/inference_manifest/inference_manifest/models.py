@@ -326,6 +326,35 @@ class SemanticTensor(StrictFrozenModel):
         return self
 
 
+class AudioContract(StrictFrozenModel):
+    """Deployment-specific audio boundary constraints."""
+
+    sample_rate_hz: Annotated[int, Field(strict=True, gt=0)] | None = None
+    channels: Annotated[int, Field(strict=True, gt=0)] | None = None
+    channel_semantics: StrictString | None = None
+    sample_dtype: TensorDType | None = None
+    frame_size: Annotated[int, Field(strict=True, gt=0)] | None = None
+    chunk_size: Annotated[int, Field(strict=True, gt=0)] | None = None
+    execution_mode: Literal["streaming", "offline", "both"] | None = None
+
+    @model_validator(mode="after")
+    def validate_declared_contract(self) -> AudioContract:
+        if not any(
+            value is not None
+            for value in (
+                self.sample_rate_hz,
+                self.channels,
+                self.channel_semantics,
+                self.sample_dtype,
+                self.frame_size,
+                self.chunk_size,
+                self.execution_mode,
+            )
+        ):
+            raise ValueError("audio_contract must declare at least one applicable constraint")
+        return self
+
+
 class EmbeddingMetadata(StrictFrozenModel):
     embedding_space_id: StrictString
     dimension: Annotated[int, Field(strict=True, gt=0)]
@@ -356,6 +385,7 @@ CANONICAL_MODEL_MAPPING: dict[str, dict[str, Any]] = {
     "zipvoice": {"interface": "tensor_model", "operations": ("synthesize",)},
     "fullsubnet": {"interface": "tensor_model", "operations": ("enhance",)},
     "silero_vad": {"interface": "tensor_model", "operations": ("vad",)},
+    "sherpa_onnx": {"interface": "tensor_model", "operations": ("recognize",)},
     "speech_direction": {"interface": "tensor_model", "operations": ("enhance_and_vad",)},
 }
 
@@ -882,6 +912,7 @@ class Deployment(StrictFrozenModel):
     execution: tuple[ExecutionRole, ...] = ()
     bindings: dict[ExecutionRole, ArtifactBindings] = Field(default_factory=dict)
     device_links: tuple[DeviceLink, ...] = ()
+    audio_contract: AudioContract | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @property

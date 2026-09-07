@@ -105,6 +105,25 @@
         }
       ]
     },
+    "audio_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "sample_rate_hz": {"type": "integer", "exclusiveMinimum": 0},
+        "channels": {"type": "integer", "exclusiveMinimum": 0},
+        "channel_semantics": {"$ref": "#/$defs/non_empty_string"},
+        "sample_dtype": {
+          "enum": [
+            "bool", "uint8", "int8", "int16", "int32", "int64",
+            "float16", "bfloat16", "float32", "float64"
+          ]
+        },
+        "frame_size": {"type": "integer", "exclusiveMinimum": 0},
+        "chunk_size": {"type": "integer", "exclusiveMinimum": 0},
+        "execution_mode": {"enum": ["streaming", "offline", "both"]}
+      }
+    },
     "binding": {
       "type": "object",
       "additionalProperties": false,
@@ -335,6 +354,7 @@
           "additionalProperties": {"$ref": "#/$defs/artifact_bindings"}
         },
         "device_links": {"type": "array", "items": {"$ref": "#/$defs/device_link"}},
+        "audio_contract": {"$ref": "#/$defs/audio_contract"},
         "metadata": {"type": "object"}
       }
     }

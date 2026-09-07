@@ -9,6 +9,7 @@ import pytest
 
 from inference_manifest import (
     AscendRuntimeProfile,
+    AudioContract,
     BackendRuntimeProfile,
     BundleFile,
     Deployment,
@@ -171,6 +172,7 @@ def test_policy_model_type_must_match_lerobot_config(tmp_path: Path):
         ("zipvoice", "synthesize"),
         ("fullsubnet", "enhance"),
         ("silero_vad", "vad"),
+        ("sherpa_onnx", "recognize"),
     ],
 )
 def test_canonical_model_identity_mapping(model_type: str, operation: str):
@@ -180,6 +182,30 @@ def test_canonical_model_identity_mapping(model_type: str, operation: str):
     assert identity.operation == operation
 
 
+def test_audio_contract_is_typed_and_deployment_scoped(tmp_path: Path):
+    contract = AudioContract(
+        sample_rate_hz=16000,
+        channels=1,
+        sample_dtype="float32",
+        chunk_size=320,
+        execution_mode="streaming",
+    )
+    assert contract.sample_rate_hz == 16000
+    assert contract.chunk_size == 320
+
+    with pytest.raises(ValueError, match="at least one applicable constraint"):
+        AudioContract()
+
+    value = _bundle(tmp_path, _request_deployment())
+    value["deployments"]["test"]["audio_contract"] = {
+        "sample_rate_hz": 16000,
+        "sample_dtype": "float32",
+        "execution_mode": "offline",
+    }
+    validated = InferenceManifest.model_validate(value)
+    assert validated.deployments["test"].audio_contract.sample_rate_hz == 16000
+
+
 def test_policy_vla_and_noncanonical_operations_are_rejected():
     with pytest.raises(ValueError, match="vla"):
         ModelIdentity(interface="policy", model_type="vla", operation="predict")
@@ -187,6 +213,8 @@ def test_policy_vla_and_noncanonical_operations_are_rejected():
         ModelIdentity(interface="policy", model_type="act", operation="sample")
     with pytest.raises(ValueError, match="grounding_dino"):
         ModelIdentity(interface="tensor_model", model_type="grounding_dino", operation="raw")
+    with pytest.raises(ValueError, match="sherpa_onnx"):
+        ModelIdentity(interface="tensor_model", model_type="sherpa_onnx", operation="vad")
 
     descriptor = InferenceManifest.model_validate_json(
         json.dumps(

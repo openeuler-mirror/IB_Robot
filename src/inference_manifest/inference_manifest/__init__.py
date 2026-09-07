@@ -44,6 +44,7 @@ from inference_manifest.models import (
     INTERNAL_SEMANTIC_PREFIX,
     ArtifactBindings,
     AscendRuntimeProfile,
+    AudioContract,
     BackendRuntimeProfile,
     BundleFile,
     CompiledDeployment,
@@ -97,6 +98,7 @@ from inference_manifest.writer import canonical_manifest_bytes, write_inference_
 
 __all__ = [
     "ArtifactBindings",
+    "AudioContract",
     "ArtifactDigestMismatch",
     "ARTIFACT_DIGEST_MISMATCH",
     "ArtifactIntegrityMode",

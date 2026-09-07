@@ -245,6 +245,11 @@ def _contract_identity(deployment: Deployment) -> dict[str, Any]:
     return contract
 
 
+def _audio_contract_identity(deployment: Deployment) -> dict[str, Any] | None:
+    contract = deployment.audio_contract
+    return contract.model_dump(mode="json", exclude_none=True) if contract is not None else None
+
+
 def _deployment_payload(
     schema_version: int,
     bundle_digest: str,
@@ -281,6 +286,7 @@ def _deployment_payload(
         "semantic_contract": _semantic_contract_value(semantic_contract) if semantic_contract is not None else None,
         "role_identities": role_identity_value,
         "execution_contract": _contract_identity(deployment),
+        "audio_contract": _audio_contract_identity(deployment),
         "execution": list(deployment.execution),
         "profiles": profile_identity,
         "artifacts": _artifact_identity(deployment),
