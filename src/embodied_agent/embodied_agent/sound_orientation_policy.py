@@ -7,10 +7,11 @@ SpeechDirection, Gateway status, and SkillCommand results to this policy.
 from __future__ import annotations
 
 import math
-import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
+
+from embodied_common.text_normalization import normalize_trigger_text
 
 _MAX_CONSUMED_DIRECTION_KEYS = 256
 
@@ -49,7 +50,12 @@ class OrientationPolicyConfig:
     max_turn_deg: float = 180.0
 
     def __post_init__(self) -> None:
-        phrases = tuple(_normalize_text(value) for value in self.trigger_phrases if _normalize_text(value))
+        phrases_list = []
+        for value in self.trigger_phrases:
+            normalized = normalize_trigger_text(value)
+            if normalized:
+                phrases_list.append(normalized)
+        phrases = tuple(phrases_list)
         if not phrases:
             raise ValueError("trigger_phrases must contain a non-empty phrase")
         if not self.direction_frame.strip():
@@ -202,7 +208,7 @@ class SoundOrientationPolicy:
     ) -> PolicyDecision:
         """Process one ASR final text using exact fixed-phrase matching."""
 
-        normalized = _normalize_text(text)
+        normalized = normalize_trigger_text(text)
         if normalized not in self.config.trigger_phrases:
             return PolicyDecision(DecisionKind.IGNORED, "NON_EXACT_TRIGGER")
         if self.state == OrientationState.FAULT_UNKNOWN:
@@ -362,14 +368,3 @@ class SoundOrientationPolicy:
         self._consumed_direction_order.append(event_key)
         while len(self._consumed_direction_order) > _MAX_CONSUMED_DIRECTION_KEYS:
             self._consumed_direction_keys.discard(self._consumed_direction_order.popleft())
-
-
-def _normalize_text(text: str) -> str:
-    """Normalize ASR text for exact phrase matching, not intent parsing."""
-
-    chars = [char.casefold() for char in text if not char.isspace()]
-    while chars and unicodedata.category(chars[0]).startswith("P"):
-        chars.pop(0)
-    while chars and unicodedata.category(chars[-1]).startswith("P"):
-        chars.pop()
-    return "".join(chars)

@@ -88,7 +88,7 @@ robot:
     # camera by accident.
     enabled: true
     # Keep the persisted map queryable while disabling online RGB-D updates.
-    query_only: false
+    query_only: true
     camera:
       peripheral: front
       mounting: fixed
@@ -1174,9 +1174,9 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      # Keep the validated wrist device binding until deployment overrides are
-      # implemented and included in the configuration digest.
-      serial_number: "349522071345"
+      # Device-specific serials belong in a deployment instance override.
+      # Leave the generic profile empty so other LeKiwi units can bind safely.
+      serial_number: ""
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.
       initial_reset: false

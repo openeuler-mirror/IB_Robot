@@ -103,12 +103,12 @@ The internal `confirm-plan` call is the Gateway's technical binding for the exac
 confirmation gate. For an explicitly selected single skill, the direct `describe -> validate -> execute` path remains
 valid.
 
-Natural-language single-Skill and Workflow requests both use the plan workflow above through the composite entry. This is not a second user confirmation gate.
-The internal binding remains separate from the user confirmation gate.
+Natural-language single-Skill and Workflow requests both use `run-workflow` through the composite entry. The internal
+binding remains separate from the user confirmation gate.
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, or rejected validation.
 Do not invent parameters absent from `describe`.
-For an ordered multi-Skill request, call `plan-workflow` exactly once with the user's original
+For an ordered multi-Skill request, call `run-workflow` exactly once with the user's original
 wording and typed steps. Read-only semantic queries needed to obtain literal coordinates happen before this call and
 are not workflow steps. The returned single plan must contain all ordered motion `workflow_steps`. If planning omits,
 reorders, or rejects a requested step, report that exact result and stop; do not retry alternate phrasings and do not

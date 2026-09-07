@@ -183,6 +183,12 @@ class InteractiveController:
         with self._state_lock:
             return self._state
 
+    @property
+    def terminal(self) -> dict[str, Any] | None:
+        """Return the terminal recorded for the current workflow, if any."""
+        with self._state_lock:
+            return dict(self._terminal) if self._terminal is not None else None
+
     def _rpc(self) -> float:
         return self._rpc_timeout_sec
 
@@ -539,6 +545,9 @@ class InteractiveController:
         confirmation = self.confirm_plan()
         if authorization_callback is not None and self.state == CONFIRMED:
             authorization_callback(confirmation)
+        with self._state_lock:
+            if self._stop_requested_now() and not self._submission_started:
+                return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
         return self.execute(stop_event=stop_event, feedback_callback=feedback_callback)
 
     def execute(
@@ -549,7 +558,7 @@ class InteractiveController:
     ) -> dict[str, Any]:
         """Feature 4: execute the confirmed plan; interruptible via ``stop_event``."""
         with self._state_lock:
-            if self._state == STOPPING and self._confirmed is None and self._pending is not None:
+            if self._state == STOPPING and not self._submission_started and self._pending is not None:
                 return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
             if self._state != CONFIRMED or self._confirmed is None or self._pending is None:
                 raise IllegalStateError("ILLEGAL_STATE", "no confirmed workflow to execute")

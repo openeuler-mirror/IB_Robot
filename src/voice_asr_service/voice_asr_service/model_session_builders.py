@@ -19,24 +19,11 @@ SPEECH_DIRECTION_BACKENDS = {
     "onnx": build_onnx_model_session,
 }
 
-_STATE_ABI = {
-    "silero_vad": (("host.silero.state_in", "host.silero.state_out"),),
-    "fullsubnet_fb": (
-        ("host.fullsubnet.fb_hidden_in", "host.fullsubnet.fb_hidden_out"),
-        ("host.fullsubnet.fb_cell_in", "host.fullsubnet.fb_cell_out"),
-    ),
-    "fullsubnet_sb": (
-        ("host.fullsubnet.sb_hidden_in", "host.fullsubnet.sb_hidden_out"),
-        ("host.fullsubnet.sb_cell_in", "host.fullsubnet.sb_cell_out"),
-    ),
-}
-
 
 def build_speech_direction_session(context, *, providers=None):
-    return StatefulAscendOmModelSession(
-        device_id=context.device_id or 0,
-        runtime_manager=getattr(providers, "acl_runtime_provider", None),
-        state_abi=_STATE_ABI,
+    return build_ascend_model_session(
+        context,
+        providers=providers,
     )
 
 

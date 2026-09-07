@@ -129,3 +129,41 @@ def test_interim_text_is_bounded(tmp_path, monkeypatch) -> None:
 
     assert len(sent) == 1
     assert '"assistant_response": "准备执行"' in sent[0]
+
+
+def test_stale_claim_files_are_cleaned_up(tmp_path, monkeypatch) -> None:
+    import os
+    import time
+
+    monkeypatch.setenv("IBROBOT_INTERIM_SPEECH_STATE", str(tmp_path))
+    monkeypatch.setenv("IBROBOT_INTERIM_SPEAKER", "/profile/hooks/ibrobot-speak")
+    stale = tmp_path / "stale-claim"
+    stale.write_text("", encoding="utf-8")
+    eight_days_ago = time.time() - 8 * 24 * 60 * 60
+    os.utime(stale, (eight_days_ago, eight_days_ago))
+    recent = tmp_path / "recent-claim"
+    recent.write_text("", encoding="utf-8")
+    spawned = []
+
+    class _Stdin:
+        def write(self, value):
+            spawned.append(value)
+
+        def close(self):
+            pass
+
+    class _Process:
+        stdin = _Stdin()
+
+    monkeypatch.setattr(speech.subprocess, "Popen", lambda *args, **kwargs: _Process())
+    speech.handle(
+        {
+            "hook_event_name": "on_interim_message",
+            "session_id": "session-1",
+            "extra": {"turn_id": "turn-1", "text": "准备执行。"},
+        }
+    )
+
+    assert not stale.exists()
+    assert recent.exists()
+    assert len(spawned) == 1

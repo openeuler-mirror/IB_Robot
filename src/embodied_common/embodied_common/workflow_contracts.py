@@ -27,6 +27,9 @@ _WORKFLOW_STEP_NAVIGATION_FIELDS = frozenset(
     {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
 )
 
+WORKFLOW_STEP_COMMON_FIELDS = _WORKFLOW_STEP_COMMON_FIELDS
+WORKFLOW_STEP_NAVIGATION_FIELDS = _WORKFLOW_STEP_NAVIGATION_FIELDS
+
 
 @dataclass(frozen=True)
 class CanonicalWorkflowStep:
@@ -124,6 +127,7 @@ class CanonicalWorkflowStep:
 def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
     if isinstance(step, CanonicalWorkflowStep):
         return step
+    schema_version = 0
     if isinstance(step, Mapping):
         values = step
         try:
@@ -162,8 +166,21 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
                 ("yaw", None),
             )
         }
+        schema_version = int(values.get("schema_version", 0))
+        if schema_version == 1 and (
+            str(values.get("direction", "")).strip()
+            or _finite_float(values.get("distance", 0.0)) != 0.0
+            or _finite_float(values.get("degree", 0.0)) != 0.0
+            or bool(values.get("has_x", False))
+            or bool(values.get("has_y", False))
+            or bool(values.get("has_yaw", False))
+            or _finite_float(values.get("x", 0.0) or 0.0) != 0.0
+            or _finite_float(values.get("y", 0.0) or 0.0) != 0.0
+            or _finite_float(values.get("yaw", 0.0) or 0.0) != 0.0
+        ):
+            raise ValueError("navigation parameters require WorkflowStep schema_version 2")
     return CanonicalWorkflowStep(
-        schema_version=schema_version if isinstance(step, Mapping) else int(values.get("schema_version", 0)),
+        schema_version=schema_version,
         skill_name=str(values.get("skill_name", "")),
         target_name=str(values.get("target_name", "")),
         container_name=str(values.get("container_name", "")),
@@ -173,12 +190,12 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         arm_side=str(values.get("arm_side", "")),
         imitation_duration_sec=_finite_float(values.get("imitation_duration_sec", 0.0)),
         timeout_sec=_finite_float(values.get("timeout_sec", 0.0)),
-        direction=str(values.get("direction", "")),
-        distance=_finite_float(values.get("distance", 0.0)),
-        degree=_finite_float(values.get("degree", 0.0)),
-        x=_optional_workflow_coordinate(values, "x"),
-        y=_optional_workflow_coordinate(values, "y"),
-        yaw=_optional_workflow_coordinate(values, "yaw"),
+        direction=str(values.get("direction", "")) if schema_version == 2 else "",
+        distance=_finite_float(values.get("distance", 0.0)) if schema_version == 2 else 0.0,
+        degree=_finite_float(values.get("degree", 0.0)) if schema_version == 2 else 0.0,
+        x=_optional_workflow_coordinate(values, "x") if schema_version == 2 else None,
+        y=_optional_workflow_coordinate(values, "y") if schema_version == 2 else None,
+        yaw=_optional_workflow_coordinate(values, "yaw") if schema_version == 2 else None,
     )
 
 
@@ -220,6 +237,17 @@ def workflow_digest_preimage(
 def compute_workflow_digest(**kwargs: Any) -> str:
     payload = workflow_digest_preimage(**kwargs)
     return sha256_text(to_canonical_json(payload))
+
+
+__all__ = [
+    "CanonicalWorkflowStep",
+    "WORKFLOW_STEP_COMMON_FIELDS",
+    "WORKFLOW_STEP_NAVIGATION_FIELDS",
+    "compute_workflow_digest",
+    "normalize_workflow_step",
+    "normalize_workflow_steps",
+    "workflow_digest_preimage",
+]
 
 
 def _task_budget_dict(task_budget: Any) -> dict[str, Any]:

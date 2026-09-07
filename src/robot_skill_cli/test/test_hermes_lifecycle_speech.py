@@ -50,7 +50,7 @@ def test_composite_workflow_can_emit_authorization_at_confirm_boundary(tmp_path,
     spawned = []
     monkeypatch.setattr(speech, "_spawn_play", lambda *args: spawned.append(args))
 
-    speech.notify_plan_authorized(session_id="task-1")
+    speech.notify_plan_confirmed(session_id="task-1")
 
     assert len(spawned) == 1
     assert spawned[0][2] == "plan_confirmed"

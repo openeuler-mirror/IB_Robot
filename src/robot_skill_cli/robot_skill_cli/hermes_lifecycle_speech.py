@@ -80,8 +80,8 @@ def _event(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def notify_plan_authorized(*, session_id: str, turn_id: str = "") -> None:
-    """Emit the authorization event when a composite workflow confirms internally."""
+def notify_plan_confirmed(*, session_id: str, turn_id: str = "") -> None:
+    """Emit the technical confirmation event for a composite workflow."""
     handle(
         {
             "hook_event_name": "post_tool_call",
@@ -199,7 +199,7 @@ def _generate(output: Path, task: str) -> None:
 
     prompt = (
         "请为机器人任务生成三个简短的中文生命周期播报，严格只输出 JSON 对象，键为 "
-        "status_check_started、planning_started、plan_authorized。"
+        "status_check_started、planning_started、plan_confirmed。"
         "每句10到28个汉字；允许零到两句自然提及用户任务，不要每句都提。"
         "第一句表示收到并观察环境，第二句表示正在规划，第三句只能表示即将执行，"
         "不能声称已经完成，不要输出解释或 Markdown。用户任务：" + task

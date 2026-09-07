@@ -456,7 +456,7 @@ class RosBridge:
 
     @staticmethod
     def _workflow_step_dict(step) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": int(step.schema_version),
             "skill_name": str(step.skill_name),
             "target_name": str(step.target_name),
@@ -466,17 +466,23 @@ class RosBridge:
             "motion_distance": float(step.motion_distance),
             "arm_side": str(step.arm_side),
             "imitation_duration_sec": float(step.imitation_duration_sec),
-            "direction": str(step.direction),
-            "distance": float(step.distance),
-            "degree": float(step.degree),
-            "has_x": bool(step.has_x),
-            "x": float(step.x),
-            "has_y": bool(step.has_y),
-            "y": float(step.y),
-            "has_yaw": bool(step.has_yaw),
-            "yaw": float(step.yaw),
             "timeout_sec": float(step.timeout_sec),
         }
+        if int(step.schema_version) == 2:
+            result.update(
+                {
+                    "direction": str(step.direction),
+                    "distance": float(step.distance),
+                    "degree": float(step.degree),
+                    "has_x": bool(step.has_x),
+                    "x": float(step.x),
+                    "has_y": bool(step.has_y),
+                    "y": float(step.y),
+                    "has_yaw": bool(step.has_yaw),
+                    "yaw": float(step.yaw),
+                }
+            )
+        return result
 
     @classmethod
     def _agent_plan_dict(cls, plan) -> dict[str, Any]:

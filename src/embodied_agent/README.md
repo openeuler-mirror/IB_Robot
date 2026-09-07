@@ -49,7 +49,7 @@ PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
 - execute 复用确认时冻结的预算，通过 Gateway 执行 Skill 或 Workflow。
 - child 接受、取消或终态未知时保持 plan 为 `ACCEPTED`，不得自动重试或释放可能仍有效的 root lease。
 
-Agent 必须通过 `robot-skill plan-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
+Agent 必须通过 `robot-skill run-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
 `raw_command` 只作为审计文本和幂等请求摘要的一部分。
 
 每个 `WorkflowStep` 必须显式携带 `schema_version`。非导航旧合同使用 v1，导航 typed step 使用 v2；CLI 拒绝缺少

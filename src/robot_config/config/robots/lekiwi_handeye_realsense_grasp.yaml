@@ -612,10 +612,9 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      # librealsense serial for the 310P wrist D435i. Explicit binding avoids
-      # selecting another RealSense when multiple devices are connected.
-      # This is the librealsense serial reported by the currently installed
-      # D435i; it intentionally differs from the USB descriptor serial.
+      # Device-specific serials belong in a deployment instance override.
+      # Leave the generic profile empty so other LeKiwi units can bind safely;
+      # the loader warns when multiple same-driver cameras stay unbound.
       serial_number: ""
       # The 310P Color-first wrapper provides deterministic sensor ordering;
       # resetting here only changes timing and can make device selection flaky.

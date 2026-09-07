@@ -28,10 +28,8 @@ Parameters (all loaded from robot_config YAML):
 import math
 import threading
 import time
-from pathlib import Path
 
 import rclpy
-import yaml
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
@@ -44,16 +42,13 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from ibrobot_msgs.action import ExecuteTaskPlan
 from ibrobot_msgs.msg import TaskStep
 from ibrobot_msgs.srv import MoveToPose
+from robot_config.loader import load_robot_section
 
 
 def _load_robot_yaml(config_path: str) -> dict:
-    """Load robot YAML config and return the 'robot' section."""
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Robot config not found: {config_path}")
-    with open(path) as f:
-        data = yaml.safe_load(f)
-    return data.get("robot", data)
+    """Load the resolved robot section through the robot_config SSOT loader."""
+    _, robot_config = load_robot_section(config_path)
+    return robot_config
 
 
 class TaskExecutorNode(Node):

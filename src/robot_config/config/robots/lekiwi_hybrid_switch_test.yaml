@@ -1,0 +1,39 @@
+robot:
+  base_config: lekiwi_nav_grasp
+
+  voice_asr:
+    enabled: false
+
+  speech_direction:
+    enabled: false
+
+  voice_tts:
+    enabled: false
+
+  nav_stages:
+    hybrid:
+      default_control_mode: base_navigation
+      skill_required_control_mode: moveit_planning
+      peripheral_names: [mid360]
+      sensor_calibration:
+        artifacts:
+          base_to_front_camera: ""
+      motion_mode:
+        navigation_enabled_on_startup: true
+      semantic_mapping:
+        enabled: false
+        query_only: true
+      perception_services:
+        enabled: false
+        services: []
+      grasp_execution:
+        enabled: false
+      placement_execution:
+        enabled: false
+      embodied:
+        enabled: true
+        imitate_human_motion:
+          enabled: false
+        skill_catalog_source_mode: development
+        skill_catalog_source_root: src/skill_catalog
+        skill_catalog_profile: lekiwi_hybrid_switch_test

@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -45,6 +46,18 @@ def _release(path: Path) -> None:
         path.unlink()
 
 
+def _cleanup_claims(root: Path, *, max_age_sec: int = 7 * 24 * 60 * 60) -> None:
+    now = time.time()
+    for entry in root.iterdir():
+        if not entry.is_file():
+            continue
+        try:
+            if now - entry.stat().st_mtime > max_age_sec:
+                entry.unlink()
+        except FileNotFoundError:
+            continue
+
+
 def handle(payload: dict[str, Any]) -> None:
     if payload.get("hook_event_name") != "on_interim_message":
         return
@@ -60,6 +73,7 @@ def handle(payload: dict[str, Any]) -> None:
     if not speaker:
         return
     claim_path = _claim_path(payload, text)
+    _cleanup_claims(claim_path.parent)
     if not _claim(claim_path):
         return
     child_payload = json.dumps(

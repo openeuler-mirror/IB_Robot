@@ -15,6 +15,7 @@ from typing import Any
 
 from embodied_common.agent_execution_contract import IMMEDIATE_AFTER_PRESENTATION
 from embodied_common.agent_terminal_contract import TERMINAL_GOAL_STATUSES, classify_agent_terminal
+from embodied_common.workflow_contracts import WORKFLOW_STEP_COMMON_FIELDS, WORKFLOW_STEP_NAVIGATION_FIELDS
 from robot_skill_cli import __version__
 from robot_skill_cli.output import (
     EXIT_GATEWAY_REJECTED,
@@ -53,9 +54,7 @@ _AGENT_TIMEOUT_CODES = {
     "SKILL_TASK_DEADLINE_EXPIRED",
     "SKILL_CANCEL_TIMEOUT",
 }
-_NAVIGATION_WORKFLOW_FIELDS = frozenset(
-    {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
-)
+_NAVIGATION_WORKFLOW_FIELDS = WORKFLOW_STEP_NAVIGATION_FIELDS
 
 
 def _agent_error_exit_code(error_code: str) -> int:
@@ -273,16 +272,7 @@ def _workflow_steps_with_schema_versions(workflow_steps: list[dict[str, Any]], c
     for step in workflow_steps:
         if not isinstance(step, dict):
             raise _CliArgumentError("each workflow step must be an object")
-        common_fields = {
-            "schema_version",
-            "skill_name",
-            "target_name",
-            "container_name",
-            "place_name",
-            "motion_direction",
-            "motion_distance",
-            "timeout_sec",
-        }
+        common_fields = WORKFLOW_STEP_COMMON_FIELDS
         allowed_fields = common_fields | _NAVIGATION_WORKFLOW_FIELDS
         unknown_fields = set(step) - allowed_fields
         if unknown_fields:
@@ -290,6 +280,12 @@ def _workflow_steps_with_schema_versions(workflow_steps: list[dict[str, Any]], c
         if "schema_version" in step:
             # The Agent plan boundary compares explicit versions against its
             # snapshot. Do not rewrite a submitted mismatch at the CLI edge.
+            try:
+                schema_version = int(step["schema_version"])
+            except (TypeError, ValueError) as exc:
+                raise _CliArgumentError("skill contract schema_version must be an integer") from exc
+            if schema_version == 1 and _NAVIGATION_WORKFLOW_FIELDS.intersection(step):
+                raise _CliArgumentError("navigation parameters require WorkflowStep schema_version 2")
             normalized.append(step)
             continue
         if _NAVIGATION_WORKFLOW_FIELDS.intersection(step):
@@ -1146,9 +1142,9 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
         if os.environ.get("IBROBOT_HERMES_LIFECYCLE_SPEECH") != "1":
             return
         try:
-            from robot_skill_cli.hermes_lifecycle_speech import notify_plan_authorized
+            from robot_skill_cli.hermes_lifecycle_speech import notify_plan_confirmed
 
-            notify_plan_authorized(session_id=str(confirmation["task_id"]))
+            notify_plan_confirmed(session_id=str(confirmation["task_id"]))
         except (ImportError, KeyError, OSError, ValueError):
             pass
 
@@ -1189,6 +1185,21 @@ def _run_workflow(args: argparse.Namespace, context, bridge) -> _CommandExit:
             flush=True,
         )
     except InteractiveControlError as exc:
+        terminal = controller.terminal
+        if terminal is not None:
+            print(
+                json_dumps(
+                    {
+                        "schema_version": 1,
+                        "command": "run-workflow",
+                        "event": "workflow_terminal",
+                        "task_id": terminal.get("task_id", ""),
+                        "data": terminal,
+                    }
+                ),
+                flush=True,
+            )
+            return _CommandExit(_agent_error_exit_code(terminal.get("error_code", exc.code)))
         raise _CommandError(exc.code, str(exc), exit_code=_agent_error_exit_code(exc.code)) from exc
     finally:
         for signum, handler in previous_handlers.items():

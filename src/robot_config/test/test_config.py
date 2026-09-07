@@ -1,5 +1,6 @@
 """Tests for robot_config package."""
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from robot_config.launch_builders.voice_asr import (
     resolve_voice_asr_path,
 )
 from robot_config.loader import (
+    _warn_unbound_serial_cameras,
     build_contract_from_robot_config_dict,
     load_embodied_config,
     load_robot_config,
@@ -790,6 +792,49 @@ def test_dict_contract_builder_warns_when_camera_lookup_fails(caplog):
     assert (
         "Observation 'observation.images.top' references peripheral 'missing_camera' but no camera found" in caplog.text
     )
+
+
+def test_unbound_serial_cameras_warn_for_shared_driver_without_serials(caplog):
+    with caplog.at_level(logging.WARNING, logger="robot_config.loader"):
+        _warn_unbound_serial_cameras(
+            {
+                "peripherals": [
+                    {"type": "camera", "name": "wrist", "driver": "realsense", "serial_number": ""},
+                    {"type": "camera", "name": "front", "driver": "realsense", "serial_number": ""},
+                ]
+            }
+        )
+
+    assert "Multiple realsense cameras (wrist, front) have empty serial_number" in caplog.text
+
+
+def test_unbound_serial_cameras_stay_silent_when_any_serial_is_pinned(caplog):
+    with caplog.at_level(logging.WARNING, logger="robot_config.loader"):
+        _warn_unbound_serial_cameras(
+            {
+                "peripherals": [
+                    {"type": "camera", "name": "wrist", "driver": "realsense", "serial_number": "12345"},
+                    {"type": "camera", "name": "front", "driver": "realsense", "serial_number": ""},
+                ]
+            }
+        )
+        _warn_unbound_serial_cameras(
+            {
+                "peripherals": [
+                    {"type": "camera", "name": "wrist", "driver": "realsense", "serial_number": ""},
+                ]
+            }
+        )
+        _warn_unbound_serial_cameras(
+            {
+                "peripherals": [
+                    {"type": "camera", "name": "left", "driver": "opencv", "serial_number": ""},
+                    {"type": "camera", "name": "right", "driver": "opencv", "serial_number": ""},
+                ]
+            }
+        )
+
+    assert "empty serial_number" not in caplog.text
 
 
 def test_dict_contract_builder_ignores_tasks_to_match_typed_contract():

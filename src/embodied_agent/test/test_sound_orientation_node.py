@@ -129,3 +129,29 @@ def test_canceled_action_enters_fault_unknown():
         if node is not None:
             node.destroy_node()
         rclpy.shutdown()
+
+
+def test_contradictory_success_result_enters_fault_unknown():
+    rclpy.init()
+    node = None
+    try:
+        node = _make_node()
+        node._now_sec = lambda: 100.0  # noqa: SLF001
+        node._direction_callback(_direction())  # noqa: SLF001
+        node._command_callback(SimpleNamespace(data="转向我"))  # noqa: SLF001
+        decision = node._policy.try_dispatch(  # noqa: SLF001
+            now_sec=100.0,
+            gateway=node._gateway_snapshot(_status()),
+        )
+        assert decision.request is not None
+        node._policy.mark_action_submitted()  # noqa: SLF001
+        result = SimpleNamespace(success=False, error_code="SKILL_BUSY")
+        node._result_done(  # noqa: SLF001
+            SimpleNamespace(result=lambda: SimpleNamespace(status=4, result=result)),
+            node._goal_generation,  # noqa: SLF001
+        )
+        assert node._policy.state is OrientationState.FAULT_UNKNOWN  # noqa: SLF001
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()

@@ -2,7 +2,9 @@
 
 状态：已接入 ROS launch，默认关闭；启用前必须在目标机器人配置中显式打开。
 
-`VoiceASRNode` 与 `speech_direction_node` 当前各自打开音频设备，没有共享采集链路。目标机器人配置保持 `sound_orientation.enabled: false`；启用前必须先验证部署环境允许两个采集进程并发读取 ReSpeaker，或者先实现共享音频采集。未经验证不得在生产配置中默认开启。
+`VoiceASRNode` 与 `speech_direction_node` 共享 `robot_config` 编排的音频采集链路：ReSpeaker 由
+`audio_capture_node` 采集并发布 `AudioDataStamped`，两个节点只订阅该话题，不直接打开音频设备。
+目标机器人配置仍应显式设置 `sound_orientation.enabled`，生产启用前需完成本节点的终态和故障恢复验证。
 
 本文定义“机器人收到固定触发词后，依据最近的新鲜声源方向执行一次底盘转向”的实现契约，供后续代码实现和大模型协作使用。
 

@@ -1,0 +1,54 @@
+robot:
+  base_config: lekiwi_nav_grasp
+  name: lekiwi_lidar
+  voice_asr:
+    enabled: true
+    auto_download_model: false
+    active_mode: continuous
+    language: zh
+    model_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
+    tokens_path: ""
+    provider: cpu
+    model_type: streaming
+    publish_partial: true
+    output_topic: /voice_command
+    sample_rate: 16000
+    chunk_size: 512
+    device_name: ""
+    exit_on_init_failure: true
+  speech_direction:
+    enabled: true
+    profile: ascend_310p
+    microphone: respeaker
+    parameters:
+      mount_yaw_deg: 90.0
+  voice_tts:
+    enabled: false
+  nav_stages:
+    navigation:
+      peripheral_names: [respeaker, mid360]
+      sensor_calibration:
+        artifacts:
+          base_to_front_camera: ""
+      embodied:
+        enabled: true
+        skill_catalog_source_mode: development
+        skill_catalog_source_root: src/skill_catalog
+        skill_catalog_profile: lekiwi_lidar
+        idle_behaviors:
+          sound_orientation:
+            enabled: true
+            trigger_phrases: ["转向我"]
+            direction_topic: /voice/speech_direction
+            command_topic: /voice_command
+            skill_name: nav_turn
+            direction_frame: base_link
+            deadband_deg: 15.0
+            max_direction_age_sec: 1.3
+            direction_wait_sec: 0.5
+            cooldown_sec: 2.0
+            max_turn_deg: 45.0
+            turn_timeout_sec: 30.0
+            action_acceptance_timeout_sec: 2.0
+            status_retry_sec: 0.5
+            reset_status_max_age_sec: 2.0

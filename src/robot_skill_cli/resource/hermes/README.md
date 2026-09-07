@@ -105,7 +105,7 @@ hermes-robot-configure --config-name so101_single_arm --dry-run
 - `hooks/ibrobot-lifecycle-speech`：机器人任务生命周期 speech hook wrapper，使用当前 IB-Robot
   workspace 中的 `robot_skill_cli` 和 `embodied_agent` 异步生成文案，并投递状态检查、规划和计划授权成功三类语音事件。
 - `hooks/ibrobot-interim-speech`：由配置器绑定当前 workspace 和 `ibrobot-speak` 绝对路径，使用完整
-  `.shrc_local` 环境启动；每个 `(session_id, turn_id, text)` 最多投递一次，失败不阻塞 Hermes。
+  `.shrc_local` 环境启动；每个 `(session_id, turn_id)` 最多投递一次，失败不阻塞 Hermes。
 
 `--accept-hooks` 先 `hermes hooks revoke` 清理旧 mtime，再用
 `hermes --accept-hooks hooks doctor` 重新批准；首次安装无既有审批时，revoke 的非零退出经

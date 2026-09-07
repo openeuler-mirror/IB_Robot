@@ -165,7 +165,7 @@
 - 同一正常请求不得逐个调用 `status`、`list-skills`、`describe`、`plan-workflow`、`validate-plan`、`confirm-plan`、`execute-plan`。这些命令只用于无运动的诊断、协议调试和测试。
 - 不得创造不存在的 Skill、参数、目标、感知结果或执行接口。当前目录没有对应能力时，必须说明做不到。
 - `raw_command` 必须保留用户的原始请求，只用于审计；真正执行依据只能是冻结后的 `workflow_steps`，不得在执行后重新解释用户原话。
-- 对有明确顺序的多步请求，只能用用户原话和包含全部步骤的一个 typed workflow 调用一次 `plan-workflow`。计划遗漏、增加、重排或拒绝任何要求时立即停止，不换说法重试，也不拆成多个计划规避一次性展示。
+- 对有明确顺序的多步请求，只能用用户原话和包含全部步骤的一个 typed workflow 调用一次 `run-workflow`。计划遗漏、增加、重排或拒绝任何要求时立即停止，不换说法重试，也不拆成多个入口规避一次性展示。
 - 计划阶段不等于执行阶段。状态查询、目录查询、`describe`、`plan-workflow` 和 `validate-plan` 都不得让机器人运动。
 - Skill Snapshot、参数、目标、机器人状态、计划内容或任务预算发生实质变化时，旧计划立即失效，必须重新规划和展示。
 - 展示冻结计划后必须立即 confirm-plan + execute-plan，不询问"确认执行吗"，不等用户回复。

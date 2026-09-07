@@ -1,12 +1,14 @@
 """Embodied minimal-closure launch builder."""
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 from launch_ros.actions import Node
 
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
+from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
     navigation_endpoint_projection,
     robot_config_digest,
@@ -410,33 +412,31 @@ def generate_embodied_nodes(
             )
         )
     if sound_orientation.get("enabled", False):
+        # Defaults come from the single SoundOrientationConfig source of truth;
+        # the validated config dict only overrides fields it explicitly sets.
+        sound_defaults = asdict(SoundOrientationConfig())
+        sound_params = {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in sound_defaults.items()
+            if key != "enabled"
+        }
+        for key in sound_params:
+            if key in sound_orientation:
+                sound_params[key] = sound_orientation[key]
+        sound_params.update(
+            {
+                "gateway_status_service": common_params["skill_gateway_status_service"],
+                "skill_action_name": common_params["skill_action_name"],
+                "debug_tracing": common_params["debug_tracing"],
+            }
+        )
         nodes.append(
             Node(
                 package="embodied_agent",
                 executable="sound_orientation_node",
                 name="sound_orientation_node",
                 output="screen",
-                parameters=[
-                    {
-                        "trigger_phrases": sound_orientation.get("trigger_phrases", ["转向我"]),
-                        "direction_topic": sound_orientation.get("direction_topic", "/voice/speech_direction"),
-                        "command_topic": sound_orientation.get("command_topic", "/voice_command"),
-                        "gateway_status_service": common_params["skill_gateway_status_service"],
-                        "skill_action_name": common_params["skill_action_name"],
-                        "skill_name": sound_orientation.get("skill_name", "nav_turn"),
-                        "direction_frame": sound_orientation.get("direction_frame", "base_link"),
-                        "deadband_deg": sound_orientation.get("deadband_deg", 15.0),
-                        "max_direction_age_sec": sound_orientation.get("max_direction_age_sec", 1.3),
-                        "direction_wait_sec": sound_orientation.get("direction_wait_sec", 0.5),
-                        "cooldown_sec": sound_orientation.get("cooldown_sec", 1.5),
-                        "max_turn_deg": sound_orientation.get("max_turn_deg", 180.0),
-                        "turn_timeout_sec": sound_orientation.get("turn_timeout_sec", 10.0),
-                        "action_acceptance_timeout_sec": sound_orientation.get("action_acceptance_timeout_sec", 2.0),
-                        "status_retry_sec": sound_orientation.get("status_retry_sec", 0.5),
-                        "reset_status_max_age_sec": sound_orientation.get("reset_status_max_age_sec", 2.0),
-                        "debug_tracing": embodied_config.get("debug_tracing", True),
-                    }
-                ],
+                parameters=[sound_params],
             )
         )
     if include_visual_games:

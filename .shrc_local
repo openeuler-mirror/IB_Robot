@@ -12,6 +12,11 @@ _IB_SKIPPED=()      # 未生效/跳过的步骤
 # 1. 加载基础 ROS 2 环境
 if [ -f "/opt/ros/humble/setup.sh" ]; then
     source /opt/ros/humble/setup.sh
+    # openEuler installs several ROS runtime dependencies (for example
+    # iceoryx_binding_c used by rmw_cyclonedds_cpp) under lib64, while the
+    # generated ROS setup only exports lib. Keep both standard ROS library
+    # directories visible to the dynamic linker.
+    export LD_LIBRARY_PATH="/opt/ros/humble/lib64:/opt/ros/humble/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
     _IB_STEPS+=("ROS 2 Humble")
 else
     _IB_SKIPPED+=("ROS 2 Humble (未找到 /opt/ros/humble)")

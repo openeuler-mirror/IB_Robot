@@ -153,8 +153,6 @@ class AscendOmModelSession(ModelSession):
         self._models = models
         self._linked_inputs = frozenset(linked_inputs)
         self._update_loaded_capabilities(
-            resettable=False,
-            stateful=False,
             supports_attention=False,
             priority_mapping=(
                 BackendPriorityMapping(tuple(range(priority_streams.level_count)))

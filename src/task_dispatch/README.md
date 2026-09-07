@@ -159,6 +159,9 @@ ros2 action list | grep execute_task_plan
 ros2 action send_goal /task_executor/execute_task_plan ibrobot_msgs/action/ExecuteTaskPlan "{steps: [{type: 2, label: 'wait_1s', wait_duration_s: 1.0}, {type: 1, label: 'open_gripper', gripper_position: 1.0}, {type: 2, label: 'wait_0.5s', wait_duration_s: 0.5}, {type: 1, label: 'close_gripper', gripper_position: 0.0}], task_id: 'test_001', task_description: 'gripper cycle test'}" --feedback
 ```
 
+以上裸 Action 仅用于隔离的底层开发调试；正常 Hermes/Agent 或真机动作必须经过
+Capability Gateway、Safety Guard 和控制模式准入。
+
 预期输出：
 ```
 Result:
@@ -266,6 +269,8 @@ class MyPlanner(Node):
 ## 配置
 
 所有参数从 robot_config YAML（SSOT）自动加载，无需手动配置。
+`robot_config_path` 使用 `robot_config` 的公共 loader 解析，包含 `base_config` 的配置继承和
+严格的容器类型校验；task_dispatch 不维护独立的 YAML 合并规则。
 
 **夹爪关节名** 从 `joints.gripper` 解析：
 

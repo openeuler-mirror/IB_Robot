@@ -1,0 +1,13 @@
+schema_version: 1
+name: lekiwi_hybrid_switch_test
+robot_name: lekiwi_handeye_realsense_grasp_lidar
+enabled_skills:
+- name: open_gripper_skill
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: close_gripper_skill
+  implementation: so101_arm_v1
+  planner_visible: true
+- name: nav_turn
+  implementation: lekiwi_navigation_v2
+  planner_visible: true

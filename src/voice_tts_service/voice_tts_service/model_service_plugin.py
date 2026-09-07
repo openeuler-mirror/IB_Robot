@@ -77,9 +77,6 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         if runtime_profile is None:
             role_profiles = getattr(validated, "role_runtime_profiles", {})
             runtime_profile = next(iter(role_profiles.values()), None)
-        # TTS limits are service-layer options. The Ascend model session only
-        # accepts backend options such as device_id.
-        session_options = {"device_id": options.get("device_id", 0)}
         context = RuntimeContext(
             validated_manifest=validated,
             runtime_options=session_options,

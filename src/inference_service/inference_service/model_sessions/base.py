@@ -32,10 +32,15 @@ from inference_service.unified_runtime import ExecutionContext, LoadRollback, Mo
 class ModelSession(ABC):
     """Execute one manifest-bound model resource behind the native runtime API."""
 
+    supports_reset: bool = False
+    is_stateful: bool = False
+
     def __init__(self, name: str, capabilities: BackendCapabilities) -> None:
         if not name:
             raise ValueError("model runtime name must be non-empty")
         self._name = name
+        if self.supports_reset or self.is_stateful:
+            capabilities = replace(capabilities, resettable=self.supports_reset, stateful=self.is_stateful)
         self._capabilities = capabilities
         self._condition = threading.Condition(threading.RLock())
         self._state = BackendState.CREATED

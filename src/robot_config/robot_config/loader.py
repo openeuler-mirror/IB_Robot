@@ -6,7 +6,6 @@ import json
 import logging
 import math
 import re
-import unicodedata
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +15,7 @@ from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
 )
+from embodied_common.text_normalization import normalize_trigger_text
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.audio_contract import find_microphones, is_audio_io_enabled
 from robot_config.benchmark_observation_transport import materialize_benchmark_observation_transport
@@ -1219,6 +1219,11 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     return resolved_config_path, robot_data
 
 
+def load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
+    """Load a validated robot section for consumers that need resolved YAML."""
+    return _load_robot_section(config_path)
+
+
 _GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
 
 
@@ -1490,14 +1495,7 @@ def _validate_sound_orientation_config(robot_config: dict[str, Any]) -> list[str
     ):
         errors.append("embodied.idle_behaviors.sound_orientation.trigger_phrases must be a non-empty string list")
     else:
-        normalized_phrases = []
-        for value in trigger_phrases:
-            chars = [char.casefold() for char in value if not char.isspace()]
-            while chars and unicodedata.category(chars[0]).startswith("P"):
-                chars.pop(0)
-            while chars and unicodedata.category(chars[-1]).startswith("P"):
-                chars.pop()
-            normalized_phrases.append("".join(chars))
+        normalized_phrases = [normalize_trigger_text(value) for value in trigger_phrases]
         if any(not phrase for phrase in normalized_phrases):
             errors.append("embodied.idle_behaviors.sound_orientation.trigger_phrases must contain usable text")
         if len(set(normalized_phrases)) != len(normalized_phrases):
@@ -1647,6 +1645,41 @@ def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
         raise ValueError(f"Invalid approved camera calibration {artifact_path}: {exc}") from exc
 
 
+_SERIAL_ADDRESS_CAMERA_DRIVERS = {"realsense"}
+
+
+def _warn_unbound_serial_cameras(robot_config: dict[str, Any]) -> None:
+    """Warn when serial-addressed cameras share a driver without explicit bindings.
+
+    Generic profiles intentionally leave ``serial_number`` empty so multiple robot
+    units can share one config; on a host with several same-driver devices that
+    means device binding silently falls back to enumeration order. Deployment
+    instance overrides should pin serials explicitly in that case.
+    """
+
+    by_driver: dict[str, list[dict[str, Any]]] = {}
+    peripherals = robot_config.get("peripherals", [])
+    if not isinstance(peripherals, list):
+        return
+    for peripheral in peripherals:
+        if not isinstance(peripheral, dict) or peripheral.get("type") != "camera":
+            continue
+        driver = str(peripheral.get("driver", "opencv"))
+        if driver in _SERIAL_ADDRESS_CAMERA_DRIVERS:
+            by_driver.setdefault(driver, []).append(peripheral)
+    for driver, cameras in by_driver.items():
+        if len(cameras) < 2:
+            continue
+        if all(not str(camera.get("serial_number") or "").strip() for camera in cameras):
+            names = ", ".join(str(camera.get("name", "?")) for camera in cameras)
+            logger.warning(
+                "Multiple %s cameras (%s) have empty serial_number; device binding falls back to "
+                "enumeration order. Provide a deployment instance override with explicit serials.",
+                driver,
+                names,
+            )
+
+
 def load_robot_config_dict(
     config_path: str | Path | None = None,
     *,
@@ -1673,6 +1706,7 @@ def load_robot_config_dict(
         with mount_path.open("r", encoding="utf-8") as stream:
             robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
     _apply_approved_camera_calibration(robot_config)
+    _warn_unbound_serial_cameras(robot_config)
     validation_errors = validate_navigation_endpoint_contract(robot_config)
     validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))

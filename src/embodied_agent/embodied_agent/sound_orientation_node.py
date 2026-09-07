@@ -105,6 +105,7 @@ class SoundOrientationNode(Node):
         self._goal_result_deadline = 0.0
         self._last_gateway_snapshot = None
         self._last_status_monotonic = 0.0
+        self._fault_entered_monotonic = 0.0
 
         callback_group = ReentrantCallbackGroup()
         self._status_client = self.create_client(
@@ -180,7 +181,11 @@ class SoundOrientationNode(Node):
             self._consume_decision(tick_decision)
             if tick_decision.reason == "DIRECTION_WAIT_TIMEOUT":
                 self._status_needed = False
-            if self._status_needed and self._status_future is None and time.monotonic() >= self._next_status_retry:
+            if (
+                (self._status_needed or self._policy.state.value == "fault_unknown")
+                and self._status_future is None
+                and time.monotonic() >= self._next_status_retry
+            ):
                 self._request_status()
             self._watchdog_tick(now)
 
@@ -334,6 +339,7 @@ class SoundOrientationNode(Node):
             }
             result = getattr(action_result, "result", None)
             error_code = str(getattr(result, "error_code", "")) if result is not None else ""
+            success = bool(getattr(result, "success", False)) if result is not None else False
             if result is not None:
                 self.get_logger().info(
                     f"sound orientation finished: success={bool(result.success)} error_code={str(result.error_code)}"
@@ -345,10 +351,13 @@ class SoundOrientationNode(Node):
             self._policy.complete_action(
                 now_sec=self._now_sec(),
                 terminal_known=(
-                    status != GoalStatus.STATUS_CANCELED
-                    and terminal_known
+                    terminal_known
                     and result is not None
                     and error_code not in _UNKNOWN_TERMINAL_CODES
+                    and (
+                        (status == GoalStatus.STATUS_SUCCEEDED and success and not error_code)
+                        or (status == GoalStatus.STATUS_ABORTED and not success and bool(error_code))
+                    )
                 ),
             )
 
@@ -382,6 +391,11 @@ class SoundOrientationNode(Node):
         self._goal_result_future = None
         self._goal_acceptance_deadline = 0.0
         self._goal_result_deadline = 0.0
+        self._last_gateway_snapshot = None
+        self._last_status_monotonic = 0.0
+        self._fault_entered_monotonic = time.monotonic()
+        self._status_needed = True
+        self._next_status_retry = 0.0
         self._policy.complete_action(now_sec=self._now_sec(), terminal_known=False)
         if goal_handle is not None:
             try:
@@ -402,6 +416,7 @@ class SoundOrientationNode(Node):
                 return response
             if (
                 self._last_gateway_snapshot is None
+                or self._last_status_monotonic <= self._fault_entered_monotonic
                 or time.monotonic() - self._last_status_monotonic > self._reset_status_max_age_sec
                 or self._last_gateway_snapshot.busy
             ):

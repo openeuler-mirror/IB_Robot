@@ -17,7 +17,6 @@ from rclpy.action.server import GoalEvent
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
 from embodied_common.agent_execution_contract import validate_agent_execution_mode
@@ -44,6 +43,7 @@ from ibrobot_msgs.srv import (
     ValidateAgentPlan,
     ValidateSkill,
 )
+from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 
 class _ChildStateUnknown(AgentPlanError):
@@ -274,7 +274,7 @@ class AgentPlanNode(Node):
 
     @staticmethod
     def _to_workflow_step_message(step: CanonicalWorkflowStep):
-        return workflow_step(
+        message = workflow_step(
             schema_version=step.schema_version,
             skill_name=step.skill_name,
             target_name=step.target_name,
@@ -284,14 +284,17 @@ class AgentPlanNode(Node):
             motion_distance=step.motion_distance,
             arm_side=step.arm_side,
             imitation_duration_sec=step.imitation_duration_sec,
-            direction=step.direction,
-            distance=step.distance,
-            degree=step.degree,
-            x=step.x,
-            y=step.y,
-            yaw=step.yaw,
             timeout_sec=step.timeout_sec,
         )
+        if step.schema_version == 2:
+            message.direction = step.direction
+            message.distance = step.distance
+            message.degree = step.degree
+            for field_name in ("x", "y", "yaw"):
+                value = getattr(step, field_name)
+                setattr(message, f"has_{field_name}", value is not None)
+                setattr(message, field_name, float(value) if value is not None else 0.0)
+        return message
 
     def _normalize_steps(self, workflow_steps, status, catalog) -> tuple[CanonicalWorkflowStep, ...]:
         try:
@@ -342,7 +345,10 @@ class AgentPlanNode(Node):
         try:
             if request.schema_version != 1:
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
-            execution_mode = validate_agent_execution_mode(request.execution_mode)
+            try:
+                execution_mode = validate_agent_execution_mode(request.execution_mode)
+            except ValueError as exc:
+                raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
             status = self._gateway_status()
             catalog = self._catalog_view(status)
             steps = self._normalize_steps(request.workflow_steps, status, catalog)
@@ -469,7 +475,10 @@ class AgentPlanNode(Node):
                 request.registry_digest,
             ):
                 raise AgentPlanError("SKILL_REGISTRY_VERSION_MISMATCH")
-            execution_mode = validate_agent_execution_mode(request.execution_mode)
+            try:
+                execution_mode = validate_agent_execution_mode(request.execution_mode)
+            except ValueError as exc:
+                raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
             task_budget_sec = self._float32(request.task_budget_sec)
             if task_budget_sec > float(status.task_budget_sec):
                 raise AgentPlanError("TIMEOUT_EXCEEDS_POLICY")

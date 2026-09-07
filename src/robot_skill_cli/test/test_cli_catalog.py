@@ -135,7 +135,7 @@ def test_agent_control_timeout_preserves_larger_configured_value():
     "workflow_step",
     [
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "skill_name": "nav_abs_coordinate",
             "has_x": False,
             "x": 0.0,

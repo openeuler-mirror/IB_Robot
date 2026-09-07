@@ -36,6 +36,7 @@ _LAZY_EXPORTS = {
     ),
     "load_robot_config": ("robot_config.loader", "load_robot_config"),
     "load_robot_config_dict": ("robot_config.loader", "load_robot_config_dict"),
+    "load_robot_section": ("robot_config.loader", "load_robot_section"),
     "resolve_robot_config_path": ("robot_config.config_path", "resolve_robot_config_path"),
     "validate_config": ("robot_config.loader", "validate_config"),
     "parse_bool": ("robot_config.utils", "parse_bool"),
@@ -93,6 +94,7 @@ __all__ = [
     # Loaders
     "load_robot_config",
     "load_robot_config_dict",
+    "load_robot_section",
     "resolve_robot_config_path",
     "build_contract_from_robot_config_dict",
     "validate_config",
