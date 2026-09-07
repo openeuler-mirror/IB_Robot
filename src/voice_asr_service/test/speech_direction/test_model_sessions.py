@@ -79,13 +79,29 @@ def test_stateful_ascend_maps_recurrent_bindings_by_semantic_suffix() -> None:
         {
             "inputs": (
                 type("Binding", (), {"semantic": "host.fullsubnet.fb_spectrum", "index": 0})(),
-                type("Binding", (), {"semantic": "host.fullsubnet.fb_hidden_in", "index": 1})(),
-                type("Binding", (), {"semantic": "host.fullsubnet.fb_cell_in", "index": 2})(),
+                type(
+                    "Binding",
+                    (),
+                    {"semantic": "host.fullsubnet.fb_hidden_in", "index": 1, "dtype": "float32", "shape": (2, 4, 512)},
+                )(),
+                type(
+                    "Binding",
+                    (),
+                    {"semantic": "host.fullsubnet.fb_cell_in", "index": 2, "dtype": "float32", "shape": (2, 4, 512)},
+                )(),
             ),
             "outputs": (
                 type("Binding", (), {"semantic": "host.fullsubnet.fb_features", "index": 0})(),
-                type("Binding", (), {"semantic": "host.fullsubnet.fb_hidden_out", "index": 1})(),
-                type("Binding", (), {"semantic": "host.fullsubnet.fb_cell_out", "index": 2})(),
+                type(
+                    "Binding",
+                    (),
+                    {"semantic": "host.fullsubnet.fb_hidden_out", "index": 1, "dtype": "float32", "shape": (2, 4, 512)},
+                )(),
+                type(
+                    "Binding",
+                    (),
+                    {"semantic": "host.fullsubnet.fb_cell_out", "index": 2, "dtype": "float32", "shape": (2, 4, 512)},
+                )(),
             ),
         },
     )()

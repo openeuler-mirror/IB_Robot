@@ -21,22 +21,21 @@ class SpeechDirectionRoleRunner:
         context: RuntimeContext,
         *,
         owns_session: bool = False,
-        role_aliases: Mapping[str, str] | None = None,
     ) -> None:
         self.session = session
         self.context = context
-        self.backend = "ascend"
+        self.backend = getattr(context, "backend", "ascend") if context is not None else "ascend"
         self._owns_session = bool(owns_session)
-        self._role_aliases = dict(role_aliases or {})
         self._request_counter = 0
         self._execution_context: ExecutionContext | None = None
 
-    def _role(self, role: str) -> str:
-        return self._role_aliases.get(role, role)
-
     @property
     def last_timing_ms(self) -> dict[str, float]:
-        return {}
+        # Forward the underlying session's per-request timing (e.g. the Torch
+        # FullSubNet session's fb/sb hop latencies) to host consumers; sessions
+        # without timing support yield an empty mapping.
+        timing = getattr(self.session, "last_timing_ms", None)
+        return dict(timing) if isinstance(timing, dict) else {}
 
     def _invoke(self, role: str, values: Mapping[str, object]) -> Mapping[str, object]:
         if self._execution_context is not None:
@@ -60,7 +59,7 @@ class SpeechDirectionRoleRunner:
             self._execution_context = None
 
     def infer_named(self, values: Mapping[str, object]) -> Mapping[str, object]:
-        return self._invoke(self._role("silero_vad"), values)
+        return self._invoke("silero_vad", values)
 
     def run_fb(self, frame: np.ndarray) -> np.ndarray:
         output = self._invoke("fullsubnet_fb", {"host.fullsubnet.fb_spectrum": np.ascontiguousarray(frame)})
@@ -71,7 +70,14 @@ class SpeechDirectionRoleRunner:
         return np.asarray(output["host.fullsubnet.sb_mask"], dtype=np.float32)
 
     def infer(self, audio: np.ndarray) -> float:
-        output = self._invoke(self._role("silero_vad"), {"host.silero.audio": np.ascontiguousarray(audio)})
+        values: dict[str, object] = {"host.silero.audio": np.ascontiguousarray(audio)}
+        # ONNX deployments declare host.silero.sample_rate as a binding input; the
+        # deployment's audio contract is the single source for its value. Sessions
+        # ignore values for semantics their deployment does not declare.
+        contract = getattr(self.context.deployment, "audio_contract", None) if self.context is not None else None
+        if contract is not None and contract.sample_rate_hz is not None:
+            values["host.silero.sample_rate"] = np.asarray(contract.sample_rate_hz, dtype=np.int64)
+        output = self._invoke("silero_vad", values)
         return float(np.asarray(output["host.silero.prob"]).reshape(-1)[0])
 
     inference = infer

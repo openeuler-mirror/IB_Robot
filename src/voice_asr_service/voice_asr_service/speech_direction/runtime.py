@@ -271,6 +271,7 @@ class SpeechDirectionRuntime:
         pipeline,
         *,
         offline: bool = False,
+        enable_capture: bool = True,
         on_fatal_error: Callable[[str], None] | None = None,
         model_runtime_handle: ModelRuntimeHandle | None = None,
     ):
@@ -285,6 +286,7 @@ class SpeechDirectionRuntime:
         """
         self.config = config
         self.pipeline = pipeline
+        self.enable_capture = bool(enable_capture)
         if model_runtime_handle is None:
             streaming_runtime = SpeechDirectionStreamingRuntime(pipeline, close_backends=True)
             model_runtime_handle = ModelRuntimeHandle(
@@ -364,11 +366,12 @@ class SpeechDirectionRuntime:
         self._running = True
         logger.info("SpeechDirection runtime 启动中...")
 
-        logger.info(
-            "等待 audio_common PCM: channels=%d, sample_rate=%d",
-            self.config.audio.channels,
-            self.config.audio.sample_rate,
-        )
+        if self.enable_capture:
+            logger.info(
+                "等待 audio_common PCM: channels=%d, sample_rate=%d",
+                self.config.audio.channels,
+                self.config.audio.sample_rate,
+            )
 
         # 核心 worker 线程；启动失败时保留原始启动错误。
         try:

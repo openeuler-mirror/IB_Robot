@@ -10,8 +10,9 @@ Deployments:
 
 - ``ascend_310p``: the fixed-ABI 310P OM (sample rate folded to a constant;
   audio + LSTM state in, probability + state out, stream contract).
-- ``torch_cpu``: the official v6 ONNX, same ABI, executed through onnxruntime
-  on the host.
+- ``torch_cpu``: the host CPU deployment name retained for configuration
+  compatibility; its actual backend is ONNX Runtime and it carries the v6
+  ONNX artifact and recurrent state ABI.
 
 This bundle is the single authoritative Silero VAD source; business consumers
 (speech_direction, ASR) resolve their artifacts from it directly.
@@ -29,6 +30,7 @@ from uuid import uuid4
 from inference_manifest import (
     ArtifactBindings,
     AscendRuntimeProfile,
+    AudioContract,
     BundleFile,
     CompiledDeployment,
     DeploymentArtifact,
@@ -38,13 +40,12 @@ from inference_manifest import (
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
+    ONNXRuntimeProfile,
     RoleRuntimeProfile,
     SemanticIdentity,
     SemanticTensor,
     StateLink,
     TensorBinding,
-    TorchDeployment,
-    TorchRuntimeProfile,
     canonical_bundle_digest,
     load_inference_manifest,
     write_inference_manifest,
@@ -53,11 +54,12 @@ from inference_manifest import (
 BUNDLE_NAME = "silero-vad"
 DEFAULT_ONNX_REL = "assets/silero_vad.onnx"
 DEFAULT_OM_REL = "artifacts/ascend/ascend_310p/silero_vad_v6_310p_mixed16.om"
-DEFAULT_OM_SOURCE_REL = "voice_asr/artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om"
-DEFAULT_ONNX_SOURCE_REL = "voice_asr/artifacts/torch/silero-vad/silero_vad.onnx"
+DEFAULT_OM_SOURCE_REL = "silero-vad/artifacts/ascend/ascend_310p/silero_vad_v6_310p_mixed16.om"
+DEFAULT_ONNX_SOURCE_REL = "silero-vad/assets/silero_vad.onnx"
 _ADAPTER_ASSET = "assets/adapter.json"
 
 SILERO_AUDIO_SEMANTIC = "host.silero.audio"
+SILERO_SAMPLE_RATE_SEMANTIC = "host.silero.sample_rate"
 SILERO_STATE_IN_SEMANTIC = "host.silero.state_in"
 SILERO_PROB_SEMANTIC = "host.silero.prob"
 SILERO_STATE_OUT_SEMANTIC = "host.silero.state_out"
@@ -81,12 +83,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _bindings() -> ArtifactBindings:
+def _bindings(*, include_sample_rate: bool) -> ArtifactBindings:
+    inputs = [
+        TensorBinding(semantic=SILERO_AUDIO_SEMANTIC, dtype="float32", shape=SILERO_AUDIO_SHAPE, index=0),
+        TensorBinding(semantic=SILERO_STATE_IN_SEMANTIC, dtype="float32", shape=SILERO_STATE_SHAPE, index=1),
+    ]
+    if include_sample_rate:
+        inputs.append(TensorBinding(semantic=SILERO_SAMPLE_RATE_SEMANTIC, dtype="int64", shape=(), index=2))
     return ArtifactBindings(
-        inputs=(
-            TensorBinding(semantic=SILERO_AUDIO_SEMANTIC, dtype="float32", shape=SILERO_AUDIO_SHAPE, index=0),
-            TensorBinding(semantic=SILERO_STATE_IN_SEMANTIC, dtype="float32", shape=SILERO_STATE_SHAPE, index=1),
-        ),
+        inputs=tuple(inputs),
         outputs=(
             TensorBinding(semantic=SILERO_PROB_SEMANTIC, dtype="float32", shape=SILERO_PROB_SHAPE, index=0),
             TensorBinding(semantic=SILERO_STATE_OUT_SEMANTIC, dtype="float32", shape=SILERO_STATE_SHAPE, index=1),
@@ -94,7 +99,7 @@ def _bindings() -> ArtifactBindings:
     )
 
 
-def _stream_contract(state_role: str = "model") -> ExecutionContract:
+def _stream_contract(state_role: str = SILERO_EXECUTION_ROLE) -> ExecutionContract:
     return ExecutionContract(
         state_scope="stream",
         execution_structure="direct",
@@ -123,12 +128,9 @@ def _model_descriptor() -> ModelDescriptor:
         operation="vad",
         inputs=(
             SemanticTensor(semantic=SILERO_AUDIO_SEMANTIC, dtype="float32", shape=SILERO_AUDIO_SHAPE),
-            SemanticTensor(semantic=SILERO_STATE_IN_SEMANTIC, dtype="float32", shape=SILERO_STATE_SHAPE),
+            SemanticTensor(semantic=SILERO_SAMPLE_RATE_SEMANTIC, dtype="int64", shape=()),
         ),
-        outputs=(
-            SemanticTensor(semantic=SILERO_PROB_SEMANTIC, dtype="float32", shape=SILERO_PROB_SHAPE),
-            SemanticTensor(semantic=SILERO_STATE_OUT_SEMANTIC, dtype="float32", shape=SILERO_STATE_SHAPE),
-        ),
+        outputs=(SemanticTensor(semantic=SILERO_PROB_SEMANTIC, dtype="float32", shape=SILERO_PROB_SHAPE),),
         semantic_identity=SemanticIdentity(
             logical_model_revision=SILERO_LOGICAL_REVISION,
             preprocessing_contract=SILERO_PREPROCESSING,
@@ -146,24 +148,51 @@ def _ascend_deployment(om_path: Path) -> CompiledDeployment:
             profile=AscendRuntimeProfile(device_id=0),
         ),
         artifacts={
-            "model": DeploymentArtifact(
+            SILERO_EXECUTION_ROLE: DeploymentArtifact(
                 path=DEFAULT_OM_REL,
                 format="om",
                 sha256=_sha256(om_path),
             )
         },
-        execution=("model",),
-        bindings={"model": _bindings()},
+        execution=(SILERO_EXECUTION_ROLE,),
+        bindings={SILERO_EXECUTION_ROLE: _bindings(include_sample_rate=False)},
+        audio_contract=AudioContract(
+            sample_rate_hz=16000,
+            channels=1,
+            channel_semantics="mono",
+            sample_dtype="float32",
+            frame_size=512,
+            chunk_size=576,
+            execution_mode="streaming",
+        ),
     )
 
 
-def _torch_deployment() -> TorchDeployment:
-    return TorchDeployment(
-        execution_contract=_stream_contract(state_role="__runtime__"),
+def _onnx_deployment(onnx_path: Path) -> CompiledDeployment:
+    return CompiledDeployment(
+        execution_contract=_stream_contract(),
         runtime_profile=RoleRuntimeProfile(
-            backend="torch",
-            target=DeploymentTarget(runtime="torch"),
-            profile=TorchRuntimeProfile(device="cpu"),
+            backend="onnx",
+            target=DeploymentTarget(runtime="onnx"),
+            profile=ONNXRuntimeProfile(device="cpu"),
+        ),
+        artifacts={
+            SILERO_EXECUTION_ROLE: DeploymentArtifact(
+                path=DEFAULT_ONNX_REL,
+                format="onnx",
+                sha256=_sha256(onnx_path),
+            )
+        },
+        execution=(SILERO_EXECUTION_ROLE,),
+        bindings={SILERO_EXECUTION_ROLE: _bindings(include_sample_rate=True)},
+        audio_contract=AudioContract(
+            sample_rate_hz=16000,
+            channels=1,
+            channel_semantics="mono",
+            sample_dtype="float32",
+            frame_size=512,
+            chunk_size=576,
+            execution_mode="streaming",
         ),
     )
 
@@ -243,13 +272,13 @@ def package_silero_vad_bundle(
         raw = json.loads(manifest_path.read_text(encoding="utf-8"))
         existing = load_inference_manifest(bundle_root, next(iter(raw["deployments"]))).manifest
 
-    files = (BundleFile(path=DEFAULT_ONNX_REL), BundleFile(path=_ADAPTER_ASSET))
+    files = (BundleFile(path=_ADAPTER_ASSET),)
     bundle_uuid = existing.bundle.uuid if existing is not None else str(uuid4())
     previous_revision = existing.bundle.revision if existing is not None else 0
     changed = existing is not None and existing.bundle.files != files
     bundle_revision = previous_revision + int(changed) if existing is not None else 1
 
-    deployments: dict[str, object] = {"torch_cpu": _torch_deployment()}
+    deployments: dict[str, object] = {"torch_cpu": _onnx_deployment(onnx_path)}
     if om_path is not None:
         deployments["ascend_310p"] = _ascend_deployment(om_path)
 

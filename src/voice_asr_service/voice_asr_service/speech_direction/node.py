@@ -73,7 +73,9 @@ _PARAMETER_TYPES = {
     "speech_direction_inference_bundle": Parameter.Type.STRING,
     "silero_vad_inference_bundle": Parameter.Type.STRING,
     "silero_vad_backend": Parameter.Type.STRING,
+    "silero_vad_deployment": Parameter.Type.STRING,
     "fullsubnet_backend": Parameter.Type.STRING,
+    "fullsubnet_deployment": Parameter.Type.STRING,
     "speech_direction_max_age_ms": Parameter.Type.INTEGER,
     "channel_indices": Parameter.Type.INTEGER_ARRAY,
     "mic_positions": Parameter.Type.DOUBLE_ARRAY,
@@ -182,11 +184,13 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if silero_backend_raw not in {"ascend", "onnx"}:
         raise ValueError("参数 silero_vad_backend 只能为 ascend 或 onnx")
     silero_backend = silero_backend_raw
+    silero_deployment = _require_non_empty_string(values, "silero_vad_deployment")
 
     fullsubnet_backend = _require_string(values, "fullsubnet_backend")
     if fullsubnet_backend not in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu", "torch"}:
         raise ValueError("参数 fullsubnet_backend 不是受支持的 Ascend/Torch 后端")
     bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
+    fullsubnet_deployment = _require_non_empty_string(values, "fullsubnet_deployment")
     silero_bundle = _require_string(values, "silero_vad_inference_bundle", allow_empty=True)
     # Torch stateful 后端需要 checkpoint + manifest；Model 类由 ibrobot-fullsubnet wheel 提供。
     max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
@@ -227,6 +231,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.doa.input_channels = list(channel_indices)
     cfg.doa.mic_positions = mic_positions
     cfg.fullnet.inference_bundle = bundle
+    cfg.fullnet.deployment = fullsubnet_deployment
     if silero_bundle:
         cfg.vad.inference_bundle = silero_bundle
     cfg.fullnet.device = {"stateful_torch_cuda": "cuda", "stateful_torch_cpu": "cpu", "torch": "cpu"}.get(
@@ -234,6 +239,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     )
     cfg.fullnet.backend = fullsubnet_backend
     cfg.vad.backend = silero_backend
+    cfg.vad.deployment = silero_deployment
     cfg.audio_topic = _require_non_empty_string(values, "audio_topic")
     cfg.mount_yaw_deg = mount_yaw_deg
     cfg.doa.angle_step_degree = angle_step_degree
@@ -248,6 +254,51 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.diagnostics.drop_when_full = diagnostics_drop_when_full
     cfg.diagnostics.fullsubnet_timing_enabled = fullsubnet_timing_enabled
     return cfg
+
+
+def _validate_silero_deployment_contract(manifest: Any, cfg: Any) -> None:
+    """Fail closed when the selected Silero deployment contradicts the host pipeline.
+
+    The node feeds fixed 16 kHz mono float32 audio through the Silero frame
+    engine (frame_size sub-frames); a deployment declaring a different rate,
+    offline execution, or an incompatible frame would silently mislabel
+    samples or fail deep inside the session.
+    """
+    contract = getattr(manifest.deployment, "audio_contract", None)
+    if contract is None:
+        raise ValueError(
+            f"Silero deployment {cfg.vad.deployment!r} declares no audio contract; "
+            "the speech_direction pipeline cannot verify its audio interface"
+        )
+    mismatches = []
+    if contract.sample_rate_hz != cfg.vad.sample_rate:
+        mismatches.append(
+            f"sample_rate_hz={contract.sample_rate_hz} but the pipeline processes {cfg.vad.sample_rate} Hz"
+        )
+    if contract.channels != 1 or contract.sample_dtype != "float32":
+        mismatches.append(
+            f"channels={contract.channels} sample_dtype={contract.sample_dtype} but the pipeline feeds mono float32"
+        )
+    if contract.frame_size is not None and contract.frame_size != cfg.vad.frame_size:
+        mismatches.append(
+            f"frame_size={contract.frame_size} but the Silero engine assembles {cfg.vad.frame_size}-sample sub-frames"
+        )
+    # The engine feeds frame_size + context samples per model call; a declared
+    # chunk_size that disagrees with that model input length is a contract lie.
+    context_size = 64 if contract.sample_rate_hz == 16000 else 32
+    expected_model_input = (contract.frame_size or 0) + context_size
+    if contract.chunk_size is not None and contract.chunk_size != expected_model_input:
+        mismatches.append(
+            f"chunk_size={contract.chunk_size} but the engine feeds {expected_model_input} "
+            "samples (frame + context) per model input"
+        )
+    if contract.execution_mode not in {None, "streaming", "both"}:
+        mismatches.append(f"execution_mode={contract.execution_mode} but speech_direction streams audio")
+    if mismatches:
+        raise ValueError(
+            f"Silero deployment {cfg.vad.deployment!r} audio contract mismatches the host pipeline: "
+            + "; ".join(mismatches)
+        )
 
 
 class SpeechDirectionNode(Node):
@@ -349,26 +400,23 @@ class SpeechDirectionNode(Node):
     @staticmethod
     def _apply_bundle_artifacts(cfg: SpeechDirectionConfig) -> None:
         """Derive artifact paths from the standalone FullSubNet/Silero bundles."""
+        bundle = Path(cfg.fullnet.inference_bundle)
+        fullsubnet = load_inference_manifest(bundle, cfg.fullnet.deployment)
+        resolved = fullsubnet.resolved_artifacts
         if cfg.fullnet.backend == "ascend":
-            bundle = Path(cfg.fullnet.inference_bundle)
-            fullsubnet = load_inference_manifest(bundle, "ascend_310p")
-            artifacts = fullsubnet.deployment.artifacts
-            cfg.fullnet.stateful_fb_om_path = str(bundle / artifacts["fullsubnet_fb"].path)
-            cfg.fullnet.stateful_sb_om_path = str(bundle / artifacts["fullsubnet_sb"].path)
-            cfg.fullnet.stateful_manifest_path = str(
-                bundle / "assets" / "cum_fullsubnet_best_model_218epochs.manifest.json"
-            )
+            cfg.fullnet.stateful_fb_om_path = str(resolved["fullsubnet_fb"])
+            cfg.fullnet.stateful_sb_om_path = str(resolved["fullsubnet_sb"])
+            cfg.fullnet.stateful_manifest_path = str(resolved["state_manifest"])
             profile = getattr(fullsubnet.runtime_profile, "profile", None)
             cfg.fullnet.device_id = int(getattr(profile, "device_id", 0) if profile is not None else 0)
+        else:
+            cfg.fullnet.ckpt = str(resolved["fullsubnet_fb"])
+            cfg.fullnet.stateful_manifest_path = str(resolved["fullsubnet_sb"])
 
         # Silero VAD always resolves through the standalone reusable bundle.
         silero_bundle = Path(cfg.vad.inference_bundle)
-        deployment_name = "ascend_310p" if cfg.vad.backend == "ascend" else "torch_cpu"
-        silero = load_inference_manifest(silero_bundle, deployment_name)
-        if cfg.vad.backend == "ascend":
-            cfg.vad.model_path = str(silero_bundle / silero.deployment.artifacts["model"].path)
-        else:
-            cfg.vad.model_path = str(silero_bundle / "assets" / "silero_vad.onnx")
+        silero = load_inference_manifest(silero_bundle, cfg.vad.deployment)
+        cfg.vad.model_path = str(silero.resolved_artifacts["silero_vad"])
 
     # ------------------------------------------------------------------ 算法链构建
     def _make_session_dir(self) -> str:
@@ -394,7 +442,7 @@ class SpeechDirectionNode(Node):
         stateful_backend = cfg.fullnet.backend in {"ascend", "stateful_torch_cuda", "stateful_torch_cpu"}
         if stateful_backend and cfg.fullnet.backend == "ascend":
             bundle = Path(cfg.fullnet.inference_bundle)
-            fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p")
+            fullsubnet_manifest = load_inference_manifest(bundle, cfg.fullnet.deployment)
             fullsubnet_role = "fullsubnet_fb"
             fullsubnet_context = RuntimeContext(
                 fullsubnet_manifest,
@@ -418,14 +466,29 @@ class SpeechDirectionNode(Node):
                 executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context, owns_session=False),
             )
         elif stateful_backend:
+            bundle = Path(cfg.fullnet.inference_bundle)
+            fullsubnet_manifest = load_inference_manifest(bundle, cfg.fullnet.deployment)
+            fullsubnet_context = RuntimeContext(
+                fullsubnet_manifest,
+                {"timing_enabled": cfg.diagnostics.fullsubnet_timing_enabled},
+                role="fullsubnet_fb",
+            )
+            fullsubnet_session = self._registry_set.session_builder_registry.create(
+                fullsubnet_context,
+                backend_registry=self._registry_set.backend_registry,
+                providers=self._providers,
+            )
+            session_entries["fullsubnet"] = (fullsubnet_session, fullsubnet_context)
+            self._session_resources = SpeechDirectionSessionResources(
+                {"fullsubnet": (fullsubnet_session, fullsubnet_context)}
+            )
             fullnet = build_stateful_fullsubnet(
                 backend=cfg.fullnet.backend,
-                checkpoint_path=cfg.fullnet.ckpt,
                 manifest_path=cfg.fullnet.stateful_manifest_path,
-                device=cfg.fullnet.device,
                 timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
+                initialize_backend=False,
+                executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context, owns_session=False),
             )
-            backend_resources.append(fullnet)
         else:
             # The non-stateful Torch path is an explicit comparison mode; it is never
             # selected as a fallback after a stateful runtime failure.
@@ -436,12 +499,13 @@ class SpeechDirectionNode(Node):
             backend_resources.append(fullnet)
 
         vad_runner = None
-        if cfg.fullnet.backend == "ascend" and cfg.vad.backend == "ascend":
-            vad_manifest = load_inference_manifest(Path(cfg.vad.inference_bundle), "ascend_310p")
+        if cfg.vad.backend in {"ascend", "onnx"}:
+            vad_manifest = load_inference_manifest(Path(cfg.vad.inference_bundle), cfg.vad.deployment)
+            _validate_silero_deployment_contract(vad_manifest, cfg)
             vad_context = RuntimeContext(
                 vad_manifest,
                 {"device_id": cfg.fullnet.device_id},
-                role="model",
+                role="silero_vad",
             )
             vad_session = self._registry_set.session_builder_registry.create(
                 vad_context,
@@ -453,24 +517,19 @@ class SpeechDirectionNode(Node):
                 self._session_resources = SpeechDirectionSessionResources({"silero_vad": (vad_session, vad_context)})
             else:
                 self._session_resources.add("silero_vad", vad_session, vad_context)
-            vad_runner = SpeechDirectionRoleRunner(
-                vad_session,
-                vad_context,
-                owns_session=False,
-                role_aliases={"silero_vad": "model"},
-            )
+            vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context, owns_session=False)
 
         # 人声门控(复用 common/vad/silero)
         # vad_runner(manifest 驱动)只做裸推理转发，不含 SileroVadEngine 的帧间 context 拼接
         # (Silero 要求 [上一帧末尾64样本|本帧512样本] 组成 (1,576) 输入)；
-        # 用 SileroVadEngine(acl_runner=vad_runner) 包一层，复用其 context 拼接逻辑，
+        # 用 SileroVadEngine(inference_runner=vad_runner) 包一层，复用其 context 拼接逻辑，
         # 同时避免重复加载 OM。
         silero_engine = (
             SileroVadEngine(
                 model_path=cfg.vad.model_path,
                 sample_rate=cfg.vad.sample_rate,
                 backend=cfg.vad.backend,
-                acl_runner=vad_runner,
+                inference_runner=vad_runner,
             )
             if vad_runner is not None
             else None

@@ -23,7 +23,8 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
-  <!-- speech_direction 链路重依赖(运行时按需导入,缺失时降级) -->
+  <exec_depend>sherpa-onnx</exec_depend>
+  <!-- speech_direction 链路重依赖 -->
   <exec_depend>python3-torch</exec_depend>
   <exec_depend>python3-onnxruntime</exec_depend>
   <!-- speech_direction 走标准 inference_manifest 契约 + inference_service ACL/Torch 后端。

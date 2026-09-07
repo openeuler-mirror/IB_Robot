@@ -227,20 +227,22 @@ Masked in production by `exit_on_init_failure: false` graceful degradation.
 **Fix**: Delete the `domains=kwargs.pop("domains", None),` line from the
 `super().__init__` call (one-line change; keep it in mind until landed).
 
-### speech_direction host layout gaps (issue #125)
+### speech_direction host layout gaps (issue #125 — resolved by the bundle migration)
 
-**Symptom**: `require_configured_models` fails on host for missing files, or
-Silero onnx runs from a `*.om` path.
+**Symptom (historical)**: `require_configured_models` failed on host for
+missing files, or Silero onnx ran from a `*.om` path.
 
-**Cause**: `FullSubNetConfig`/`VadConfig` defaults point at board-side
-artifact paths (`artifacts/ascend/...`) and are NOT ROS parameters; the torch
-backends bypass bundle-manifest resolution entirely.
+**Cause**: pre-migration `FullSubNetConfig`/`VadConfig` defaults pointed at
+board-side artifact paths (`models/voice_asr/artifacts/...`) and the torch
+backends bypassed bundle-manifest resolution entirely.
 
-**Fix (local, no code change)**: copy the cumulative manifest json into
-`models/voice_asr/artifacts/ascend/fullsubnet/` and the
-`silero_vad_v5.onnx` content to
-`artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om`
-(onnxruntime loads by content). Long-term fix tracked in issue #125.
+**Fix**: resolved by the schema-v3 bundle migration — speech direction now
+resolves every artifact from the selected deployment of the standalone
+`models/fullsubnet` / `models/silero-vad` bundles, and the torch backends go
+through manifest sessions like every other runtime. Run
+`scripts/download_speech_direction_models.sh` (Ubuntu assets) and
+`scripts/verify_speech_direction_assets.py` (structure + SHA-256) instead of
+copying files into legacy artifact directories.
 
 ### Synthetic audio never triggers Silero VAD
 

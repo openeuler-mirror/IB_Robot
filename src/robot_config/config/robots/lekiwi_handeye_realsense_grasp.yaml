@@ -504,13 +504,10 @@ robot:
 
   voice_asr:
     enabled: false
-    auto_download_model: true
     active_mode: continuous
     language: zh
-    model_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
-    tokens_path: ""
-    provider: cpu
-    model_type: streaming
+    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
     realtime_pre_roll_seconds: 0.5

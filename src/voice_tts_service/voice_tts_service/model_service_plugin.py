@@ -23,6 +23,37 @@ from .defaults import VOICE_TTS_DEFAULTS
 from .errors import TTSError
 from .service_core import TTSLimits, TTSServiceCore
 
+_SYNTHESIS_SAMPLE_RATE = 24000
+
+
+def validate_synthesis_audio_contract(validated) -> None:
+    """Fail closed when a declared synthesis contract contradicts the service output.
+
+    ZipVoice deployments declare only the audio parameters they actually
+    require: mono float32 PCM at the service synthesis sample rate. A declared
+    contract that disagrees with the service output is a bundle/service
+    mismatch and must not start.
+    """
+
+    contract = getattr(validated.deployment, "audio_contract", None)
+    if contract is None:
+        return
+    execution_mode = getattr(contract, "execution_mode", None)
+    if execution_mode not in (None, "offline", "both"):
+        raise ValueError(
+            f"ZipVoice deployment declares execution_mode={execution_mode!r}, "
+            "but the service performs complete offline synthesis"
+        )
+    if contract.sample_rate_hz is not None and contract.sample_rate_hz != _SYNTHESIS_SAMPLE_RATE:
+        raise ValueError(
+            f"ZipVoice deployment declares sample_rate_hz={contract.sample_rate_hz}, "
+            f"but the service synthesizes at {_SYNTHESIS_SAMPLE_RATE}"
+        )
+    if contract.channels is not None and contract.channels != 1:
+        raise ValueError(f"ZipVoice deployment declares channels={contract.channels}, expected mono output")
+    if contract.sample_dtype is not None and contract.sample_dtype != "float32":
+        raise ValueError(f"ZipVoice deployment declares sample_dtype={contract.sample_dtype}, expected float32")
+
 
 class ZipVoiceSynthesizePlugin(ModelServicePlugin):
     """Expose ZipVoice through the family-neutral typed model-service host."""
@@ -53,6 +84,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
             or model.operation != self.operation
         ):
             raise ValueError(f"ZipVoice plugin requires {self.interface}/{self.model_type}/{self.operation}")
+        validate_synthesis_audio_contract(validated)
 
         allowed = {
             "device_id",

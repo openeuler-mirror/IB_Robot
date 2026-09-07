@@ -163,35 +163,30 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
     monkeypatch.setattr(
         voice_asr,
         "_load_voice_asr_service",
-        lambda: (
-            {
-                "auto_download_model": False,
-                "language": "zh",
-                "provider": "cpu",
-                "model_type": "auto",
-                "max_recording_duration": 10.0,
-                "vad_sensitivity": 0.6,
-                "realtime_pre_roll_seconds": 0.5,
-                "publish_partial": True,
-                "output_topic": "/voice_command",
-                "sample_rate": 16000,
-                "chunk_size": 512,
-                "buffer_seconds": 5.0,
-                "exit_on_init_failure": False,
-            },
-            object(),
-            lambda: tmp_path,
-            object(),
-            object(),
-        ),
+        lambda: {
+            "bundle_path": "models/voice_asr/demo",
+            "deployment": "torch_cpu",
+            "language": "zh",
+            "max_recording_duration": 10.0,
+            "vad_sensitivity": 0.6,
+            "vad_bundle_path": "models/silero-vad",
+            "vad_deployment": "torch_cpu",
+            "realtime_pre_roll_seconds": 0.5,
+            "publish_partial": True,
+            "output_topic": "/voice_command",
+            "sample_rate": 16000,
+            "chunk_size": 512,
+            "buffer_seconds": 5.0,
+            "exit_on_init_failure": False,
+        },
     )
     monkeypatch.setattr(voice_asr, "validate_voice_asr_model_config", lambda **_kwargs: [])
     config = _audio_config()
     config["voice_asr"] = {
         "enabled": True,
-        "model_path": str(tmp_path),
+        "bundle_path": str(tmp_path),
+        "deployment": "torch_cpu",
         "active_mode": "manual",
-        "auto_download_model": False,
     }
 
     node = voice_asr.generate_voice_asr_nodes(config)[0]

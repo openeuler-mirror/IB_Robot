@@ -36,7 +36,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -75,7 +74,7 @@ REPOSITORY_ALIASES = {
 }
 RUNTIME_DIRECTORIES = {
     "IB_Robot_ACT_banana_pick_distill": "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
-    "fullsubnet": "voice_asr",
+    "fullsubnet": "fullsubnet",
     "graspgen": "graspgen",
     "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
 }
@@ -260,25 +259,14 @@ def repository_for_name(name: str) -> str:
 
 
 def materialize_runtime_aliases(repo_name: str, bundle_dir: Path) -> None:
-    """Expose legacy runtime paths while preserving manifest-relative files."""
-    if repo_name != "fullsubnet":
-        return
-    aliases = {
-        "assets/cum_fullsubnet_best_model_218epochs.tar": "artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar",
-        "assets/cum_fullsubnet_best_model_218epochs.manifest.json": "artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json",
-    }
-    for source_name, target_name in aliases.items():
-        source = bundle_dir / source_name
-        target = bundle_dir / target_name
-        if not source.is_file():
-            continue
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.exists() or target.is_symlink():
-            if target.is_symlink() and target.resolve() == source.resolve():
-                continue
-            target.unlink()
-        target.symlink_to(Path(os.path.relpath(source, target.parent)))
-        print(f"[alias] {target.relative_to(bundle_dir)} -> {source_name}")
+    """Expose legacy runtime paths while preserving manifest-relative files.
+
+    The FullSubNet aliases pointed at the retired ``artifacts/{torch,ascend}``
+    layout of the pre-migration composite bundle; the standalone
+    ``models/fullsubnet`` bundle consumes ``assets/`` files directly, so no
+    alias remains necessary.
+    """
+    return
 
 
 def download_bundle(plan: BundlePlan, dest_root: Path, dry_run: bool = False) -> Path:

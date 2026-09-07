@@ -201,15 +201,14 @@ class VoiceASRConfig:
     """Voice ASR node configuration managed by robot_config."""
 
     enabled: bool = False
-    auto_download_model: bool = True
     active_mode: str = "continuous"
     language: str = "zh"
-    model_path: str = ""
-    tokens_path: str = ""
-    provider: str = "cpu"
-    model_type: str = "auto"
+    bundle_path: str = "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    deployment: str = "torch_cpu"
     max_recording_duration: float = 10.0
     vad_sensitivity: float = 0.6
+    vad_bundle_path: str = "models/silero-vad"
+    vad_deployment: str = "torch_cpu"
     realtime_pre_roll_seconds: float = 0.5
     publish_partial: bool = True
     output_topic: str = "/voice_command"

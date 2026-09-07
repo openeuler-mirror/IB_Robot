@@ -164,6 +164,16 @@ def _build_manifest(destination: Path, bundle_uuid: str, deployment_uuid: str) -
                     "flow_decoder_1537": {"inputs": flow_inputs, "outputs": flow_outputs},
                 },
                 "device_links": [],
+                # Synthesis-only audio contract: the deployment consumes text and
+                # emits mono float32 PCM at 24 kHz. It declares no microphone
+                # input frame/chunk constraints because it has no waveform input.
+                "audio_contract": {
+                    "sample_rate_hz": 24000,
+                    "channels": 1,
+                    "channel_semantics": "mono",
+                    "sample_dtype": "float32",
+                    "execution_mode": "offline",
+                },
             }
         },
     }

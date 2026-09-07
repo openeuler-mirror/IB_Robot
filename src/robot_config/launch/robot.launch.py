@@ -504,9 +504,9 @@ def launch_setup(context, *args, **kwargs):
         voice_asr_cfg = robot_config.setdefault("voice_asr", {})
         voice_asr_cfg["enabled"] = True
         voice_asr_cfg["active_mode"] = "continuous"
-        voice_asr_cfg.setdefault("auto_download_model", True)
         logger.info(
-            "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous, voice_asr.auto_download_model=true"
+            "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous; "
+            "bundle_path and deployment must be configured explicitly"
         )
 
     if with_embodied_str != "":

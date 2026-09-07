@@ -26,6 +26,9 @@ setup(
     entry_points={
         "console_scripts": [
             "voice_asr_node = voice_asr_service.voice_asr_node:main",
+            "package_sherpa_asr_bundle = voice_asr_service.package_sherpa_asr_bundle:main",
+            "package_silero_vad_bundle = voice_asr_service.package_silero_vad_bundle:main",
+            "package_fullsubnet_bundle = voice_asr_service.package_fullsubnet_bundle:main",
             "speech_direction_node = voice_asr_service.speech_direction.node:main",
             "speech_direction_report = voice_asr_service.speech_direction.report_cli:main",
         ],

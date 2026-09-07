@@ -1881,20 +1881,25 @@ def load_contract_config(data: dict[str, Any]) -> ContractExtensionConfig:
 def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
     """Load voice ASR configuration from dict."""
     defaults = VoiceASRConfig()
-    model_path = data.get("model_path", "")
-    tokens_path = data.get("tokens_path", "")
+    stale_fields = {"model_path", "tokens_path", "provider", "model_type", "auto_download_model"}
+    configured_stale_fields = sorted(stale_fields.intersection(data))
+    if configured_stale_fields:
+        raise ValueError(
+            "voice_asr uses deprecated raw model fields; configure bundle_path/deployment instead: "
+            + ", ".join(configured_stale_fields)
+        )
+    bundle_path = data.get("bundle_path", defaults.bundle_path)
 
     return VoiceASRConfig(
         enabled=data.get("enabled", defaults.enabled),
-        auto_download_model=data.get("auto_download_model", defaults.auto_download_model),
         active_mode=data.get("active_mode", defaults.active_mode),
         language=data.get("language", defaults.language),
-        model_path=resolve_ros_path(model_path) if model_path else "",
-        tokens_path=resolve_ros_path(tokens_path) if tokens_path else "",
-        provider=data.get("provider", defaults.provider),
-        model_type=data.get("model_type", defaults.model_type),
+        bundle_path=resolve_ros_path(bundle_path) if bundle_path else "",
+        deployment=data.get("deployment", defaults.deployment),
         max_recording_duration=data.get("max_recording_duration", defaults.max_recording_duration),
         vad_sensitivity=data.get("vad_sensitivity", defaults.vad_sensitivity),
+        vad_bundle_path=resolve_ros_path(data.get("vad_bundle_path", defaults.vad_bundle_path)),
+        vad_deployment=data.get("vad_deployment", defaults.vad_deployment),
         realtime_pre_roll_seconds=data.get("realtime_pre_roll_seconds", defaults.realtime_pre_roll_seconds),
         publish_partial=data.get("publish_partial", defaults.publish_partial),
         output_topic=data.get("output_topic", defaults.output_topic),
@@ -2531,8 +2536,11 @@ def validate_config(config: RobotConfig) -> list[str]:
     else:
         errors.extend(validate_observation_transports(contract.observations))
 
-    if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
-        errors.append("voice_asr.model_path is required when voice_asr.enabled is true")
+    if config.voice_asr.enabled:
+        if not config.voice_asr.bundle_path:
+            errors.append("voice_asr.bundle_path is required when voice_asr.enabled is true")
+        if not config.voice_asr.deployment:
+            errors.append("voice_asr.deployment is required when voice_asr.enabled is true")
 
     if config.voice_tts.enabled:
         if not config.voice_tts.bundle_path:

@@ -12,12 +12,72 @@ ASRInferenceModule - ASR推理模块
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from inference_manifest import load_inference_manifest
+from inference_service.unified_runtime import (
+    ExecutionContext,
+    ExecutionContract,
+    ModelRequest,
+    ModelRuntimeHandle,
+    RuntimeAssembly,
+)
+
 _MAX_FINAL_DECODE_STEPS = 200
+
+
+class _SherpaStream:
+    def __init__(self, recognizer: Any, sample_rate: int) -> None:
+        self.recognizer = recognizer
+        self.sample_rate = sample_rate
+        self.stream = recognizer.create_stream()
+
+
+class _SherpaStreamingRuntime:
+    """Adapt one sherpa recognizer to the unified stream lifecycle."""
+
+    def __init__(self, recognizer: Any, sample_rate: int) -> None:
+        self._recognizer = recognizer
+        self._sample_rate = sample_rate
+
+    def load(self, _context=None) -> None:
+        return None
+
+    def open_stream(self, _context: ExecutionContext) -> _SherpaStream:
+        return _SherpaStream(self._recognizer, self._sample_rate)
+
+    def step(self, stream: _SherpaStream, request: ModelRequest, context: ExecutionContext) -> dict[str, object]:
+        context.check("sherpa.accept_waveform")
+        audio = request.inputs.get("audio")
+        if not isinstance(audio, np.ndarray):
+            raise TypeError("ASR stream request requires a numpy audio input")
+        stream.stream.accept_waveform(stream.sample_rate, audio)
+        if request.metadata.get("final", False):
+            # Final decode must drain the recognizer completely: silent
+            # truncation would drop undecoded audio while reporting success.
+            stream.stream.input_finished()
+            while self._recognizer.is_ready(stream.stream):
+                self._recognizer.decode_stream(stream.stream)
+        elif self._recognizer.is_ready(stream.stream):
+            # Live streaming: decode one step per admitted chunk when the
+            # recognizer has work queued; the queue drains across chunks.
+            self._recognizer.decode_stream(stream.stream)
+        result = self._recognizer.get_result(stream.stream)
+        text = result if isinstance(result, str) else getattr(result, "text", "")
+        return {"text": text if isinstance(text, str) else "", "is_final": bool(request.metadata.get("final", False))}
+
+    def reset_stream(self, stream: _SherpaStream, _context: ExecutionContext) -> None:
+        stream.stream = self._recognizer.create_stream()
+
+    def close_stream(self, stream: _SherpaStream, _context: ExecutionContext) -> None:
+        # Release the native sherpa stream so its buffers do not stay
+        # referenced by the runtime's closed-stream records.
+        stream.stream = None
+
+    def close(self) -> None:
+        return None
 
 
 class ASRState(Enum):
@@ -64,30 +124,29 @@ class ASRInferenceModule:
 
         self._active_stream: Any | None = None
         self._pending_stream: Any | None = None
+        self._last_stream_text = ""
 
-        self._model_path: str | None = None
+        self._bundle_path: str | None = None
+        self._deployment: str | None = None
         self._language: str = "zh"
         self._last_error: str | None = None
+        self._runtime_handle: ModelRuntimeHandle | None = None
+        self._runtime_context: ExecutionContext | None = None
 
         self._lock = threading.Lock()
 
     def initialize(
         self,
-        model_path: str,
-        tokens_path: str | None = None,
-        provider: str = "cpu",
+        bundle_path: str,
+        deployment: str,
         language: str = "zh",
-        model_type: str = "auto",
     ) -> bool:
         """
         初始化 ASR 模型
 
         Args:
-            model_path: 模型文件路径或目录
-            tokens_path: tokens 文件路径（可选，默认在模型目录查找）
-            provider: 推理后端 (cpu/cuda/coreml)
-            language: 语言 (zh/en)
-            model_type: 模型类型 (streaming/offline/auto)
+            bundle_path: schema-v3 ASR bundle directory
+            deployment: named deployment in the bundle manifest
 
         Returns:
             bool: 是否初始化成功
@@ -102,25 +161,42 @@ class ASRInferenceModule:
             self._active_stream = None
             self._pending_stream = None
             self._last_error = None
-            self._model_path = model_path
+            validated = load_inference_manifest(bundle_path, deployment)
+            identity = validated.identity
+            if (identity.interface, identity.model_type, identity.operation) != (
+                "tensor_model",
+                "sherpa_onnx",
+                "recognize",
+            ):
+                raise ValueError("ASR bundle must use tensor_model/sherpa_onnx/recognize")
+            self._bundle_path = str(validated.bundle_root)
+            self._deployment = deployment
             self._language = language
 
-            if model_type == "streaming":
+            roles = validated.resolved_artifacts
+            role_paths = {str(role): str(path) for role, path in roles.items()}
+            provider = "cuda" if validated.deployment.device == "cuda" else "cpu"
+            tokens_path = role_paths.get("tokens")
+            if tokens_path is None:
+                raise ValueError("ASR deployment must declare a tokens artifact")
+            if {"encoder", "decoder", "joiner"}.issubset(role_paths):
                 self._model_type = ModelType.STREAMING
-            elif model_type == "offline":
+                recognizer = self._create_streaming_recognizer(
+                    role_paths["encoder"], role_paths["decoder"], role_paths["joiner"], tokens_path, provider
+                )
+            elif {"encoder", "decoder"}.issubset(role_paths):
+                self._model_type = ModelType.STREAMING
+                recognizer = self._create_streaming_paraformer_recognizer(
+                    role_paths["encoder"], role_paths["decoder"], tokens_path, provider
+                )
+            elif "model" in role_paths:
                 self._model_type = ModelType.OFFLINE
+                recognizer = self._create_offline_recognizer(role_paths["model"], tokens_path, provider)
             else:
-                self._model_type = self._detect_model_type(model_path)
-
-            if self._model_type == ModelType.STREAMING:
-                recognizer = self._create_streaming_recognizer(model_path, tokens_path, provider)
-            else:
-                recognizer = self._create_offline_recognizer(model_path, tokens_path, provider)
+                raise ValueError("ASR deployment must declare streaming or offline artifact roles")
 
             if recognizer is None:
-                raise RuntimeError(
-                    "Recognizer factory returned None. Check model_path, tokens_path, and provider settings."
-                )
+                raise RuntimeError("Recognizer factory returned None for the selected ASR deployment")
 
             # 流式和离线模型都必须从 recognizer 配置读取真实采样率，
             # 不能用默认值代替，否则节点层无法验证完整音频链路契约。
@@ -134,6 +210,27 @@ class ASRInferenceModule:
 
             self._recognizer = recognizer
             self._sample_rate = int(sample_rate)
+            if self._model_type == ModelType.STREAMING:
+                streaming_runtime = _SherpaStreamingRuntime(self._recognizer, self._sample_rate)
+                self._runtime_handle = ModelRuntimeHandle(
+                    RuntimeAssembly(
+                        runtime_executor=streaming_runtime,
+                        streaming_runtime=streaming_runtime,
+                        session=streaming_runtime,
+                        execution_contract=ExecutionContract(
+                            state_scope="stream",
+                            state_bank_mode="per_stream",
+                            max_open_streams=1,
+                        ),
+                        stateful=True,
+                        resettable=True,
+                        state_scope="stream",
+                        state_bank_mode="per_stream",
+                        max_open_streams=1,
+                    )
+                )
+                self._runtime_context = ExecutionContext.create("voice-asr")
+                self._runtime_handle.load()
             self.state = ASRState.READY
             return True
 
@@ -149,102 +246,46 @@ class ASRInferenceModule:
             self.state = ASRState.ERROR
             raise RuntimeError(f"Failed to initialize ASR: {e}") from e
 
-    def _detect_model_type(self, model_path: str) -> ModelType:
-        """
-        自动检测模型类型
-
-        流式模型通常包含: encoder-xxx.onnx, decoder-xxx.onnx, joiner-xxx.onnx
-        非流式模型通常只有一个: model.onnx 或 model.int8.onnx
-        """
-        path = Path(model_path)
-
-        if path.is_file():
-            model_dir = path.parent
-        else:
-            model_dir = path
-
-        has_encoder = list(model_dir.glob("encoder*.onnx"))
-        has_decoder = list(model_dir.glob("decoder*.onnx"))
-        has_joiner = list(model_dir.glob("joiner*.onnx"))
-
-        if has_encoder and has_decoder and has_joiner:
-            return ModelType.STREAMING
-
-        streaming_keywords = ["streaming", "online", "transducer", "conformer"]
-        model_name = model_dir.name.lower()
-        for keyword in streaming_keywords:
-            if keyword in model_name:
-                return ModelType.STREAMING
-
-        return ModelType.OFFLINE
-
-    def _create_streaming_recognizer(self, model_path: str, tokens_path: str | None, provider: str) -> Any:
+    def _create_streaming_recognizer(
+        self, encoder: str, decoder: str, joiner: str, tokens_path: str, provider: str
+    ) -> Any:
         """
         创建流式识别器 (OnlineRecognizer)
         使用 sherpa-onnx 工厂方法
         """
         import sherpa_onnx
 
-        path = Path(model_path)
-        if path.is_file():
-            model_dir = path.parent
-        else:
-            model_dir = path
+        return sherpa_onnx.OnlineRecognizer.from_transducer(
+            encoder=encoder,
+            decoder=decoder,
+            joiner=joiner,
+            tokens=tokens_path,
+            num_threads=4,
+            provider=provider,
+        )
 
-        if tokens_path is None:
-            tokens_path = str(model_dir / "tokens.txt")
+    def _create_streaming_paraformer_recognizer(
+        self, encoder: str, decoder: str, tokens_path: str, provider: str
+    ) -> Any:
+        import sherpa_onnx
 
-        encoder = list(model_dir.glob("encoder*.onnx"))
-        decoder = list(model_dir.glob("decoder*.onnx"))
-        joiner = list(model_dir.glob("joiner*.onnx"))
+        return sherpa_onnx.OnlineRecognizer.from_paraformer(
+            encoder=encoder,
+            decoder=decoder,
+            tokens=tokens_path,
+            num_threads=4,
+            provider=provider,
+        )
 
-        if encoder and decoder and joiner:
-            return sherpa_onnx.OnlineRecognizer.from_transducer(
-                encoder=str(encoder[0]),
-                decoder=str(decoder[0]),
-                joiner=str(joiner[0]),
-                tokens=tokens_path,
-                num_threads=4,
-                provider=provider,
-            )
-
-        encoder = list(model_dir.glob("encoder*.onnx"))
-        decoder = list(model_dir.glob("decoder*.onnx"))
-        if encoder and decoder:
-            return sherpa_onnx.OnlineRecognizer.from_paraformer(
-                encoder=str(encoder[0]),
-                decoder=str(decoder[0]),
-                tokens=tokens_path,
-                num_threads=4,
-                provider=provider,
-            )
-
-        raise RuntimeError(f"Cannot create streaming recognizer from {model_path}")
-
-    def _create_offline_recognizer(self, model_path: str, tokens_path: str | None, provider: str) -> Any:
+    def _create_offline_recognizer(self, model_path: str, tokens_path: str, provider: str) -> Any:
         """
         创建非流式识别器 (OfflineRecognizer)
         使用 sherpa-onnx 工厂方法
         """
         import sherpa_onnx
 
-        path = Path(model_path)
-        if path.is_file():
-            model_dir = path.parent
-        else:
-            model_dir = path
-
-        if tokens_path is None:
-            tokens_path = str(model_dir / "tokens.txt")
-
-        onnx_files = list(model_dir.glob("*.onnx"))
-        if not onnx_files:
-            raise FileNotFoundError(f"No .onnx files found in {model_dir}")
-
-        model_file = str(onnx_files[0])
-
         return sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=model_file,
+            paraformer=model_path,
             tokens=tokens_path,
             num_threads=4,
             provider=provider,
@@ -253,9 +294,9 @@ class ASRInferenceModule:
 
     def create_stream(self) -> Any:
         """创建新的识别流"""
-        if self._recognizer is None:
-            raise RuntimeError("ASR not initialized")
-        return self._recognizer.create_stream()
+        if self._runtime_handle is None or self._runtime_context is None:
+            raise RuntimeError("streaming ASR runtime not initialized")
+        return self._runtime_handle.open_stream(self._runtime_context)
 
     def _require_recognizer(self, operation: str) -> None:
         """Ensure the underlying recognizer exists before using it."""
@@ -317,6 +358,7 @@ class ASRInferenceModule:
                 )
 
             self._active_stream = self.create_stream()
+            self._last_stream_text = ""
             self.state = ASRState.RECOGNIZING
             return True
 
@@ -334,10 +376,13 @@ class ASRInferenceModule:
             if self._active_stream is None:
                 return None
 
-            self._active_stream.accept_waveform(self._sample_rate, audio_data)
-
-            self._decode_online_stream_until_idle(self._active_stream, max_steps=1)
-            text = self._extract_streaming_text(self._active_stream)
+            result = self._runtime_handle.step(
+                self._active_stream,
+                ModelRequest(inputs={"audio": audio_data}),
+                self._runtime_context,
+            )
+            text = str(result.outputs.get("text", ""))
+            self._last_stream_text = text
             if text:
                 return ASRResult(text=text, is_final=False, confidence=1.0)
 
@@ -349,7 +394,7 @@ class ASRInferenceModule:
             if self._active_stream is None:
                 return ASRResult(text="", is_final=False)
 
-            text = self._extract_streaming_text(self._active_stream)
+            text = self._last_stream_text
             return ASRResult(text=text, is_final=False, confidence=1.0)
 
     def get_final_result(self) -> ASRResult:
@@ -358,16 +403,18 @@ class ASRInferenceModule:
             if self._active_stream is None:
                 return ASRResult(text="", is_final=True)
 
-            self._active_stream.input_finished()
-            self._decode_online_stream_until_idle(
+            result = self._runtime_handle.step(
                 self._active_stream,
-                max_steps=_MAX_FINAL_DECODE_STEPS,
+                ModelRequest(inputs={"audio": np.zeros(0, dtype=np.float32)}, metadata={"final": True}),
+                self._runtime_context,
             )
-            text = self._extract_streaming_text(self._active_stream)
+            text = str(result.outputs.get("text", ""))
 
             result = ASRResult(text=text, is_final=True, confidence=1.0)
 
+            self._runtime_handle.close_stream(self._active_stream, self._runtime_context)
             self._active_stream = None
+            self._last_stream_text = ""
             self.state = ASRState.READY
 
             return result
@@ -425,38 +472,34 @@ class ASRInferenceModule:
         results = []
 
         if not enable_vad or vad_module is None:
+            segments = [(0, len(audio_data), audio_data)]
+        else:
+            segments = vad_module.segment_audio(audio_data)
+        for start_sample, end_sample, audio_segment in segments:
+            # File recognition shares the runtime handle protocol with live
+            # streaming: one admitted stream per segment, final decode, and
+            # guaranteed release so the single open-stream slot is free again.
             stream = self.create_stream()
-            stream.accept_waveform(self._sample_rate, audio_data)
-            stream.input_finished()
-            while self._recognizer.is_ready(stream):
-                self._recognizer.decode_stream(stream)
-            text = self._extract_streaming_text(stream)
+            try:
+                result = self._runtime_handle.step(
+                    stream,
+                    ModelRequest(
+                        inputs={"audio": np.ascontiguousarray(audio_segment, dtype=np.float32)},
+                        metadata={"final": True},
+                    ),
+                    self._runtime_context,
+                )
+                text = str(result.outputs.get("text", ""))
+            finally:
+                self._runtime_handle.close_stream(stream, self._runtime_context)
             if text:
                 results.append(
                     self._create_file_result(
                         text=text,
-                        start_sample=0,
-                        end_sample=len(audio_data),
+                        start_sample=start_sample,
+                        end_sample=end_sample,
                     )
                 )
-        else:
-            segments = vad_module.segment_audio(audio_data)
-            for segment in segments:
-                start_sample, end_sample, audio_segment = segment
-                stream = self.create_stream()
-                stream.accept_waveform(self._sample_rate, audio_segment)
-                stream.input_finished()
-                while self._recognizer.is_ready(stream):
-                    self._recognizer.decode_stream(stream)
-                text = self._extract_streaming_text(stream)
-                if text:
-                    results.append(
-                        self._create_file_result(
-                            text=text,
-                            start_sample=start_sample,
-                            end_sample=end_sample,
-                        )
-                    )
 
         return results
 
@@ -530,8 +573,14 @@ class ASRInferenceModule:
     def reset(self):
         """重置识别状态"""
         with self._lock:
+            if self._active_stream is not None and self._runtime_handle is not None:
+                # Facade reset ends the current recognition and returns to
+                # READY: close the stream so the single open-stream slot is
+                # released for the next start_streaming()/recognize_file().
+                self._runtime_handle.close_stream(self._active_stream, self._runtime_context)
             self._active_stream = None
             self._pending_stream = None
+            self._last_stream_text = ""
             if self._recognizer is not None:
                 self.state = ASRState.READY
             elif self._last_error:
@@ -542,8 +591,13 @@ class ASRInferenceModule:
     def cleanup(self):
         """清理资源"""
         with self._lock:
+            if self._active_stream is not None and self._runtime_handle is not None:
+                self._runtime_handle.close_stream(self._active_stream, self._runtime_context)
             self._active_stream = None
             self._pending_stream = None
+            if self._runtime_handle is not None:
+                self._runtime_handle.close()
+                self._runtime_handle = None
             self._recognizer = None
             self.state = ASRState.IDLE
 

@@ -23,9 +23,9 @@ from .asr_inference_module import ASRInferenceModule
 from .audio_capture_module import AudioCaptureModule, AudioConfig
 from .defaults import VOICE_ASR_DEFAULTS
 from .file_input_module import FileInputModule
-from .model_manager import resolve_model_assets
 from .state_machine import ActiveMode, NodeState, StateMachine
 from .vad_module import VADConfig, VADModule, VADState
+from .vad_runtime import ManifestVadRuntime
 
 _AUDIO_STALL_TIMEOUT_SECONDS = 2.0
 _AUDIO_RESTART_MIN_INTERVAL_SECONDS = 5.0
@@ -163,13 +163,12 @@ class VoiceASRNode(Node):
         """声明 ROS 参数"""
         self.declare_parameter("active_mode", VOICE_ASR_DEFAULTS["active_mode"])
         self.declare_parameter("language", VOICE_ASR_DEFAULTS["language"])
-        self.declare_parameter("model_path", VOICE_ASR_DEFAULTS["model_path"])
-        self.declare_parameter("tokens_path", VOICE_ASR_DEFAULTS["tokens_path"])
-        self.declare_parameter("provider", VOICE_ASR_DEFAULTS["provider"])
-        self.declare_parameter("model_type", VOICE_ASR_DEFAULTS["model_type"])
-        self.declare_parameter("auto_download_model", VOICE_ASR_DEFAULTS["auto_download_model"])
+        self.declare_parameter("bundle_path", VOICE_ASR_DEFAULTS["bundle_path"])
+        self.declare_parameter("deployment", VOICE_ASR_DEFAULTS["deployment"])
         self.declare_parameter("max_recording_duration", VOICE_ASR_DEFAULTS["max_recording_duration"])
         self.declare_parameter("vad_sensitivity", VOICE_ASR_DEFAULTS["vad_sensitivity"])
+        self.declare_parameter("vad_bundle_path", VOICE_ASR_DEFAULTS["vad_bundle_path"])
+        self.declare_parameter("vad_deployment", VOICE_ASR_DEFAULTS["vad_deployment"])
         self.declare_parameter("publish_partial", VOICE_ASR_DEFAULTS["publish_partial"])
         self.declare_parameter("output_topic", VOICE_ASR_DEFAULTS["output_topic"])
         self.declare_parameter("sample_rate", VOICE_ASR_DEFAULTS["sample_rate"])
@@ -183,13 +182,12 @@ class VoiceASRNode(Node):
 
         self._active_mode = self.get_parameter("active_mode").value
         self._language = self.get_parameter("language").value
-        self._model_path = self.get_parameter("model_path").value
-        self._tokens_path = self.get_parameter("tokens_path").value
-        self._provider = self.get_parameter("provider").value
-        self._model_type = self.get_parameter("model_type").value
-        self._auto_download_model = self.get_parameter("auto_download_model").value
+        self._bundle_path = str(self.get_parameter("bundle_path").value)
+        self._deployment = str(self.get_parameter("deployment").value)
         self._max_recording_duration = self.get_parameter("max_recording_duration").value
         self._vad_sensitivity = self.get_parameter("vad_sensitivity").value
+        self._vad_bundle_path = str(self.get_parameter("vad_bundle_path").value)
+        self._vad_deployment = str(self.get_parameter("vad_deployment").value)
         self._publish_partial = self.get_parameter("publish_partial").value
         self._output_topic = self.get_parameter("output_topic").value
         self._sample_rate = self.get_parameter("sample_rate").value
@@ -222,8 +220,8 @@ class VoiceASRNode(Node):
 
         vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
         self._vad = VADModule(vad_config)
-        self._vad.set_logger(self.get_logger())
         self._vad.set_sensitivity(self._vad_sensitivity)
+        self._vad_runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
 
         self._asr = ASRInferenceModule()
         self._asr_init_error: str | None = None
@@ -233,40 +231,21 @@ class VoiceASRNode(Node):
             # sample_rate/chunk_size 是完整 Voice ASR 链路的硬契约；
             # 在模型装配前拒绝无效组合，避免后续 VAD/ASR 以不同时间基准运行。
             self._validate_voice_audio_contract()
-            resolved_assets = resolve_model_assets(
-                model_path=self._model_path,
-                tokens_path=self._tokens_path,
-                model_type=self._model_type,
-                active_mode=self._active_mode,
-                language=self._language,
-                auto_download_model=self._auto_download_model,
-                logger=self.get_logger(),
-            )
-            self._model_path = resolved_assets.model_path
-            self._tokens_path = resolved_assets.tokens_path
-
-            if not self._model_path:
-                raise ValueError(
-                    "ASR model_path is empty. Configure robot.voice_asr.model_path, "
-                    "pass the model_path parameter, or enable auto_download_model."
-                )
-
             self._asr.initialize(
-                model_path=self._model_path,
-                tokens_path=self._tokens_path if self._tokens_path else None,
-                provider=self._provider,
+                bundle_path=self._bundle_path,
+                deployment=self._deployment,
                 language=self._language,
-                model_type=self._model_type,
             )
             # ASR 模型采样率只有初始化 recognizer 后才能确定；必须与音频输入一致。
             self._validate_asr_audio_sample_rate()
+            self._vad_runtime.initialize()
+            self._validate_vad_audio_contract(self._vad_runtime)
+            self._vad.set_runtime(self._vad_runtime)
             self._vad.initialize()
             model_type_str = "streaming" if self._asr.is_streaming() else "offline"
-            self.get_logger().info(f"ASR model loaded: {self._model_path} (type: {model_type_str})")
-            if resolved_assets.downloaded:
-                self.get_logger().info(
-                    f"ASR model bundle '{resolved_assets.profile}' was downloaded automatically during node startup."
-                )
+            self.get_logger().info(
+                f"ASR deployment loaded: {self._bundle_path}#{self._deployment} (type: {model_type_str})"
+            )
             if not self._asr.is_streaming():
                 self.get_logger().info(
                     "Offline ASR model loaded. File recognition is available; "
@@ -288,11 +267,27 @@ class VoiceASRNode(Node):
         self._last_audio_restart_time = 0.0
         self._last_status_publish_time = 0.0
 
+    def _validate_vad_audio_contract(self, runtime: ManifestVadRuntime) -> None:
+        """The loaded Silero deployment must share the node's audio time base."""
+        if runtime.sample_rate_hz != self._sample_rate:
+            raise ValueError(
+                f"Silero VAD deployment expects sample_rate={runtime.sample_rate_hz}, "
+                f"but Voice ASR audio input uses {self._sample_rate}"
+            )
+        if runtime.frame_size != self._chunk_size:
+            raise ValueError(
+                f"Silero VAD deployment expects frame_size={runtime.frame_size}, "
+                f"but Voice ASR audio input uses chunk_size={self._chunk_size}"
+            )
+
     def _create_vad_module(self) -> VADModule:
         vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
         vad = VADModule(vad_config)
-        vad.set_logger(self.get_logger())
         vad.set_sensitivity(self._vad_sensitivity)
+        runtime = ManifestVadRuntime(self._vad_bundle_path, self._vad_deployment)
+        runtime.initialize()
+        self._validate_vad_audio_contract(runtime)
+        vad.set_runtime(runtime)
         vad.initialize()
         return vad
 
@@ -570,6 +565,7 @@ class VoiceASRNode(Node):
         if not result.success:
             return self._fail_response(response, result.error_message)
 
+        vad_module = None
         try:
             vad_module = self._create_vad_module() if enable_vad else None
             asr_results = self._asr.recognize_file(
@@ -581,6 +577,9 @@ class VoiceASRNode(Node):
             message = f"Failed to recognize file '{file_path}': {e}"
             self.get_logger().error(message)
             return self._fail_response(response, message)
+        finally:
+            if vad_module is not None:
+                vad_module.close()
 
         response.success = True
         response.error_message = ""
@@ -633,15 +632,20 @@ class VoiceASRNode(Node):
                 self.get_logger().error(f"Failed to load file: {result.error_message}")
                 return
 
+            vad_module = None
             try:
+                vad_module = self._create_vad_module()
                 asr_results = self._asr.recognize_file(
                     result.audio_data,
                     enable_vad=True,
-                    vad_module=self._create_vad_module(),
+                    vad_module=vad_module,
                 )
             except Exception as e:
                 self.get_logger().error(f"Failed to recognize file '{file_path}': {e}")
                 return
+            finally:
+                if vad_module is not None:
+                    vad_module.close()
 
             for asr_result in asr_results:
                 self._publish_command(asr_result.text, asr_result.confidence)
@@ -701,6 +705,8 @@ class VoiceASRNode(Node):
             self._control_timer.cancel()
         self._audio_capture.cleanup()
         self._asr.cleanup()
+        if hasattr(self, "_vad"):
+            self._vad.close()
         super().destroy_node()
 
 

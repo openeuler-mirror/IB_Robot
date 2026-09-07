@@ -42,7 +42,7 @@ class SileroVadEngine:
         model_path: str,
         sample_rate: int = SILERO_SAMPLE_RATE,
         backend: str = "ascend",
-        acl_runner=None,
+        inference_runner=None,
     ):
         """
         Args:
@@ -50,10 +50,10 @@ class SileroVadEngine:
             sample_rate: 输入采样率(默认 16000)
             backend: 推理后端 "ascend"(Ascend NPU,默认) 或
                      "onnx"(CPU,onnxruntime,Ubuntu 回归基线)
-            acl_runner: 可选,注入已构造好的 Ascend ACL 推理器(需实现 infer/reset/close,
+            inference_runner: 可选,注入已构造好的推理器(需实现 infer/reset/close,
                          如 manifest/RuntimeContext 驱动的 SpeechDirectionRoleRunner)。
-                         提供时复用其已加载的 OM/会话,不再另建 SileroVadAclRunner,
-                         避免同一模型被重复加载;仅在 backend="ascend" 时生效。
+                         提供时复用其已加载的模型会话,不再另建推理器,
+                         避免同一模型被重复加载。
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Silero VAD 模型不存在: {model_path}")
@@ -62,15 +62,29 @@ class SileroVadEngine:
         self.sample_rate = sample_rate
         self.frame_size = SILERO_FRAME_SIZE
         self.backend = backend
-        self._acl_runner = None
+        self._inference_runner = None
         self._closed = False
         self._backend_closed = False
 
+        if self.backend == "onnx" and inference_runner is not None:
+            # Reuse the manifest-backed ONNX session supplied by the node.
+            self._inference_runner = inference_runner
+            self._sess = None
+            self._input_names = []
+            self._output_names = []
+            self._audio_in = self._state_in = self._sr_in = None
+            self._out_name = self._state_out = None
+            self._state = self._zero_state()
+            self._context_size = 64 if sample_rate == 16000 else 32
+            self._context = np.zeros(self._context_size, dtype=np.float32)
+            logger.info("Silero VAD loaded through manifest runner: sr=%d, backend=%s", sample_rate, backend)
+            return
+
         if self.backend == "ascend":
-            if acl_runner is not None:
-                # 复用调用方已构造的 Ascend ACL 推理器(如 manifest 驱动的 SpeechDirectionRoleRunner)，
-                # 仅借用本类的 context 拼接逻辑，不重复加载 OM。
-                self._acl_runner = acl_runner
+            if inference_runner is not None:
+                # 复用调用方已构造好的推理器(如 manifest 驱动的 SpeechDirectionRoleRunner)，
+                # 仅借用本类的 context 拼接逻辑，不重复加载模型。
+                self._inference_runner = inference_runner
                 self._sess = None
                 self._input_names = []
                 self._output_names = []
@@ -84,7 +98,7 @@ class SileroVadEngine:
             # 310P 生产路径直接使用 Ascend ACL，Silero 的 LSTM state 保留在 Device。
             from .silero_acl import SileroVadAclRunner
 
-            self._acl_runner = SileroVadAclRunner(model_path)
+            self._inference_runner = SileroVadAclRunner(model_path)
             self._sess = None
             self._input_names = []
             self._output_names = []
@@ -147,9 +161,9 @@ class SileroVadEngine:
         x = np.concatenate([self._context, chunk]).astype(np.float32)
         audio_in = x.reshape(1, -1)
 
-        if self.backend == "ascend":
+        if self._inference_runner is not None:
             # Ascend ACL 走 ACL runner；仅 onnx 走 ONNX Runtime。
-            prob = self._acl_runner.infer(audio_in)
+            prob = self._inference_runner.infer(audio_in)
             out_map = {}
         else:
             feed = {self._audio_in: audio_in}
@@ -176,16 +190,16 @@ class SileroVadEngine:
             return
         self._state = self._zero_state()
         self._context = np.zeros(self._context_size, dtype=np.float32)
-        if self._acl_runner is not None:
-            self._acl_runner.reset()
+        if self._inference_runner is not None:
+            self._inference_runner.reset()
 
     def close(self, *, close_runner: bool = True) -> None:
         """释放 Ascend ACL Silero 资源；ONNX Runtime 会话由其运行库管理。"""
         if self._backend_closed:
             return
         self._closed = True
-        if close_runner and self._acl_runner is not None:
-            self._acl_runner.close()
+        if close_runner and self._inference_runner is not None:
+            self._inference_runner.close()
         if close_runner:
             self._backend_closed = True
 

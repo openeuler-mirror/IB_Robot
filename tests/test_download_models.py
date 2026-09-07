@@ -208,7 +208,7 @@ def test_repository_aliases_and_runtime_directories():
         == "IB_Robot_ACT_banana_pick_distill"
     )
     assert dm.runtime_directory("graspgen", "grasp") == "graspgen"
-    assert dm.runtime_directory("fullsubnet", "fullsubnet") == "voice_asr"
+    assert dm.runtime_directory("fullsubnet", "fullsubnet") == "fullsubnet"
     assert (
         dm.runtime_directory("grounding_dino_swint_seq8_1280x720", "grounding_dino_swint_seq8_1280x720")
         == "grounding_dino_swint_seq8_1280x720"
@@ -229,21 +229,19 @@ def test_build_plan_separates_repository_from_local_directory():
     assert plan.repo_id == "openEuler/IB_Robot_ACT_banana_pick_distill"
 
 
-def test_fullsubnet_runtime_aliases(tmp_path):
-    source_root = tmp_path / "voice_asr"
+def test_fullsubnet_runtime_aliases_are_retired(tmp_path):
+    """The legacy artifacts/{torch,ascend} aliases are gone: the standalone
+    models/fullsubnet bundle consumes assets/ files directly."""
+    source_root = tmp_path / "fullsubnet"
     assets = source_root / "assets"
     assets.mkdir(parents=True)
-    checkpoint = assets / "cum_fullsubnet_best_model_218epochs.tar"
-    manifest = assets / "cum_fullsubnet_best_model_218epochs.manifest.json"
-    checkpoint.write_bytes(b"checkpoint")
-    manifest.write_text("{}")
+    (assets / "cum_fullsubnet_best_model_218epochs.tar").write_bytes(b"checkpoint")
+    (assets / "cum_fullsubnet_best_model_218epochs.manifest.json").write_text("{}")
 
     dm.materialize_runtime_aliases("fullsubnet", source_root)
 
-    torch_alias = source_root / "artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
-    ascend_alias = source_root / "artifacts/ascend/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
-    assert torch_alias.is_symlink() and torch_alias.read_bytes() == b"checkpoint"
-    assert ascend_alias.is_symlink() and ascend_alias.read_text() == "{}"
+    assert not (source_root / "artifacts/torch/fullsubnet").exists()
+    assert not (source_root / "artifacts/ascend/fullsubnet").exists()
 
 
 def test_legacy_download_uses_filtered_snapshot(monkeypatch, tmp_path):

@@ -3,8 +3,12 @@
 profiles:
   ascend_310p:
     silero_vad_backend: "ascend"
+    silero_vad_deployment: "ascend_310p"
     fullsubnet_backend: "ascend"
+    fullsubnet_deployment: "ascend_310p"
   ubuntu_cuda:
     silero_vad_backend: "onnx"
+    silero_vad_deployment: "torch_cpu"
     fullsubnet_backend: "stateful_torch_cuda"
+    fullsubnet_deployment: "torch_cuda"
   custom: {}

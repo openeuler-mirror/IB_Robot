@@ -22,7 +22,7 @@ def _prepend_env(current: str, entries: tuple[Path, ...]) -> str:
     return os.pathsep.join(values)
 
 
-_MODEL_PATH_KEYS = ("speech_direction_inference_bundle",)
+_MODEL_PATH_KEYS = ("speech_direction_inference_bundle", "silero_vad_inference_bundle")
 
 
 def _workspace_root() -> Path:
@@ -50,7 +50,9 @@ def _load_profile_overrides(profiles_path: str | Path, profile: str) -> dict[str
         raise ValueError(f"平台 profile {profile} 必须是 mapping")
     allowed = {
         "silero_vad_backend",
+        "silero_vad_deployment",
         "fullsubnet_backend",
+        "fullsubnet_deployment",
     }
     unexpected = set(overrides) - allowed
     if unexpected:
@@ -72,6 +74,57 @@ def _validate_profile_combination(profile: str, params: Mapping[str, object]) ->
     mismatched = {key: (params.get(key), value) for key, value in expected.items() if params.get(key) != value}
     if mismatched:
         raise ValueError(f"平台 profile {profile} 后端组合错误: {mismatched}")
+
+
+def _expected_deployment_backend(backend: str) -> str:
+    """Map a node backend selector to its manifest backend family."""
+    if backend == "ascend":
+        return "ascend"
+    if backend == "onnx":
+        return "onnx"
+    if backend in {"stateful_torch_cuda", "stateful_torch_cpu", "torch"}:
+        return "torch"
+    raise ValueError(f"未知的 speech_direction 后端: {backend}")
+
+
+def _resolve_bundle_path(value: str, models_root: Path, default_name: str) -> Path:
+    path = Path(value.strip()).expanduser() if value.strip() else models_root / default_name
+    if not path.is_absolute():
+        path = models_root / path
+    return path
+
+
+def _validate_deployment_platform(params: Mapping[str, object], models_root: Path) -> None:
+    """校验 deployment 的 manifest backend 与声明的平台后端一致。"""
+    from inference_manifest import ManifestValidationError, load_inference_manifest
+
+    checks = (
+        (
+            str(params.get("silero_vad_backend", "")),
+            str(params.get("silero_vad_deployment", "")),
+            _resolve_bundle_path(str(params.get("silero_vad_inference_bundle", "")), models_root, "silero-vad"),
+            "silero_vad",
+        ),
+        (
+            str(params.get("fullsubnet_backend", "")),
+            str(params.get("fullsubnet_deployment", "")),
+            _resolve_bundle_path(str(params.get("speech_direction_inference_bundle", "")), models_root, "fullsubnet"),
+            "fullsubnet",
+        ),
+    )
+    for backend, deployment, bundle_path, label in checks:
+        if not backend or not deployment:
+            continue
+        expected = _expected_deployment_backend(backend)
+        try:
+            validated = load_inference_manifest(bundle_path, deployment)
+        except ManifestValidationError as exc:
+            raise ValueError(f"{label} deployment '{deployment}' 无法从 {bundle_path} 加载: {exc}") from exc
+        actual = validated.deployment.backend
+        if actual != expected:
+            raise ValueError(
+                f"{label}_backend={backend} 需要 {expected} deployment，但 {deployment} 的 manifest backend 是 {actual}"
+            )
 
 
 def _load_speech_direction_parameters(
@@ -149,6 +202,7 @@ def _launch_setup(context):
         profiles_path=profiles_path,
         parameter_overrides=parameter_overrides,
     )
+    _validate_deployment_platform(params, models_root)
     # 只有 Ascend ACL profile 需要 CANN；Ubuntu CUDA 不注入无关环境。
     environment = {}
     if params.get("silero_vad_backend") == "ascend" or params.get("fullsubnet_backend") == "ascend":

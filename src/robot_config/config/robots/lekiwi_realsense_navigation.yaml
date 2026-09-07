@@ -106,9 +106,8 @@ robot:
     enabled: true
     active_mode: continuous
     language: zh
-    model_path: models/voice_asr/sherpa-onnx-streaming-paraformer-zh
-    model_type: streaming
-    auto_download_model: true
+    bundle_path: models/voice_asr/sherpa-onnx-streaming-paraformer-zh
+    deployment: torch_cpu
     publish_partial: true
     output_topic: /voice_command
     audio_input_channel: 0

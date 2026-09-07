@@ -495,6 +495,7 @@ platform_install_rosdeps() {
         ament_python
         feetech-servo-sdk
         pyserial
+        sherpa-onnx
     )
 
     # Append platform-specific skip keys

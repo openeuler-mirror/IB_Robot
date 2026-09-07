@@ -44,11 +44,11 @@ YAML 的模型相对路径以 models 目录为根，不再包含额外的 `model
 ros2 launch voice_asr_service speech_direction.launch.py profile:=ubuntu_cuda
 ```
 
-profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsubnet_backend`、`fullsubnet_device` 四个平台字段；写入公共算法字段会被 launch 拒绝。`ascend_310p` 与 `ubuntu_cuda` 还会被校验后端组合一致性，避免后端与模型路径错配的半切换配置。仅 `ascend` 后端会在节点环境注入 CANN 库路径，`ubuntu_cuda` 不注入无关环境。
+profile 只允许覆盖 `silero_vad_backend`、`silero_vad_deployment`、`fullsubnet_backend`、`fullsubnet_deployment` 四个平台字段；写入公共算法字段会被 launch 拒绝。`ascend_310p` 与 `ubuntu_cuda` 还会被校验后端组合一致性，launch 还会用 manifest 校验 deployment 的 backend 与声明的平台后端一致，避免后端与 deployment 错配的半切换配置。仅 `ascend` 后端会在节点环境注入 CANN 库路径，`ubuntu_cuda` 不注入无关环境。
 
 ### 模型资产下载
 
-执行 `python3 scripts/verify_speech_direction_assets.py` 时，脚本走两条校验：先用 `load_inference_manifest_metadata` 标准入口校验 `config/inference_manifest.json` 的 bundle 结构、deployment bindings/execution 与 semantic_identity（不校验文件存在），再读 `config/assets/adapter.json` 逐资产校验 310P 资产的 `algorithm_contract`（model_type、norm_type、time_steps、input_samples 等）、文件大小与 SHA-256。标准 manifest schema 不收留 sha256/size/algorithm_contract，这些字段由 `assets/adapter.json` 承载，仍由 Python 的 `STATEFUL_FULLSUBNET_CONTRACT` 做 SSOT 校验。脚本只校验不下载，资产不在本仓库管理，需从 NAS 手动获取后放入 `models/` 对应路径；缺失的资产会打印来源提示并跳过，已存在的资产校验不通过则报错。FullSubNet 两平台共用同一 cumulative 218epochs checkpoint 权重：310P 预导出为 FB/SB 拆分 OM，Ubuntu 由 Torch 直接加载同一 checkpoint。
+Ubuntu 依赖（Silero ONNX、FullSubNet cumulative checkpoint）通过 `./scripts/download_speech_direction_models.sh` 显式预取，分别落入 `models/silero-vad/assets/` 与 `models/fullsubnet/assets/`；310P OM 资产需从 NAS/HuggingFace 手动获取后放入对应 bundle 的 `artifacts/ascend/` 目录。执行 `python3 scripts/verify_speech_direction_assets.py` 会遍历 `models/silero-vad` 与 `models/fullsubnet` 两个独立 bundle 的全部 deployment（`ascend_310p`/`torch_cpu`/`torch_cuda`），先用 `load_inference_manifest_metadata` 校验 bundle 结构与 bindings，再逐资产校验文件存在性与 SHA-256。脚本只校验不下载；缺失的资产会打印来源提示并跳过，已存在的资产校验不通过则报错。FullSubNet 两平台共用同一 cumulative 218epochs checkpoint 权重：310P 预导出为 FB/SB 拆分 OM，Ubuntu 由 Torch 直接加载同一 checkpoint。
 
 ### 配置所有权
 
@@ -61,15 +61,12 @@ profile 只允许覆盖 `silero_vad_backend`、`silero_vad_model_path`、`fullsu
 | 阵列 | `mount_yaw_deg` | `0.0`，阵列安装偏角（度），逆时针为正。把阵列坐标系角度对齐到小车坐标系，详见下方[坐标系与安装偏角](#坐标系与安装偏角) |
 | 阵列 | `angle_step_degree` | `5`，SRP-PHAT 扫描角度步长（度），DOA 输出只能为该步长的整数倍；必须为 360 的正整数约数。详见下方[SRP 角度精度](#srp-角度精度) |
 | 阵列 | `mic_positions` | 四麦二维坐标的一维展开数组，长度必须为通道数的两倍 |
-| 模型 | `silero_vad_model_path` | Silero VAD 模型路径 |
-| 模型 | `silero_vad_backend` | `ascend`（310P OM）；Ubuntu profile 覆盖为 `onnx` |
-| 模型 | `fullsubnet_ckpt` | FullSubNet cumulative 218epochs checkpoint，两平台共用同一权重 |
-| 模型 | `fullsubnet_backend` | `ascend`（310P 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda` |
-| 模型 | `fullsubnet_device` | `cuda`；Ubuntu Torch 后端固定 CUDA，禁止静默回退 CPU |
-| 模型 | `fullsubnet_device_id` | `0`；310P ACL 设备 ID，多卡场景下指定目标卡 |
-| 模型 | `fullsubnet_stateful_fb_om_path` | Ascend ACL 的 FullBand 拆分 OM 路径，相对 `models/` |
-| 模型 | `fullsubnet_stateful_sb_om_path` | Ascend ACL 的 SubBand 拆分 OM 路径，相对 `models/` |
-| 模型 | `fullsubnet_stateful_manifest_path` | stateful cumulative manifest 路径（声明 norm/checkpoint 契约），相对 `models/` |
+| 模型 | `speech_direction_inference_bundle` | FullSubNet 独立 bundle 目录（`models/fullsubnet`），相对 `models/` |
+| 模型 | `fullsubnet_deployment` | FullSubNet deployment 名；`ascend_310p`（310P 拆分 OM）或 `torch_cpu`/`torch_cuda`（Torch checkpoint） |
+| 模型 | `fullsubnet_backend` | `ascend`（310P 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda`，必须与 deployment 的 manifest backend 一致 |
+| 模型 | `silero_vad_inference_bundle` | Silero VAD 独立 bundle 目录（`models/silero-vad`），相对 `models/` |
+| 模型 | `silero_vad_deployment` | Silero deployment 名；`ascend_310p`（OM）或 `torch_cpu`（ONNX） |
+| 模型 | `silero_vad_backend` | `ascend`（310P OM）；Ubuntu profile 覆盖为 `onnx`，必须与 deployment 的 manifest backend 一致 |
 | 运行时效 | `speech_direction_max_age_ms` | `1300` ms，方向结果最大保鲜时间 |
 
 这些参数均由 `voice_asr_service` 独占管理。`sound_follow` 只维护底盘最小集和跟随行为参数，其完整 launch 通过无参数 include 复用本包的 `speech_direction.launch.py`，不读取或转发任何音频参数。
@@ -216,7 +213,7 @@ Speech Direction 固定订阅 `/audio/capture_stamped`，不直接打开 ALSA，
 核心职责包括：
 
 1. 读取 ROS 参数并初始化各个运行模块。
-2. 在模型文件缺失时自动解析并下载默认 ASR bundle。
+2. 从选定的 schema-v3 bundle deployment 解析 ASR 与 Silero VAD 模型资产（不做启动期下载或目录名推断）。
 3. 从麦克风采集音频或从文件加载音频。
 4. 使用 VAD 判断语音起止边界。
 5. 调用 sherpa-onnx 执行解码，并发布中间/最终结果。
@@ -235,8 +232,8 @@ Speech Direction 固定订阅 `/audio/capture_stamped`，不直接打开 ALSA，
 ```bash
 cd /path/to/IB_Robot
 source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run voice_asr_service voice_asr_node --ros-args \
-  -p model_path:=models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23 \
-  -p model_type:=streaming
+  -p bundle_path:=models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23 \
+  -p deployment:=torch_cpu
 ```
 
 生产或完整系统场景仍建议通过 `robot_config` 启动，因为机器人级参数的单一事实来源仍然是 `robot_config`：
@@ -270,9 +267,9 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.
 | `AudioCaptureModule` | `audio_capture_module.py` | 麦克风设备选择、缓冲、pre-roll、分块采集 |
 | `FileInputModule` | `file_input_module.py` | 文件加载、解码、重采样、进度回调 |
 | `VADModule` | `vad_module.py` | 语音活动检测与语音/静音分段 |
-| `ASRInferenceModule` | `asr_inference_module.py` | sherpa-onnx 模型初始化与解码 |
+| `ASRInferenceModule` | `asr_inference_module.py` | 从 bundle deployment 加载 sherpa-onnx recognizer 并解码 |
+| `ManifestVadRuntime` | `vad_runtime.py` | Silero VAD 的 manifest-backed 统一 runtime 会话 |
 | `StateMachine` | `state_machine.py` | 节点模式与状态切换 |
-| `model_manager` | `model_manager.py` | 在配置模型缺失时解析/下载默认 ASR bundle |
 
 整体数据流：
 
@@ -301,44 +298,74 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.
 - **离线模型仍可用于 `~/recognize_file` 和 `/voice_file_input`。**
 - 如果当前加载的是离线模型，而外部请求实时识别，节点会明确拒绝并记录错误，而不是崩溃。
 
-## 5. 模型加载与自动下载
+## 5. 模型 bundle 与 deployment
 
 节点主要读取这些参数：
 
-- `model_path`
-- `tokens_path`
-- `model_type`
+- `bundle_path`（ASR bundle 目录）
+- `deployment`（bundle manifest 中的命名 deployment）
+- `vad_bundle_path`（Silero VAD 独立 bundle 目录）
+- `vad_deployment`（Silero deployment 名）
 - `language`
-- `provider`
-- `auto_download_model`
 
 初始化流程如下：
 
-1. `resolve_model_assets()` 先检查 `model_path` 是否为空或已存在。
-2. 如果 `model_path` 为空，或配置的模型缺失，且 `auto_download_model=true`，
-   节点会在启动时按当前意图选择默认 bundle 并在缺失时自动下载。
-3. 下载后的 bundle 路径会回填到节点实际使用的运行参数里。
-4. `ASRInferenceModule.initialize()` 根据模型类型创建流式或离线 recognizer。
+1. `ASRInferenceModule.initialize()` 用 `load_inference_manifest()` 校验 bundle，
+   并按 deployment 声明的 artifact 角色创建 recognizer：
+   - 流式 transducer：`encoder` + `decoder` + `joiner` + `tokens`
+   - 流式 Paraformer：`encoder` + `decoder` + `tokens`
+   - 离线：`model` + `tokens`
+2. 采样率从 recognizer 配置读取，并与音频输入的 `sample_rate` 交叉校验。
+3. `ManifestVadRuntime` 加载 Silero VAD 的 `torch_cpu`（ONNX Runtime）deployment，
+   并校验其 `audio_contract`（采样率、帧长、mono float32）与节点音频输入一致。
+4. 任何 manifest/artifact 缺失或契约不匹配都会 fail-closed：节点不会下载模型、
+   不会按目录名推断模型类型，也不会静默切换到其他后端。
 
-当前默认 bundle：
+历史遗留的 `model_path`、`tokens_path`、`provider`、`model_type`、`auto_download_model`
+字段已退役；在启用的 Voice ASR 配置里出现会被 `robot_config` 与 launch builder 直接拒绝。
 
-| Profile | Bundle | 用途 |
-| --- | --- | --- |
-| `streaming_zh` | `sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23` | 默认中文实时 ASR |
-| `offline_zh` | `sherpa-onnx-paraformer-zh-int8-2025-10-07` | 默认中文离线文件识别 |
+### Bundle 制作与预取（离线/气隙环境）
 
-模型目录：
+ASR bundle 通过打包器显式生成，产物是 schema-v3 manifest + 声明式 artifacts：
 
-```text
-models/voice_asr/
+```bash
+# 流式 transducer（默认）
+python3 -m voice_asr_service.package_sherpa_asr_bundle \
+  --bundle-root models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23 \
+  --tokens <tokens.txt> --encoder <encoder.onnx> --decoder <decoder.onnx> --joiner <joiner.onnx>
+
+# 流式 Paraformer：把 --joiner 换成 --paraformer
+# 离线：--offline --model <model.onnx>
 ```
+
+打包器会同时生成 `torch_cpu` 与 `torch_cuda` 两个 deployment（`--skip-cuda` 可只保留 CPU），
+并对每个 deployment 执行 `load_inference_manifest()` 自校验。
+
+Silero VAD 与 FullSubNet 的 Ubuntu 依赖由 `./scripts/download_speech_direction_models.sh`
+下载并重新打包对应独立 bundle；部署完整性用 `python3 scripts/verify_speech_direction_assets.py`
+校验。气隙环境可先在有网机器执行上述步骤，再把 `models/silero-vad`、`models/fullsubnet`
+与 ASR bundle 目录整体拷贝到目标机器。
+
+### 从旧版 raw 模型目录迁移
+
+旧布局（`models/voice_asr/<bundle>/` 下平铺 onnx + tokens.txt，配置 `model_path` +
+`auto_download_model`）迁移步骤：
+
+1. 用 `package_sherpa_asr_bundle` 把现有 onnx/tokens 打成 schema-v3 bundle（见上）。
+2. 把 robot YAML 的 `voice_asr` 段从 `model_path`/`tokens_path`/`provider`/`model_type`/
+   `auto_download_model` 改为 `bundle_path` + `deployment`（流式实时识别用含
+   `encoder`/`decoder` 的 deployment；离线文件识别用 `model` + `tokens` 的 deployment）。
+3. 保留旧模型目录直到新 bundle 验证通过；回滚时只需把 YAML 恢复为旧字段前先确认
+   目标部署仍包含旧布局——新版本节点**不再读取** raw 字段，回滚需要同时回滚
+   `voice_asr_service` 包。
 
 ### 流式与离线模型的判定
 
-运行时的区分方式是：
+运行时的区分方式是 deployment 声明的 artifact 角色：
 
-- 流式模型：目录中存在 `encoder*.onnx`、`decoder*.onnx`、`joiner*.onnx`
-- 离线模型：通常是 paraformer 这种单模型 ONNX 布局，例如 `model.int8.onnx`
+- 流式 transducer：`encoder`、`decoder`、`joiner`、`tokens`
+- 流式 Paraformer：`encoder`、`decoder`、`tokens`
+- 离线：`model`、`tokens`
 
 ## 6. 实时麦克风识别流程
 
@@ -449,11 +476,10 @@ models/voice_asr/
 | --- | --- | --- |
 | `active_mode` | `continuous` | 节点激活模式 |
 | `language` | `zh` | 传给 ASR 初始化的语言提示 |
-| `model_path` | `""` | 模型文件或目录路径；具体机器人配置可在 `robot_config` YAML 中覆盖 |
-| `tokens_path` | `""` | 可选的显式 tokens 路径 |
-| `provider` | `cpu` | sherpa-onnx 推理 provider |
-| `model_type` | `auto` | `auto`、`streaming` 或 `offline` |
-| `auto_download_model` | `true` | 配置模型缺失时是否自动下载默认 bundle |
+| `bundle_path` | `models/voice_asr` | schema-v3 ASR bundle 目录；具体机器人配置可在 `robot_config` YAML 中覆盖 |
+| `deployment` | `torch_cpu` | bundle manifest 中的命名 deployment；模型类型/后端/artifact 均由 deployment 派生 |
+| `vad_bundle_path` | `models/silero-vad` | Silero VAD 独立 bundle 目录 |
+| `vad_deployment` | `torch_cpu` | Silero deployment 名（ONNX Runtime 后端） |
 | `max_recording_duration` | `10.0` | 实时识别最长录音时长，超时后强制收尾 |
 | `publish_partial` | `true` | 是否发布中间解码结果 |
 | `output_topic` | `/voice_command` | 最终命令输出 topic |
@@ -499,7 +525,7 @@ idle -> listening -> recognizing -> listening -> idle
 
 节点已经对以下常见失败情况做了显式保护：
 
-- `model_path` 缺失
+- ASR bundle/deployment 缺失或校验失败
 - ASR 初始化失败
 - 使用离线模型请求实时识别
 - 文件解码失败
@@ -508,7 +534,7 @@ idle -> listening -> recognizing -> listening -> idle
 需要注意：
 
 - `VoiceASRNode initialized` **并不代表** ASR 已经可用。
-- 真正的成功信号通常是后续日志里的 `ASR model loaded: ...`。
+- 真正的成功信号通常是后续日志里的 `ASR deployment loaded: ...`。
 - 如果 `exit_on_init_failure=true`，初始化失败会直接导致启动失败。
 - 如果 `exit_on_init_failure=false`，节点会继续存活，但在 ASR 初始化成功之前会拒绝相关请求。
 
@@ -528,13 +554,12 @@ robot:
     enabled: false
     active_mode: continuous
     language: zh
-    model_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
-    tokens_path: ""
-    provider: cpu
-    model_type: streaming
-    auto_download_model: true
+    bundle_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
+    deployment: torch_cpu
     max_recording_duration: 10.0
     vad_sensitivity: 0.6
+    vad_bundle_path: models/silero-vad
+    vad_deployment: torch_cpu
     realtime_pre_roll_seconds: 0.5
     publish_partial: true
     output_topic: /voice_command
@@ -571,7 +596,7 @@ robot:
 | `start_recognition` 被拒绝 | ASR 未就绪，或当前模型是离线模型 | 查看 `_asr_init_error` 相关日志和模型类型 |
 | 文件识别立即失败 | 文件路径错误或解码失败 | 确认文件存在且格式受支持 |
 | 麦克风没有音频输入 | `audio_capture_node` 未就绪或 microphone peripheral 配置不对 | 检查 `/audio/capture_stamped` 及 `audio_io.microphone` 引用的 `device`/`channels` |
-| 模型路径缺失 | bundle 尚未下载完成 | 开启 `auto_download_model`，并在首次启动 ASR 节点时等待自动下载完成 |
+| 启动报 bundle/deployment 无效 | bundle 尚未打包或 deployment 名不匹配 | 用 `package_sherpa_asr_bundle` 生成 bundle，并确认 YAML 的 `deployment` 与 manifest 中的名字一致 |
 
 ## 14. 当前已验证行为
 
@@ -579,7 +604,7 @@ robot:
 
 - 流式模型初始化
 - 离线模型下的实时识别保护逻辑
-- 配置模型缺失时的自动解析与下载
+- 从 bundle deployment 解析 ASR 与 Silero VAD 资产并校验音频契约
 - 使用自带 streaming 样例音频进行真实解码
 - 保持离线文件识别可用
 

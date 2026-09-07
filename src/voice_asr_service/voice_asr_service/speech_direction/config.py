@@ -75,6 +75,7 @@ class FullSubNetConfig:
     device: str = "cuda"  # Ubuntu stateful Torch 固定 CUDA；禁止静默回退 CPU
     # ACL is the backend identity; statefulness is selected by the streaming execution path.
     backend: str = "ascend"
+    deployment: str = "ascend_310p"
     num_freqs: int = 257
     n_fft: int = 512  # FullSubNet 内部 STFT(固定)
     hop: int = 256
@@ -95,6 +96,7 @@ class VadConfig:
     input_source: str = "enh_mic1_mono"  # 增强 ch1 单麦
     # 推理后端:ascend(Ascend NPU,默认) 或 onnx(Ubuntu)
     backend: str = "ascend"
+    deployment: str = "ascend_310p"
     # 独立 Silero VAD bundle(models/silero-vad):多业务共享的同源部署,唯一解析来源。
     inference_bundle: str = field(default_factory=lambda: _model_path("silero-vad"))
 

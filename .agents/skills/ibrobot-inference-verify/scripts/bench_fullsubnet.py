@@ -23,7 +23,7 @@ from voice_asr_service.speech_direction.enhancement.fullsubnet_stateful_torch im
     StatefulTorchFullSubNetExecutor,
 )
 
-CKPT = REPO_ROOT / "models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+CKPT = REPO_ROOT / "models/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar"
 MANIFEST = CKPT.with_name(CKPT.name.replace(".tar", ".manifest.json"))
 
 

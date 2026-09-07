@@ -132,12 +132,11 @@ runner scripts.
 ### FullSubNet (speech_direction pipeline, stateful streaming)
 
 ```bash
-# 1. one-time local layout fixes (config defaults point at board paths; see
-#    troubleshooting + issue #125):
-cp models/voice_asr/artifacts/torch/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json \
-   models/voice_asr/artifacts/ascend/fullsubnet/
-cp models/voice_asr/silero-vad/silero_vad_v5.onnx \
-   models/voice_asr/artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om
+# 1. prefetch the speech bundles (Ubuntu assets land in models/silero-vad
+#    and models/fullsubnet; Ascend OM pairs come from NAS / the 310B export
+#    flow and are optional on host):
+./scripts/download_speech_direction_models.sh
+python3 scripts/verify_speech_direction_assets.py
 
 # 2. real-speech test wav (synthetic audio FAILS Silero VAD):
 python3 .agents/skills/ibrobot-inference-verify/scripts/make_speech_wav.py

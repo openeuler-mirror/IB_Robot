@@ -225,7 +225,7 @@ def test_silero_host_close_leaves_backend_close_for_the_owner(tmp_path) -> None:
     model_path = tmp_path / "silero.om"
     model_path.write_bytes(b"mock")
     backend = _VadBackend()
-    engine = SileroVadEngine(str(model_path), acl_runner=backend)
+    engine = SileroVadEngine(str(model_path), inference_runner=backend)
     engine.close(close_runner=False)
     assert backend.close_calls == 0
     engine.close()

@@ -256,6 +256,15 @@ manifest["deployments"][UBUNTU_ONNX_DEPLOYMENT_NAME] = {
         "target": {"runtime": "torch"},
         "profile": {"device": "cpu"},
     },
+    # Synthesis-only audio contract, mirroring the Ascend deployments: the
+    # plugin's validate_synthesis_audio_contract checks it fail-closed.
+    "audio_contract": {
+        "sample_rate_hz": 24000,
+        "channels": 1,
+        "channel_semantics": "mono",
+        "sample_dtype": "float32",
+        "execution_mode": "offline",
+    },
 }
 
 manifest["bundle"] = {

@@ -8,8 +8,9 @@
 #
 # Prerequisites (see references/troubleshooting.md "speech_direction host
 # layout gaps" and issue #125):
-#   models/voice_asr/artifacts/ascend/fullsubnet/cum_....manifest.json   (copy from artifacts/torch/fullsubnet/)
-#   models/voice_asr/artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om (copy silero_vad_v5.onnx content)
+#   models/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.tar        (download_speech_direction_models.sh)
+#   models/fullsubnet/assets/cum_fullsubnet_best_model_218epochs.manifest.json
+#   models/silero-vad/assets/silero_vad.onnx                               (download_speech_direction_models.sh)
 #   a real-speech 6ch 16k wav (scripts/make_speech_wav.py)
 #
 # Usage: run_fullsubnet.sh <cpu|cuda> <ros_domain_id> [wav_path]
@@ -28,7 +29,9 @@ mode, out = sys.argv[1], sys.argv[2]
 c = yaml.safe_load(open("src/voice_asr_service/config/speech_direction.yaml"))
 p = c["speech_direction_node"]["ros__parameters"]
 p["silero_vad_backend"] = "onnx"
+p["silero_vad_deployment"] = "torch_cpu"
 p["fullsubnet_backend"] = f"stateful_torch_{mode}"
+p["fullsubnet_deployment"] = f"torch_{mode}"
 p["fullsubnet_timing_enabled"] = True
 for k in ("diagnostics_save_raw6ch", "diagnostics_save_enh4ch", "diagnostics_save_frame_metrics",
           "diagnostics_save_gray_events", "diagnostics_high_throughput_enabled"):
