@@ -115,6 +115,21 @@ def _session() -> StatefulAscendOmModelSession:
     return StatefulAscendOmModelSession(device_id=0, runtime_manager=object())
 
 
+def test_stateful_capabilities_are_declared_before_load_and_inherited():
+    from inference_service.model_sessions.ascend import AscendOmModelSession
+
+    class SpecializedStatefulSession(StatefulAscendOmModelSession):
+        pass
+
+    for session_type in (StatefulAscendOmModelSession, SpecializedStatefulSession):
+        session = session_type(device_id=0, runtime_manager=object())
+        assert session.capabilities.resettable
+        assert session.capabilities.stateful
+    stateless = AscendOmModelSession(device_id=0, runtime_manager=object())
+    assert not stateless.capabilities.resettable
+    assert not stateless.capabilities.stateful
+
+
 def test_state_link_resolves_recurrent_abi_pair() -> None:
     pairs = StatefulAscendOmModelSession._state_indices_for_role(
         _role_bindings(), _state_link(state_name="hidden"), "model"

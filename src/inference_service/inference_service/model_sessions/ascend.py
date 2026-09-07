@@ -186,6 +186,8 @@ class AscendOmModelSession(ModelSession):
         self._models = models
         self._linked_inputs = frozenset(linked_inputs)
         self._update_loaded_capabilities(
+            resettable=self.supports_reset,
+            stateful=self.is_stateful,
             supports_attention=False,
             supports_isolated_stage_execution=priority_streams is not None,
             priority_mapping=(

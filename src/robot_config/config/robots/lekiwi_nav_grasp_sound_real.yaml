@@ -5,7 +5,7 @@ robot:
     enabled: true
     active_mode: continuous
     language: zh
-    bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    bundle_path: models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23
     deployment: torch_cpu
     publish_partial: true
     output_topic: /voice_command
