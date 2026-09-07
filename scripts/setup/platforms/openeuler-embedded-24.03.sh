@@ -114,17 +114,23 @@ openeuler_extras_repo_file() {
 }
 
 ensure_openeuler_extras_repo_excludes() {
-    local repo_file="$1"
+    local repo_file="$1" exclude_line="" missing_excludes=""
 
-    if grep -Eq '^exclude=([[:space:]]|[^[:space:]]+[[:space:]])*yaml-cpp\*([[:space:]]|$)' "${repo_file}"; then
+    grep -Eq '^exclude=([[:space:]]|[^[:space:]]+[[:space:]])*yaml-cpp\*([[:space:]]|$)' "${repo_file}" \
+        || missing_excludes="yaml-cpp*"
+    if ! grep -Eq '^exclude=([[:space:]]|[^[:space:]]+[[:space:]])*qhull\*([[:space:]]|$)' "${repo_file}"; then
+        missing_excludes="${missing_excludes:+${missing_excludes} }qhull*"
+    fi
+    if [[ -z "${missing_excludes}" ]]; then
         return 0
     fi
 
-    log_info "Excluding yaml-cpp from openEuler extras repo to preserve the ROS 2 ABI package."
+    log_info "Excluding yaml-cpp and qhull from openEuler extras repo to preserve the ROS 2 ABI packages."
     if grep -q '^exclude=' "${repo_file}"; then
-        run_sudo sed -i '/^exclude=/ s/$/ yaml-cpp*/' "${repo_file}"
+        exclude_line="$(grep -m1 '^exclude=' "${repo_file}")"
+        run_sudo sed -i "0,/^exclude=/ s|^exclude=.*|${exclude_line} ${missing_excludes}|" "${repo_file}"
     else
-        printf '\nexclude=yaml-cpp*\n' | run_sudo tee -a "${repo_file}" >/dev/null
+        printf '\nexclude=yaml-cpp* qhull*\n' | run_sudo tee -a "${repo_file}" >/dev/null
     fi
 }
 

@@ -169,7 +169,7 @@ setup_os_variables() {
         PACKAGE_MANAGER="dnf"
         ROS_DISTRO="humble"
         # install_openeuler_ros() writes the authoritative repo configuration.
-        OPENEULER_ROS_REPO_URL="https://eulermaker.openeuler.openatom.cn/api/ems1/repositories/openEuler-Embedded-ROS2-humble-release3/openEuler%3A24.03-LTS/${ARCH}/"
+        OPENEULER_ROS_REPO_URL="https://eulermaker.openeuler.openatom.cn/api/ems1/repositories/openEuler-Embedded-ROS2-humble-2609-release-1/openEuler%3A24.03-LTS/${ARCH}/"
     fi
 }
 

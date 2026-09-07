@@ -18,7 +18,7 @@ _openeuler_ros_repo_content() {
     cat << 'REPOEOF'
 [openEuler-Embedded-ROS2-humble]
 name=openEuler-Embedded-ROS2-humble
-baseurl=https://eulermaker.openeuler.openatom.cn/api/ems1/repositories/openEuler-Embedded-ROS2-humble-release3/openEuler%3A24.03-LTS/$basearch/
+baseurl=https://eulermaker.openeuler.openatom.cn/api/ems1/repositories/openEuler-Embedded-ROS2-humble-2609-release-1/openEuler%3A24.03-LTS/$basearch/
 enabled=1
 gpgcheck=0
 priority=1
