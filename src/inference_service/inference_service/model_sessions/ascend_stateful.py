@@ -51,6 +51,25 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
             state_indices[role] = tuple(sorted(set(previous or ()) | set(pairs)))
         if not state_indices:
             raise BackendLoadError("stateful Ascend sessions require model state links", code="invalid_state_contract")
+        contract = deployment.execution_contract
+        if contract.state_bank_mode != "runtime_exclusive":
+            raise BackendLoadError(
+                "stateful Ascend sessions require runtime_exclusive state banks",
+                code="invalid_state_contract",
+            )
+        execution_roles = tuple(deployment.execution)
+        unlinked_roles = [role for role in execution_roles if role not in state_indices]
+        if unlinked_roles:
+            raise BackendLoadError(
+                f"stateful execution roles without state links: {unlinked_roles}",
+                code="invalid_state_contract",
+            )
+        non_execution_roles = sorted(set(state_indices) - set(execution_roles))
+        if non_execution_roles:
+            raise BackendLoadError(
+                f"state links reference non-execution roles: {non_execution_roles}",
+                code="invalid_state_contract",
+            )
         self._state_indices = state_indices
         super()._load(context, rollback)
 
@@ -70,14 +89,33 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
             if binding.index is not None and binding.semantic.rsplit(".", 1)[-1].endswith(f"_{state_kind}_out")
         ]
         if state_kind == "hidden" and not input_matches:
-            input_matches = [binding for binding in bindings.inputs if binding.semantic.endswith(".state_in")]
-            output_matches = [binding for binding in bindings.outputs if binding.semantic.endswith(".state_out")]
+            input_matches = [
+                binding
+                for binding in bindings.inputs
+                if binding.index is not None and binding.semantic.endswith(".state_in")
+            ]
+            output_matches = [
+                binding
+                for binding in bindings.outputs
+                if binding.index is not None and binding.semantic.endswith(".state_out")
+            ]
         if len(input_matches) != 1 or len(output_matches) != 1:
             raise BackendLoadError(
                 f"state link for role {role!r} has no unique ABI mapping for {state_kind!r}",
                 code="invalid_state_link_abi",
             )
-        return ((int(input_matches[0].index), int(output_matches[0].index)),)
+        input_binding, output_binding = input_matches[0], output_matches[0]
+        if input_binding.shape != output_binding.shape or input_binding.dtype != output_binding.dtype:
+            raise BackendLoadError(
+                f"state link for role {role!r} changes shape or dtype across inference",
+                code="state_size_mismatch",
+            )
+        if any(dimension < 1 for dimension in input_binding.shape):
+            raise BackendLoadError(
+                f"state link for role {role!r} requires a static shape, got {input_binding.shape}",
+                code="invalid_state_link_abi",
+            )
+        return ((int(input_binding.index), int(output_binding.index)),)
 
     def _prepare_models(self, deployment: CompiledDeployment, models: Mapping[str, AclModel]) -> None:
         if deployment.device_links:
