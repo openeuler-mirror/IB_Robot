@@ -50,6 +50,12 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
             raise BackendLoadError("stateful Ascend sessions require model state links", code="invalid_state_contract")
         self._state_indices = state_indices
         super()._load(context, rollback)
+        # Stateful sessions own device state banks and can clear them safely.
+        self._update_loaded_capabilities(
+            priority_mapping=self.capabilities.priority_mapping,
+            resettable=True,
+            stateful=True,
+        )
 
     @staticmethod
     def _state_indices_for_role(bindings, link, role: str) -> tuple[tuple[int, int], ...]:
