@@ -4,6 +4,7 @@ import types
 from pathlib import Path
 
 import pytest
+import yaml
 
 _MODULE_NAMES = (
     "robot_config",
@@ -16,6 +17,7 @@ package.__path__ = [str(Path(__file__).resolve().parents[1] / "robot_config")]
 sys.modules["robot_config"] = package
 
 from robot_config.launch_builders.teleop import (  # noqa: E402
+    ConfigError,
     _generate_device_nodes,
     generate_teleop_nodes,
     validate_teleop_config,
@@ -434,3 +436,201 @@ def test_validation_does_not_require_joint_limits_for_mobile_base_joy_teleop():
     )
 
     assert not any("joint_limits" in error for error in errors)
+
+
+# ---------------------------------------------------------------------------
+# Follower gripper calibration: single source of truth (PR 391 review #1/#3)
+# ---------------------------------------------------------------------------
+
+_PROFILE_DIR = Path(__file__).resolve().parents[1] / "config" / "robots"
+
+
+@pytest.fixture
+def fake_node(monkeypatch):
+    """Replace launch_ros Node so device generation stays in-process."""
+
+    class FakeNode:
+        def __init__(self, **kwargs):
+            self.parameters = kwargs.get("parameters", [])
+
+    monkeypatch.setattr(_TELEOP_MODULE, "Node", FakeNode)
+    return FakeNode
+
+
+def _write_calib(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{}\n", encoding="utf-8")
+    return path
+
+
+def _leader_robot_config(*, leader_calib, follower_calib=None, xacro_args=None):
+    ros2_control = {}
+    if follower_calib is not None:
+        ros2_control["calib_file"] = str(follower_calib)
+    if xacro_args is not None:
+        ros2_control["xacro_args"] = xacro_args
+    return {
+        "name": "leader_test",
+        "joints": {"arm": ["1", "2", "3", "4", "5"], "gripper": ["6"]},
+        "ros2_control": ros2_control,
+        "teleoperation": {
+            "enabled": True,
+            "active_device": "so101_leader",
+            "devices": [
+                {
+                    "name": "so101_leader",
+                    "type": "leader_arm",
+                    "port": "/dev/ttyACM1",
+                    "calib_file": str(leader_calib),
+                }
+            ],
+            "safety": {"joint_limits": {"1": {"min": -1.0, "max": 1.0}}},
+        },
+    }
+
+
+def _device_config(config):
+    nodes = _generate_device_nodes(config, config["teleoperation"]["devices"][0], {})
+    return json.loads(nodes[0].parameters[0]["device_config"])
+
+
+def test_map_gripper_flag_derives_follower_calib_from_ros2_control(tmp_path, fake_node):
+    """#3: the follower calibration path lives only in ros2_control.calib_file."""
+    leader = _write_calib(tmp_path / "leader.json")
+    follower = _write_calib(tmp_path / "follower.json")
+    config = _leader_robot_config(leader_calib=leader, follower_calib=follower)
+    config["teleoperation"]["devices"][0]["map_gripper_to_follower_stroke"] = True
+
+    device_config = _device_config(config)
+
+    assert device_config["follower_calib_file"] == str(follower)
+
+
+def test_map_gripper_flag_expands_env_substitution_in_derived_path(tmp_path, monkeypatch, fake_node):
+    """#1 + #3: derivation must expand $(env HOME), not pass it through."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    leader = _write_calib(tmp_path / "leader.json")
+    follower = _write_calib(tmp_path / ".calibrate" / "so101_follower_calibrate.json")
+    config = _leader_robot_config(leader_calib=leader)
+    config["ros2_control"]["calib_file"] = "$(env HOME)/.calibrate/so101_follower_calibrate.json"
+    config["teleoperation"]["devices"][0]["map_gripper_to_follower_stroke"] = True
+
+    device_config = _device_config(config)
+
+    assert device_config["follower_calib_file"] == str(follower)
+    assert "$(env" not in device_config["follower_calib_file"]
+
+
+def test_explicit_follower_calib_file_is_expanded(tmp_path, monkeypatch, fake_node):
+    """#1: an explicitly configured follower_calib_file must be expanded too."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    leader = _write_calib(tmp_path / "leader.json")
+    follower = _write_calib(tmp_path / ".calibrate" / "so101_follower_calibrate.json")
+    config = _leader_robot_config(leader_calib=leader, follower_calib=follower)
+    config["teleoperation"]["devices"][0]["follower_calib_file"] = (
+        "$(env HOME)/.calibrate/so101_follower_calibrate.json"
+    )
+
+    device_config = _device_config(config)
+
+    assert device_config["follower_calib_file"] == str(follower)
+    assert "$(env" not in device_config["follower_calib_file"]
+
+
+def test_map_gripper_flag_conflicts_with_explicit_follower_calib_file(tmp_path, fake_node):
+    leader = _write_calib(tmp_path / "leader.json")
+    follower = _write_calib(tmp_path / "follower.json")
+    config = _leader_robot_config(leader_calib=leader, follower_calib=follower)
+    device = config["teleoperation"]["devices"][0]
+    device["map_gripper_to_follower_stroke"] = True
+    device["follower_calib_file"] = str(follower)
+
+    with pytest.raises(ConfigError, match="map_gripper_to_follower_stroke"):
+        _device_config(config)
+
+
+def test_map_gripper_flag_rejects_ambiguous_calibration_sources(tmp_path, fake_node):
+    """so101_dual_arm shape: multiple namespaced sources cannot be derived from."""
+    leader = _write_calib(tmp_path / "leader.json")
+    left = _write_calib(tmp_path / "left.json")
+    right = _write_calib(tmp_path / "right.json")
+    config = _leader_robot_config(
+        leader_calib=leader,
+        xacro_args={"calib_file_left": str(left), "calib_file_right": str(right)},
+    )
+    config["teleoperation"]["devices"][0]["map_gripper_to_follower_stroke"] = True
+
+    with pytest.raises(ConfigError) as excinfo:
+        _device_config(config)
+
+    message = str(excinfo.value)
+    assert "left" in message and "right" in message
+
+
+def test_map_gripper_flag_without_calibration_source_raises(tmp_path, fake_node):
+    leader = _write_calib(tmp_path / "leader.json")
+    config = _leader_robot_config(leader_calib=leader)
+    config["teleoperation"]["devices"][0]["map_gripper_to_follower_stroke"] = True
+
+    with pytest.raises(ConfigError):
+        _device_config(config)
+
+
+def test_missing_follower_calib_file_fails_loudly(tmp_path, fake_node):
+    """The silent 0~1 fallback must become a launch-time failure."""
+    leader = _write_calib(tmp_path / "leader.json")
+    config = _leader_robot_config(leader_calib=leader, follower_calib=tmp_path / "absent.json")
+    config["teleoperation"]["devices"][0]["map_gripper_to_follower_stroke"] = True
+
+    with pytest.raises(RuntimeError, match="absent.json"):
+        _device_config(config)
+
+
+def test_leader_arm_without_flag_keeps_device_config_unchanged(tmp_path, fake_node):
+    """Zero spillover: the other six leader_arm profiles must be untouched."""
+    leader = _write_calib(tmp_path / "leader.json")
+    follower = _write_calib(tmp_path / "follower.json")
+    config = _leader_robot_config(leader_calib=leader, follower_calib=follower)
+
+    device_config = _device_config(config)
+
+    assert "follower_calib_file" not in device_config
+    assert "map_gripper_to_follower_stroke" not in device_config
+
+
+def test_lekiwi_rtp_distributed_profile_resolves_follower_calib(tmp_path, monkeypatch, fake_node):
+    """Guards against a typo in the flag key inside the shipped profile."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _write_calib(tmp_path / ".calibrate" / "so101_leader_calibrate.json")
+    follower = _write_calib(tmp_path / ".calibrate" / "so101_follower_calibrate.json")
+    profile = yaml.safe_load((_PROFILE_DIR / "lekiwi_rtp_distributed.yaml").read_text(encoding="utf-8"))["robot"]
+    leader_device = next(device for device in profile["teleoperation"]["devices"] if device["type"] == "leader_arm")
+
+    nodes = _generate_device_nodes(profile, leader_device, {})
+    device_config = json.loads(nodes[0].parameters[0]["device_config"])
+
+    assert device_config["follower_calib_file"] == str(follower)
+
+
+@pytest.mark.parametrize(
+    "profile_name",
+    [
+        "lekiwi_navi_hardware_only",
+        "lekiwi_realsense_navigation",
+        "so101_rtp_distributed",
+        "so101_single_arm",
+        "so101_single_arm_rgbd",
+        "so101_dual_arm",
+    ],
+)
+def test_other_leader_arm_profiles_gain_no_follower_calib(profile_name, tmp_path, monkeypatch, fake_node):
+    """Zero spillover, asserted against the shipped profiles themselves."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    profile = yaml.safe_load((_PROFILE_DIR / f"{profile_name}.yaml").read_text(encoding="utf-8"))["robot"]
+    leader_devices = [device for device in profile["teleoperation"]["devices"] if device.get("type") == "leader_arm"]
+    assert leader_devices, f"{profile_name} is expected to declare a leader_arm device"
+
+    for device in leader_devices:
+        device["calib_file"] = str(_write_calib(tmp_path / f"{device['name']}.json"))
+        device_config = json.loads(_generate_device_nodes(profile, device, {})[0].parameters[0]["device_config"])
+        assert "follower_calib_file" not in device_config

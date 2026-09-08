@@ -34,6 +34,9 @@
 #   - Leader arm and gamepad on a separate workstation (the common case):
 #     leave it false here, keep this same file on both ends so the contract
 #     fingerprint matches, and start the teleop stack on the workstation.
+#     Note that `robot.launch.py` always brings up ros2_control outside
+#     simulation, so it cannot serve a teleoperation-only host: run the
+#     workstation's teleop_node directly instead of launching this file there.
 #
 # The teleoperation block is not part of the contract fingerprint, so the two
 # ends may legitimately disagree on it. Enabling it on a host that has no
@@ -453,7 +456,25 @@ robot:
         # runs a radian position controller. The follower calibration supplies
         # the physical stroke the percentage is mapped onto; without it the
         # command is executed as radians and the gripper only half closes.
-        follower_calib_file: "$(env HOME)/.calibrate/so101_follower_calibrate.json"
+        #
+        # Setting this reads that stroke from robot.ros2_control.calib_file
+        # above, which stays the single source of truth for the follower
+        # calibration. Re-calibrating the follower, or moving the file, is one
+        # edit there and this device follows automatically; the path is never
+        # repeated, so the two cannot drift apart and silently restore the
+        # half-closing gripper.
+        #
+        # The resolved file must exist on the host that runs teleoperation,
+        # because that host converts the percentage into radians. When the
+        # leader lives on an operator workstation, keep a copy of the follower
+        # calibration there too. A missing file fails the launch with the
+        # calibration command to run; it is never degraded silently.
+        #
+        # Configs whose ros2_control declares several calibration sources (the
+        # per-arm xacro_args.calib_file_<namespace> form) have no single file to
+        # derive from and must set follower_calib_file to an explicit path
+        # instead of this flag.
+        map_gripper_to_follower_stroke: true
 
       - name: "lekiwi_gamepad"
         type: "joy_teleop"

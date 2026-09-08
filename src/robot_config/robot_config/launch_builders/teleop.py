@@ -15,10 +15,18 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
-from robot_config.utils import prepare_lerobot_env, resolve_ros_path
+from robot_config.utils import (
+    prepare_lerobot_env,
+    resolve_calibration_source_specs_from_config,
+    resolve_ros_path,
+)
 from robot_teleop.teleop_groups import resolve_target_publish_groups
 
 logger = get_colored_logger("robot_config.teleop")
+
+# Opt-in flag that derives follower_calib_file from the ros2_control calibration
+# source, so the follower calibration path is configured in exactly one place.
+_MAP_GRIPPER_FLAG = "map_gripper_to_follower_stroke"
 
 
 def _shutdown_when_process_exits(node_name: str):
@@ -132,6 +140,81 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     return _generate_device_nodes(robot_config, device_config, robot_description_dict)
 
 
+def _resolve_follower_calib_file(robot_config: dict, device_config: dict, device_type: str) -> str | None:
+    """Resolve the follower calibration that maps the leader gripper into radians.
+
+    The leader reports its gripper as a 0~1 percentage while the follower runs a
+    radian position controller, so the follower's calibrated stroke is needed to
+    convert between them.  ``map_gripper_to_follower_stroke`` derives that file
+    from the single ``ros2_control`` calibration source, keeping the path in
+    exactly one place: re-calibrating the follower then needs no teleoperation
+    edit and cannot silently go out of sync.  An explicit ``follower_calib_file``
+    remains supported for layouts the derivation cannot express and is expanded
+    the same way.
+
+    Returns:
+        Resolved absolute path, or None when neither key is configured (the
+        device then keeps the legacy 0~1 gripper behavior).
+    """
+    derive = bool(device_config.get(_MAP_GRIPPER_FLAG, False))
+    explicit = str(device_config.get("follower_calib_file", "") or "").strip()
+    device_name = device_config.get("name", "")
+
+    if not derive and not explicit:
+        return None
+
+    if device_type != "leader_arm":
+        raise ConfigError(
+            f"Device '{device_name}': {_MAP_GRIPPER_FLAG}/follower_calib_file only apply to "
+            f"leader_arm devices, but this device is '{device_type}'"
+        )
+
+    if derive and explicit:
+        raise ConfigError(
+            f"Device '{device_name}': {_MAP_GRIPPER_FLAG} derives the follower calibration from "
+            "ros2_control, so it cannot be combined with an explicit follower_calib_file; "
+            "keep one of the two"
+        )
+
+    if derive:
+        try:
+            specs = resolve_calibration_source_specs_from_config(robot_config)
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(
+                f"Device '{device_name}': cannot derive the follower calibration from ros2_control: {exc}"
+            ) from exc
+        if len(specs) != 1:
+            namespaces = ", ".join(spec.namespace for spec in specs) or "(none)"
+            raise ConfigError(
+                f"Device '{device_name}': {_MAP_GRIPPER_FLAG} needs exactly one ros2_control "
+                f"calibration source, found: {namespaces}; set follower_calib_file explicitly instead"
+            )
+        resolved = specs[0].resolved_path
+    else:
+        resolved = resolve_ros_path(explicit)
+
+    # Mirror the calib_file pre-flight check: a missing file used to degrade
+    # silently to the 0~1 command, i.e. the half-closing gripper this mapping
+    # exists to fix. Fail at launch instead.
+    if not Path(resolved).exists():
+        logger.error("=" * 60)
+        logger.error("Follower calibration file not found!")
+        logger.error(f"  Resolved path: {resolved}")
+        logger.error(f"  Source:        {'ros2_control (derived)' if derive else 'follower_calib_file'}")
+        logger.error(f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}")
+        logger.error("")
+        logger.error("  Please run calibration first:")
+        follower_port = (robot_config.get("ros2_control", {}) or {}).get("port", "/dev/ttyACM0")
+        logger.error(f"    ros2 run so101_hardware calibrate_arm --arm follower --port {follower_port}")
+        logger.error("=" * 60)
+        raise RuntimeError(
+            f"Follower calibration file not found: {resolved}. "
+            f"Run: ros2 run so101_hardware calibrate_arm --arm follower --port {follower_port}"
+        )
+
+    return resolved
+
+
 def _generate_device_nodes(robot_config: dict, device_config: dict, robot_description_dict: dict = None) -> list[Node]:
     nodes = []
     teleop_config = robot_config.get("teleoperation", {})
@@ -188,6 +271,9 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
             logger.error("    " + calibration_command)
             logger.error("=" * 60)
             raise RuntimeError(f"Calibration file not found: {calib_file_expanded}. Run: {calibration_command}")
+    follower_calib_file = _resolve_follower_calib_file(robot_config, device_config, device_type)
+    if follower_calib_file:
+        device_param["follower_calib_file"] = follower_calib_file
     if "joint_mapping" in device_config:
         device_param["joint_mapping"] = device_config["joint_mapping"]
 
@@ -207,6 +293,10 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         "port",
         "lib_path",
         "calib_file",
+        # Handled above; leaving these out would let the passthrough loop below
+        # overwrite the resolved path with the raw, unexpanded config value.
+        "follower_calib_file",
+        _MAP_GRIPPER_FLAG,
         "joint_mapping",
         "phone_config",
         "group_name",
