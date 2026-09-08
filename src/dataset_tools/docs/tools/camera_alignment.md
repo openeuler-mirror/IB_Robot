@@ -58,6 +58,16 @@ colcon build --merge-install --symlink-install --packages-select dataset_tools
 - 开发容器中的 X11 转发
 - VNC / 远程桌面
 
+## 标定板打印件
+
+真机模式下需要 ArUco marker 作为对齐参考。仓库提供机械臂底座 ArUco marker
+打印件，可直接打印使用：
+
+- `docs/calibration_targets/机械臂底座marker0and1.pdf`：marker 0 和 1
+- `docs/calibration_targets/机械臂底座marker2and3.pdf`：marker 2 和 3
+
+工具使用 `DICT_4X4_50` 字典族的 ArUco 码。如果使用自制标定板，需确保字典一致。
+
 ## ROS 2 中的使用方式
 
 在 ROS 2 环境中直接读取本机视频设备：

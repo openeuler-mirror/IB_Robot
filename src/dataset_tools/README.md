@@ -404,11 +404,15 @@ ros2 run dataset_tools camera_alignment \
 - 真机路径的 `OpenCVFrameSource` 工作流保持兼容；ROS 2 依赖只会在仿真 topic 路径下触发。
 - markerless 模式只跳过 ArUco 误差计算，不影响真机模式的原有 reference JSON / image 行为。
 
+标定板打印件：真机模式需要 ArUco marker 作为对齐参考，仓库提供机械臂底座 ArUco
+marker 打印件（`docs/calibration_targets/机械臂底座marker0and1.pdf`、
+`docs/calibration_targets/机械臂底座marker2and3.pdf`），使用 `DICT_4X4_50` 字典族。
+
 详细说明见：
 
 - `docs/tools/camera_alignment.md`
 
-### 5. camera_isp_calibrator - 基于参考图的相机色彩对齐工具
+### 6. camera_isp_calibrator - 基于参考图的相机色彩对齐工具
 
 让一台 USB 摄像头（usb_cam 节点）的画面在曝光、白平衡、增益、对比度等
 方面尽可能接近一张参考图片，并把结果保存为 override JSON，下次启动
@@ -470,7 +474,7 @@ ros2 run dataset_tools camera_isp_calibrator \
 **保存生效**：保存后下次 `robot.launch.py` 启动时，`perception.py` 会自动
 读取 override 并覆盖 YAML 默认值；删除 JSON 即可回退。
 
-#### 5.1 统一 K/C/Sat 色彩搜索（实验性，独立模块）
+#### 6.1 统一 K/C/Sat 色彩搜索（实验性，独立模块）
 
 模块 `dataset_tools/camera_isp/color_search.py` 实现了统一 K/C/Sat 搜索路径，
 **与既有 4 阶段流水线（曝光/增益/亮度/锐度）并行存在，不修改任何曝光相关代码**。
@@ -503,7 +507,10 @@ from dataset_tools.camera_isp.color_search import (
 
 测试：`test/test_camera_isp_color_search.py`（16 个用例，覆盖 ΔE2000、聚类、匈牙利、settle、driver fallback、device caps 裁剪）。
 
-### 6. lerobot_action_gap_repair - 数据集 action 间隙修复工具
+cc24 色彩校准模式需要标准 24 色 ColorChecker 色卡作为参考。仓库提供打印件：
+`docs/calibration_targets/标准24色色卡.pdf`，直接打印即可使用。
+
+### 7. lerobot_action_gap_repair - 数据集 action 间隙修复工具
 
 用于分析 LeRobot 数据集中 action 各维度的值分布与非活跃间隙，并可将短间隙用相邻活跃值填充（桥接）。
 
