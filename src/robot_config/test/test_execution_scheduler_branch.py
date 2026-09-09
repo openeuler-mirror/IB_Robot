@@ -1,9 +1,12 @@
-"""Launch-graph branch tests for the scheduler.enable switch.
+"""Launch-graph branch tests for the scheduler.enable and executor.enabled switches.
 
 Asserts the false/absent branch produces the legacy `action_dispatcher_node` set
 byte-for-byte unchanged, and the true branch produces the scheduled topology
 (`pipeline_policy_node` + `global_inference_scheduler_node` +
 `scheduled_action_dispatcher_node`). The two dispatchers never coexist.
+
+Also asserts `executor.enabled: false` drops the dispatcher while keeping the
+pipeline node, which is what a recording-only deployment needs.
 """
 
 from __future__ import annotations
@@ -216,6 +219,50 @@ def test_scheduler_enable_false_produces_legacy_dispatcher_only(tmp_path: Path) 
 
     executables = [node.node_executable for node in nodes]
     assert executables == ["pipeline_policy_node", "action_dispatcher_node"]
+
+
+def test_executor_enabled_false_drops_the_dispatcher_but_keeps_the_pipeline(tmp_path: Path) -> None:
+    """A recording-only deployment streams video but must never request inference.
+
+    The cloud peer runs no inference backend, so a dispatched request can only
+    time out; that timeout invalidates the distributed session and the edge
+    stops sending video altogether. `executor.enabled: false` is how a config
+    declares "stream, do not dispatch" — the pipeline node must survive because
+    it owns the RTP sender.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    robot_config["control_modes"]["model_inference"]["executor"]["enabled"] = False
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node"]
+
+
+def test_executor_enabled_absent_keeps_the_dispatcher(tmp_path: Path) -> None:
+    """Absent means enabled: the switch must not change any existing config."""
+    bundle = _create_bundle(tmp_path / "bundle")
+    robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    assert "enabled" not in robot_config["control_modes"]["model_inference"]["executor"]
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
+
+
+def test_executor_disabled_with_scheduler_enabled_is_rejected(tmp_path: Path) -> None:
+    """The scheduled topology exists to feed a dispatcher, so the pair is incoherent.
+
+    Honouring the switch on only one branch is how a config silently means two
+    different things, so refuse the combination instead of ignoring it.
+    """
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    robot_config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, profile)
+    robot_config["control_modes"]["model_inference"]["executor"]["enabled"] = False
+
+    with pytest.raises(ValueError, match="executor.enabled"):
+        generate_execution_nodes(robot_config, "model_inference")
 
 
 def test_scheduler_enable_false_matches_absent_scheduler_launch_graph(tmp_path: Path) -> None:

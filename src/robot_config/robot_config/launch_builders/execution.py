@@ -609,6 +609,16 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
     )
 
 
+def _executor_enabled(robot_config: dict, control_mode: str) -> bool:
+    """Report whether this control mode wants an action dispatcher at all.
+
+    Absent means enabled, so every configuration written before this switch
+    existed keeps its current launch graph.
+    """
+    executor_config = robot_config.get("control_modes", {}).get(control_mode, {}).get("executor", {}) or {}
+    return parse_bool(executor_config.get("enabled", True), default=True)
+
+
 def generate_robot_evaluate_node(robot_config: dict, control_mode: str, use_sim: object = False) -> Node:
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
@@ -693,6 +703,12 @@ def generate_execution_nodes(
 
     # scheduler.enable=true selects the scheduled topology.
     if scheduler is not None and scheduler.enable:
+        if not _executor_enabled(robot_config, control_mode):
+            raise ValueError(
+                f"control mode {control_mode!r} sets executor.enabled=false with inference.scheduler.enable=true; "
+                "the scheduled topology exists to feed a dispatcher, so disable one or the other rather than "
+                "leaving the switch to mean two different things"
+            )
         inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
         scheduler_node = generate_global_inference_scheduler_node(
             robot_config, control_mode, scheduler, _resolve_use_sim_time(use_sim, use_sim_time)
@@ -733,6 +749,12 @@ def generate_execution_nodes(
 
     # False or absent selects the unchanged legacy behavior.
     inference_nodes = generate_inference_node(robot_config, control_mode, use_sim, use_sim_time, runtime_target)
+    if not _executor_enabled(robot_config, control_mode):
+        # A recording-only deployment streams video but has no inference backend
+        # to answer a request. Dispatching one anyway lets it time out, and the
+        # timeout invalidates the distributed session, which stops the RTP
+        # sender for good. The pipeline node stays because it owns that sender.
+        return list(inference_nodes)
     dispatcher = generate_action_dispatcher_node(
         robot_config,
         control_mode,
