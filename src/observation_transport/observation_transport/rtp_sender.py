@@ -20,6 +20,7 @@ from observation_transport.video_codec import EncodedPacket
 _RTP_VERSION = 2
 _RTP_HEADER = struct.Struct("!BBHII")
 _ANNEX_B_START = b"\x00\x00\x00\x01"
+_ANNEX_B_SHORT_START = b"\x00\x00\x01"
 
 
 class StreamLifecycleState(str, Enum):
@@ -191,17 +192,19 @@ def packetize_h264(
 
 
 def split_annex_b(payload: bytes) -> list[bytes]:
+    # Scan with bytes.find so the search runs in C. The sender splits every
+    # access unit inline on the encode worker, where a per-byte Python loop
+    # costs more than the H.264 encode itself on the edge board.
     starts: list[tuple[int, int]] = []
-    index = 0
-    while index <= len(payload) - 3:
-        if payload[index : index + 4] == _ANNEX_B_START:
-            starts.append((index, 4))
-            index += 4
-        elif payload[index : index + 3] == b"\x00\x00\x01":
-            starts.append((index, 3))
-            index += 3
+    index = payload.find(_ANNEX_B_SHORT_START)
+    while index != -1:
+        # A start code preceded by a zero byte is the four-byte form. Anchoring
+        # one byte earlier keeps the surplus zero out of the NAL body.
+        if index and payload[index - 1] == 0:
+            starts.append((index - 1, 4))
         else:
-            index += 1
+            starts.append((index, 3))
+        index = payload.find(_ANNEX_B_SHORT_START, index + 3)
     if not starts:
         return [payload] if payload else []
     return [

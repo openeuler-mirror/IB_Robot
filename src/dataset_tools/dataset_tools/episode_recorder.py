@@ -95,6 +95,7 @@ from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import RecordEpisode
 from robot_config.contract_utils import contract_fingerprint, qos_profile_from_dict
+from robot_config.observation_transport import effective_observation_transport
 from robot_config.utils import build_lerobot_conversion_metadata, resolve_calibration_source_specs_from_config
 
 # ------------------------------ Constants ------------------------------
@@ -219,6 +220,29 @@ class WriterState:
 def _normalize_max_cache_size(value: int) -> int:
     """Normalize rosbag cache size values so negative inputs disable caching."""
     return max(0, int(value))
+
+
+def _recordable_topics(contract: Any) -> list[tuple[str, str, dict]]:
+    """Derive the (topic, type, qos) list the recorder subscribes to.
+
+    Observations carried over RTP are left out. Their frames reach the
+    recorder as an H.264 elementary stream with a sidecar, so a DDS
+    subscription would only duplicate them -- and it is not free: a single
+    640x480 rgb8 sample is 921,600 bytes, and one cross-machine subscriber
+    fragmenting those over UDP drags the publisher from 30 Hz down to about
+    1.4 Hz for every reader, including the edge-local one that feeds the
+    encoder. Recording the raw topic therefore starves the very stream the
+    recording depends on, with no error on either side.
+    """
+    topics: list[tuple[str, str, dict]] = []
+    topics += [
+        (o.topic, o.type, o.qos or {})
+        for o in contract.observations or []
+        if effective_observation_transport(o.transport).mode != "rtp"
+    ]
+    topics += [(t.topic, t.type, t.qos or {}) for t in contract.tasks or []]
+    topics += [(a.publish_topic, a.type, a.publish_qos or {}) for a in contract.actions or []]
+    return topics
 
 
 def _topic_counter_diagnostics(
@@ -366,13 +390,7 @@ class EpisodeRecorderServer(Node):
         self._cbg = ReentrantCallbackGroup()
 
         # Derive unified topic list (topic, type, qos_dict) from contract sections.
-        obs = self._contract.observations or []
-        tks = self._contract.tasks or []
-        acts = self._contract.actions or []
-        self._topics: list[tuple[str, str, dict]] = []
-        self._topics += [(o.topic, o.type, o.qos or {}) for o in obs]
-        self._topics += [(t.topic, t.type, t.qos or {}) for t in tks]
-        self._topics += [(a.publish_topic, a.type, a.publish_qos or {}) for a in acts]
+        self._topics: list[tuple[str, str, dict]] = _recordable_topics(self._contract)
 
         # Subscriptions (created once; callbacks no-op unless recording)
         self._subs: list[Any] = []

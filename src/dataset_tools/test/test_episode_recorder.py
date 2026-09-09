@@ -12,10 +12,71 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from dataset_tools.episode_recorder import (  # noqa: E402
     _ensure_serialized_message,
     _normalize_max_cache_size,
+    _recordable_topics,
     _resolve_dataset_location,
     _topic_counter_diagnostics,
     _TopicCounter,
 )
+
+
+class _FakeSpec:
+    def __init__(self, topic, type_str, qos=None, transport=None, publish_topic=None, publish_qos=None):
+        self.topic = topic
+        self.type = type_str
+        self.qos = qos
+        self.transport = transport
+        self.publish_topic = publish_topic
+        self.publish_qos = publish_qos
+
+
+class _FakeContract:
+    def __init__(self, observations=None, tasks=None, actions=None):
+        self.observations = observations or []
+        self.tasks = tasks or []
+        self.actions = actions or []
+
+
+def test_recordable_topics_keeps_dds_observations_tasks_and_actions():
+    contract = _FakeContract(
+        observations=[_FakeSpec("/joint_states", "sensor_msgs/msg/JointState", {"depth": 5})],
+        tasks=[_FakeSpec("/task", "std_msgs/msg/String")],
+        actions=[_FakeSpec(None, "std_msgs/msg/Float64MultiArray", publish_topic="/arm/commands")],
+    )
+
+    assert _recordable_topics(contract) == [
+        ("/joint_states", "sensor_msgs/msg/JointState", {"depth": 5}),
+        ("/task", "std_msgs/msg/String", {}),
+        ("/arm/commands", "std_msgs/msg/Float64MultiArray", {}),
+    ]
+
+
+def test_recordable_topics_excludes_rtp_transported_observations():
+    from robot_config.observation_transport import ObservationTransportSpec
+
+    # An RTP observation's frames reach the recorder as an H.264 elementary
+    # stream with a sidecar. Subscribing to the raw image topic as well drags
+    # the publisher down to roughly 1.4 Hz on the edge board, starving the very
+    # stream the recording depends on.
+    contract = _FakeContract(
+        observations=[
+            _FakeSpec("/joint_states", "sensor_msgs/msg/JointState"),
+            _FakeSpec(
+                "/camera/front/image_raw",
+                "sensor_msgs/msg/Image",
+                transport=ObservationTransportSpec(mode="rtp", stream_id="front"),
+            ),
+        ]
+    )
+
+    assert [topic for topic, _, _ in _recordable_topics(contract)] == ["/joint_states"]
+
+
+def test_recordable_topics_treats_a_missing_transport_as_dds():
+    contract = _FakeContract(
+        observations=[_FakeSpec("/camera/front/image_raw", "sensor_msgs/msg/Image", transport=None)]
+    )
+
+    assert [topic for topic, _, _ in _recordable_topics(contract)] == ["/camera/front/image_raw"]
 
 
 def test_normalize_max_cache_size_clamps_negative_values():

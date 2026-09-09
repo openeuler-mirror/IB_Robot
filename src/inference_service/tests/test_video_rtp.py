@@ -96,6 +96,47 @@ def test_rtp_packet_round_trip_validates_fixed_header_and_identity():
         RtpPacket.from_bytes(bytes((0,)) + packet.to_bytes()[1:])
 
 
+def test_split_annex_b_returns_payload_unchanged_without_a_start_code():
+    assert split_annex_b(b"\x41no start code here") == [b"\x41no start code here"]
+    assert split_annex_b(b"") == []
+
+
+def test_split_annex_b_handles_three_and_four_byte_start_codes():
+    payload = b"\x00\x00\x01" + b"\x67abc" + b"\x00\x00\x00\x01" + b"\x65defg"
+
+    assert split_annex_b(payload) == [b"\x67abc", b"\x65defg"]
+
+
+def test_split_annex_b_treats_an_extra_leading_zero_as_a_four_byte_start_code():
+    # 00 00 00 00 01 must anchor at offset 1 so the surplus zero stays outside
+    # the NAL body, matching how H.264 Annex-B trailing_zero_8bits is emitted.
+    assert split_annex_b(b"\x00\x00\x00\x00\x01\x65payload") == [b"\x65payload"]
+
+
+def test_split_annex_b_discards_bytes_before_the_first_start_code():
+    assert split_annex_b(b"junk\x00\x00\x00\x01\x65body") == [b"\x65body"]
+
+
+def test_split_annex_b_skips_empty_nal_units_between_adjacent_start_codes():
+    payload = b"\x00\x00\x00\x01" + b"\x00\x00\x00\x01" + b"\x65body" + b"\x00\x00\x00\x01"
+
+    assert split_annex_b(payload) == [b"\x65body"]
+
+
+def test_split_annex_b_splits_a_megabyte_access_unit_without_per_byte_scanning():
+    # The sender splits every access unit inline on the encode worker, so a
+    # per-byte Python scan shows up directly as lost capture frame rate on the
+    # edge board. 1 MiB must stay far below one frame period at 30 FPS.
+    payload = b"".join(b"\x00\x00\x00\x01\x41" + bytes(4095) for _ in range(256))
+
+    start = time.perf_counter()
+    nal_units = split_annex_b(payload)
+    elapsed_s = time.perf_counter() - start
+
+    assert len(nal_units) == 256
+    assert elapsed_s < 0.020, f"split_annex_b took {elapsed_s * 1000:.1f} ms for {len(payload)} bytes"
+
+
 def test_h264_packetization_round_trip_handles_single_nal_and_fu_a():
     small = b"\x67" + b"s" * 8
     large = b"\x65" + bytes(range(256)) * 8
@@ -622,3 +663,44 @@ def _deliver(datagrams: list[bytes], receiver: H264RtpReceiver, *, start_receive
     for index, datagram in enumerate(datagrams):
         decoded.extend(receiver.process_datagram(datagram, receive_time_ns=start_receive_ns + index * 1_000_000))
     return decoded
+
+
+def test_recording_receiver_keeps_frame_index_monotonic_across_session_resets(tmp_path):
+    """A heartbeat flap re-handshakes the RTP session mid-episode.
+
+    frame_index belongs to the recording, not to the RTP session, so it must keep
+    counting across the reset. Restarting at 0 makes the whole episode unconvertible.
+    """
+    recorder = H264StreamRecorder(integrity_mode="tolerant")
+    receiver, _ = _receiver(recorder=recorder, decode=False)
+    receiver.start()
+    encoder = _encoder(gop_frames=1)
+    recorder.start_episode(tmp_path, "observation.images.top")
+
+    for generation in (1, 2, 3):
+        if generation > 1:
+            receiver.reset(generation)  # what a heartbeat expiry triggers
+        receiver.timestamp_mapper.update(
+            90_000 * generation,
+            1_000_000_000 * generation,
+            2_000_000_000 * generation,
+            session_generation=generation,
+        )
+        memory = _MemoryDatagramSender([])
+        sender = _sender(memory, queue_capacity=2)
+        capture_ns = 1_000_000_000 * generation
+        for packet in encoder.encode(
+            VideoFrame(np.zeros((48, 64, 3), dtype=np.uint8), capture_ns, capture_ns, 64, 48, "rgb24")
+        ):
+            sender.enqueue(packet)
+            sender.send_pending()
+        _deliver(memory.datagrams, receiver, start_receive_ns=2_000_000_000 * generation)
+        sender.close()
+
+    assert recorder.stop_episode() is True
+    sidecar = tmp_path / "observation.images.top.h264.json"
+    indices = [json.loads(line)["frame_index"] for line in sidecar.read_text().splitlines()]
+    assert len(indices) == 3
+    assert indices == list(range(len(indices)))
+    encoder.close()
+    receiver.close()

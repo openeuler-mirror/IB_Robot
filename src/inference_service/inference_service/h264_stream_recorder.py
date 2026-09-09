@@ -12,6 +12,8 @@ from pathlib import Path
 from threading import Lock
 from typing import Literal
 
+from robot_config.observation_transport import NON_FAULT_DROP_REASONS
+
 
 @dataclass(frozen=True, slots=True)
 class AccessUnitMetadata:
@@ -34,6 +36,9 @@ class H264StreamRecorder:
     """
 
     _ANNEX_B_START_CODE = b"\x00\x00\x00\x01"
+    # Annex-B permits a three-byte start code as well; only the four-byte form is
+    # written, but both count as "already prefixed" when inspecting a payload.
+    _ANNEX_B_SHORT_START_CODE = b"\x00\x00\x01"
 
     def __init__(self, *, integrity_mode: Literal["strict", "tolerant"] = "strict") -> None:
         """Initialize recorder with integrity policy.
@@ -60,6 +65,7 @@ class H264StreamRecorder:
         self._frame_count: int = 0
         self._invalid: bool = False
         self._initial_generation: int | None = None
+        self._waiting_for_keyframe: bool = True
         self._lost_packets = 0
         self._timestamp_mapping_failures = 0
         self._recording_generation = 0
@@ -85,6 +91,7 @@ class H264StreamRecorder:
             self._frame_count = 0
             self._invalid = False
             self._initial_generation = None
+            self._waiting_for_keyframe = True
             self._recording_generation += 1
             self._lost_packets = 0
             self._timestamp_mapping_failures = 0
@@ -147,8 +154,21 @@ class H264StreamRecorder:
             elif session_generation != self._initial_generation:
                 lost_packets = max(lost_packets, 1)  # Treat generation change as gap
 
-            # Detect integrity violations
-            has_gap = lost_packets > 0 or dropped is not None
+            if self._waiting_for_keyframe:
+                # An episode that opens mid-stream begins on P-frames that
+                # predict from access units it never recorded. Writing them
+                # would inflate the sidecar with entries no decoder can turn
+                # into frames, so hold every payload back until the first clean
+                # keyframe arrives.
+                if keyframe and dropped is None and payload:
+                    self._waiting_for_keyframe = False
+                else:
+                    payload = b""
+                    dropped = dropped or "pre_keyframe"
+
+            # Detect integrity violations. Waiting for the opening keyframe is
+            # normal stream entry rather than a transport fault.
+            has_gap = lost_packets > 0 or (dropped is not None and dropped not in NON_FAULT_DROP_REASONS)
             self._lost_packets += lost_packets
             if dropped == "timestamp_unmapped":
                 self._timestamp_mapping_failures += 1
@@ -161,7 +181,14 @@ class H264StreamRecorder:
 
             # Write Annex-B access unit (even if dropped, for frame count consistency)
             if not dropped and payload:
-                self._stream_handle.write(self._ANNEX_B_START_CODE)
+                # The depacketizer already emits Annex-B, so prefixing unconditionally
+                # would open every access unit with a zero-length NAL. Decoders skip
+                # those, but the stream is malformed and each frame wastes four bytes.
+                # Both Annex-B start-code forms count as already prefixed, so the guard
+                # matches what the format permits rather than what today's depacketizer
+                # happens to emit.
+                if not payload.startswith((self._ANNEX_B_START_CODE, self._ANNEX_B_SHORT_START_CODE)):
+                    self._stream_handle.write(self._ANNEX_B_START_CODE)
                 self._stream_handle.write(payload)
                 self._stream_handle.flush()
 

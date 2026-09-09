@@ -17,6 +17,13 @@ VIDEO_CODEC_BACKENDS = frozenset({"auto", "software", "ascend", "nvidia", "vaapi
 _PROFILES = {"baseline", "main", "high"}
 _COLOR_RANGES = {"limited", "full"}
 
+# ``dropped`` reasons that describe normal stream entry rather than a transport fault.
+# The recorder consults this when it computes ``has_gap``; the offline converter consults
+# it when it counts ``integrity.frame_gaps``. The two must classify a reason identically
+# -- when they disagree, a healthy episode is silently marked ``clean=false``, which is
+# why the set lives here rather than as a literal on either side.
+NON_FAULT_DROP_REASONS = frozenset({"pre_keyframe"})
+
 
 @dataclass(frozen=True, slots=True)
 class RtpEndpointSpec:

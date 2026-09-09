@@ -18,6 +18,7 @@ from typing import Any
 import av
 
 from dataset_tools.bag_to_lerobot import IntegrityReport, VideoFrameEntry, VideoInputAdapter
+from robot_config.observation_transport import NON_FAULT_DROP_REASONS
 
 
 class AnnexBInputAdapter(VideoInputAdapter):
@@ -200,6 +201,12 @@ class AnnexBInputAdapter(VideoInputAdapter):
         - lost_packets > 0  (RTP packet loss)
         - dropped != null   (timestamp mapping failure, frame not in bitstream)
 
+        ``pre_keyframe`` is excluded: it marks the access units held back before the
+        first clean keyframe, which is how a recording enters a running stream rather
+        than a transport fault. ``h264_stream_recorder`` makes the same exclusion when
+        it computes ``has_gap``; the two sides have to agree on a given ``dropped``
+        value or a normal episode is reported as unclean.
+
         Parameters
         ----------
         obs_key : str
@@ -216,11 +223,12 @@ class AnnexBInputAdapter(VideoInputAdapter):
         gaps = []
 
         for entry in self._sidecar_entries:
-            if entry.get("dropped") is not None:
+            dropped = entry.get("dropped")
+            if dropped is not None and dropped not in NON_FAULT_DROP_REASONS:
                 gaps.append(
                     {
                         "frame_index": entry["frame_index"],
-                        "reason": entry["dropped"],
+                        "reason": dropped,
                     }
                 )
             elif entry["lost_packets"] > 0:

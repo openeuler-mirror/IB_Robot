@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from inference_service.h264_stream_recorder import H264StreamRecorder
 
+from inference_service.observation_sync import ObservationSynchronizationError, RtpTimestampMapper
 from observation_transport.rtp_sender import (
     DatagramReceiver,
     DatagramSender,
@@ -28,8 +29,6 @@ from observation_transport.rtp_sender import (
     split_annex_b,
 )
 from observation_transport.video_codec import EncodedPacket, VideoCodecError, VideoDecoder, VideoFrame
-
-from inference_service.observation_sync import ObservationSynchronizationError, RtpTimestampMapper
 from robot_config.contract_utils import StreamBuffer
 
 _RTP_HEADER_SIZE = 12
@@ -362,7 +361,8 @@ class H264RtpReceiver:
             self.frame_buffer.reset()
             self.timestamp_mapper.reset(session_generation)
             self.session_generation = session_generation
-            self._frame_count = 0
+            # _frame_count is deliberately not reset here: it indexes the recording,
+            # not the RTP session. _record_access_unit() rezeroes it per episode.
             self._have_sps = False
             self._have_pps = False
             self._keyframe_ready = False

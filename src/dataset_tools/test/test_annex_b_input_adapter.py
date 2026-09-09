@@ -88,3 +88,45 @@ def test_rejects_missing_sidecar(tmp_path):
 
     with pytest.raises(FileNotFoundError, match="Sidecar not found"):
         AnnexBInputAdapter(stream_path)
+
+
+def test_pre_keyframe_entries_are_not_counted_as_frame_gaps(tmp_path):
+    """Waiting for the opening keyframe is normal stream entry, not a transport fault.
+
+    h264_stream_recorder treats it that way via the shared ``NON_FAULT_DROP_REASONS``;
+    the converter has to agree, or nearly every episode this pipeline records lands in
+    the dataset with ``integrity.clean == false``.
+    """
+    stream_path = _write_fixture(
+        tmp_path,
+        [
+            _entry(0, None, dropped="pre_keyframe"),
+            _entry(1, None, dropped="pre_keyframe"),
+            _entry(2, 3_000_000_000),
+            _entry(3, 4_000_000_000),
+            _entry(4, 5_000_000_000),
+        ],
+    )
+
+    report = AnnexBInputAdapter(stream_path).integrity_report("observation.images.top")
+
+    assert report.clean is True
+    assert report.frame_gaps is None
+
+
+def test_real_faults_are_still_counted_alongside_pre_keyframe(tmp_path):
+    """Excluding pre_keyframe must not mask a genuine drop or packet loss."""
+    stream_path = _write_fixture(
+        tmp_path,
+        [
+            _entry(0, None, dropped="pre_keyframe"),
+            _entry(1, 2_000_000_000, lost_packets=3),
+            _entry(2, None, dropped="timestamp_unmapped"),
+            _entry(3, 4_000_000_000),
+        ],
+    )
+
+    report = AnnexBInputAdapter(stream_path).integrity_report("observation.images.top")
+
+    assert report.clean is False
+    assert [gap["reason"] for gap in report.frame_gaps] == ["rtp_sequence_gap", "timestamp_unmapped"]
