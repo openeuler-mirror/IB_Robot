@@ -74,8 +74,10 @@ Notes
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import shutil
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -112,6 +114,7 @@ from robot_config.utils import (
     normalize_lerobot_norm_mode,
     resolve_calibration_source_specs_from_config,
     resolve_gripper_joints_from_config,
+    resolve_joint_names_from_config,
     resolve_lerobot_norm_mode,
 )
 
@@ -211,6 +214,18 @@ def _merge_integrity_report(
                 **gap,
             }
         )
+
+
+def _persist_custom_info(
+    info_path: Path,
+    custom_info: dict[str, Any],
+) -> None:
+    """Merge project-specific metadata into LeRobot's typed info output."""
+    with info_path.open("r", encoding="utf-8") as info_file:
+        serialized_info = json.load(info_file)
+    serialized_info.update(custom_info)
+    with info_path.open("w", encoding="utf-8") as info_file:
+        json.dump(serialized_info, info_file, indent=4, ensure_ascii=False)
 
 
 class VideoInputAdapter(Protocol):
@@ -355,6 +370,7 @@ def _resolve_fallback_conversion_config(robot_config_path: Path) -> dict[str, An
         "gripper_joints": resolve_gripper_joints_from_config(robot_config),
         "calibration_source_specs": calibration_source_specs,
         "calibration_file": calibration_file,
+        "joint_names": resolve_joint_names_from_config(robot_config),
     }
 
 
@@ -362,11 +378,67 @@ def _build_feature_conversion_table(
     feature_names: list[str],
     conversion_meta: dict[str, Any],
     fallback_config: dict[str, Any],
+    feature_kind: str = "",
 ) -> list[tuple[float, float, float, float]]:
-    """Build a per-feature conversion table in the feature's declared joint order."""
+    """Build a per-feature conversion table in the feature's declared order.
+
+    Hardware-only contracts use semantic feature names rather than calibration keys.
+    The suffix of ``position.<joint>`` / ``velocity.<joint>`` is the joint name itself,
+    and ``action.<i>`` indexes the arm joints in declared order, because the ``action``
+    feature is the concatenation of the arm, gripper and base specs. The authoritative
+    joint list comes from the contract, so no index range is assumed here: LeKiWi merely
+    happens to name its joints "1".."6".
+
+    Features with no calibration entry (base wheels, anything unknown) keep an identity
+    tuple so their native rad/s values pass through untouched.
+    """
     ordered_names = [str(name) for name in feature_names]
     if not ordered_names:
         return []
+
+    arm_joints = [
+        str(name) for name in (conversion_meta.get("joint_names") or fallback_config.get("joint_names") or [])
+    ]
+    arm_joint_set = set(arm_joints)
+
+    def conversion_names() -> list[str | None]:
+        resolved: list[str | None] = []
+        for name in ordered_names:
+            field, _, suffix = name.partition(".")
+            if field in ("position", "velocity"):
+                # Only a position maps onto calibration. `range_min`/`range_max` describe
+                # travel in ticks, so scaling a rad/s value by them is a dimensional error
+                # that still reads as plausible data. Velocity passes through whether it
+                # is a base wheel or an arm joint.
+                resolved.append(suffix if field == "position" and suffix in arm_joint_set else None)
+            elif feature_kind == "action" and field == "action" and suffix.isdigit():
+                index = int(suffix)
+                resolved.append(arm_joints[index] if index < len(arm_joints) else None)
+            else:
+                resolved.append(name)
+            # An identity tuple writes raw radians into a field declared as normalized
+            # units. That is intended for base values -- `velocity.*` and the action
+            # indices past the arm -- so warn only about a joint position that should
+            # have been calibrated and was not. Warning on the base wheels every run
+            # would just teach readers to ignore the message.
+            if resolved[-1] is None and field == "position":
+                print(f"[WARN] Feature {name!r} has no calibration mapping; values pass through unconverted")
+        return resolved
+
+    resolved_names = conversion_names()
+
+    def build_in_feature_order(build: Any) -> list[tuple[float, float, float, float]]:
+        """Apply ``build`` once to the mapped names, then restore the feature order.
+
+        Batching matters for the calibration-file paths: ``build_joint_conversion_table``
+        re-reads and re-parses the file on every call.
+        """
+        mapped = [name for name in resolved_names if name is not None]
+        mapped_table = list(build(mapped)) if mapped else []
+        if len(mapped_table) != len(mapped):
+            raise ValueError(f"Conversion table has {len(mapped_table)} rows for {len(mapped)} calibrated joints")
+        rows = iter(mapped_table)
+        return [(0.0, 1.0, 1.0, 0.0) if name is None else next(rows) for name in resolved_names]
 
     if conversion_meta:
         norm_mode = normalize_lerobot_norm_mode(str(conversion_meta.get("norm_mode", "")))
@@ -374,31 +446,37 @@ def _build_feature_conversion_table(
             return []
         calibration = conversion_meta.get("calibration")
         if isinstance(calibration, dict):
-            return build_joint_conversion_table_from_calibration(
-                calibration=calibration,
-                joint_names=ordered_names,
-                gripper_joints=conversion_meta.get("gripper_joints"),
-                norm_mode=norm_mode,
+            return build_in_feature_order(
+                lambda names: build_joint_conversion_table_from_calibration(
+                    calibration=calibration,
+                    joint_names=names,
+                    gripper_joints=conversion_meta.get("gripper_joints"),
+                    norm_mode=norm_mode,
+                )
             )
         raise ValueError("Dataset conversion metadata is missing calibration snapshot")
 
     calibration_source_specs = fallback_config.get("calibration_source_specs") or []
     if calibration_source_specs:
-        return build_joint_conversion_table(
-            calib_file=calibration_source_specs,
-            joint_names=ordered_names,
-            gripper_joints=fallback_config.get("gripper_joints"),
-            norm_mode=str(fallback_config.get("norm_mode", "")),
+        return build_in_feature_order(
+            lambda names: build_joint_conversion_table(
+                calib_file=calibration_source_specs,
+                joint_names=names,
+                gripper_joints=fallback_config.get("gripper_joints"),
+                norm_mode=str(fallback_config.get("norm_mode", "")),
+            )
         )
 
     calib_file = str(fallback_config.get("calibration_file", "") or "")
     if not calib_file:
         return []
-    return build_joint_conversion_table(
-        calib_file=calib_file,
-        joint_names=ordered_names,
-        gripper_joints=fallback_config.get("gripper_joints"),
-        norm_mode=str(fallback_config.get("norm_mode", "")),
+    return build_in_feature_order(
+        lambda names: build_joint_conversion_table(
+            calib_file=calib_file,
+            joint_names=names,
+            gripper_joints=fallback_config.get("gripper_joints"),
+            norm_mode=str(fallback_config.get("norm_mode", "")),
+        )
     )
 
 
@@ -439,6 +517,24 @@ def _clean_float_array(
             )
         arr[mask] = 0.0
     return arr
+
+
+def _image_to_hwc(
+    values: Any,
+    feature_shape: tuple[int, ...] | list[int],
+    *,
+    feature_name: str = "",
+) -> np.ndarray:
+    """Normalize decoded image arrays to the HWC layout expected by the writer."""
+    arr = np.asarray(values)
+    expected = tuple(int(dim) for dim in feature_shape)
+    if arr.shape == expected:
+        return np.ascontiguousarray(arr)
+    if len(expected) == 3 and arr.shape == (expected[2], expected[0], expected[1]):
+        return np.ascontiguousarray(np.transpose(arr, (1, 2, 0)))
+    label = f" for {feature_name}" if feature_name else ""
+    chw_shape = (expected[2], expected[0], expected[1])
+    raise ValueError(f"Image shape{label} must be HWC {expected} or CHW {chw_shape}, got {arr.shape}")
 
 
 def _dataset_feature_names_for_spec(spec: Any) -> list[str]:
@@ -809,6 +905,7 @@ def export_bags_to_lerobot(
             feature["info"]["video.is_depth_map"] = True
 
     # Dataset
+    out_root_existed = out_root.exists()
     ds = LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
@@ -821,12 +918,17 @@ def export_bags_to_lerobot(
         batch_encoding_size=1,
     )
 
-    # Persist the contract fingerprint into info.json so training can validate & propagate it
+    custom_info: dict[str, Any] = {}
+
+    # Persist the contract fingerprint into info.json so training can validate & propagate it.
+    # DatasetInfo is typed and intentionally rejects unknown fields, so project-specific
+    # metadata is merged into the serialized info.json after LeRobot writes its metadata.
     try:
         fp = contract_fingerprint(contract)
-        ds.meta.info["ibrobot_fingerprint"] = fp
+        custom_info["ibrobot_fingerprint"] = fp
     except Exception:
         pass  # non-fatal; downstream will just skip the check
+    custom_info["integrity"] = {"clean": True}
     ds.meta.update_chunk_settings(
         chunks_size=chunk_size,
         data_files_size_in_mb=data_mb,
@@ -848,6 +950,8 @@ def export_bags_to_lerobot(
     ] = {}
 
     # Episodes
+    converted_episodes = 0
+    skipped_bags: list[tuple[Path, str]] = []
     for epi_idx, bag_dir in enumerate(bag_dirs):
         print(f"[Episode {epi_idx}] {bag_dir}")
 
@@ -888,6 +992,7 @@ def export_bags_to_lerobot(
             for adapter in video_adapters.values():
                 adapter.close()
             print(f"⚠️  Skipping bag {bag_dir} due to error: {e}")
+            skipped_bags.append((bag_dir, str(e)))
             continue
 
         tmap = _topic_type_map(reader)
@@ -1013,6 +1118,7 @@ def export_bags_to_lerobot(
                         feature_names=state_feature_names,
                         conversion_meta=conversion_meta,
                         fallback_config=fallback_conversion_config,
+                        feature_kind="state",
                     )
                 except (FileNotFoundError, KeyError, ValueError) as exc:
                     print(f"[WARN] Failed to build observation.state conversion table for {bag_dir}: {exc}")
@@ -1028,6 +1134,7 @@ def export_bags_to_lerobot(
                         feature_names=feature_names,
                         conversion_meta=conversion_meta,
                         fallback_config=fallback_conversion_config,
+                        feature_kind="action",
                     )
                 except (FileNotFoundError, KeyError, ValueError) as exc:
                     print(f"[WARN] Failed to build {action_key} conversion table for {bag_dir}: {exc}")
@@ -1035,135 +1142,150 @@ def export_bags_to_lerobot(
             action_conversion_tables[action_key] = conversion_table_cache[cache_key]
 
         # Write frames
-        for i in range(n_ticks):
-            frame: dict[str, Any] = {}
+        try:
+            for i in range(n_ticks):
+                frame: dict[str, Any] = {}
 
-            # Handle consolidated observation.state by concatenating multiple state streams first
-            if "observation.state" in features and state_specs:
-                # Concatenate all observation.state values from different topics
-                state_values = []
-                for sv in state_specs:
-                    topic_suffix = sv.topic.replace("/", "_").lstrip("_")
-                    unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
-                    stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
-                    if stream_val is not None:
-                        val_array = _clean_float_array(stream_val, np.float32, feature_name="observation.state")
-                        state_values.append(val_array)
-
-                if state_values:
-                    # Concatenate all state values
-                    concatenated_state = np.concatenate(state_values)
-                    exp = int(features["observation.state"]["shape"][0])
-                    if concatenated_state.shape[0] != exp:
-                        fixed = np.zeros((exp,), dtype=np.float32)
-                        fixed[: min(exp, concatenated_state.shape[0])] = concatenated_state[
-                            : min(exp, concatenated_state.shape[0])
-                        ]
-                        concatenated_state = fixed
-                    if state_conversion_table:
-                        concatenated_state = _rad_to_lerobot(concatenated_state, state_conversion_table)
-                    frame["observation.state"] = concatenated_state
-                else:
-                    # Use zero padding if no state values available
-                    frame["observation.state"] = zero_pad_map["observation.state"]
-
-            # Handle consolidated action specs by concatenating multiple action streams
-            for action_key, action_specs in action_specs_by_key.items():
-                if action_key in features:
-                    # Concatenate all action values from different topics
-                    action_values = []
-                    for sv in action_specs:
+                # Handle consolidated observation.state by concatenating multiple state streams first
+                if "observation.state" in features and state_specs:
+                    # Concatenate all observation.state values from different topics
+                    state_values = []
+                    for sv in state_specs:
                         topic_suffix = sv.topic.replace("/", "_").lstrip("_")
                         unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
                         stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
                         if stream_val is not None:
-                            val_array = _clean_float_array(stream_val, np.float32, feature_name=action_key)
-                            action_values.append(val_array)
+                            val_array = _clean_float_array(stream_val, np.float32, feature_name="observation.state")
+                            state_values.append(val_array)
 
-                    if action_values:
-                        # Concatenate all action values
-                        concatenated_action = np.concatenate(action_values)
-
-                        # Pad or truncate to match feature shape if necessary
-                        exp = int(features[action_key]["shape"][0])
-                        if concatenated_action.shape[0] != exp:
+                    if state_values:
+                        # Concatenate all state values
+                        concatenated_state = np.concatenate(state_values)
+                        exp = int(features["observation.state"]["shape"][0])
+                        if concatenated_state.shape[0] != exp:
                             fixed = np.zeros((exp,), dtype=np.float32)
-                            fixed[: min(exp, concatenated_action.shape[0])] = concatenated_action[
-                                : min(exp, concatenated_action.shape[0])
+                            fixed[: min(exp, concatenated_state.shape[0])] = concatenated_state[
+                                : min(exp, concatenated_state.shape[0])
                             ]
-                            concatenated_action = fixed
-                        conversion_table = action_conversion_tables.get(action_key, [])
-                        if conversion_table:
-                            concatenated_action = _rad_to_lerobot(concatenated_action, conversion_table)
-
-                        frame[action_key] = concatenated_action
+                            concatenated_state = fixed
+                        if state_conversion_table:
+                            concatenated_state = _rad_to_lerobot(concatenated_state, state_conversion_table)
+                        frame["observation.state"] = concatenated_state
                     else:
-                        # Use zero padding if no action values available
-                        frame[action_key] = zero_pad_map[action_key]
+                        # Use zero padding if no state values available
+                        frame["observation.state"] = zero_pad_map["observation.state"]
 
-            # Process all other features
-            for name in write_keys:
-                # Skip observation.state as it's handled above
-                if name == "observation.state":
-                    continue
+                # Handle consolidated action specs by concatenating multiple action streams
+                for action_key, action_specs in action_specs_by_key.items():
+                    if action_key in features:
+                        # Concatenate all action values from different topics
+                        action_values = []
+                        for sv in action_specs:
+                            topic_suffix = sv.topic.replace("/", "_").lstrip("_")
+                            unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
+                            stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
+                            if stream_val is not None:
+                                val_array = _clean_float_array(stream_val, np.float32, feature_name=action_key)
+                                action_values.append(val_array)
 
-                # Skip actions as they're handled above
-                if name in action_specs_by_key:
-                    continue
-                ft = features[name]
-                dtype = ft["dtype"]
-                val = resampled.get(name, [None] * n_ticks)[i]
+                        if action_values:
+                            # Concatenate all action values
+                            concatenated_action = np.concatenate(action_values)
 
-                if val is None:
-                    frame[name] = zero_pad_map[name]
-                    continue
+                            # Pad or truncate to match feature shape if necessary
+                            exp = int(features[action_key]["shape"][0])
+                            if concatenated_action.shape[0] != exp:
+                                fixed = np.zeros((exp,), dtype=np.float32)
+                                fixed[: min(exp, concatenated_action.shape[0])] = concatenated_action[
+                                    : min(exp, concatenated_action.shape[0])
+                                ]
+                                concatenated_action = fixed
+                            conversion_table = action_conversion_tables.get(action_key, [])
+                            if conversion_table:
+                                concatenated_action = _rad_to_lerobot(concatenated_action, conversion_table)
 
-                if dtype in ("video", "image"):
-                    arr = np.asarray(val)
-                    # Ensure deterministic storage; lerobot loaders will map back to float [0,1]
-                    if arr.dtype != np.uint8:
-                        arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
-                    frame[name] = arr
+                            frame[action_key] = concatenated_action
+                        else:
+                            # Use zero padding if no action values available
+                            frame[action_key] = zero_pad_map[action_key]
 
-                elif dtype in ("float32", "float64"):
-                    tgt_dt = np.float32 if dtype == "float32" else np.float64
-                    arr = _clean_float_array(val, tgt_dt, feature_name=name)
-                    exp = int(ft["shape"][0])
-                    if arr.shape[0] != exp:
-                        fixed = np.zeros((exp,), dtype=tgt_dt)
-                        fixed[: min(exp, arr.shape[0])] = arr[: min(exp, arr.shape[0])]
-                        arr = fixed
-                    frame[name] = arr
+                # Process all other features
+                for name in write_keys:
+                    # Skip observation.state as it's handled above
+                    if name == "observation.state":
+                        continue
 
-                elif dtype == "string":
-                    frame[name] = str(val)
+                    # Skip actions as they're handled above
+                    if name in action_specs_by_key:
+                        continue
+                    ft = features[name]
+                    dtype = ft["dtype"]
+                    val = resampled.get(name, [None] * n_ticks)[i]
 
-                else:
-                    # Fallback – should not happen with current features
-                    frame[name] = val
+                    if val is None:
+                        frame[name] = zero_pad_map[name]
+                        continue
 
-            # Collect point cloud data into side-car buffers (not passed to ds.add_frame)
-            for pc_key in pc_keys:
-                pc_val = resampled.get(pc_key, [None] * n_ticks)[i]
-                buf = pc_buf[pc_key]
-                if pc_val is not None and isinstance(pc_val, dict):
-                    buf["xyz"].append(pc_val["xyz"])
-                    buf["rgb"].append(pc_val["rgb"])
-                else:
-                    buf["xyz"].append(np.zeros((0, 3), dtype=np.float32))
-                    buf["rgb"].append(np.zeros((0, 3), dtype=np.uint8))
-                buf["ts"].append(int(ticks_ns[i]))
+                    if dtype in ("video", "image"):
+                        arr = _image_to_hwc(val, ft["shape"], feature_name=name)
+                        # Ensure deterministic storage; lerobot loaders will map back to float [0,1]
+                        if arr.dtype != np.uint8:
+                            arr = np.clip(arr * 255.0, 0, 255).astype(np.uint8)
+                        frame[name] = arr
 
-            # Episode-level operator prompt from bag metadata (kept for policy compatibility).
-            # This is`` distinct from any per-frame task.* fields coming from ROS topics.
-            # LeRobot requires 'task' field in every frame, so always set it (empty string if no prompt).
-            frame["task"] = prompt if prompt else ""
-            ds.add_frame(frame)
+                    elif dtype in ("float32", "float64"):
+                        tgt_dt = np.float32 if dtype == "float32" else np.float64
+                        arr = _clean_float_array(val, tgt_dt, feature_name=name)
+                        exp = int(ft["shape"][0])
+                        if arr.shape[0] != exp:
+                            fixed = np.zeros((exp,), dtype=tgt_dt)
+                            fixed[: min(exp, arr.shape[0])] = arr[: min(exp, arr.shape[0])]
+                            arr = fixed
+                        frame[name] = arr
 
-        output_episode_index = int(ds.meta.info["total_episodes"])
+                    elif dtype == "string":
+                        frame[name] = str(val)
+
+                    else:
+                        # Fallback – should not happen with current features
+                        frame[name] = val
+
+                # Collect point cloud data into side-car buffers (not passed to ds.add_frame)
+                for pc_key in pc_keys:
+                    pc_val = resampled.get(pc_key, [None] * n_ticks)[i]
+                    buf = pc_buf[pc_key]
+                    if pc_val is not None and isinstance(pc_val, dict):
+                        buf["xyz"].append(pc_val["xyz"])
+                        buf["rgb"].append(pc_val["rgb"])
+                    else:
+                        buf["xyz"].append(np.zeros((0, 3), dtype=np.float32))
+                        buf["rgb"].append(np.zeros((0, 3), dtype=np.uint8))
+                    buf["ts"].append(int(ticks_ns[i]))
+
+                # Episode-level operator prompt from bag metadata (kept for policy compatibility).
+                # This is`` distinct from any per-frame task.* fields coming from ROS topics.
+                # LeRobot requires 'task' field in every frame, so always set it (empty string if no prompt).
+                frame["task"] = prompt if prompt else ""
+                ds.add_frame(frame)
+        except ValueError as exc:
+            # Reader-layer failures above already drop a bag and carry on; a decode
+            # failure here has to do the same or one bad frame aborts a run that has
+            # already written good episodes. The half-filled buffer must go with it,
+            # otherwise the next bag inherits this episode's frames.
+            print(f"⚠️  Skipping bag {bag_dir} due to error: {exc}")
+            skipped_bags.append((bag_dir, str(exc)))
+            ds.clear_episode_buffer()
+            continue
+
+        output_episode_index = int(ds.meta.info.get("total_episodes", 0))
         for obs_key, report in integrity_reports.items():
-            _merge_integrity_report(ds.meta.info, output_episode_index, obs_key, report)
+            _merge_integrity_report(custom_info, output_episode_index, obs_key, report)
         ds.save_episode()
+        converted_episodes += 1
+        # save_episode() ends in LeRobot's write_info, so info.json is already on disk;
+        # merge the project-specific fields into it by rewriting the file. Mutating
+        # ds.meta.info here would not reach disk -- nothing writes it again afterwards.
+        _persist_custom_info(ds.meta.root / "meta" / "info.json", custom_info)
         expected_duration_s = n_ticks / fps if fps > 0 else 0
         print(
             f"  → saved {n_ticks} frames @ {int(round(fps))} FPS "
@@ -1236,7 +1358,25 @@ def export_bags_to_lerobot(
             )
         )
 
+    # A run that converted nothing must fail loudly. Skipped bags are only warned
+    # about inside the loop, so without this an all-failed run would still print
+    # "[OK]" over an empty dataset and exit 0.
+    if converted_episodes == 0:
+        details = "; ".join(f"{bag_dir}: {reason}" for bag_dir, reason in skipped_bags) or "no bags were provided"
+        # Drop the skeleton LeRobotDataset.create() laid down, but only when this run
+        # created it — an out_root the caller already had is never ours to delete.
+        if not out_root_existed and out_root.exists():
+            shutil.rmtree(out_root, ignore_errors=True)
+        raise RuntimeError(
+            f"Converted 0 of {len(bag_dirs)} bag(s); no episode was written to {out_root}. Causes: {details}"
+        )
+
     print(f"\n[OK] Dataset root: {ds.root.resolve()}")
+    print(f"  - converted {converted_episodes}/{len(bag_dirs)} bags")
+    if skipped_bags:
+        print(f"⚠️  Skipped {len(skipped_bags)} of {len(bag_dirs)} bag(s):")
+        for bag_dir, reason in skipped_bags:
+            print(f"    - {bag_dir}: {reason}")
     if use_videos:
         print("  - videos/<image_key>/chunk-*/file-*.mp4")
     else:
