@@ -84,59 +84,53 @@ def main() -> None:
     rclpy.init()
     node = Node("perception_verify")
     results = {}
-    try:
-        cli = node.create_client(EncodeEmbeddings, "/perception/siglip2/encode_embeddings")
-        stamp = node.get_clock().now().to_msg()
-        req = EncodeEmbeddings.Request()
-        req.image = make_image(node, stamp)
-        req.masks = [make_mask(node, stamp)]
-        req.candidate_labels = ["red object", "background"]
-        r = call(node, cli, req, args.siglip2_timeout)
-        results["siglip2"] = (
-            info(r, f" embeddings={len(r.results)} dims={[e.embedding_dim for e in r.results]}")
-            if not isinstance(r, str)
-            else r
-        )
 
-        cli = node.create_client(RecognizeTags, "/perception/ram_plus/recognize_tags")
-        req = RecognizeTags.Request()
+    cli = node.create_client(EncodeEmbeddings, "/perception/siglip2/encode_embeddings")
+    stamp = node.get_clock().now().to_msg()
+    req = EncodeEmbeddings.Request()
+    req.image = make_image(node, stamp)
+    req.masks = [make_mask(node, stamp)]
+    req.candidate_labels = ["red object", "background"]
+    r = call(node, cli, req, args.siglip2_timeout)
+    results["siglip2"] = (
+        info(r, f" embeddings={len(r.results)} dims={[e.embedding_dim for e in r.results]}")
+        if not isinstance(r, str)
+        else r
+    )
+
+    cli = node.create_client(RecognizeTags, "/perception/ram_plus/recognize_tags")
+    req = RecognizeTags.Request()
+    req.image = make_image(node, node.get_clock().now().to_msg())
+    req.score_threshold = 0.5
+    r = call(node, cli, req, args.ram_timeout)
+    results["ram_plus"] = info(r, f" tags={len(r.tags)}") if not isinstance(r, str) else r
+
+    cli = node.create_client(GenerateMasks, "/perception/sam2/generate_masks")
+    req = GenerateMasks.Request()
+    req.image = make_image(node, node.get_clock().now().to_msg())
+    req.max_masks = 5
+    r = call(node, cli, req, args.sam2_timeout)
+    results["sam2"] = info(r, f" masks={len(r.detections.detections)}") if not isinstance(r, str) else r
+
+    if args.include_grounding:
+        cli = node.create_client(GroundingDetect, "/perception/grounding_dino/detect")
+        req = GroundingDetect.Request()
         req.image = make_image(node, node.get_clock().now().to_msg())
-        req.score_threshold = 0.5
-        r = call(node, cli, req, args.ram_timeout)
-        results["ram_plus"] = info(r, f" tags={len(r.tags)}") if not isinstance(r, str) else r
+        req.text_prompt = "banana . red object ."
+        req.box_threshold = 0.3
+        r = call(node, cli, req, args.grounding_timeout)
+        if isinstance(r, str):
+            results["grounding_dino"] = r
+        else:
+            dets = r.detections.detections
+            boxes = [f"{d.label}:{d.confidence:.2f}@{[round(v, 1) for v in d.bbox]}" for d in dets]
+            results["grounding_dino"] = info(r, f" boxes={len(dets)} {boxes[:4]}")
 
-        cli = node.create_client(GenerateMasks, "/perception/sam2/generate_masks")
-        req = GenerateMasks.Request()
-        req.image = make_image(node, node.get_clock().now().to_msg())
-        req.max_masks = 5
-        r = call(node, cli, req, args.sam2_timeout)
-        results["sam2"] = info(r, f" masks={len(r.detections.detections)}") if not isinstance(r, str) else r
-
-        if args.include_grounding:
-            cli = node.create_client(GroundingDetect, "/perception/grounding_dino/detect")
-            req = GroundingDetect.Request()
-            req.image = make_image(node, node.get_clock().now().to_msg())
-            req.text_prompt = "banana . red object ."
-            req.box_threshold = 0.3
-            r = call(node, cli, req, args.grounding_timeout)
-            if isinstance(r, str):
-                results["grounding_dino"] = r
-            else:
-                dets = r.detections.detections
-                boxes = [f"{d.label}:{d.confidence:.2f}@{[round(v, 3) for v in d.bbox]}" for d in dets]
-                results["grounding_dino"] = info(r, f" boxes={len(dets)} {boxes[:4]}")
-    finally:
-        for k, v in results.items():
-            print(f"[{k}] {v}")
-        node.destroy_node()
-        rclpy.shutdown()
+    for k, v in results.items():
+        print(f"[{k}] {v}")
+    node.destroy_node()
+    rclpy.shutdown()
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:  # keep partial results visible on parse errors
-        import traceback
-
-        traceback.print_exc()
-        raise SystemExit(f"caller failed: {exc}") from exc
+    main()

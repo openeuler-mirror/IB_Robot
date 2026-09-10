@@ -6,9 +6,9 @@
 # Launch and verification MUST stay in the same shell invocation: background
 # processes are killed when the invoking session/call ends.
 #
-# Usage: run_perception_services.sh <robot.yaml> <ros_domain_id> <logfile> [timeout_s] [extra caller args...]
+# Usage: run_perception_services.sh <robot.yaml> <ros_domain_id> <logfile> [timeout_s]
 set -e
-YAML="$1"; DOMAIN="$2"; LOG="$3"; TIMEOUT="${4:-600}"; shift 4 2>/dev/null || shift $#
+YAML="$1"; DOMAIN="$2"; LOG="$3"; TIMEOUT="${4:-600}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)"
 source .shrc_local >/dev/null 2>&1
@@ -43,5 +43,5 @@ done
 echo "LAUNCH_STATE=$STATE ELAPSED=$(( $(date +%s) - START ))s"
 if [[ "$STATE" == "SERVICES_READY" ]]; then
   sleep 5  # let sessions finish loading after registration
-  python3 "$SCRIPT_DIR/call_perception_services.py" "$@"
+  python3 "$SCRIPT_DIR/call_perception_services.py"
 fi

@@ -79,6 +79,18 @@ test -f libs/lerobot/src/lerobot/__init__.py
 git -C libs/lerobot rev-parse --is-inside-work-tree
 
 source "$MAIN_REPO/venv/bin/activate"
+# ros2 CLI entry points use a hardcoded `#!/usr/bin/python3` shebang, so they
+# run under the SYSTEM python regardless of venv activation. The main repo's
+# .shrc_local exposes its venv site-packages to that system python via
+# PYTHONPATH; the worktree's .shrc_local instead points at the worktree's own
+# (nonexistent) venv path, which drops the shared venv's packages. Prepend the
+# shared venv site-packages explicitly, or `ros2 launch` fails with e.g.
+# `ImportError: cannot import name 'model_validator' from 'pydantic'
+# (/usr/lib/python3/dist-packages/pydantic/__init__.py)` and similar
+# venv-only-symbol errors before the launch file even loads.
+_PY_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
+export PYTHONPATH="$MAIN_REPO/venv/lib/${_PY_VER}/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+unset _PY_VER
 source "$WORKTREE/.shrc_local"
 ```
 
@@ -166,6 +178,18 @@ for source, value in path_entries:
             problems.append(f"{source} contains other checkout path: {path}")
             break
 
+# ros2 CLI entry points use a hardcoded system-python shebang; they only see
+# venv-provided packages when PYTHONPATH exposes the active venv site-packages.
+# In the shared-venv flow the worktree's .shrc_local cannot do this (it points
+# at the worktree's own nonexistent venv path), so the caller must prepend it.
+venv_site = shared_venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+pythonpath_entries = [resolve_path(v) for v in os.environ.get("PYTHONPATH", "").split(os.pathsep) if v]
+if resolve_path(os.environ.get("VIRTUAL_ENV", "")) == shared_venv and venv_site not in pythonpath_entries:
+    problems.append(
+        "PYTHONPATH does not expose the shared venv site-packages, so ros2 CLI "
+        f"(system python shebang) cannot import venv packages: add {venv_site}"
+    )
+
 if problems:
     raise SystemExit("Unsafe mixed worktree environment:\n  - " + "\n  - ".join(problems))
 
@@ -191,6 +215,13 @@ This workaround is a **manual stopgap**, not a full solution. Be aware of:
 - **Editable source leakage**: an absolute editable-install `.pth` in the shared venv may expose the main repo's source. The verification snippet rejects this; use a dedicated worktree venv instead of relying on import order.
 - **Local venv takeover**: once a worktree has its own `venv/bin/activate`, its `.shrc_local` switches to the local venv. The shared-venv flow therefore refuses to start when `venv/` already exists.
 - **Absolute paths in pre-commit / entry scripts**: `.git/hooks/pre-commit` and similar entry scripts may contain absolute paths captured at venv-creation time. Usually fine as long as the main repo is not moved on disk; breaks if the main repo is relocated.
+- **Empty install/ in fresh worktrees**: a fresh shared-venv worktree has no build
+  artifacts. `build.sh --packages-up-to <pkg>` covers only that package's
+  dependency closure — NOT the full launch graph. A `ros2 launch robot_config
+  robot.launch.py` stack additionally needs e.g. `hardware_mock` (mock platform)
+  and `so101_hardware` (URDF `$(find ...)` references); build them explicitly
+  (`--packages-up-to hardware_mock --packages-up-to so101_hardware`) or expect
+  `package '<name>' not found` at launch time.
 
 ## Decision Flowchart
 
