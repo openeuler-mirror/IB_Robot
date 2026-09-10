@@ -74,8 +74,8 @@ robot:
     controller_switch_service: controller_manager/switch_controller
     manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
     navigation_controllers: [base_velocity_controller]
-    transition_timeout_s: 2.0
-    bridge_heartbeat_timeout_s: 1.0
+    transition_timeout_s: 5.0
+    bridge_heartbeat_timeout_s: 5.0
     manipulation_control_mode: moveit_planning
     navigation_control_mode: base_navigation
 
