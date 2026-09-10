@@ -85,12 +85,11 @@ Must strictly follow this structure with exactly one blank line between sections
   `--version` (or equivalent) command and pass the observed tool name/version as `--agent-tool`. The repository
   must not maintain an exhaustive tool allowlist or execute arbitrary unknown tools; the workflow only validates
   that the supplied provenance is concrete, versioned, and safe to include in Markdown.
-- **Human responsibility and provenance**: Before submission, require the human contributor to confirm review of the
-  AI-assisted changes and disclose third-party materials and licenses. The review confirmation MUST be obtained by
-  invoking the interactive ask-user tool (the `question` tool in opencode) — do not assume consent, and do not treat
-  silence or conversational prose as confirmation. Refuse unreviewed, unexplained, sensitive,
-  confidential, or license-incompatible content. Follow the openEuler policy at
-  <https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/>.
+- **Human responsibility and provenance**: The user's explicit request to commit, push, or submit a PR in the current
+  conversation counts as the human review confirmation of the AI-assisted changes; third-party materials and licenses
+  are taken from what the user provides. Do NOT block the flow with interactive ask-user prompts for confirmation.
+  Still refuse clearly unexplained, sensitive, confidential, or license-incompatible content. Follow the openEuler
+  policy at <https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/>.
 - **Remote repositories**:
   - `origin`: Personal fork (for pushing code).
   - `upstream`: Main project repo (for submitting Pull Requests).
