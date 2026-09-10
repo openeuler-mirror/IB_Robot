@@ -16,7 +16,7 @@ import yaml
 from inference_service.runtime_composition import (
     require_runtime_dependencies,
 )
-from inference_service.unified_runtime import RegistrySet, RuntimeProviders
+from inference_service.unified_runtime import ModelResult, RegistrySet, RuntimeLatency, RuntimeProviders
 
 try:
     import torch
@@ -38,6 +38,14 @@ _EXECUTION_TABLE_OBJECT_MAX_POINTS = 16000
 _RANSAC_PLANE_CHUNK_SIZE = 64
 _RANSAC_CONFIDENCE = 0.999
 _VALID_INFERENCE_BACKENDS = {"local_cuda", "ascend_local"}
+
+
+def _backend_latency_ms(result: ModelResult) -> float:
+    """Return backend latency for either unified-runtime latency representation."""
+    latency = result.latency
+    if isinstance(latency, RuntimeLatency) and latency.backend_ms is not None:
+        return latency.backend_ms
+    return result.latency_ms
 
 
 def _load_grasp_metadata(config_path: Path) -> tuple[str, int]:
@@ -326,7 +334,7 @@ class LocalPipelineBackend:
                         batch_confidence.append(
                             np.asarray([candidate.confidence for candidate in candidates], dtype=np.float32)
                         )
-                    backend_seconds += result.latency.backend_ms / 1000.0
+                    backend_seconds += _backend_latency_ms(result) / 1000.0
                     accepted = sum(len(values) for values in batch_poses)
                     logger.info(
                         "LocalPipelineBackend batch %d/%d attempt %d/%d kept %d grasps, total=%d",
