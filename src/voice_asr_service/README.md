@@ -44,11 +44,15 @@ YAML 的模型相对路径以 models 目录为根，不再包含额外的 `model
 ros2 launch voice_asr_service speech_direction.launch.py profile:=ubuntu_cuda
 ```
 
-profile 只允许覆盖 `silero_vad_backend`、`silero_vad_deployment`、`fullsubnet_backend`、`fullsubnet_deployment` 四个平台字段；写入公共算法字段会被 launch 拒绝。`ascend_310p` 与 `ubuntu_cuda` 还会被校验后端组合一致性，launch 还会用 manifest 校验 deployment 的 backend 与声明的平台后端一致，避免后端与 deployment 错配的半切换配置。仅 `ascend` 后端会在节点环境注入 CANN 库路径，`ubuntu_cuda` 不注入无关环境。
+profile 只允许覆盖 `silero_vad_backend`、`silero_vad_deployment`、`fullsubnet_backend`、`fullsubnet_deployment` 四个平台字段；写入公共算法字段会被 launch 拒绝。`ascend_310p` 与 `ubuntu_cuda` 还会被校验后端组合一致性，launch 还会用 manifest 校验 deployment 的 backend 与声明的平台后端一致，避免后端与 deployment 错配的半切换配置。仅 `ascend` 后端会在节点环境注入 CANN 库路径，`ubuntu_cuda` 不注入无关环境。`ascend_310b` 仅作为 FullSubNet bundle 的额外 deployment 供 `custom` profile 显式选择，不是当前默认 profile。
+
+FullSubNet bundle 额外提供 `ascend_310b` deployment，可通过 `custom` profile 和显式 `fullsubnet_deployment:=ascend_310b` 使用；当前仓库的默认 `ascend_310p` launch profile 仍指向 310P 组合。
+
+> 命名说明：deployment 名中的 `torch_` 前缀沿袭独立 bundle 的宿主运行时命名惯例（如 silero-vad bundle），表示运行在宿主 CPU/CUDA 上的 deployment。sherpa ASR 与 Silero `torch_cpu` deployment 的 manifest backend 实际为 `onnx`（由 ONNX Runtime 执行），launch 与节点的后端校验始终以 manifest backend 为准，而不是 deployment 名。
 
 ### 模型资产下载
 
-Ubuntu 依赖（Silero ONNX、FullSubNet cumulative checkpoint）通过 `./scripts/download_speech_direction_models.sh` 显式预取，分别落入 `models/silero-vad/assets/` 与 `models/fullsubnet/assets/`；310P OM 资产需从 NAS/HuggingFace 手动获取后放入对应 bundle 的 `artifacts/ascend/` 目录。执行 `python3 scripts/verify_speech_direction_assets.py` 会遍历 `models/silero-vad` 与 `models/fullsubnet` 两个独立 bundle 的全部 deployment（`ascend_310p`/`torch_cpu`/`torch_cuda`），先用 `load_inference_manifest_metadata` 校验 bundle 结构与 bindings，再逐资产校验文件存在性与 SHA-256。脚本只校验不下载；缺失的资产会打印来源提示并跳过，已存在的资产校验不通过则报错。FullSubNet 两平台共用同一 cumulative 218epochs checkpoint 权重：310P 预导出为 FB/SB 拆分 OM，Ubuntu 由 Torch 直接加载同一 checkpoint。
+推荐统一预取入口：`source .shrc_local && python3 scripts/download_models.py --models fullsubnet --deployment torch_cuda`（Silero 用 `--models silero-vad`），从 HuggingFace `openEuler/fullsubnet`、`openEuler/silero-vad` 下载已发布的 schema-v3 完整 bundle（含 manifest、adapter、全部平台 artifacts 含 310B），落盘 `models/fullsubnet`、`models/silero-vad` 并可直接通过 `load_inference_manifest` 校验。离线手工流程：Ubuntu 依赖（Silero ONNX、FullSubNet cumulative checkpoint）可通过 `./scripts/download_speech_direction_models.sh` 预取，分别落入 `models/silero-vad/assets/` 与 `models/fullsubnet/assets/`，再用打包器生成 manifest；310P OM 资产需从 NAS 手动获取后放入对应 bundle 的 `artifacts/ascend/` 目录，310B OM 由本地导出流程生成后放入 `artifacts/ascend_310b/`。执行 `python3 scripts/verify_speech_direction_assets.py` 会遍历 `models/silero-vad` 与 `models/fullsubnet` 两个独立 bundle 的全部 deployment（`ascend_310p`/`ascend_310b`/`torch_cpu`/`torch_cuda`），先用 `load_inference_manifest_metadata` 校验 bundle 结构与 bindings，再逐资产校验文件存在性与 SHA-256。脚本只校验不下载；缺失的资产会打印来源提示并跳过，已存在的资产校验不通过则报错。FullSubNet 三个平台共用同一 cumulative 218epochs checkpoint 权重：310P/310B 预导出为 FB/SB 拆分 OM，Ubuntu 由 Torch 直接加载同一 checkpoint。
 
 ### 配置所有权
 
@@ -62,8 +66,8 @@ Ubuntu 依赖（Silero ONNX、FullSubNet cumulative checkpoint）通过 `./scrip
 | 阵列 | `angle_step_degree` | `5`，SRP-PHAT 扫描角度步长（度），DOA 输出只能为该步长的整数倍；必须为 360 的正整数约数。详见下方[SRP 角度精度](#srp-角度精度) |
 | 阵列 | `mic_positions` | 四麦二维坐标的一维展开数组，长度必须为通道数的两倍 |
 | 模型 | `speech_direction_inference_bundle` | FullSubNet 独立 bundle 目录（`models/fullsubnet`），相对 `models/` |
-| 模型 | `fullsubnet_deployment` | FullSubNet deployment 名；`ascend_310p`（310P 拆分 OM）或 `torch_cpu`/`torch_cuda`（Torch checkpoint） |
-| 模型 | `fullsubnet_backend` | `ascend`（310P 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda`，必须与 deployment 的 manifest backend 一致 |
+| 模型 | `fullsubnet_deployment` | FullSubNet deployment 名；`ascend_310p` / `ascend_310b`（310P/310B 拆分 OM）或 `torch_cpu`/`torch_cuda`（Torch checkpoint） |
+| 模型 | `fullsubnet_backend` | `ascend`（310P/310B 拆分 OM）；Ubuntu profile 覆盖为 `stateful_torch_cuda`，必须与 deployment 的 manifest backend 一致 |
 | 模型 | `silero_vad_inference_bundle` | Silero VAD 独立 bundle 目录（`models/silero-vad`），相对 `models/` |
 | 模型 | `silero_vad_deployment` | Silero deployment 名；`ascend_310p`（OM）或 `torch_cpu`（ONNX） |
 | 模型 | `silero_vad_backend` | `ascend`（310P OM）；Ubuntu profile 覆盖为 `onnx`，必须与 deployment 的 manifest backend 一致 |
@@ -341,10 +345,11 @@ python3 -m voice_asr_service.package_sherpa_asr_bundle \
 打包器会同时生成 `torch_cpu` 与 `torch_cuda` 两个 deployment（`--skip-cuda` 可只保留 CPU），
 并对每个 deployment 执行 `load_inference_manifest()` 自校验。
 
-Silero VAD 与 FullSubNet 的 Ubuntu 依赖由 `./scripts/download_speech_direction_models.sh`
-下载并重新打包对应独立 bundle；部署完整性用 `python3 scripts/verify_speech_direction_assets.py`
-校验。气隙环境可先在有网机器执行上述步骤，再把 `models/silero-vad`、`models/fullsubnet`
-与 ASR bundle 目录整体拷贝到目标机器。
+Silero VAD 与 FullSubNet 优先用统一入口 `python3 scripts/download_models.py --models silero-vad,fullsubnet`
+下载已发布 bundle（HF `openEuler` org，含全部 deployment 与音频契约）；气隙环境可先在有网机器执行后把
+`models/silero-vad`、`models/fullsubnet` 与 ASR bundle 目录整体拷贝到目标机器。离线手工制作路径
+（`download_speech_direction_models.sh` + 打包器）仅服务原始资产制作。部署完整性统一用
+`python3 scripts/verify_speech_direction_assets.py` 校验。
 
 ### 从旧版 raw 模型目录迁移
 

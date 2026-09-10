@@ -10,6 +10,8 @@ Deployments:
 
 - ``ascend_310p``: the fixed-ABI 310P OM (sample rate folded to a constant;
   audio + LSTM state in, probability + state out, stream contract).
+- ``ascend_310b``: the same fixed-ABI OM recompiled for Ascend310B1 from the
+  sr-folded no-If graph (fp16; see docs/silero_vad_310b_deployment.md).
 - ``torch_cpu``: the host CPU deployment name retained for configuration
   compatibility; its actual backend is ONNX Runtime and it carries the v6
   ONNX artifact and recurrent state ABI.
@@ -55,6 +57,8 @@ BUNDLE_NAME = "silero-vad"
 DEFAULT_ONNX_REL = "assets/silero_vad.onnx"
 DEFAULT_OM_REL = "artifacts/ascend/ascend_310p/silero_vad_v6_310p_mixed16.om"
 DEFAULT_OM_SOURCE_REL = "silero-vad/artifacts/ascend/ascend_310p/silero_vad_v6_310p_mixed16.om"
+DEFAULT_OM_310B_REL = "artifacts/ascend_310b/silero_vad_v6_310b_fp16.om"
+DEFAULT_OM_310B_SOURCE_REL = "silero-vad/artifacts/ascend_310b/silero_vad_v6_310b_fp16.om"
 DEFAULT_ONNX_SOURCE_REL = "silero-vad/assets/silero_vad.onnx"
 _ADAPTER_ASSET = "assets/adapter.json"
 
@@ -139,17 +143,17 @@ def _model_descriptor() -> ModelDescriptor:
     )
 
 
-def _ascend_deployment(om_path: Path) -> CompiledDeployment:
+def _ascend_deployment(om_path: Path, *, rel: str, soc: str, runtime_abi: str) -> CompiledDeployment:
     return CompiledDeployment(
         execution_contract=_stream_contract(),
         runtime_profile=RoleRuntimeProfile(
             backend="ascend",
-            target=DeploymentTarget(runtime="acl", runtime_abi="cann-8.1.RC1", soc="Ascend310P1"),
+            target=DeploymentTarget(runtime="acl", runtime_abi=runtime_abi, soc=soc),
             profile=AscendRuntimeProfile(device_id=0),
         ),
         artifacts={
             SILERO_EXECUTION_ROLE: DeploymentArtifact(
-                path=DEFAULT_OM_REL,
+                path=rel,
                 format="om",
                 sha256=_sha256(om_path),
             )
@@ -214,12 +218,44 @@ def _resolve_source(explicit: Path | None, workspace: Path, relative: str) -> Pa
     return candidate if candidate.is_file() else None
 
 
+def _deployment_revision(existing: dict | None, name: str, deployment: CompiledDeployment) -> tuple[str, int]:
+    """Keep one deployment's identity stable across repackaging runs."""
+    previous = None
+    if existing is not None:
+        raw = existing.get("deployments", {}).get(name)
+        if isinstance(raw, dict):
+            previous = raw
+    if previous is None:
+        return str(uuid4()), 1
+    uuid = str(previous.get("uuid") or uuid4())
+    revision = int(previous.get("revision", 1))
+    candidate = json.loads(
+        json.dumps(
+            deployment.model_dump(
+                mode="json", exclude_none=True, exclude_defaults=True, exclude={"uuid": True, "revision": True}
+            )
+        )
+    )
+
+    # Compare every declared field, normalizing null and empty containers so the
+    # writer's null-vs-empty serialization drift does not look like a change.
+    def _normalized(value: object) -> object:
+        if value is None or value == [] or value == {}:
+            return None
+        return value
+
+    if any(_normalized(previous.get(key)) != _normalized(value) for key, value in candidate.items()):
+        revision += 1
+    return uuid, revision
+
+
 def package_silero_vad_bundle(
     bundle_root: Path,
     *,
     workspace: Path | None = None,
     onnx_source: Path | None = None,
     om_source: Path | None = None,
+    om_310b_source: Path | None = None,
     include_ascend: bool = True,
 ) -> Path:
     """Create or refresh the standalone Silero VAD bundle under ``bundle_root``."""
@@ -237,10 +273,14 @@ def package_silero_vad_bundle(
     onnx_path = _materialize(bundle_root, onnx, DEFAULT_ONNX_REL)
 
     om_path: Path | None = None
+    om_310b_path: Path | None = None
     if include_ascend:
         om = _resolve_source(om_source, root, DEFAULT_OM_SOURCE_REL)
         if om is not None:
             om_path = _materialize(bundle_root, om, DEFAULT_OM_REL)
+        om_310b = _resolve_source(om_310b_source, root, DEFAULT_OM_310B_SOURCE_REL)
+        if om_310b is not None:
+            om_310b_path = _materialize(bundle_root, om_310b, DEFAULT_OM_310B_REL)
 
     adapter_path = bundle_root / _ADAPTER_ASSET
     adapter_path.parent.mkdir(parents=True, exist_ok=True)
@@ -269,18 +309,28 @@ def package_silero_vad_bundle(
     manifest_path = bundle_root / "inference_manifest.json"
     existing = None
     if manifest_path.is_file():
-        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-        existing = load_inference_manifest(bundle_root, next(iter(raw["deployments"]))).manifest
+        existing = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     files = (BundleFile(path=_ADAPTER_ASSET),)
-    bundle_uuid = existing.bundle.uuid if existing is not None else str(uuid4())
-    previous_revision = existing.bundle.revision if existing is not None else 0
-    changed = existing is not None and existing.bundle.files != files
+    previous_bundle = existing.get("bundle", {}) if isinstance(existing, dict) else {}
+    bundle_uuid = str(previous_bundle.get("uuid") or uuid4())
+    previous_revision = int(previous_bundle.get("revision", 0)) if previous_bundle else 0
+    changed = isinstance(existing, dict) and previous_bundle.get("files") != [{"path": entry.path} for entry in files]
     bundle_revision = previous_revision + int(changed) if existing is not None else 1
 
-    deployments: dict[str, object] = {"torch_cpu": _onnx_deployment(onnx_path)}
+    deployments_raw: dict[str, CompiledDeployment] = {"torch_cpu": _onnx_deployment(onnx_path)}
     if om_path is not None:
-        deployments["ascend_310p"] = _ascend_deployment(om_path)
+        deployments_raw["ascend_310p"] = _ascend_deployment(
+            om_path, rel=DEFAULT_OM_REL, soc="Ascend310P1", runtime_abi="cann-8.1.RC1"
+        )
+    if om_310b_path is not None:
+        deployments_raw["ascend_310b"] = _ascend_deployment(
+            om_310b_path, rel=DEFAULT_OM_310B_REL, soc="Ascend310B1", runtime_abi="cann-8.3.RC1"
+        )
+    deployments: dict[str, object] = {}
+    for name, deployment in deployments_raw.items():
+        uuid, revision = _deployment_revision(existing, name, deployment)
+        deployments[name] = deployment.model_copy(update={"uuid": uuid, "revision": revision})
 
     manifest = InferenceManifest(
         schema_version=3,
@@ -309,7 +359,8 @@ def main() -> int:
     parser.add_argument("--bundle-root", type=Path, required=True)
     parser.add_argument("--workspace", type=Path, default=None, help="Workspace root used to resolve default sources")
     parser.add_argument("--onnx-source", type=Path, default=None)
-    parser.add_argument("--om-source", type=Path, default=None)
+    parser.add_argument("--om-source", type=Path, default=None, help="310P OM source")
+    parser.add_argument("--om-310b-source", type=Path, default=None, help="310B OM source")
     parser.add_argument("--skip-ascend", action="store_true", help="Package the Torch deployment only")
     args = parser.parse_args()
     print(
@@ -318,6 +369,7 @@ def main() -> int:
             workspace=args.workspace,
             onnx_source=args.onnx_source,
             om_source=args.om_source,
+            om_310b_source=args.om_310b_source,
             include_ascend=not args.skip_ascend,
         )
     )

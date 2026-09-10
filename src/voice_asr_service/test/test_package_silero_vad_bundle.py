@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from voice_asr_service.package_silero_vad_bundle import (
+    DEFAULT_OM_310B_REL,
     DEFAULT_OM_REL,
     DEFAULT_ONNX_REL,
     package_silero_vad_bundle,
@@ -24,8 +25,10 @@ def _write_model(path: Path, payload: bytes) -> None:
 def workspace(tmp_path: Path) -> Path:
     onnx = tmp_path / "models" / "silero-vad" / "assets" / "silero_vad.onnx"
     om = tmp_path / "models" / "silero-vad" / "artifacts" / "ascend" / "ascend_310p" / "silero_vad_v6_310p_mixed16.om"
+    om_310b = tmp_path / "models" / "silero-vad" / "artifacts" / "ascend_310b" / "silero_vad_v6_310b_fp16.om"
     _write_model(onnx, b"fake-v6-onnx-bytes")
     _write_model(om, b"fake-310p-om-bytes")
+    _write_model(om_310b, b"fake-310b-om-bytes")
     return tmp_path
 
 
@@ -38,7 +41,7 @@ def test_bundle_contains_both_deployments(tmp_path: Path, workspace: Path) -> No
     assert manifest["schema_version"] == 3
     assert manifest["model"]["model_type"] == "silero_vad"
     assert manifest["model"]["operation"] == "vad"
-    assert set(manifest["deployments"]) == {"ascend_310p", "torch_cpu"}
+    assert set(manifest["deployments"]) == {"ascend_310p", "ascend_310b", "torch_cpu"}
 
     onnx = manifest["deployments"]["torch_cpu"]
     assert onnx["runtime_profile"]["backend"] == "onnx"
@@ -62,8 +65,19 @@ def test_bundle_contains_both_deployments(tmp_path: Path, workspace: Path) -> No
     assert ascend["execution_contract"]["stateful"] is True
     assert "host.silero.sample_rate" not in {item["semantic"] for item in ascend["bindings"]["silero_vad"]["inputs"]}
 
+    ascend_310b = manifest["deployments"]["ascend_310b"]
+    artifact_310b = ascend_310b["artifacts"]["silero_vad"]
+    assert artifact_310b["path"] == DEFAULT_OM_310B_REL
+    assert artifact_310b["sha256"] == hashlib.sha256(b"fake-310b-om-bytes").hexdigest()
+    target_310b = ascend_310b["runtime_profile"]["target"]
+    assert target_310b["soc"] == "Ascend310B1"
+    assert target_310b["runtime_abi"] == "cann-8.3.RC1"
+    assert ascend_310b["bindings"]["silero_vad"]["inputs"] == ascend["bindings"]["silero_vad"]["inputs"]
+    assert ascend_310b["audio_contract"] == ascend["audio_contract"]
+
     assert (bundle_root / DEFAULT_ONNX_REL).read_bytes() == b"fake-v6-onnx-bytes"
     assert (bundle_root / DEFAULT_OM_REL).read_bytes() == b"fake-310p-om-bytes"
+    assert (bundle_root / DEFAULT_OM_310B_REL).read_bytes() == b"fake-310b-om-bytes"
     files = {entry["path"] for entry in manifest["bundle"]["files"]}
     assert DEFAULT_ONNX_REL not in files
     assert "assets/adapter.json" in files
@@ -79,6 +93,7 @@ def test_bundle_without_ascend_source(tmp_path: Path) -> None:
     manifest = json.loads((bundle_root / "inference_manifest.json").read_text(encoding="utf-8"))
     assert set(manifest["deployments"]) == {"torch_cpu"}
     assert not (bundle_root / DEFAULT_OM_REL).exists()
+    assert not (bundle_root / DEFAULT_OM_310B_REL).exists()
 
 
 def test_missing_onnx_raises(tmp_path: Path) -> None:

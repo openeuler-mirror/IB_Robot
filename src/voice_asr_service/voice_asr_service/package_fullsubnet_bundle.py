@@ -5,13 +5,19 @@ deployments. Artifact roles per deployment:
 
 - ``ascend_310p``: ``fullsubnet_fb``/``fullsubnet_sb`` fixed-ABI OMs plus the
   auxiliary ``state_manifest`` cumulative contract.
+- ``ascend_310b``: same fixed-ABI OM pair recompiled for Ascend310B1 (fused
+  ONNX LSTM maps to a slow 310B1 kernel, so these OMs come from the
+  statically unrolled LSTM export; ``origin`` precision keeps the recurrent
+  state update in fp32 — see docs/fullsubnet_310b_deployment.md).
 - ``torch_cpu``/``torch_cuda``: the shared cumulative checkpoint is mapped to
   the ``fullsubnet_fb`` role and the cumulative contract manifest to the
   ``fullsubnet_sb`` role; FB/SB recurrent state stays inside the Torch
   executor and is declared only through state links.
 
-Run after ``scripts/download_speech_direction_models.sh`` populated
-``assets/`` and the 310P OM artifacts are present.
+Run after ``scripts/download_speech_direction_models.sh`` populated ``assets/``.
+Ascend OM pairs are optional: each pair that is present locally gets its
+deployment, and without any OM the bundle degrades to the torch deployments
+(mirroring ``package_silero_vad_bundle``).
 """
 
 from __future__ import annotations
@@ -51,6 +57,8 @@ _CHECKPOINT_ASSET = "assets/cum_fullsubnet_best_model_218epochs.tar"
 _STATE_CONTRACT_ASSET = "assets/cum_fullsubnet_best_model_218epochs.manifest.json"
 _FB_OM_REL = "artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
 _SB_OM_REL = "artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
+_FB_OM_310B_REL = "artifacts/ascend_310b/fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_310b_origin.om"
+_SB_OM_310B_REL = "artifacts/ascend_310b/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_310b_origin.om"
 
 _STATE_SUFFIXES = ("_hidden_in", "_hidden_out", "_cell_in", "_cell_out", ".state_in", ".state_out")
 
@@ -160,6 +168,27 @@ def _ascend_deployment(root: Path) -> CompiledDeployment:
     )
 
 
+def _ascend_310b_deployment(root: Path) -> CompiledDeployment:
+    return CompiledDeployment(
+        execution_contract=_execution_contract(),
+        runtime_profile=RoleRuntimeProfile(
+            backend="ascend",
+            target=DeploymentTarget(runtime="acl", runtime_abi="cann-8.3.RC1", soc="Ascend310B1"),
+            profile=AscendRuntimeProfile(device_id=0),
+        ),
+        artifacts={
+            "fullsubnet_fb": _artifact(_FB_OM_310B_REL, "om", _sha256(root / _FB_OM_310B_REL)),
+            "fullsubnet_sb": _artifact(_SB_OM_310B_REL, "om", _sha256(root / _SB_OM_310B_REL)),
+            "state_manifest": _artifact(_STATE_CONTRACT_ASSET, "json", _sha256(root / _STATE_CONTRACT_ASSET)),
+        },
+        execution=("fullsubnet_fb", "fullsubnet_sb"),
+        bindings={
+            "fullsubnet_fb": speech_direction_bindings("fullsubnet_fb"),
+            "fullsubnet_sb": speech_direction_bindings("fullsubnet_sb"),
+        },
+    )
+
+
 def _torch_deployment(root: Path, device: str) -> CompiledDeployment:
     return CompiledDeployment(
         execution_contract=_execution_contract(),
@@ -221,21 +250,41 @@ def package_fullsubnet_bundle(bundle_root: Path) -> Path:
     """Regenerate the FullSubNet bundle manifest from local bundle assets."""
 
     root = bundle_root.resolve()
-    required = (_ADAPTER_ASSET, _CHECKPOINT_ASSET, _STATE_CONTRACT_ASSET, _FB_OM_REL, _SB_OM_REL)
+    # Torch assets are always required; each Ascend OM pair is optional so an
+    # Ubuntu host can regenerate the torch deployments without NAS-fetched OMs.
+    # A partially present OM pair is an error rather than a silent skip.
+    required = (_ADAPTER_ASSET, _CHECKPOINT_ASSET, _STATE_CONTRACT_ASSET)
     missing = [str(root / rel) for rel in required if not (root / rel).is_file()]
     if missing:
         raise FileNotFoundError(
             "FullSubNet bundle assets are missing:\n  "
             + "\n  ".join(missing)
-            + "\nRun scripts/download_speech_direction_models.sh and fetch the 310P OM artifacts first."
+            + "\nRun scripts/download_speech_direction_models.sh first."
+        )
+    om_pairs = (
+        ("ascend_310p", (_FB_OM_REL, _SB_OM_REL)),
+        ("ascend_310b", (_FB_OM_310B_REL, _SB_OM_310B_REL)),
+    )
+    present = {name: all((root / rel).is_file() for rel in rels) for name, rels in om_pairs}
+    partial = {
+        name: [rel for rel in rels if not (root / rel).is_file()]
+        for name, rels in om_pairs
+        if not present[name] and any((root / rel).is_file() for rel in rels)
+    }
+    if partial:
+        details = "\n  ".join(f"{name}: missing {', '.join(rels)}" for name, rels in partial.items())
+        raise FileNotFoundError(
+            "FullSubNet Ascend OM pair is incomplete; fetch the full pair or remove both files:\n  " + details
         )
 
     existing = _existing_raw(root)
-    deployments_raw = {
-        "ascend_310p": _ascend_deployment(root),
-        "torch_cpu": _torch_deployment(root, "cpu"),
-        "torch_cuda": _torch_deployment(root, "cuda"),
-    }
+    deployments_raw: dict[str, CompiledDeployment] = {}
+    if present["ascend_310p"]:
+        deployments_raw["ascend_310p"] = _ascend_deployment(root)
+    if present["ascend_310b"]:
+        deployments_raw["ascend_310b"] = _ascend_310b_deployment(root)
+    deployments_raw["torch_cpu"] = _torch_deployment(root, "cpu")
+    deployments_raw["torch_cuda"] = _torch_deployment(root, "cuda")
     deployments: dict[str, CompiledDeployment] = {}
     for name, deployment in deployments_raw.items():
         uuid, revision = _deployment_revision(existing, name, deployment)

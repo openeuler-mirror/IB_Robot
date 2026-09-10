@@ -38,11 +38,14 @@ def _silero_bundle(tmp_path: Path, *, include_ascend: bool = False) -> Path:
     onnx.write_bytes(b"fake-silero-onnx")
     om = tmp_path / "silero.om"
     om.write_bytes(b"fake-silero-om")
+    om_310b = tmp_path / "silero_310b.om"
+    om_310b.write_bytes(b"fake-silero-310b-om")
     bundle = tmp_path / "silero-vad"
     package_silero_vad_bundle(
         bundle,
         onnx_source=onnx,
         om_source=om if include_ascend else None,
+        om_310b_source=om_310b if include_ascend else None,
         include_ascend=include_ascend,
     )
     return bundle
@@ -122,6 +125,10 @@ def _fullsubnet_bundle(tmp_path: Path) -> Path:
     fb.mkdir(parents=True)
     (fb / "fullsubnet_cum_stateful_fb_b4_t2_fp16.om").write_bytes(b"fb-om")
     (fb / "fullsubnet_cum_stateful_sb_b4_t2_fp16.om").write_bytes(b"sb-om")
+    fb310b = bundle / "artifacts" / "ascend_310b" / "fullsubnet"
+    fb310b.mkdir(parents=True)
+    (fb310b / "fullsubnet_cum_stateful_fb_b4_t2_310b_origin.om").write_bytes(b"fb-om-310b")
+    (fb310b / "fullsubnet_cum_stateful_sb_b4_t2_310b_origin.om").write_bytes(b"sb-om-310b")
     package_fullsubnet_bundle(bundle)
     return bundle
 

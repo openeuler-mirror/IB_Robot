@@ -85,7 +85,7 @@ Not every PR needs all tiers. Use the table below to pick tiers.
 |--------------|----------------|
 | `model_sessions/`, `unified_runtime/`, `pipeline/` | 1, 2, 3 |
 | `perception_service/`, `model_service_plugins.py` | 1, 2, 4 |
-| `voice_tts_service/`, `voice_asr_service/` | 1, 2 |
+| `voice_tts_service/`, `voice_asr_service/` | 1, 2, 4b |
 | `manipulation_service/` | 1, 2 |
 | `backends/`, `runtime_composition.py` | 1, 2, 3 |
 | LeRobot patch stack | 1, 3, 5 |

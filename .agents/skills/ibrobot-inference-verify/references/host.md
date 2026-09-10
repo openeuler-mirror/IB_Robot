@@ -135,7 +135,7 @@ runner scripts.
 # 1. prefetch the speech bundles (Ubuntu assets land in models/silero-vad
 #    and models/fullsubnet; Ascend OM pairs come from NAS / the 310B export
 #    flow and are optional on host):
-./scripts/download_speech_direction_models.sh
+python3 scripts/download_models.py --models silero-vad,fullsubnet
 python3 scripts/verify_speech_direction_assets.py
 
 # 2. real-speech test wav (synthetic audio FAILS Silero VAD):

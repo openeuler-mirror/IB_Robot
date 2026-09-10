@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -116,7 +117,7 @@ def test_silero_engine_reuses_runner_and_adds_context(tmp_path) -> None:
     model_path = tmp_path / "silero.om"
     model_path.write_bytes(b"mock-om")
     runner = _VadRunner()
-    engine = SileroVadEngine(str(model_path), acl_runner=runner)
+    engine = SileroVadEngine(str(model_path), inference_runner=runner)
 
     assert engine.inference(np.zeros(512, dtype=np.float32)) == pytest.approx(0.5)
     assert runner.inputs[0].shape == (1, 576)
@@ -158,15 +159,79 @@ def test_silero_inference_uses_standalone_session_execution() -> None:
     assert [call[0] for call in session.execute_role_calls] == ["silero_vad"]
 
 
+def _silero_context(*, declares_sample_rate: bool):
+    inputs = [
+        SimpleNamespace(semantic="host.silero.audio"),
+        SimpleNamespace(semantic="host.silero.state_in"),
+    ]
+    if declares_sample_rate:
+        inputs.append(SimpleNamespace(semantic="host.silero.sample_rate"))
+    bindings = SimpleNamespace(inputs=inputs)
+    deployment = SimpleNamespace(
+        bindings={"silero_vad": bindings},
+        audio_contract=SimpleNamespace(sample_rate_hz=16000),
+    )
+    return SimpleNamespace(deployment=deployment)
+
+
+def test_silero_inference_passes_declared_sample_rate_input() -> None:
+    session = _Session()
+    runner = SpeechDirectionRoleRunner(session, context=_silero_context(declares_sample_rate=True))
+
+    runner.infer(np.zeros((1, 576), dtype=np.float32))
+
+    role, values, _request, _context = session.execute_role_calls[-1]
+    assert role == "silero_vad"
+    assert values["host.silero.audio"].shape == (1, 576)
+    assert values["host.silero.sample_rate"] == 16000
+
+
+def test_silero_inference_omits_sample_rate_when_not_declared() -> None:
+    session = _Session()
+    runner = SpeechDirectionRoleRunner(session, context=_silero_context(declares_sample_rate=False))
+
+    runner.infer(np.zeros((1, 576), dtype=np.float32))
+
+    role, values, _request, _context = session.execute_role_calls[-1]
+    assert role == "silero_vad"
+    # Ascend OM deployments fold the sample rate into the graph; the stateful
+    # session rejects unexpected semantics, so the runner must not send it.
+    assert "host.silero.sample_rate" not in values
+
+
+def _local_speech_manifest_ready(bundle_rel: str, deployment_name: str) -> bool:
+    manifest_path = _WORKSPACE_SRC.parent / "models" / bundle_rel / "inference_manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        deployments = json.loads(manifest_path.read_text(encoding="utf-8")).get("deployments", {})
+    except (OSError, ValueError):
+        return False
+    return deployment_name in deployments
+
+
+@pytest.mark.skipif(
+    not all(
+        _local_speech_manifest_ready(bundle_rel, deployment_name)
+        for bundle_rel, deployment_name in (
+            ("fullsubnet", "ascend_310p"),
+            ("fullsubnet", "ascend_310b"),
+            ("silero-vad", "ascend_310p"),
+        )
+    ),
+    reason="local speech-direction bundles are not present (run the packagers or download script)",
+)
 @pytest.mark.parametrize(
-    "bundle_rel,deployment_name,role",
+    "bundle_rel,deployment_name,role,runtime_abi",
     [
-        ("fullsubnet", "ascend_310p", "fullsubnet_fb"),
-        ("silero-vad", "ascend_310p", "model"),
+        ("fullsubnet", "ascend_310p", "fullsubnet_fb", "cann-8.1.RC1"),
+        ("fullsubnet", "ascend_310b", "fullsubnet_fb", "cann-8.3.RC1"),
+        ("silero-vad", "ascend_310p", "model", "cann-8.1.RC1"),
+        ("silero-vad", "ascend_310b", "model", "cann-8.3.RC1"),
     ],
 )
-def test_checked_in_speech_manifest_selects_generic_stateful_session(
-    tmp_path, bundle_rel, deployment_name, role
+def test_local_speech_manifest_selects_generic_stateful_session(
+    tmp_path, bundle_rel, deployment_name, role, runtime_abi
 ) -> None:
     config_root = _WORKSPACE_SRC.parent / "models" / bundle_rel
     manifest = json.loads((config_root / "inference_manifest.json").read_text(encoding="utf-8"))
@@ -188,7 +253,7 @@ def test_checked_in_speech_manifest_selects_generic_stateful_session(
 
     context = RuntimeContext(load_inference_manifest(tmp_path, deployment_name), {"device_id": 0}, role=role)
     assert context.target_runtime == "acl"
-    assert context.runtime_abi == "cann-8.1.RC1"
+    assert context.runtime_abi == runtime_abi
     dependencies = build_runtime_dependencies(
         lambda session_registry, _assembler_registry: register_speech_direction_session_builder(session_registry)
     )

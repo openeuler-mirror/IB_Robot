@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -29,14 +30,16 @@ for _root in (_INFERENCE_MANIFEST_ROOT,):
 
 from inference_manifest import load_inference_manifest_metadata  # noqa: E402
 
-# 独立 bundle 与各自支持的 deployment：与各 bundle 的 inference_manifest.json
-# deployments 字典 key 对齐（models/silero-vad 与 models/fullsubnet）。
-_BUNDLES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("silero-vad", ("ascend_310p", "torch_cpu")),
-    ("fullsubnet", ("ascend_310p", "torch_cpu", "torch_cuda")),
-)
+# 独立 bundle 名单。每个 bundle 支持哪些 deployment 以其 inference_manifest.json
+# 的 deployments 字典为唯一事实来源（SSOT）：新 deployment 自动纳入校验，
+# 无需在本脚本维护平行清单。
+_BUNDLES: tuple[str, ...] = ("silero-vad", "fullsubnet")
 
-_NAS_HINT = "310P OM 资产需从 NAS/HuggingFace 手动获取；Ubuntu 依赖用 scripts/download_speech_direction_models.sh 下载"
+_NAS_HINT = (
+    "优先统一入口: python3 scripts/download_models.py --models <bundle>（HF openEuler org 已发布完整 bundle）；"
+    "离线制作: 310P OM 从 NAS 获取、310B OM 由 models/_work/{fullsubnet,silero-vad} 导出流程生成、"
+    "Ubuntu 依赖用 scripts/download_speech_direction_models.sh"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -64,23 +67,37 @@ def main() -> int:
         default=_WORKSPACE_ROOT / "models",
         help="模型根目录（含 silero-vad/ 与 fullsubnet/ 独立 bundle）",
     )
-    parser.add_argument("--bundle", choices=[name for name, _ in _BUNDLES], default=None, help="只校验该 bundle")
+    parser.add_argument("--bundle", choices=list(_BUNDLES), default=None, help="只校验该 bundle")
     parser.add_argument("--deployment", default=None, help="只校验该 deployment 的资产（默认校验全部 deployment）")
     args = parser.parse_args()
 
     models_root = args.models_root.resolve()
     missing = False
-    for bundle_name, deployments in _BUNDLES:
+    for bundle_name in _BUNDLES:
         if args.bundle and bundle_name != args.bundle:
             continue
         bundle_dir = models_root / bundle_name
-        if not (bundle_dir / "inference_manifest.json").is_file():
-            print(f"[missing] bundle {bundle_name}: {bundle_dir / 'inference_manifest.json'}")
+        manifest_path = bundle_dir / "inference_manifest.json"
+        if not manifest_path.is_file():
+            print(f"[missing] bundle {bundle_name}: {manifest_path}")
             print(f"           {_NAS_HINT}")
             missing = True
             continue
+        # deployment 清单以 manifest 为唯一事实来源，顺序保持 manifest 写入顺序。
+        deployment_names = tuple(json.loads(manifest_path.read_text(encoding="utf-8")).get("deployments", {}))
+        if not deployment_names:
+            print(f"[error] bundle {bundle_name}: manifest declares no deployments")
+            missing = True
+            continue
+        if args.deployment and args.deployment not in deployment_names:
+            print(
+                f"[error] bundle {bundle_name}: requested deployment {args.deployment!r} "
+                f"not in manifest deployments {list(deployment_names)}"
+            )
+            missing = True
+            continue
         loaded = []
-        for dep_name in deployments:
+        for dep_name in deployment_names:
             if args.deployment and dep_name != args.deployment:
                 continue
             vm = load_inference_manifest_metadata(bundle_dir, dep_name)
@@ -104,7 +121,8 @@ def main() -> int:
             print(f"[ok] {bundle_name}/{desc} SHA-256 OK")
 
     if missing:
-        print("\n存在缺失资产；请先下载/获取后重新校验。")
+        print("\n存在缺失资产或 deployment 选择未命中，请补齐后重新校验。")
+        return 1
     return 0
 
 

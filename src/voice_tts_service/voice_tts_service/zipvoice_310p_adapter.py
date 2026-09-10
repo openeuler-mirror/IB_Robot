@@ -73,8 +73,10 @@ class ZipVoiceAscendSession(AscendOmModelSession):
             raise SessionLoadError("ZipVoice Ascend session requires a compiled Ascend deployment")
         if context.target_runtime != "acl":
             raise SessionLoadError("ZipVoice Ascend session requires target.runtime='acl'")
-        if deployment.target.soc != "Ascend310P1":
-            raise SessionLoadError(f"verified ZipVoice OM requires Ascend310P1, got {deployment.target.soc!r}")
+        if deployment.target.soc not in {"Ascend310P1", "Ascend310B1"}:
+            raise SessionLoadError(
+                f"verified ZipVoice OM requires Ascend310P1 or Ascend310B1, got {deployment.target.soc!r}"
+            )
         self._root = context.validated_manifest.bundle_root
         self._config = self._load_json(self._root / "assets" / "zipvoice_310p.json")
         text_role = str(self._config.get("text_role", "text_encoder"))

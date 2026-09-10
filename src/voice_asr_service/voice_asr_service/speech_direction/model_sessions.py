@@ -71,12 +71,17 @@ class SpeechDirectionRoleRunner:
 
     def infer(self, audio: np.ndarray) -> float:
         values: dict[str, object] = {"host.silero.audio": np.ascontiguousarray(audio)}
-        # ONNX deployments declare host.silero.sample_rate as a binding input; the
-        # deployment's audio contract is the single source for its value. Sessions
-        # ignore values for semantics their deployment does not declare.
-        contract = getattr(self.context.deployment, "audio_contract", None) if self.context is not None else None
-        if contract is not None and contract.sample_rate_hz is not None:
-            values["host.silero.sample_rate"] = np.asarray(contract.sample_rate_hz, dtype=np.int64)
+        # Only supply inputs the deployment actually declares: ONNX deployments
+        # bind host.silero.sample_rate (sourced from the audio contract), while
+        # Ascend OM deployments fold the sample rate into the graph and reject
+        # unexpected semantics at validation time.
+        deployment = getattr(self.context, "deployment", None) if self.context is not None else None
+        bindings = getattr(deployment, "bindings", {}).get("silero_vad") if deployment is not None else None
+        declared = {binding.semantic for binding in bindings.inputs} if bindings is not None else set()
+        if "host.silero.sample_rate" in declared:
+            contract = getattr(deployment, "audio_contract", None)
+            if contract is not None and contract.sample_rate_hz is not None:
+                values["host.silero.sample_rate"] = np.asarray(contract.sample_rate_hz, dtype=np.int64)
         output = self._invoke("silero_vad", values)
         return float(np.asarray(output["host.silero.prob"]).reshape(-1)[0])
 
