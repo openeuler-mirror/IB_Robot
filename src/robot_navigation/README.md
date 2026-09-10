@@ -326,21 +326,21 @@ ros2 launch robot_navigation lekiwi_lidar_navigation_rviz.launch.py
 等待启动 warm-up 完成后，在开发板检查 Action 可发现性：
 
 ```bash
-ros2 run robot_navigation nav_cmd status
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute status
 ```
 
 `status` 不是定位收敛判据。发送运动命令前还应确认地图已加载、Nav2 lifecycle active，并且
 `map -> base_link` 定位稳定。平移和绝对坐标单位为米，CLI 转向角单位为度：
 
 ```bash
-ros2 run robot_navigation nav_cmd forward 0.5
-ros2 run robot_navigation nav_cmd backward 0.5
-ros2 run robot_navigation nav_cmd leftward 0.5
-ros2 run robot_navigation nav_cmd rightward 0.5
-ros2 run robot_navigation nav_cmd turn-left 10
-ros2 run robot_navigation nav_cmd turn-right 10
-ros2 run robot_navigation nav_cmd absolute <x> <y> <yaw_deg>
-ros2 run robot_navigation nav_cmd cancel
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute forward 0.5
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute backward 0.5
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute leftward 0.5
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute rightward 0.5
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute turn-left 10
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute turn-right 10
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute absolute <x> <y> <yaw_deg>
+ros2 run robot_navigation nav_cmd --action-name /navigation/execute cancel
 ```
 
 导航 stage 的速度链是 `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> cmd_vel_bridge`。导航期间不要另启
