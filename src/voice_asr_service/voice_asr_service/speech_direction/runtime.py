@@ -451,7 +451,7 @@ class SpeechDirectionRuntime:
                         self._stream_handle,
                         ExecutionContext(f"speech-direction-gap-{item.start_sample}"),
                     )
-                    logger.warning(
+                    logger.debug(
                         "RingBuffer 覆盖导致 pipeline 跳过 %d 帧(%.3fs)，从 sample=%d 冷启动",
                         gap_frames,
                         gap_frames / self.pipeline.sr,
