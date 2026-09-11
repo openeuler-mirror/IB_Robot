@@ -723,7 +723,50 @@ robot:
         queue_size: 100
         watermark_threshold: 50
         control_frequency: 20.0
+      dispatch:
+        scheduler: continuous   # continuous | wait_for_feedback，与 executor.type 存在配对约束
+        chunking: full_chunk    # 缺省 full_chunk
+        blending: none          # none | temporal_ensemble，缺省 none；唯一融合开关
 ```
+
+### 动作分发策略 SSOT
+
+`executor`、可选的 `dispatch` 和 `inference` 是 `robot.control_modes.<mode>` 下的同级块。
+`robot_config.dispatch_strategies.resolve_dispatch_strategies` 统一解析策略，两个 launch
+分支和直接节点入口均校验合法组合：legacy 支持 `topic` + `continuous` 或
+`benchmark` + `wait_for_feedback`；scheduled 仅支持 `topic` + `continuous`。
+
+| YAML 字段（相对于控制模式） | 默认值 | 节点参数 / 作用 |
+|----------------------------|--------|-----------------|
+| `executor.type` | `topic` | `executor_type`，输出通道 |
+| `dispatch.scheduler` | `continuous` | `scheduler_mode`，逐 tick 调度；另支持 `wait_for_feedback` |
+| `dispatch.chunking` | `full_chunk` | `chunking_strategy`，目前唯一的 chunk 选择策略 |
+| `dispatch.blending` | `none` | `blending_strategy`，另支持 `temporal_ensemble` |
+| `executor.watermark_threshold` | `20` | 剩余动作数的补货阈值，0 表示耗尽后补货；不改变 blending 选择 |
+| `executor.queue_size` | `100` | queue 容量，不限制 smoother 存储 |
+| `executor.control_frequency` | `100.0` | 控制 tick 频率（Hz），不是推理频率 |
+| `executor.chunk_size` | `100` | smoother 权重表大小，不控制模型实际返回步数 |
+| `executor.temporal_ensemble_coeff` | `0.01` | 指数融合系数 |
+| `executor.smoothing_device` | `''` | smoother 设备，空值使用输入 tensor 设备（NumPy 为 CPU） |
+
+- 策略字段缺失、null 或空字符串采用默认：executor 为 `topic`，scheduler 为
+  `continuous`，chunking 为 `full_chunk`，blending 为 `none`。
+  false、0、list、dict、未知名及大小写变体拒绝，不再作为缺省值。
+- `executor.temporal_smoothing_enabled` 已删除；配置加载（包括继承的 base_config）和
+  launch 均拒绝该键，不论值是什么或是否与 blending 一致。迁移时删除旧键，将原来的
+  `true` 改为 `dispatch.blending: temporal_ensemble`，`false` 改为 `dispatch.blending: none`。
+  `temporal_ensemble_coeff`、`chunk_size`、`smoothing_device` 等调参字段保持不变。
+- 历史 `executor.type: action` 仅由 launch 边界映射为 `topic`。直接节点参数
+  `executor_type` 不接受此别名。ROS 参数类型约束仍适用，YAML null 默认语义不适用于 ROS CLI override。
+- `inference.scheduler.enable` 选择产品入口，不等同于 `dispatch.scheduler`。
+  scheduled 显式选择 benchmark 或 wait_for_feedback 会报错；AutoHorizon/RTC 也不是当前支持的策略名。
+
+耗尽后补货与异步提前补货的完整解释统一放在
+[推理补货与融合配置示例](../action_dispatch/README.md#推理补货与融合配置示例)
+（[English](../action_dispatch/README.en.md#inference-replenishment-and-blending-examples)）。
+运行时存储、失败处理和 toggle 限制见
+[调度策略分层与状态归属](../action_dispatch/README.md#调度策略分层与状态归属)及
+[运行时切换](../action_dispatch/README.md#运行时切换)。
 
 ### 推理调度控制面
 
@@ -1255,7 +1298,7 @@ robot:
 
 3. **动作分发集成：**
    - `action_dispatch` 节点从 `robot_config` 读取当前模式
-   - 实例化适当的执行器（TopicExecutor 或 ActionExecutor）
+   - 推理分发按策略选择 TopicExecutor 或 BenchmarkExecutor；MoveIt 规划使用独立执行路径
    - 为上游推理服务提供统一 API
 
 ### 控制模式故障排除

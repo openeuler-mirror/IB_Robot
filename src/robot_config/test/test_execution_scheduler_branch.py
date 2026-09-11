@@ -12,10 +12,12 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
+from robot_config.dispatch_strategies import DispatchStrategyError
 from robot_config.launch_builders.execution import generate_execution_nodes
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
@@ -333,10 +335,11 @@ def test_scheduler_disabled_matches_63d80599_legacy_launch_contract(tmp_path: Pa
         "watermark_threshold",
         "min_queue_size",
         "control_frequency",
-        "temporal_smoothing_enabled",
         "temporal_ensemble_coeff",
         "chunk_size",
         "smoothing_device",
+        "chunking_strategy",
+        "blending_strategy",
         "control_mode",
         "interpolation_enabled",
         "interpolation_step",
@@ -467,3 +470,84 @@ def test_scheduler_node_receives_pipeline_registry_and_endpoints(tmp_path: Path)
     assert pipelines[0]["hardware_profile_fingerprint"] == "a" * 64
     assert pipelines[0]["runtime_policy_fingerprint"]  # non-empty sha256
     assert params["session_idle_timeout_ns"] == 30_000_000_000
+
+
+@pytest.fixture(params=[False, True], ids=["legacy", "scheduled"])
+def strategy_launch_config(request, tmp_path):
+    bundle = _create_bundle(tmp_path / "bundle")
+    if request.param:
+        return _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    return _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+
+
+@pytest.mark.parametrize("field", ["scheduler", "chunking", "blending", "type"])
+@pytest.mark.parametrize("value", [False, 0, [], {}, "unknown_strategy"])
+def test_launch_rejects_invalid_strategy_names(strategy_launch_config, field, value):
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    section = mode["executor"] if field == "type" else mode.setdefault("dispatch", {})
+    section[field] = value
+    with pytest.raises(DispatchStrategyError, match="unknown"):
+        generate_execution_nodes(strategy_launch_config, "model_inference")
+
+
+@pytest.mark.parametrize("value", [False, True, None, "", "false", "true", 0, 1, [], {}])
+def test_launch_rejects_removed_smoothing(strategy_launch_config, value):
+    strategy_launch_config["control_modes"]["model_inference"]["executor"]["temporal_smoothing_enabled"] = value
+    with pytest.raises(DispatchStrategyError, match="has been removed.*dispatch.blending"):
+        generate_execution_nodes(strategy_launch_config, "model_inference")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_launch_blending_parameters(strategy_launch_config, enabled):
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    blending = "temporal_ensemble" if enabled else "none"
+    mode["dispatch"] = {"blending": blending}
+    nodes = _nodes(generate_execution_nodes(strategy_launch_config, "model_inference"))
+    dispatcher = next(node for node in nodes if "action_dispatcher_node" in node.node_executable)
+    params = _node_parameters(dispatcher)
+    assert params["chunking_strategy"] == "full_chunk"
+    assert params["blending_strategy"] == blending
+    assert "temporal_smoothing_enabled" not in params
+
+
+@pytest.mark.parametrize("value", [None, ""])
+def test_launch_name_defaults(strategy_launch_config, value):
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    mode["executor"]["type"] = value
+    mode["dispatch"] = dict.fromkeys(("scheduler", "chunking", "blending"), value)
+    nodes = _nodes(generate_execution_nodes(strategy_launch_config, "model_inference"))
+    dispatcher = next(node for node in nodes if "action_dispatcher_node" in node.node_executable)
+    params = _node_parameters(dispatcher)
+    assert params["chunking_strategy"] == "full_chunk"
+    assert params["blending_strategy"] == "none"
+    assert "temporal_smoothing_enabled" not in params
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("blending", ["none", "temporal_ensemble"])
+def test_launch_rejects_removed_flag_even_with_explicit_blending(strategy_launch_config, enabled, blending):
+    mode = strategy_launch_config["control_modes"]["model_inference"]
+    mode["executor"]["temporal_smoothing_enabled"] = enabled
+    mode["dispatch"] = {"blending": blending}
+    with pytest.raises(DispatchStrategyError, match="has been removed"):
+        generate_execution_nodes(strategy_launch_config, "model_inference")
+
+
+def test_launch_preserves_legacy_action_alias(strategy_launch_config):
+    strategy_launch_config["control_modes"]["model_inference"]["executor"]["type"] = "action"
+    nodes = _nodes(generate_execution_nodes(strategy_launch_config, "model_inference"))
+    assert sum("action_dispatcher_node" in node.node_executable for node in nodes) == 1
+
+
+@pytest.mark.parametrize(
+    "executor,scheduler",
+    [("benchmark", "wait_for_feedback"), ("topic", "wait_for_feedback"), ("benchmark", "continuous")],
+)
+def test_scheduled_rejects_unsupported_explicit_selection(tmp_path, executor, scheduler):
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+    mode = config["control_modes"]["model_inference"]
+    mode["executor"]["type"] = executor
+    mode["dispatch"] = {"scheduler": scheduler}
+    with pytest.raises(DispatchStrategyError, match="scheduled entrypoint requires"):
+        generate_execution_nodes(config, "model_inference")

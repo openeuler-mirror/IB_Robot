@@ -211,8 +211,8 @@ robot:
         queue_size: 100
         chunk_size: 100
         control_frequency: 20.0
-        temporal_smoothing_enabled: false
       dispatch:
+        blending: none
         scheduler: wait_for_feedback
         execution_timeout_sec: 30.0
 

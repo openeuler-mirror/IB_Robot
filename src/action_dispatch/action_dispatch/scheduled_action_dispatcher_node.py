@@ -24,13 +24,14 @@ import signal
 import threading
 import time
 import uuid
-from collections import deque
 from enum import Enum
 
 import numpy as np
 import rclpy
 import rclpy.action
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.clock import Clock, ClockType
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -39,6 +40,8 @@ from std_msgs.msg import Bool, Int32
 from std_srvs.srv import Empty, Trigger
 
 from action_dispatch.action_chunk import validate_action_chunk
+from action_dispatch.active_plan import ActivePlan, PlanSource
+from action_dispatch.chunk_planning import create_chunk_planner
 from action_dispatch.safe_stop import (
     JointSnapshot,
     SafeStopError,
@@ -46,12 +49,17 @@ from action_dispatch.safe_stop import (
     construct_safety_command,
     validate_joint_state,
 )
+from action_dispatch.schedulers.continuous import should_replenish_plan
 from action_dispatch.temporal_smoother import TemporalSmootherManager
 from action_dispatch.topic_executor import TopicExecutor
 from ibrobot_msgs.action import (
     CloseInferenceSession,
     OpenInferenceSession,
     ScheduledDispatchInfer,
+)
+from robot_config.dispatch_strategies import (
+    DispatchStrategyError,
+    resolve_dispatch_strategies,
 )
 
 
@@ -70,6 +78,8 @@ class ScheduledActionDispatcherNode(Node):
     def __init__(self, *, parameter_overrides=None) -> None:
         super().__init__("action_dispatcher", parameter_overrides=parameter_overrides)
         self._load_parameters()
+        self._blending_update = None
+        self.add_on_set_parameters_callback(self._validate_blending_update)
         self._load_contract_and_plan()
         self._state_lock = threading.RLock()
         self._lifecycle_lock = threading.RLock()
@@ -85,9 +95,9 @@ class ScheduledActionDispatcherNode(Node):
         self._inflight_observation_time_ns = 0
         self._inflight_goal_handle = None
         self._plan_length_at_inference_start = 0
-        self._queue: deque = deque()
         self._startup_started_ns = time.monotonic_ns()
         self._failure_handling = False
+        self._pending_failure: tuple[str | None, str, int, str] | None = None
         self._shutdown_started = False
         self._pending_open_session_id = ""
         self._pending_open_completion: threading.Event | None = None
@@ -106,6 +116,16 @@ class ScheduledActionDispatcherNode(Node):
             chunk_size=self._chunk_size,
             device=self._smoothing_device,
         )
+        # Strategy instances are constructed once at init (matching the
+        # scheduler/executor registry wiring) so stateful follow-up
+        # strategies can hold cross-request state; per-tick code selects
+        # instances, never types. The internal smoothing flag is derived from
+        # the authoritative blending strategy.
+        self._chunk_planner = create_chunk_planner(self._chunking_strategy)
+        # Scheduled toggles retain the queue but discard the disabled smoother.
+        # Each retained store therefore owns its own source and watermark.
+        self._queue_plan = ActivePlan(capacity=self._queue_size, watermark=self._watermark, overflow="fail_closed")
+        self._smoothed_plan = ActivePlan(capacity=self._queue_size, watermark=self._watermark, smoother=self._smoother)
         self._control_group = MutuallyExclusiveCallbackGroup()
         self._client_group = ReentrantCallbackGroup()
 
@@ -156,6 +176,12 @@ class ScheduledActionDispatcherNode(Node):
         )
         # Readiness polling before Open.
         self._readiness_timer = self.create_timer(0.5, self._readiness_poll, callback_group=ReentrantCallbackGroup())
+        self._failure_timer = self.create_timer(
+            0.01,
+            self._drain_pending_failure,
+            callback_group=MutuallyExclusiveCallbackGroup(),
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
+        )
         # Both modes wait for verified Scheduler readiness. Navigation mode then
         # enters STOPPED; normal mode opens immediately.
 
@@ -164,6 +190,8 @@ class ScheduledActionDispatcherNode(Node):
     # ------------------------------------------------------------------
 
     def _load_parameters(self) -> None:
+        if "temporal_smoothing_enabled" in self._parameter_overrides:
+            raise ValueError("temporal_smoothing_enabled was removed; use blending_strategy=none|temporal_ensemble")
         for name, default in (
             ("robot_config_path", ""),
             ("joint_state_topic", "/joint_states"),
@@ -171,7 +199,6 @@ class ScheduledActionDispatcherNode(Node):
             ("watermark_threshold", 20),
             ("control_frequency", 100.0),
             ("chunk_size", 100),
-            ("temporal_smoothing_enabled", False),
             ("temporal_ensemble_coeff", 0.01),
             ("smoothing_device", ""),
             ("navigation_mode", False),
@@ -186,6 +213,13 @@ class ScheduledActionDispatcherNode(Node):
             ("inference_fallback_chain", "[]"),
             ("inference_retry_json", "{}"),
             ("inference_prompt", ""),
+            # Chunk-planning and action-blending strategy selection. SSOT
+            # ``dispatch.chunking``/``dispatch.blending`` are passed through by
+            # launch builders. Standalone fusion defaults to none.
+            ("chunking_strategy", ""),
+            ("blending_strategy", "none"),
+            ("executor_type", "topic"),
+            ("scheduler_mode", "continuous"),
         ):
             self.declare_parameter(name, default)
         for name in (
@@ -201,7 +235,6 @@ class ScheduledActionDispatcherNode(Node):
         self._watermark = int(self.get_parameter("watermark_threshold").value)
         self._control_hz = float(self.get_parameter("control_frequency").value)
         self._chunk_size = int(self.get_parameter("chunk_size").value)
-        self._smoothing_enabled = bool(self.get_parameter("temporal_smoothing_enabled").value)
         self._ensemble_coeff = float(self.get_parameter("temporal_ensemble_coeff").value)
         self._smoothing_device = str(self.get_parameter("smoothing_device").value) or None
         self._navigation_mode = bool(self.get_parameter("navigation_mode").value)
@@ -217,6 +250,15 @@ class ScheduledActionDispatcherNode(Node):
         self._retry_max_attempts = int(retry.get("max_not_started_attempts", 3))
         self._retry_initial_ms = int(retry.get("initial_backoff_ms", 50))
         self._retry_max_ms = int(retry.get("max_backoff_ms", 500))
+        self._strategy_selection = resolve_dispatch_strategies(
+            executor_type=self.get_parameter("executor_type").value,
+            scheduler_mode=self.get_parameter("scheduler_mode").value,
+            chunking=self.get_parameter("chunking_strategy").value,
+            blending=self.get_parameter("blending_strategy").value,
+            entrypoint="scheduled",
+        )
+        self._chunking_strategy = self._strategy_selection.chunking
+        self._smoothing_enabled = self._strategy_selection.blending == "temporal_ensemble"
         self._startup_readiness_timeout_ns = int(self.get_parameter("startup_readiness_timeout_ns").value)
         self._default_open_timeout_ns = int(self.get_parameter("default_open_timeout_ns").value)
         self._default_request_timeout_ns = int(self.get_parameter("default_request_timeout_ns").value)
@@ -317,8 +359,7 @@ class ScheduledActionDispatcherNode(Node):
             self._close_after_open = False
             self._received_results.clear()
             self._clear_inflight_locked()
-            self._queue.clear()
-            self._smoother.reset()
+            self._clear_plans_locked()
         goal = OpenInferenceSession.Goal()
         goal.session_id = session_id
         open_deadline_ns = time.time_ns() + self._default_open_timeout_ns
@@ -340,7 +381,7 @@ class ScheduledActionDispatcherNode(Node):
             except Exception:  # noqa: BLE001
                 if self._tracks_pending_open(session_id):
                     self._complete_pending_open(session_id, completion)
-                    self._fail_and_close("Open outcome unknown")
+                    self._fail_and_close("Open outcome unknown", session_id=session_id)
                 else:
                     self._complete_pending_open(session_id, completion)
 
@@ -352,7 +393,7 @@ class ScheduledActionDispatcherNode(Node):
         except Exception:  # noqa: BLE001
             if self._tracks_pending_open(session_id):
                 self._complete_pending_open(session_id, completion)
-                self._fail_and_close("Open result outcome unknown")
+                self._fail_and_close("Open result outcome unknown", session_id=session_id)
             else:
                 self._complete_pending_open(session_id, completion)
             return
@@ -361,7 +402,7 @@ class ScheduledActionDispatcherNode(Node):
             return
         if result.session_id != session_id:
             self._complete_pending_open(session_id, completion)
-            self._fail_and_close("Open result identity mismatch")
+            self._fail_and_close("Open result identity mismatch", session_id=session_id)
             return
         if not result.success and result.outcome.value == 1 and result.error.recoverable:
             self._handle_open_not_started(session_id, completion)
@@ -369,9 +410,9 @@ class ScheduledActionDispatcherNode(Node):
         close_after_open, failure_reason = self._on_open_result(result, session_id)
         self._complete_pending_open(session_id, completion)
         if failure_reason:
-            self._fail_and_close(failure_reason)
+            self._fail_and_close(failure_reason, session_id=session_id)
         elif close_after_open:
-            self._begin_close_session()
+            self._begin_close_session(expected_identity=(session_id, int(result.session_generation)))
 
     def _tracks_pending_open(self, session_id: str) -> bool:
         with self._state_lock:
@@ -425,8 +466,18 @@ class ScheduledActionDispatcherNode(Node):
         return close_after_open, failure_reason
 
     def _start_cb(self, _req, resp: Trigger.Response) -> Trigger.Response:
-        with self._lifecycle_lock:
-            return self._start_cb_locked(_req, resp)
+        return self._run_lifecycle_service(self._start_cb_locked, _req, resp)
+
+    def _run_lifecycle_service(self, callback, request, response: Trigger.Response) -> Trigger.Response:
+        # A contending service must leave a worker available for Open/Close.
+        if not self._lifecycle_lock.acquire(blocking=False):
+            response.success = False
+            response.message = "lifecycle operation in progress"
+            return response
+        try:
+            return callback(request, response)
+        finally:
+            self._lifecycle_lock.release()
 
     def _start_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
         with self._state_lock:
@@ -451,8 +502,7 @@ class ScheduledActionDispatcherNode(Node):
         return resp
 
     def _stop_cb(self, _req, resp: Trigger.Response) -> Trigger.Response:
-        with self._lifecycle_lock:
-            return self._stop_cb_locked(_req, resp)
+        return self._run_lifecycle_service(self._stop_cb_locked, _req, resp)
 
     def _stop_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
         # Safe-stop first, then Close; both succeed -> STOPPED.
@@ -466,8 +516,7 @@ class ScheduledActionDispatcherNode(Node):
         return resp
 
     def _restart_cb(self, _req, resp: Trigger.Response) -> Trigger.Response:
-        with self._lifecycle_lock:
-            return self._restart_cb_locked(_req, resp)
+        return self._run_lifecycle_service(self._restart_cb_locked, _req, resp)
 
     def _restart_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
         # Safe-stop -> Close -> clear local -> Open new UUID.
@@ -475,7 +524,7 @@ class ScheduledActionDispatcherNode(Node):
         close_ok = self._close_session_sync()
         with self._state_lock:
             self._received_results.clear()
-            self._queue.clear()
+            self._clear_plans_locked()
             self._last_action = None
         if not safe_ok:
             # A safe-stop failure still closes, but must not open a new session.
@@ -504,12 +553,51 @@ class ScheduledActionDispatcherNode(Node):
             resp.message = self._state.value
         return resp
 
+    def _validate_blending_update(self, parameters):
+        for parameter in parameters:
+            if parameter.name == "blending_strategy":
+                if parameter is not self._blending_update:
+                    return SetParametersResult(successful=False, reason="Use ~/toggle_smoothing at runtime")
+                # Single-use object identity, not a flag that concurrent writes can inherit.
+                self._blending_update = None
+        return SetParametersResult(successful=True)
+
     def _toggle_smoothing_cb(self, _request, response: Empty.Response) -> Empty.Response:
         with self._state_lock:
-            self._smoothing_enabled = not self._smoothing_enabled
-            self._smoother.set_enabled(self._smoothing_enabled)
+            enabled = not self._smoothing_enabled
+            current = self._strategy_selection
+            try:
+                selection = resolve_dispatch_strategies(
+                    executor_type=current.executor_type,
+                    scheduler_mode=current.scheduler_mode,
+                    chunking=current.chunking,
+                    blending="temporal_ensemble" if enabled else "none",
+                    entrypoint="scheduled",
+                )
+            except DispatchStrategyError as exc:
+                self.get_logger().error(f"Temporal smoothing toggle rejected: {exc}")
+                return response
+            from rclpy.parameter import Parameter
+
+            parameter = Parameter("blending_strategy", value=selection.blending)
+            self._blending_update = parameter
+            try:
+                result = self.set_parameters_atomically([parameter])
+            finally:
+                self._blending_update = None
+            if not result.successful:
+                self.get_logger().error(f"Temporal smoothing toggle rejected: {result.reason}")
+                return response
+            old_remaining = self._active_plan.snapshot().remaining
+            self._strategy_selection = selection
+            self._smoothing_enabled = selection.blending == "temporal_ensemble"
+            self._smoothed_plan.set_smoothing_enabled(self._smoothing_enabled)
             if not self._smoothing_enabled:
-                self._smoother.reset()
+                self._smoothed_plan.clear()
+            if self._inflight_request_id:
+                # Keep request-relative consumption unchanged when switching
+                # between retained stores of different lengths.
+                self._plan_length_at_inference_start += self._active_plan.snapshot().remaining - old_remaining
             enabled = self._smoothing_enabled
         self._smoothing_pub.publish(Bool(data=enabled))
         self.get_logger().info(f"Temporal smoothing {'ENABLED' if enabled else 'DISABLED'}")
@@ -521,12 +609,19 @@ class ScheduledActionDispatcherNode(Node):
 
     def _control_loop(self) -> None:
         with self._state_lock:
-            if self._state != DispatcherState.ACTIVE:
+            # One-way lifecycle gate: closed sessions block inference requests
+            # and action submission until the lifecycle reopens dispatch.
+            if self._state is not DispatcherState.ACTIVE:
                 return
-            q_size = self._current_plan_length_locked()
+            snapshot = self._active_plan.snapshot()
+            q_size = snapshot.remaining
+            replenish = should_replenish_plan(
+                q_size, snapshot.watermark, inference_in_progress=bool(self._inflight_request_id)
+            )
         self._queue_size_pub.publish(Int32(data=q_size))
-        # watermark trigger
-        if q_size <= self._watermark and not self._inflight_request_id:
+        # Watermark replenishment via the shared continuous per-tick rule. The
+        # scheduled path has no policy-reset gate, so that flag stays False.
+        if replenish:
             self._request_dispatch()
         # execute one action per tick
         self._execute_next_action()
@@ -539,6 +634,8 @@ class ScheduledActionDispatcherNode(Node):
                 return
             if replace_request_id and self._inflight_request_id != replace_request_id:
                 return
+            if not replace_request_id and self._inflight_request_id:
+                return
             request_id = str(uuid.uuid4())
             if replace_request_id:
                 deadline_utc_ns = self._inflight_deadline_utc_ns
@@ -549,17 +646,18 @@ class ScheduledActionDispatcherNode(Node):
                 observation_time_ns = self.get_clock().now().nanoseconds
                 self._inflight_observation_time_ns = observation_time_ns
             if deadline_utc_ns <= time.time_ns():
-                self._clear_inflight_locked()
+                request_id = self._inflight_request_id
                 expired = True
             else:
                 expired = False
                 self._inflight_request_id = request_id
                 self._inflight_goal_handle = None
-                self._plan_length_at_inference_start = self._current_plan_length_locked()
+                if not replace_request_id:
+                    self._plan_length_at_inference_start = self._current_plan_length_locked()
             sid = self._session_id
             gen = self._session_generation
         if expired:
-            self._fail_and_close("scheduled dispatch deadline expired before retry")
+            self._fail_current_request(request_id, sid, gen, "scheduled dispatch deadline expired before retry")
             return
         goal = ScheduledDispatchInfer.Goal()
         goal.request_id = request_id
@@ -621,7 +719,7 @@ class ScheduledActionDispatcherNode(Node):
             or result.session_id != session_id
             or int(result.session_generation) != session_generation
         ):
-            self._fail_and_close("scheduled result identity mismatch")
+            self._fail_current_request(request_id, session_id, session_generation, "scheduled result identity mismatch")
             return
         if not result.success and result.outcome.value == 1 and result.error.recoverable:
             self._retry_dispatch_not_started(request_id, attempt, result.error.code)
@@ -639,11 +737,10 @@ class ScheduledActionDispatcherNode(Node):
 
     def _dispatch_rejected(self, request_id: str) -> None:
         with self._state_lock:
-            is_current = self._inflight_request_id == request_id
-            if is_current:
-                self._clear_inflight_locked()
-        if is_current:
-            self._fail_and_close("scheduled dispatch rejected because endpoint goal slots are full")
+            sid, gen = self._session_id, self._session_generation
+        self._fail_current_request(
+            request_id, sid, gen, "scheduled dispatch rejected because endpoint goal slots are full"
+        )
 
     def _retry_dispatch_not_started(self, request_id: str, attempt: int, code: str = "") -> None:
         non_retryable = {
@@ -657,15 +754,13 @@ class ScheduledActionDispatcherNode(Node):
         }
         if code in non_retryable:
             with self._state_lock:
-                is_current = self._state == DispatcherState.ACTIVE and self._inflight_request_id == request_id
-            if is_current:
-                self._fail_and_close(f"scheduled dispatch rejected: {code}")
+                sid, gen = self._session_id, self._session_generation
+            self._fail_current_request(request_id, sid, gen, f"scheduled dispatch rejected: {code}")
             return
         if attempt >= self._retry_max_attempts:
             with self._state_lock:
-                is_current = self._state == DispatcherState.ACTIVE and self._inflight_request_id == request_id
-            if is_current:
-                self._fail_and_close("scheduled dispatch retries exhausted")
+                sid, gen = self._session_id, self._session_generation
+            self._fail_current_request(request_id, sid, gen, "scheduled dispatch retries exhausted")
             return
         delay_ms = min(self._retry_initial_ms * (2**attempt), self._retry_max_ms)
         timer = None
@@ -677,54 +772,73 @@ class ScheduledActionDispatcherNode(Node):
         timer = self.create_timer(max(0.001, delay_ms / 1000.0), _retry, callback_group=ReentrantCallbackGroup())
 
     def _on_dispatch_result(self, result) -> None:
-        failure_reason = ""
+        source = PlanSource(
+            result.request_id, session_id=result.session_id, session_generation=int(result.session_generation)
+        )
         with self._state_lock:
             key = (result.session_id, int(result.session_generation), result.request_id)
-            if key in self._received_results:
-                if self._inflight_request_id == result.request_id:
-                    self._clear_inflight_locked()
-                return
-            if self._state != DispatcherState.ACTIVE:
-                if self._inflight_request_id == result.request_id:
-                    self._clear_inflight_locked()
-                return
-            if (
-                result.request_id != self._inflight_request_id
-                or result.session_id != self._session_id
-                or int(result.session_generation) != self._session_generation
+            if key in self._received_results or not self._request_is_current(
+                source.request_id, source.session_id, source.session_generation
             ):
-                self._clear_inflight_locked()
-                failure_reason = "scheduled result identity mismatch"
-            # Only the first successful result enqueues; duplicates are idempotent acknowledgements.
-            elif result.success:
-                self._received_results.add(key)
-                current_plan_length = self._current_plan_length_locked()
-                actions_executed = max(0, self._plan_length_at_inference_start - current_plan_length)
-                try:
-                    self._enqueue_chunk(
-                        result.action_chunk,
-                        reported_chunk_size=int(result.chunk_size),
-                        actions_executed=actions_executed,
-                    )
-                except (TypeError, ValueError) as exc:
-                    self.get_logger().error(f"invalid scheduled action chunk: {exc}")
-                    failure_reason = "invalid scheduled action chunk"
-            else:
-                failure_reason = result.error.code or "scheduled dispatch failed"
-            self._clear_inflight_locked()
+                return
+        failure_reason = ""
+        if result.success:
+            try:
+                self._enqueue_chunk(result.action_chunk, reported_chunk_size=int(result.chunk_size), source=source)
+            except (TypeError, ValueError, RuntimeError, MemoryError) as exc:
+                self.get_logger().error(f"invalid scheduled action chunk: {exc}")
+                failure_reason = "invalid scheduled action chunk"
+        else:
+            failure_reason = result.error.code or "scheduled dispatch failed"
         if failure_reason:
-            self._fail_and_close(failure_reason)
+            self._fail_current_request(source.request_id, source.session_id, source.session_generation, failure_reason)
 
     def _on_dispatch_unknown(self, request_id: str, session_id: str, session_generation: int) -> None:
         with self._state_lock:
             if self._inflight_request_id == request_id:
                 self._inflight_goal_handle = None
-        if self._request_is_current(request_id, session_id, session_generation):
-            self._fail_and_close(f"scheduled dispatch outcome unknown: {request_id}")
+        self._fail_current_request(
+            request_id, session_id, session_generation, f"scheduled dispatch outcome unknown: {request_id}"
+        )
 
-    def _fail_and_close(self, reason: str) -> None:
-        with self._lifecycle_lock:
+    def _fail_current_request(self, request_id, session_id, session_generation, reason):
+        if not self._request_is_current(request_id, session_id, session_generation):
+            return
+        self._try_failure(request_id, session_id, session_generation, reason)
+
+    def _try_failure(self, request_id, session_id, session_generation, reason):
+        # Never wait for a lifecycle owner that may need this worker for Close.
+        acquired = self._lifecycle_lock.acquire(blocking=False)
+        try:
+            with self._state_lock:
+                if (self._session_id, self._session_generation) != (session_id, session_generation):
+                    return
+                if request_id is not None and not self._request_is_current(request_id, session_id, session_generation):
+                    return
+                if not acquired:
+                    # Only the current identity can occupy this bounded mailbox.
+                    self._pending_failure = (request_id, session_id, session_generation, reason)
+                    return
+                if request_id is not None:
+                    self._state = DispatcherState.CLOSING
             self._fail_and_close_locked(reason)
+        finally:
+            if acquired:
+                self._lifecycle_lock.release()
+
+    def _drain_pending_failure(self):
+        with self._state_lock:
+            failure = self._pending_failure
+            self._pending_failure = None
+        if failure is not None:
+            self._try_failure(*failure)
+
+    def _fail_and_close(self, reason: str, *, session_id: str | None = None) -> None:
+        with self._state_lock:
+            sid, gen = self._session_id, self._session_generation
+            if session_id is not None and sid != session_id:
+                return
+        self._try_failure(None, sid, gen, reason)
 
     def _fail_and_close_locked(self, reason: str) -> None:
         with self._state_lock:
@@ -740,7 +854,7 @@ class ScheduledActionDispatcherNode(Node):
             with self._state_lock:
                 self._failure_handling = False
 
-    def _enqueue_chunk(self, action_chunk_msg, *, reported_chunk_size: int, actions_executed: int) -> None:
+    def _enqueue_chunk(self, action_chunk_msg, *, reported_chunk_size: int, source: PlanSource) -> None:
         from tensormsg.converter import TensorMsgConverter
 
         decoded = TensorMsgConverter.from_variant(action_chunk_msg)
@@ -753,20 +867,27 @@ class ScheduledActionDispatcherNode(Node):
             reported_chunk_size=reported_chunk_size,
         ).array
         with self._state_lock:
-            if self._smoothing_enabled:
-                self._smoother.update(action_np, actions_executed)
-            else:
-                incoming = action_np[actions_executed:]
-                if len(incoming) > self._queue_size:
-                    raise ValueError(
-                        f"scheduled action chunk has {len(incoming)} remaining steps, queue capacity is "
-                        f"{self._queue_size}"
-                    )
-                self._queue.clear()
-                self._queue.extend(incoming)
+            key = (source.session_id, source.session_generation, source.request_id)
+            if key in self._received_results or not self._request_is_current(
+                source.request_id, source.session_id, source.session_generation
+            ):
+                return
+            actions_executed = max(0, self._plan_length_at_inference_start - self._current_plan_length_locked())
+            chunk_plan = self._chunk_planner.plan(action_np, actions_executed=actions_executed)
+            self._active_plan.accept(chunk_plan, source, action_dimension=self._safe_stop_plan.total_positions)
+            self._received_results.add(key)
+            self._clear_inflight_locked()
+
+    @property
+    def _active_plan(self) -> ActivePlan:
+        return self._smoothed_plan if self._smoothing_enabled else self._queue_plan
+
+    def _clear_plans_locked(self) -> None:
+        self._queue_plan.clear()
+        self._smoothed_plan.clear()
 
     def _current_plan_length_locked(self) -> int:
-        return self._smoother.plan_length if self._smoothing_enabled else len(self._queue)
+        return self._active_plan.snapshot().remaining
 
     def _clear_inflight_locked(self) -> None:
         self._inflight_request_id = ""
@@ -776,23 +897,16 @@ class ScheduledActionDispatcherNode(Node):
 
     def _execute_next_action(self) -> None:
         with self._state_lock:
-            if self._state != DispatcherState.ACTIVE:
+            # One-way lifecycle gate: only an ACTIVE session permits submission.
+            if self._state is not DispatcherState.ACTIVE:
                 return
-            if self._smoothing_enabled:
-                if self._smoother.plan_length == 0:
-                    action = self._last_action.copy() if self._last_action is not None else None
-                else:
-                    action = self._smoother.get_next_action()
-            elif self._queue:
-                action = np.array(self._queue.popleft(), dtype=float)
-            elif self._last_action is not None:
-                action = self._last_action.copy()
-            else:
-                return
+            blended = self._active_plan.take_action(last_action=self._last_action)
+            action = blended.action
             if action is None:
                 return
             self._last_action = np.asarray(action, dtype=float).reshape(-1)
-        self._executor.execute(self._last_action)
+            # Serialize publication with safe-stop's freeze and safety output.
+            self._executor.execute(self._last_action)
 
     # ------------------------------------------------------------------
     # Contract-based safe-stop command construction.
@@ -804,8 +918,7 @@ class ScheduledActionDispatcherNode(Node):
             # freeze: stop control timer output + new dispatch
             if self._state not in (DispatcherState.STOPPED, DispatcherState.FAILED):
                 self._state = DispatcherState.CLOSING
-            self._queue.clear()
-            self._smoother.reset()
+            self._clear_plans_locked()
             self._clear_inflight_locked()
             last = self._last_action
             snap = self._joint_snapshot
@@ -866,8 +979,12 @@ class ScheduledActionDispatcherNode(Node):
                 spin_once(timeout_sec=wait_sec)
         return True
 
-    def _begin_close_session(self) -> threading.Event | None:
+    def _begin_close_session(self, *, expected_identity: tuple[str, int] | None = None) -> threading.Event | None:
         with self._state_lock:
+            if expected_identity is not None and (self._session_id, self._session_generation) != expected_identity:
+                return None
+            self._clear_plans_locked()
+            self._clear_inflight_locked()
             sid = self._session_id
             gen = self._session_generation
             if not sid:
@@ -932,6 +1049,8 @@ class ScheduledActionDispatcherNode(Node):
 
     def _close_session_sync(self, *, spin_once=None) -> bool:
         with self._state_lock:
+            self._clear_plans_locked()
+            self._clear_inflight_locked()
             sid = self._session_id
             pending_open = (
                 self._pending_open_completion

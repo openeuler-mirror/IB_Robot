@@ -3,14 +3,12 @@
 Mirrors the existing IB-Robot dispatcher control loop exactly:
 - request inference when ``plan_length <= watermark`` and no inference or
   policy reset is pending;
-- ``TAKE_NEXT`` when the plan is non-empty;
-- ``HOLD_LAST`` when the plan is empty but a last action exists;
-- ``WAIT`` otherwise;
+- ``TAKE_NEXT`` permits owner selection, including hold/empty;
 - inference timestamp is ``None`` so the dispatcher keeps using
   ``get_clock().now()`` (current ROS time);
 - no backpressure, no in-flight gate, no fault state, no timeout.
 
-The continuous scheduler is stateless; ``reset``/``set_observation_timestamp``/
+The continuous scheduler is stateless; ``set_observation_timestamp``/
 ``on_submission``/``on_completion``/``on_tick`` are all no-ops so the
 continuous path is provably zero-regression.
 """
@@ -26,6 +24,22 @@ from .base import (
 )
 
 
+def should_replenish_plan(
+    plan_length: int,
+    watermark: int,
+    *,
+    inference_in_progress: bool,
+    policy_reset_in_progress: bool = False,
+) -> bool:
+    """Shared watermark replenishment rule for continuous dispatch loops.
+
+    Single implementation of the ``plan_length <= watermark`` trigger used
+    by ``ContinuousScheduler`` and the inline control loops of both
+    dispatcher paths, so the legacy and scheduled paths cannot drift apart.
+    """
+    return plan_length <= watermark and not inference_in_progress and not policy_reset_in_progress
+
+
 class ContinuousScheduler(DispatchScheduler):
     """Stateless scheduler that reproduces the existing IB-Robot control loop."""
 
@@ -36,19 +50,16 @@ class ContinuousScheduler(DispatchScheduler):
     def scheduler_mode(self) -> str:
         return "continuous"
 
-    def reset(self) -> None:
-        # Continuous is stateless; nothing to clear.
-        return
-
     def set_observation_timestamp(self, timestamp_ns: int) -> None:
         # Continuous always uses ROS current time; ignore environment timestamps.
         return
 
     def should_request_inference(self, snapshot: SchedulerSnapshot) -> bool:
-        return (
-            snapshot.plan_length <= snapshot.watermark
-            and not snapshot.inference_in_progress
-            and not snapshot.policy_reset_in_progress
+        return should_replenish_plan(
+            snapshot.plan_length,
+            snapshot.watermark,
+            inference_in_progress=snapshot.inference_in_progress,
+            policy_reset_in_progress=snapshot.policy_reset_in_progress,
         )
 
     def observation_timestamp_for_inference(self) -> int | None:
@@ -56,11 +67,7 @@ class ContinuousScheduler(DispatchScheduler):
         return None
 
     def choose_action(self, snapshot: SchedulerSnapshot) -> ActionDecision:
-        if snapshot.plan_length > 0:
-            return ActionDecision.TAKE_NEXT
-        if snapshot.has_last_action:
-            return ActionDecision.HOLD_LAST
-        return ActionDecision.WAIT
+        return ActionDecision.TAKE_NEXT
 
     def on_submission(self, context, receipt, submitted_monotonic_ns: int) -> None:
         # Continuous does not gate on submissions.

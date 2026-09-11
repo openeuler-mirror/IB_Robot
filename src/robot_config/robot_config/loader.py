@@ -36,6 +36,7 @@ from robot_config.config import (
     VoiceASRConfig,
     VoiceTTSConfig,
 )
+from robot_config.dispatch_strategies import reject_legacy_smoothing_config
 from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.observation_transport import (
     parse_observation_transport,
@@ -1175,6 +1176,12 @@ def _load_robot_section_with_sources(
     if not isinstance(robot_data, dict):
         raise ValueError(f"Invalid robot config: 'robot' section must be a mapping in {resolved_config_path}")
 
+    for mode_name, mode_config in (robot_data.get("control_modes", {}) or {}).items():
+        try:
+            reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})
+        except ValueError as exc:
+            raise ValueError(f"{resolved_config_path}:robot.control_modes.{mode_name}.{exc}") from exc
+
     base_ref = robot_data.pop("base_config", None)
     if base_ref is not None:
         if not isinstance(base_ref, str) or not base_ref.strip():
@@ -1698,6 +1705,11 @@ def load_robot_config_dict(
         resolve_robot_config_path(config_path=config_path)
     )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    for mode_name, mode_config in (robot_config.get("control_modes", {}) or {}).items():
+        try:
+            reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})
+        except ValueError as exc:
+            raise ValueError(f"control_modes.{mode_name}.{exc}") from exc
     if materialize_benchmark_transport is True:
         materialize_benchmark_observation_transport(robot_config)
     mount_file = robot_config.get("mid360_mount_file")

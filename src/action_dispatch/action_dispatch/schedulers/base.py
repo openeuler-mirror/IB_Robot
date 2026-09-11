@@ -20,7 +20,6 @@ class ActionDecision(str, Enum):
 
     WAIT = "wait"
     TAKE_NEXT = "take_next"
-    HOLD_LAST = "hold_last"
 
 
 class CompletionDecision(str, Enum):
@@ -43,7 +42,6 @@ class SchedulerSnapshot:
     watermark: int
     inference_in_progress: bool
     policy_reset_in_progress: bool
-    has_last_action: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,10 +67,6 @@ class DispatchScheduler(ABC):
     @abstractmethod
     def scheduler_mode(self) -> str:
         """Return the exact SSOT scheduler mode string."""
-
-    @abstractmethod
-    def reset(self) -> None:
-        """Clear all in-flight context, faults and cached timestamps."""
 
     @abstractmethod
     def set_observation_timestamp(self, timestamp_ns: int) -> None:

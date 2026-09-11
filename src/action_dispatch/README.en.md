@@ -4,12 +4,33 @@ A pull-based action distribution layer between inference models and ros2_control
 
 ## Overview
 
-This package provides an efficient action dispatching mechanism for distributing actions output by embodied AI models to robot controllers. It supports cross-frame temporal smoothing for Action Chunking models (e.g., ACT, Diffusion Policy), ensuring smooth transitions between consecutive inference outputs.
+This package distributes action chunks from embodied AI models such as ACT and Diffusion Policy
+to robot controllers. Temporal blending can soften changes between overlapping predictions,
+but guarantees neither continuous physical motion nor a gap-free supply of inference results.
 
-The legacy and scheduled executables are mutually exclusive. The scheduled dispatcher validates the reported
-`chunk_size` against the decoded tensor, uses local monotonic receive time for safe-stop joint-state freshness, and
-performs safe-stop followed by Close on terminal or uncertain failures. With the scheduler switch absent or `false`,
-the legacy dispatcher behavior remains unchanged.
+Two mutually exclusive executables are selected solely by
+`control_modes.<mode>.inference.scheduler.enable`:
+
+- Absent or `false`: `action_dispatcher_node` uses the named
+  `executor.inference_pipeline` through `DispatchInfer /dispatch` and `/reset`.
+- `true`: `scheduled_action_dispatcher_node` waits for Global readiness, then uses
+  `OpenInferenceSession`, `ScheduledDispatchInfer` and `CloseInferenceSession`.
+  Open establishes only a logical session, with no model or fallback binding. The dispatcher
+  owns one product session and validates every result identity. Terminal failure or `UNKNOWN`
+  clears queue/smoother storage, publishes safe-stop, then closes and enters `FAILED`.
+  Each Dispatch carries a target, priority and fresh absolute deadline; priority-0 also carries
+  a fallback chain. Only retryable recoverable `NOT_STARTED` results receive bounded retries
+  with a new request UUID and the original deadline. Infeasible deadlines, full capacity and
+  ingress rejection safe-stop/Close immediately. Global reserves priority-0 ingress capacity
+  that lower-priority requests cannot exhaust. Stop/Restart waits for pending Open and closes
+  using the actual generation. SIGINT/SIGTERM keeps the executor and ROS context alive until
+  safe-stop/Close completes or times out. Returned tensor steps must match result `chunk_size`
+  before alignment by actions consumed during inference. Temporary exhaustion holds the last
+  action. Safe-stop joint snapshot freshness uses local monotonic receive time, not ROS/sim
+  time or header stamps.
+
+Both nodes use `/action_dispatcher` and expose start/stop/status/toggle-smoothing interfaces;
+the launch graph never runs them together. Scheduled consumes Global's whole-graph action chunk.
 
 ## System Architecture
 
@@ -85,112 +106,254 @@ the legacy dispatcher behavior remains unchanged.
 
 ### Internal Data Flow
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      ActionDispatcherNode Internal Flow                      │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│    ┌─────────────┐                                                          │
-│    │ Inference   │                                                          │
-│    │ Request     │                                                          │
-│    │ (watermark) │                                                          │
-│    └──────┬──────┘                                                          │
-│           │                                                                  │
-│           ▼                                                                  │
-│    ┌─────────────┐      ┌─────────────┐      ┌─────────────┐               │
-│    │ Record      │      │ Send        │      │ Wait for    │               │
-│    │ Current     │─────▶│ DispatchInfer─────▶│ Inference   │               │
-│    │ Queue Len   │      │ Goal        │      │ Result      │               │
-│    └─────────────┘      └─────────────┘      └──────┬──────┘               │
-│                                                      │                      │
-│                                                      ▼                      │
-│    ┌─────────────┐      ┌─────────────┐      ┌─────────────┐               │
-│    │ Calculate   │      │ Time        │      │ Decode      │               │
-│    │ Actions     │◀─────│ Alignment   │◀─────│ VariantsList│               │
-│    │ Executed    │      │ (skip done) │      │ to Tensor   │               │
-│    └──────┬──────┘      └─────────────┘      └─────────────┘               │
-│           │                                                                  │
-│           ▼                                                                  │
-│    ┌─────────────────────────────────────────────────────────┐             │
-│    │                    TemporalSmoother                      │             │
-│    │  ┌─────────────────────────────────────────────────┐    │             │
-│    │  │  Smoothing Enabled:                               │    │             │
-│    │  │    old_actions + new_actions → blended_actions   │    │             │
-│    │  │    (exponential weighted smoothing)               │    │             │
-│    │  └─────────────────────────────────────────────────┘    │             │
-│    │  ┌─────────────────────────────────────────────────┐    │             │
-│    │  │  Smoothing Disabled:                              │    │             │
-│    │  │    new_actions → direct queue replacement         │    │             │
-│    │  └─────────────────────────────────────────────────┘    │             │
-│    └───────────────────────────┬─────────────────────────────┘             │
-│                                │                                            │
-│                                ▼                                            │
-│    ┌─────────────┐      ┌─────────────┐      ┌─────────────┐               │
-│    │ Control     │      │ Pop Next    │      │ TopicExecutor│               │
-│    │ Loop        │─────▶│ Action      │─────▶│ Publish to  │               │
-│    │ (100Hz)     │      │             │      │ Topics      │               │
-│    └─────────────┘      └─────────────┘      └─────────────┘               │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+`continuous` consumes one available action per control tick when lifecycle gates allow,
+without waiting for per-step execution feedback. It does not mean nonstop inference.
+Replenishment requires `remaining <= watermark_threshold`, no in-flight inference, and
+lifecycle permission (legacy is running with no policy reset; the scheduled session is ACTIVE).
+`full_chunk` skips the new chunk prefix corresponding to actions consumed during the request,
+then selects the entire remainder. It neither waits for the old chunk to be exhausted nor
+limits the new chunk to its overlapping region.
+
+```text
+Control tick -> lifecycle gate -> check remaining/watermark -> record plan length, request asynchronously
+                              -> ActivePlan consumes one (or hold/empty) -> executor
+
+Result -> validate identity/decode -> count consumption during request -> FullChunkPlanner selects interval
+       -> ActivePlan accepts atomically: none replaces; temporal_ensemble blends overlap and appends new tail
 ```
 
-## Core Components
+`TopicExecutor` routes `Float64MultiArray` or `JointTrajectory` according to the contract;
+benchmark commits consumption through feedback instead. The communication diagram above
+shows the legacy topic path; scheduled endpoints are listed under
+[Topics and Services](#topics-and-services). Storage need not pass through a smoother;
+the boundaries are detailed below.
 
-### 1. ActionDispatcherNode
+## Strategy Layers And State Ownership
 
-The main ROS2 node responsible for:
-- Maintaining an action queue
-- Triggering inference requests based on watermark thresholds
-- Publishing actions to ros2_control at a fixed frequency
-- Optional cross-frame temporal smoothing
+action_dispatch responsibilities are split into six boundaries. The
+mutually exclusive legacy (`action_dispatcher_node`) and scheduled
+(`scheduled_action_dispatcher_node`) product paths share the same boundary
+contracts:
 
-### 2. TemporalSmoother
+| Layer | Module | Owns | Never owns |
+|-------|--------|------|-----------|
+| Session lifecycle | per-node lifecycle state machines | session open/close, retry, result dedup, safe-stop, fail-and-close; gates per-tick dispatch | chunk algorithms, blending weights |
+| Per-tick scheduler | `schedulers/` (registry + `continuous` / `wait_for_feedback`) | per-tick inference-request and action-submission decisions (`should_replenish_plan` is the shared watermark rule) | lifecycle state, chunk contents |
+| Chunk planning | `chunk_planning.py` (`FullChunkPlanner`) | describes original-chunk interval `[start, stop)` and optional replenishment watermark | mutating the accepted plan, publishing, requesting inference |
+| Active plan | `active_plan.py` (`ActivePlan`) | atomically owns accepted storage, source, position, watermark and revision; direct consumption or reservation/commit; hold/empty selection | ROS I/O, episode/session transitions |
+| Action blending | `temporal_smoother.py` | prepares overlapping weighted actions/counts before committing references; existing coefficient semantics | inference timing, session state |
+| Executor | `executors/` (registry + `topic` / `benchmark`) | the final output channel | any scheduling decision |
 
-A cross-frame exponential smoother for handling Action Chunking model outputs:
-- Maintains a smoothed action plan
-- Performs temporal alignment when new inference results arrive
-- Applies exponential weighted smoothing to overlapping regions
+All three paths use planning and owner acceptance. Benchmark consumption remains
+completion-driven: reserve/submit does not consume; matching episode-approved
+feedback commits once. It does not use continuous direct consumption.
 
-### 3. TopicExecutor
+| Product | Executor / scheduler | Storage and blending | Capacity / consumption |
+|---------|----------------------|----------------------|------------------------|
+| Legacy continuous | `topic` / `continuous` | queue with `none`; existing smoother manager with `temporal_ensemble` or disabled passthrough | queue keeps newest actions within capacity; direct logical consumption |
+| Legacy benchmark | `benchmark` / `wait_for_feedback` | same queue/manager choices | same queue clipping; revision-bound reservation and feedback commit |
+| Scheduled | `topic` / `continuous` only | queue with `none`; separate smoother with `temporal_ensemble` | queue overflow rejects, safe-stops and closes; direct logical consumption |
 
-A topic-based action executor:
-- Routes actions to correct topics based on Contract specifications
-- Supports `Float64MultiArray` and `JointTrajectory` message types
-- High-frequency position control
+Smoother storage does not inherit deque capacity limits. Legacy toggles retain an
+existing manager and its plan; a node without a manager cannot enable one via the
+toggle. Scheduled toggles retain the inactive queue and its metadata, but discard
+the smoother plan when disabling. No cross-store action migration is performed.
+Legacy continuous stop/start retains actions, source, position and watermark while
+invalidating old in-flight requests. Reset and benchmark cleanup discard the plan;
+scheduled stop/safe-stop/close/restart clear both stores, including inactive metadata.
+
+### State ownership (existing per-path differences, preserved by the refactor)
+
+| State / semantics | Owner |
+|-------------------|-------|
+| `policy_reset_in_progress` inference gate, request/generation accounting | legacy node |
+| queue clipping, accepted source interval, revision and watermark | active-plan owner (path-selected overflow policy) |
+| capacity overflow as failure (`ValueError` -> safe-stop + session close), `(session_id, generation, request_id)` result dedup | scheduled path |
+| session state machine (WAITING_READY/.../FAILED) and retries | scheduled path (not moved into `DispatchScheduler`) |
+| watermark replenishment rule | shared (`schedulers.continuous.should_replenish_plan`) |
+
+### Extension points (follow-up changes)
+
+- **#401 AutoHorizon**: `executed_during_inference` is the original-chunk start;
+  `execution_horizon` is the exclusive stop, not a count after skipping.
+  `replenishment_watermark=None` uses the configured default; zero means replenish when empty.
+  Both stores apply the interval once. Attention estimation, model capability checks and runtime options are not implemented.
+- **#411 RTC**: `PlanSource` records request and applicable generation/session IDs.
+  Direct single-source `PlanSnapshot.next_position` includes skipped/clipped prefixes.
+  Revision only invalidates local reservations. Ensemble has no exact single-source coordinate;
+  latest source is diagnostic. Local acceptance/topic progress is neither physical completion nor remote cache acknowledgment.
+  Cross-request cache identity, routing/failure reconciliation, coordinate transforms/relative-action re-anchoring
+  and wire forwarding remain gaps. Neither AutoHorizon nor RTC is a production strategy name;
+  follow-up PRs must independently rebase and verify node wiring and protocol behavior.
 
 ## Installation
 
+After setting up the environment, build from the workspace root:
+
 ```bash
-cd ~/ibrobot_ws
-colcon build --packages-select action_dispatch
-source install/setup.bash
+source .shrc_local
+./scripts/build.sh --packages-up-to action_dispatch
+source .shrc_local
 ```
 
-## Usage
+## Configuration and Usage
 
 ### Launch Node
 
+Use robot_config launch for a complete robot. The standalone legacy debug entrypoint below
+still needs valid robot YAML, an inference service and controllers. Additional scheduled
+configuration is described in the [scheduler control plane](../robot_config/README.md#推理调度控制面).
+
 ```bash
-ros2 run action_dispatch action_dispatcher_node
+ros2 run action_dispatch action_dispatcher_node --ros-args -p robot_config_path:=/path/to/robot.yaml
 ```
+
+### Strategy configuration and combination validation
+
+The SSOT for strategy names and legal combinations lives in
+`robot_config.dispatch_strategies`; launch builders (launch-time validation)
+and both dispatcher nodes (init-time defensive validation) share one
+resolver, with entrypoint-specific capability checks:
+
+In robot YAML, `executor`, `dispatch` and `inference` are siblings under `robot.control_modes.<mode>`.
+See the [robot_config dispatch strategy SSOT](../robot_config/README.md#动作分发策略-ssot) for the schema.
+
+- Legacy legal pairings: `topic`+`continuous`, `benchmark`+`wait_for_feedback`.
+  Scheduled accepts only `topic`+`continuous`; explicit unsupported selections
+  are rejected, not discarded. The historical executor `action` alias is mapped
+  to `topic` only at the robot_config launch boundary, not direct node startup.
+- **Breaking interface change:** `temporal_smoothing_enabled` is removed, with
+  no alias or compatibility path. Old robot YAML and direct ROS overrides
+  (constructor, CLI or parameter file) are rejected even when consistent.
+  Migrate false to `dispatch.blending: none`, true to `temporal_ensemble`;
+  direct ROS callers use `blending_strategy` instead.
+- Omitted `dispatch.chunking`/`dispatch.blending` resolve to `full_chunk`/`none`.
+  Both legacy and scheduled standalone nodes default to `blending_strategy: none`.
+- Missing, null or empty-string strategy names use defaults (`topic`,
+  `continuous`, `full_chunk`, and `none`). False, zero, lists, mappings,
+  unknown names and case variants are rejected.
+- Node parameters are `executor_type`, `scheduler_mode`, `chunking_strategy`,
+  and `blending_strategy`. ROS parameter typing
+  still applies; YAML null defaults refer to configuration resolution, not a
+  promise that a ROS CLI null override is accepted.
+- Deliberate rejection changes: malformed/empty/non-finite raw chunks are not
+  accepted. Legacy continuous retains its old plan and logs rejection; benchmark
+  aborts as inference-failed before successful startup; scheduled safe-stops and
+  closes. A valid nonempty chunk with an empty selected interval clears executable
+  storage. Rejected replacements cannot change the accepted watermark.
 
 ### Parameters
 
+These are standalone node defaults. robot_config launch overrides runtime parameters from
+same-named `executor` fields and strategy fields from `dispatch`. Legacy endpoints do not
+apply to scheduled; see the [scheduler control plane](../robot_config/README.md#推理调度控制面).
+
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `queue_size` | int | 100 | Maximum action queue length |
-| `watermark_threshold` | int | 20 | Watermark threshold to trigger inference |
-| `control_frequency` | double | 100.0 | Control frequency (Hz) |
-| `inference_action_server` | string | `/inference/policy/dispatch` | Named-pipeline inference action; robot_config overrides it from `executor.inference_pipeline` |
-| `inference_reset_service` | string | `/inference/policy/reset` | Named-pipeline reset service; called best-effort during reset |
-| `policy_reset_timeout_sec` | double | 2.0 | Max wait time for inference-side policy reset completion |
-| `contract_path` | string | `''` | Contract file path |
+| `executor_type` | string | `topic` | Output channel; pairing constraints above |
+| `scheduler_mode` | string | `continuous` | Per-tick scheduling, not the inference product-entrypoint switch |
+| `chunking_strategy` | string | `''` | Empty resolves to `full_chunk` |
+| `blending_strategy` | string | `none` | `none` or `temporal_ensemble` |
+| `queue_size` | int | 100 | Maximum queue length; does not limit smoother storage |
+| `watermark_threshold` | int | 20 | Replenish when remaining is at or below this value; not a fixed execution interval |
+| `control_frequency` | double | 100.0 | Control tick frequency (Hz), not inference frequency |
+| `robot_config_path` | string | `''` | Robot YAML path containing the contract |
 | `joint_state_topic` | string | `/joint_states` | Joint state topic |
-| `navigation_mode` | bool | false | Navigation mode (stopped at startup, waiting for external trigger) |
-| `temporal_smoothing_enabled` | bool | false | Enable cross-frame smoothing |
-| `temporal_ensemble_coeff` | double | 0.01 | Smoothing coefficient |
-| `chunk_size` | int | 100 | Action chunk size |
-| `smoothing_device` | string | `''` | Device for smoothing computation (empty=auto-detect) |
+| `navigation_mode` | bool | false | Wait for an external trigger at startup |
+| `temporal_ensemble_coeff` | double | 0.01 | Exponential blending coefficient |
+| `chunk_size` | int | 100 | Smoother weight-table size, not the actual model output length |
+| `smoothing_device` | string | `''` | Empty uses the input tensor device, or CPU for NumPy input |
+| `inference_action_server` | string | `/inference/policy/dispatch` | Legacy only; launch overrides from the named pipeline |
+| `inference_reset_service` | string | `/inference/policy/reset` | Legacy only; called best-effort during reset |
+| `policy_reset_timeout_sec` | double | 2.0 | Legacy only; maximum wait for policy reset |
+
+### Inference Replenishment and Blending Examples
+
+These are partial settings to merge into an existing robot YAML, not complete launch
+configurations. `executor` and `dispatch` are siblings under
+`robot.control_modes.model_inference`. Keep `inference.enabled`, valid
+`inference.pipelines`, controllers and the contract configured.
+`executor.inference_pipeline: policy` must reference a declared pipeline; the scheduled
+entrypoint also needs its session/scheduler configuration and is not enabled by these snippets alone.
+
+**Replenish after exhaustion, without blending:**
+
+```yaml
+robot:
+  control_modes:
+    model_inference:
+      executor:
+        type: topic
+        inference_pipeline: policy
+        queue_size: 100
+        watermark_threshold: 0
+      dispatch:
+        scheduler: continuous
+        chunking: full_chunk
+        blending: none
+```
+
+With watermark 0, the next chunk is requested only after the old plan is exhausted.
+While awaiting the result there are no new planned actions; the last action, if available,
+continues to be published (hold last). This is neither a physical stop nor safe-stop,
+and does not guarantee uninterrupted motion. Hold does not consume planned steps and
+therefore does not increase the new chunk's skipped prefix.
+
+**Replenish early and blend the overlap:**
+
+```yaml
+robot:
+  control_modes:
+    model_inference:
+      executor:
+        type: topic
+        inference_pipeline: policy
+        queue_size: 100
+        watermark_threshold: 80
+        chunk_size: 100
+        temporal_ensemble_coeff: 0.01
+      dispatch:
+        scheduler: continuous
+        chunking: full_chunk
+        blending: temporal_ensemble
+```
+
+Assume A and B each actually return 100 steps, with no pause, toggle or failure in between.
+Indices below are zero-based with exclusive upper bounds:
+
+```text
+A returns: 100 steps
+  -> Consume 20 steps: A[20:100], 80 remaining, trigger request B
+  -> Consume 30 steps during asynchronous inference B: A[50:100], 50 remaining
+  -> B returns 100 steps: skip B[0:30], retain B[30:100], 70 steps
+
+Alignment at acceptance:   Overlap: 50 steps                New tail: 20 steps
+Old plan                   A[50:100]                       (none)
+New plan                   B[30:80]                        B[80:100]
+Output                     blend(A[50:100], B[30:80])     + B[80:100] = 70 steps
+```
+
+The skipped prefix is the **30 steps** consumed since B's observation/request baseline,
+not the cumulative 50 steps consumed from A. The implementation aligns using the change
+in plan length between request start and result arrival, not elapsed wall time, and adds
+no compensation for sensor sample age before the request. Consumption is local logical
+progress, not confirmation of physical completion. Since 70 is still below watermark 80,
+C may be requested on the next tick once the request has finished and other gates allow.
+Watermark 80 does not mean inference every fixed 20 steps. Early replenishment also cannot
+guarantee that inference is fast enough to prevent exhaustion.
+
+Watermark and blending are independent choices:
+
+- With watermark 0 and omitted `dispatch.blending`, the current resolver, legacy/scheduled
+  launch paths and standalone nodes all default to `none`. The Python launch example later
+  in this README explicitly enables ensemble; it is not the default.
+- With watermark 0 and explicit `temporal_ensemble`, the selection is not rewritten to
+  `none`. Normal replenish-after-exhaustion flow has no old/new plan overlap, but still uses
+  a smoother. Compute/storage costs, capacity, source coordinates and toggle behavior differ;
+  it is not fully equivalent to `none`. See the storage and state-ownership discussion above.
+- With watermark 80 and `none`, early requests and prefix skipping still apply, but B's
+  70 retained steps directly replace A's remaining 50 steps without blending or waiting
+  behind the old plan.
 
 ### Launch File Example
 
@@ -206,12 +369,12 @@ def generate_launch_description():
             name='action_dispatcher',
             parameters=[{
                 'queue_size': 100,
-                'watermark_threshold': 20,
+                'watermark_threshold': 80,
                 'control_frequency': 100.0,
-                'temporal_smoothing_enabled': True,
+                'blending_strategy': 'temporal_ensemble',
                 'temporal_ensemble_coeff': 0.01,
                 'chunk_size': 100,
-                'contract_path': '/path/to/contract.yaml',
+                'robot_config_path': '/path/to/robot.yaml',
             }]
         )
     ])
@@ -219,102 +382,17 @@ def generate_launch_description():
 
 ## Cross-Frame Temporal Smoothing
 
-### Principle
+### Alignment and Overlap
 
-Embodied models typically output in Action Chunk format, producing n actions per inference. Cross-frame smoothing solves the following problem:
+Use the [asynchronous replenishment example](#inference-replenishment-and-blending-examples)
+above as the timing reference. One inference returns one chunk containing N actions, not
+N chunks. The planner selects `[skip:N]`; the owner applies that interval once. The smoother
+receives already-aligned actions and does not skip the prefix again.
 
-```
-First inference: produces n action chunks
-After executing l actions (l < n), second inference completes
-New inference results need to be smoothed and aligned with remaining n-l actions
-```
-
-### Cross-Frame Smoothing Diagram
-
-```
-Timeline ──────────────────────────────────────────────────────────────────────▶
-
-                    ┌─ Inference Start ─┐                ┌─ Inference End ─┐
-                    │                   │                │                 │
-                    ▼                   │                ▼                 │
-                                                                                                  
-T1: First Inference [a1, a2, a3, a4, a5, a6, a7, a8, a9, a10]  (n=10 actions)
-                    │                                               │
-                    │  Executing actions...                        │
-                    ▼                                               ▼
-T2: During Exec     [a4, a5, a6, a7, a8, a9, a10]                Remaining 7
-                    │     ▲                                       ▲
-                    │     │                                       │
-                    │     └─ 3 actions executed during inference ┘
-                    │
-                    ▼
-T3: Second Inference [b1, b2, b3, b4, b5, b6, b7, b8, b9, b10]  (new n=10)
-                    │     │
-                    │     └─ First 3 are outdated, skip
-                    ▼
-T4: Aligned New     [b4, b5, b6, b7, b8, b9, b10]              Relevant (n-l=7)
-                    │
-                    │  Smooth overlap with old actions
-                    ▼
-T5: Smoothed Result [blend, blend, blend, blend, b8, b9, b10]
-                    │  └───────┬───────┘  │
-                    │    Overlap Region   New Tail
-                    │    (7 old + 7 new → 7 blended)
-                    ▼
-                    Final: 7 blended + 3 new = 10 actions
-```
-
-### Smoothing Process Detail
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      Cross-Frame Smoothing Calculation                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  Original Action Queue (first inference result):                             │
-│  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐ ┌────┬────┬────┬────┬────┬────┬────┐                │
-│  │  a1   a2   a3   │ │ a4 │ a5 │ a6 │ a7 │ a8 │ a9 │a10 │                │
-│  └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘ └────┴────┴────┴────┴────┴────┴────┘                │
-│  ╎                    │    │    │    │    │    │    │                      │
-│  ╎ Executed (skip)    │    │    │    │    │    │    │   Remaining Queue   │
-│  ╎ (3 during infer)   │    │    │    │    │    │    │   count: [1,1,1,1,1,1,1]│
-│  ╎                    ▼    ▼    ▼    ▼    ▼    ▼    ▼                      │
-│  ╎                                                                     │
-│  ╎  New Inference Result (complete):                                    │
-│  ╎  ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─┐ ┌────┬────┬────┬────┬────┬────┬────┐            │
-│  ╎  │  b1   b2   b3   │ │ b4 │ b5 │ b6 │ b7 │ b8 │ b9 │b10 │            │
-│  ╎  └ ─ ─ ─ ─ ─ ─ ─ ─ ─┘ └────┴────┴────┴────┴────┴────┴────┴────┘        │
-│  ╎  Outdated (skip)      │    │    │    │    │    │    │                  │
-│  ╎                       │    │    │    │    └────┴────┴──▶ New tail      │
-│  ╎                       │    │    │    │          (direct append)        │
-│  ╎                       └────┴────┴────┴──▶ Overlap (needs smoothing)    │
-│  ╎                                                                     │
-│  ╎  Weight: w = exp(-0.01 * k),  Cumsum: [1.00, 1.99, 2.97, ...]       │
-│                                                                              │
-│  Smoothing Calculation (overlap region):                                     │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  blended[i] = (old[i] * cumsum[count-1] + new[i] * weight[count])   │   │
-│  │                         cumsum[count]                                 │   │
-│  │                                                                       │   │
-│  │  Example (i=0, count=1):                                              │   │
-│  │    blended = (a4 * 1.00 + b4 * 0.99) / 1.99                          │   │
-│  │           = 0.502 * a4 + 0.498 * b4                                  │   │
-│  │                                                                       │   │
-│  │  After multiple smoothings (count=k):                                 │   │
-│  │    Old action weights accumulate, new action weights decrease         │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  Final Smoothed Result:                                                      │
-│  ┌────────┬────────┬────────┬────────┬────┬────┬────┬────┬────┬────┐      │
-│  │blend(4)│blend(5)│blend(6)│blend(7)│ b8 │ b9 │b10 │    │    │    │      │
-│  └────────┴────────┴────────┴────────┴────┴────┴────┴────┴────┴────┘      │
-│    └──────────┬──────────┘   └──┬──┘                                        │
-│        Smoothed Region        New Tail                                      │
-│                                                                              │
-│  Legend: ╎ ╎ ╎ = Dashed lines show executed/outdated actions, not smoothed   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+Overlap length is `min(old remaining length, new selected length)`. Only the new tail beyond
+the overlap is appended; any old tail beyond the new selection is discarded. The resulting
+length therefore equals the new selected length. The first aligned position in the example
+is `A[50]` with `B[30]`, not equal indices within the two chunks.
 
 ### Smoothing Formula
 
@@ -324,9 +402,16 @@ blended[i] = (old[i] * cumsum[count[i]-1] + new[i] * weight[count[i]]) / cumsum[
 
 Where:
 - `old[i]`: The i-th action in the old action plan
-- `new[i]`: The i-th action in the new inference result
+- `new[i]`: The i-th action in the aligned new selection
+- `count[i]`: Existing prediction contributions at that position, initially 1
 - `weight[k]`: Weight for k-th contribution = exp(-coeff * k)
 - `cumsum[k]`: Cumulative weight sum
+
+For the first example position with `count=1`:
+`(A[50] * 1 + B[30] * exp(-0.01)) / (1 + exp(-0.01))`, approximately
+`0.5025 * A[50] + 0.4975 * B[30]`. New tail counts start at 1. Once a count reaches
+`chunk_size`, that position freezes and accepts no further weighted contributions.
+`chunk_size` sizes the weight table; it is not the model output length or queue capacity.
 
 ### Smoothing Coefficient
 
@@ -336,16 +421,26 @@ Where:
 | `Positive` | More weight to older actions (stable, conservative) |
 | `Negative` | More weight to newer actions (responsive, may cause jitter) |
 
-Default value `0.01` is from the original ACT paper.
+The current default coefficient is `0.01`; blending weights do not determine inference timing.
 
 ### Runtime Toggle
+
+`blending_strategy` accepts startup CLI/YAML overrides but rejects direct runtime parameter writes,
+including valid values and no-op writes. Both nodes use `~/toggle_smoothing` (Empty): all parameter
+veto callbacks must pass before plan state changes. A successful toggle updates both the authoritative
+strategy and public parameter, preserving the selection through parameter export/restart.
+Rejection is logged; Empty has no error field. Legacy startup with `none` has no manager and cannot
+enable one through toggle; an existing manager retains its plan. Scheduled retains the inactive queue
+and discards the smoother plan when disabling, without migrating actions across stores.
+See [state ownership](#strategy-layers-and-state-ownership) for pause and cleanup differences.
+The following calls can change robot state:
 
 ```bash
 # Toggle smoothing on/off
 ros2 service call /action_dispatcher/toggle_smoothing std_srvs/srv/Empty
 
-# Reset state
-ros2 service call /action_dispatcher/reset std_srvs/srv/Empty
+# Legacy only: reset state; scheduled uses restart_session (Trigger)
+ros2 service call /action_dispatcher/reset std_srvs/srv/Empty "{}"
 ```
 
 ## Navigation Mode
@@ -409,7 +504,7 @@ ros2 service call /action_dispatcher/get_status std_srvs/srv/Trigger
 
 ### Configuration Example
 
-Enable in robot configuration YAML:
+Merge these partial settings under the `robot` block in robot YAML:
 
 ```yaml
 control_modes:
@@ -426,7 +521,9 @@ control_modes:
 
 | Direction | Topic/Action | Message Type | Description |
 |-----------|--------------|--------------|-------------|
-| Request | `/inference/policy/dispatch` | `ibrobot_msgs/action/DispatchInfer` | Send a request to the default `policy` pipeline; robot_config may override the endpoint |
+| Legacy request | `/inference/policy/dispatch` | `ibrobot_msgs/action/DispatchInfer` | Request the selected `executor.inference_pipeline` when scheduler is absent/false |
+| Scheduled session | `/inference/session/open`, `/inference/session/close` | `OpenInferenceSession`, `CloseInferenceSession` | Global endpoints only; Open does not route models |
+| Scheduled request | `/inference/dispatch` | `ScheduledDispatchInfer` | Carries session/generation/request/target/priority/deadline; priority-0 adds fallback chain |
 | Response | `result.action_chunk` | `ibrobot_msgs/msg/VariantsList` | Receive action chunk (Tensor) |
 
 ### Published Topics
@@ -446,11 +543,17 @@ control_modes:
 
 | Service | Type | Description |
 |---------|------|-------------|
-| `~/reset` | `std_srvs/Empty` | Reset queue and state; also best-effort calls `inference_reset_service` to reset inference-side policy state |
+| `~/reset` | `std_srvs/Empty` | Legacy only: reset queue/state and best-effort call `inference_reset_service`; scheduled uses `~/restart_session` |
 | `~/toggle_smoothing` | `std_srvs/Empty` | Toggle smoothing on/off |
 | `~/start_evaluate` | `std_srvs/Trigger` | Resume dispatcher execution |
 | `~/stop_evaluate` | `std_srvs/Trigger` | Pause dispatcher execution; also stop the base when `navigation_mode=true` |
-| `~/get_status` | `std_srvs/Trigger` | Get running status (running/stopped) |
+| `~/get_status` | `std_srvs/Trigger` | Get running status; scheduled returns session state-machine status |
+| `~/restart_session` | `std_srvs/Trigger` | Scheduled only: safe-stop, Close, clear local state, then Open with a new UUID |
+
+On the scheduled path, `~/start_evaluate`, `~/stop_evaluate`, and `~/restart_session` return
+`success=false` with `message="lifecycle operation in progress"` on lifecycle contention.
+This means the requested operation was **not executed**, including Stop: a busy response
+is not a successful stop. Callers must check the response and decide whether to retry based on the state.
 
 ### Communication with ros2_control
 
@@ -478,16 +581,20 @@ smoother = TemporalSmoother(config)
 
 # First inference
 actions1 = model.inference(obs)  # shape: (100, action_dim)
-smoother.update(actions1, actions_executed=0)
+smoother.update(actions1, actions_executed_during_inference=0)
 
-# Get actions one by one
+# Consume 20 steps before requesting B
+for _ in range(20):
+    robot.execute(smoother.get_next_action())
+
+# Sample/compute B at the request baseline; simulate delaying asynchronous delivery
+actions2 = model.inference(obs)
 for _ in range(30):
     action = smoother.get_next_action()
     robot.execute(action)
 
-# Second inference (30 actions executed during inference)
-actions2 = model.inference(obs)
-smoother.update(actions2, actions_executed=30)
+# Deliver B after 30 steps were consumed during the request; 70 remain after update
+smoother.update(actions2, actions_executed_during_inference=30)
 
 # Continue executing smoothed actions
 while smoother.plan_length > 0:

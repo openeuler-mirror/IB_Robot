@@ -8,7 +8,6 @@ Publishes actions to ros2_control via TopicExecutor at a fixed frequency.
 Supports cross-frame temporal smoothing for action chunks.
 """
 
-import collections
 import json
 
 # Business tracepoints via Python logging.
@@ -18,12 +17,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from functools import wraps
 
 import numpy as np
 import rclpy
 import rclpy.action
 import rclpy.time
 import torch
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.node import Node
@@ -35,10 +36,13 @@ from std_srvs.srv import Empty, Trigger
 from ibrobot_msgs.action import DispatchInfer, RunPolicy
 from ibrobot_msgs.srv import PreparePolicyEpisode
 from robot_config.contract_utils import iter_specs
+from robot_config.dispatch_strategies import resolve_dispatch_strategies
 from robot_config.tracing_utils import create_trace_logger
 from tensormsg.converter import TensorMsgConverter
 
 from .action_chunk import normalize_action_chunk
+from .active_plan import ActivePlan, PlanSource
+from .chunk_planning import create_chunk_planner
 from .episode import (
     TERMINATION_CANCELED,
     TERMINATION_EXECUTION_FAILED,
@@ -60,6 +64,7 @@ from .schedulers.base import (
     CompletionDecision,
     SchedulerSnapshot,
 )
+from .schedulers.continuous import should_replenish_plan
 from .schedulers.registry import create_scheduler
 from .temporal_smoother import (
     TemporalSmootherManager,
@@ -107,6 +112,17 @@ class PrepareContext:
 _normalize_action_chunk = normalize_action_chunk
 
 
+def _dispatch_locked(method):
+    """Serialize local dispatch transitions; never use on a blocking barrier."""
+
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._dispatch_lock:
+            return method(self, *args, **kwargs)
+
+    return locked
+
+
 class ActionDispatcherNode(Node):
     """
     Simplified action dispatcher.
@@ -121,6 +137,25 @@ class ActionDispatcherNode(Node):
     def __init__(self, **kwargs):
         super().__init__("action_dispatcher", **kwargs)
         self.get_logger().info("Initializing Action Dispatcher")
+        if "temporal_smoothing_enabled" in self._parameter_overrides:
+            raise ValueError("temporal_smoothing_enabled was removed; use blending_strategy=none|temporal_ensemble")
+
+        # rclpy merges programmatic, YAML and CLI overrides here. Read raw
+        # values before declarations can replace NOT_SET with a default.
+        strategy_parameters = {
+            "executor_type": "executor_type",
+            "scheduler_mode": "scheduler_mode",
+            "chunking_strategy": "chunking",
+            "blending_strategy": "blending",
+        }
+        self._strategy_selection = resolve_dispatch_strategies(
+            **{
+                argument: self._parameter_overrides[parameter].value
+                for parameter, argument in strategy_parameters.items()
+                if parameter in self._parameter_overrides
+            },
+            entrypoint="legacy",
+        )
 
         # 1. Parameters
         self.declare_parameter("queue_size", 100)
@@ -148,6 +183,13 @@ class ActionDispatcherNode(Node):
         # modifying robot_config/YAML. Default ``continuous`` keeps all
         # existing IB-Robot behaviour byte-for-byte.
         self.declare_parameter("scheduler_mode", "continuous")
+        # Chunk-planning and action-blending strategy selection. SSOT
+        # ``dispatch.chunking``/``dispatch.blending`` are passed through by
+        # launch builders. Standalone fusion defaults to none.
+        self.declare_parameter("chunking_strategy", "")
+        self.declare_parameter("blending_strategy", "none")
+        self._blending_update = None
+        self.add_on_set_parameters_callback(self._validate_blending_update)
         # Execution timeout for ``wait_for_feedback`` mode only. Monotonic
         # nanoseconds, never mixed with ROS/sim observation time. Continuous
         # mode does not use this value.
@@ -160,7 +202,6 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("benchmark_step_service", "")
 
         # Temporal smoothing parameters
-        self.declare_parameter("temporal_smoothing_enabled", False)
         self.declare_parameter("temporal_ensemble_coeff", 0.01)
         self.declare_parameter("chunk_size", 100)
         self.declare_parameter("smoothing_device", "")
@@ -171,7 +212,7 @@ class ActionDispatcherNode(Node):
         self._server_name = self.get_parameter("inference_action_server").value
 
         # Smoothing config
-        self._smoothing_enabled = self.get_parameter("temporal_smoothing_enabled").value
+        self._smoothing_enabled = self._strategy_selection.blending == "temporal_ensemble"
         self._temporal_ensemble_coeff = self.get_parameter("temporal_ensemble_coeff").value
         self._chunk_size = self.get_parameter("chunk_size").value
         smoothing_device = self.get_parameter("smoothing_device").value
@@ -180,11 +221,11 @@ class ActionDispatcherNode(Node):
 
         # 2. State & Queue
         self._navigation_mode = self.get_parameter("navigation_mode").value
-        self._queue = collections.deque(maxlen=self._queue_limit)
         self._last_action: np.ndarray | None = None
         self._inference_in_progress = False
         self._inflight_request_id = ""
         self._policy_reset_in_progress = False
+        self._policy_reset_future = None
         self._policy_reset_started_at = 0.0
         self._policy_reset_timeout_s = float(self.get_parameter("policy_reset_timeout_sec").value)
         self._inference_started_at = 0.0
@@ -240,7 +281,7 @@ class ActionDispatcherNode(Node):
             self.get_logger().info(f"Detected base action spec: {[n for n in self._base_act_spec.names]}")
 
         # 5. Executor (Topic-based, selected via registry)
-        executor_type_str = self.get_parameter("executor_type").value
+        executor_type_str = self._strategy_selection.executor_type
         self.get_logger().info(f"[IBROBOT_EXECUTOR][SELECTED] type={executor_type_str}")
         # production benchmark wiring: read scheduler_mode early so the generic pairing guard can
         # fail-fast on illegal combinations before any executor/scheduler is
@@ -248,8 +289,18 @@ class ActionDispatcherNode(Node):
         # ``topic``/``benchmark``/``continuous``/``wait_for_feedback``; it
         # does NOT alias, lowercase or fall back. Legacy ``action`` and other
         # unknown strings pass through to the registries which fail-fast.
-        scheduler_mode_str = self.get_parameter("scheduler_mode").value
-        self._validate_executor_scheduler_pairing(executor_type_str, scheduler_mode_str)
+        scheduler_mode_str = self._strategy_selection.scheduler_mode
+        # Strategy resolution: exact names, compatibility defaults, and
+        # contradiction checks (including the executor/scheduler pairing)
+        # share the canonical robot_config validators with the launch
+        # builders, so both layers cannot silently diverge.
+        self._chunking_strategy = self._strategy_selection.chunking
+        # Strategy instances are constructed once at init (matching the
+        # scheduler/executor registry wiring) so stateful follow-up
+        # strategies can hold cross-request state; per-tick code selects
+        # instances, never types.
+        self._chunk_planner = create_chunk_planner(self._chunking_strategy)
+        self._active_plan = ActivePlan(capacity=self._queue_limit, watermark=self._watermark, smoother=self._smoother)
         # create_executor raises ExecutorNotFoundError for unknown types; letting
         # it propagate fail-fasts the node at init without falling back.
         # production benchmark wiring: factory config is a unified dict containing ``action_specs``
@@ -287,8 +338,8 @@ class ActionDispatcherNode(Node):
         # completion-aware executor contract wait-for-feedback reservation state. Only used when
         # scheduler_mode == "wait_for_feedback"; continuous never touches this.
         self._reservation_context: ExecutionContext | None = None
-        self._reservation_plan_generation: int = 0
-        self._plan_generation: int = 0
+        self._plan_reservation = None
+        self._reserved_action = None
 
         # benchmark episode controller: episode state machine and benchmark-only goal gate.
         # The episode state machine is created unconditionally (it is pure
@@ -397,45 +448,9 @@ class ActionDispatcherNode(Node):
         self._hold_count = 0
         self._consecutive_failures = 0
         self._last_stats_dispatch_count = 0
-        self._active_request_id = ""
-        self._actions_executed_from_active_request = 0
         self._last_queue_refill_monotonic_ns = 0
         self._last_stall_log_ns = time.monotonic_ns()
         self._benchmark_inference_timings: dict[str, dict[str, object]] = {}
-
-    @staticmethod
-    def _validate_executor_scheduler_pairing(executor_type: str, scheduler_mode: str) -> None:
-        """production benchmark wiring generic executor/scheduler pairing guard.
-
-        Legal combinations:
-        - ``topic`` + ``continuous``
-        - ``benchmark`` + ``wait_for_feedback``
-
-        Illegal:
-        - ``benchmark`` + ``continuous`` (benchmark requires step feedback)
-        - ``wait_for_feedback`` + any executor other than ``benchmark``
-
-        Unknown executor/scheduler strings are NOT aliased, case-folded or
-        fallback-corrected here; they pass through so the executor/scheduler
-        registries can fail-fast with their own clear error messages. The
-        legacy ``action`` string is preserved verbatim (it is not silently
-        rewritten to ``topic``).
-
-        Raises:
-            ValueError: if a known special-pair rule is violated.
-        """
-        # benchmark requires wait_for_feedback; benchmark + continuous illegal.
-        if executor_type == "benchmark" and scheduler_mode != "wait_for_feedback":
-            raise ValueError(
-                f"executor type 'benchmark' requires scheduler_mode 'wait_for_feedback'; "
-                f"got scheduler_mode={scheduler_mode!r}"
-            )
-        # wait_for_feedback requires benchmark; any non-benchmark executor illegal.
-        if scheduler_mode == "wait_for_feedback" and executor_type != "benchmark":
-            raise ValueError(
-                f"scheduler_mode 'wait_for_feedback' requires executor type 'benchmark'; "
-                f"got executor_type={executor_type!r}"
-            )
 
     def _joint_cb(self, msg):
         """Optional: could use current state for safety or initialization."""
@@ -443,15 +458,14 @@ class ActionDispatcherNode(Node):
 
     def _get_plan_length(self) -> int:
         """Get current plan length (works for both modes)."""
-        if self._smoother is not None:
-            return self._smoother.plan_length
-        return len(self._queue)
+        with self._dispatch_lock:
+            return self._active_plan.snapshot().remaining
 
+    @_dispatch_locked
     def _control_loop(self):
         # benchmark episode controller: benchmark/wait_for_feedback uses the episode gate (opened by
         # RunPolicy goal, closed on terminal), NOT the legacy ``_is_running``
-        # flag. Routing this path BEFORE the ``_is_running`` check keeps the
-        # continuous body below byte-for-byte identical to executor registry contract/completion-aware executor contract.
+        # flag. Both paths serialize their plan operations with lifecycle changes.
         if self._scheduler_mode == "wait_for_feedback":
             self._control_loop_wait_for_feedback()
             return
@@ -462,12 +476,19 @@ class ActionDispatcherNode(Node):
         self._expire_policy_reset_if_needed()
         self._expire_inference_if_needed()
 
-        q_size = self._get_plan_length()
+        plan = self._active_plan.snapshot()
+        q_size = plan.remaining
         self._queue_size_pub.publish(Int32(data=q_size))
         self._smoothing_enabled_pub.publish(Bool(data=self._smoothing_enabled))
 
-        # A. Trigger Inference if queue is low
-        if q_size <= self._watermark and not self._inference_in_progress and not self._policy_reset_in_progress:
+        # A. Trigger Inference if queue is low (shared watermark rule; the
+        # legacy policy-reset gate stays a legacy-owned inference gate).
+        if should_replenish_plan(
+            q_size,
+            plan.watermark,
+            inference_in_progress=self._inference_in_progress,
+            policy_reset_in_progress=self._policy_reset_in_progress,
+        ):
             self._request_inference()
 
         # Diagnostic: surface a running-but-not-dispatching loop (stays quiet in
@@ -486,25 +507,16 @@ class ActionDispatcherNode(Node):
                     f"watermark={self._watermark} gen={self._request_generation}"
                 )
 
-        # B. Get Action
-        action = None
-        action_source = "empty"
-        if q_size > 0:
-            if self._smoother is not None:
-                action_tensor = self._smoother.get_next_action()
-                if isinstance(action_tensor, torch.Tensor):
-                    action = action_tensor.detach().cpu().numpy()
-                else:
-                    action = action_tensor
-                action_source = "smoother"
-            else:
-                action = self._queue.popleft()
-                action_source = "queue"
+        # B. Get Action (action-blending boundary: direct queue consumption,
+        # temporal-ensemble plan, or hold-last fallback).
+        plan = self._active_plan.snapshot()
+        blended = self._active_plan.take_action(last_action=self._last_action)
+        action = blended.action
+        action_source = blended.source
+        if action_source not in ("empty", "hold"):
             self._last_action = action
-        elif self._last_action is not None:
-            action = self._last_action
+        elif action_source == "hold":
             self._hold_count += 1
-            action_source = "hold"
 
         # C. Execute
         if action is not None:
@@ -512,12 +524,13 @@ class ActionDispatcherNode(Node):
                 action_np = action.detach().cpu().numpy()
             else:
                 action_np = np.array(action)
-            execute_index = self._actions_executed_from_active_request
+            execute_index = plan.next_position if plan.next_position is not None else -1
+            request_id = plan.source.request_id if plan.source is not None else ""
             execute_start = time.perf_counter()
             self._executor.execute(
                 action_np,
                 {
-                    "request_id": self._active_request_id,
+                    "request_id": request_id,
                     "execute_index": execute_index,
                     "queue_size": q_size,
                 },
@@ -535,7 +548,7 @@ class ActionDispatcherNode(Node):
             _trace.info(
                 "[action_execute] request_id=%s index=%d source=%s "
                 "queue_before=%d queue_after=%d since_refill_ms=%.2f publish_ms=%.2f",
-                self._active_request_id,
+                request_id,
                 execute_index,
                 action_source,
                 q_size,
@@ -543,8 +556,6 @@ class ActionDispatcherNode(Node):
                 since_refill_ms,
                 publish_ms,
             )
-            if action_source != "hold":
-                self._actions_executed_from_active_request += 1
 
         # D. Periodic stats (only when new inferences arrived)
         now = time.monotonic()
@@ -561,6 +572,7 @@ class ActionDispatcherNode(Node):
             self._hold_count = 0
             self._last_stats_time = now
 
+    @_dispatch_locked
     def _request_inference(self, timestamp_ns: int | None = None):
         """Send async goal to inference service.
 
@@ -570,7 +582,7 @@ class ActionDispatcherNode(Node):
         the dispatcher wall clock. Continuous mode always passes ``None`` and
         keeps using ``get_clock().now()`` exactly as before.
         """
-        if not self._infer_client.wait_for_server(timeout_sec=0.1):
+        if not self._infer_client.server_is_ready():
             return
 
         self._inference_in_progress = True
@@ -601,7 +613,7 @@ class ActionDispatcherNode(Node):
             "[dispatch_request] request_id=%s queue_size=%d watermark=%d",
             self._current_request_id,
             self._plan_length_at_inference_start,
-            self._watermark,
+            self._active_plan.snapshot().watermark,
         )
         self.get_logger().debug(
             f"Requesting inference @ {goal.obs_timestamp.sec}, "
@@ -620,6 +632,7 @@ class ActionDispatcherNode(Node):
             )
         )
 
+    @_dispatch_locked
     def _control_loop_wait_for_feedback(self) -> None:
         """completion-aware executor contract/benchmark episode controller wait-for-feedback control loop.
 
@@ -628,7 +641,6 @@ class ActionDispatcherNode(Node):
         goal or after terminal), only stale completions are drained; no new
         inference or step submission occurs.
 
-        The continuous legacy block stays byte-for-byte identical to executor registry contract.
         Uses peek/submit/drain/reservation so the logical cursor only advances
         after a matching completion; never pops speculatively, never holds,
         never auto-retries on timeout.
@@ -688,16 +700,16 @@ class ActionDispatcherNode(Node):
         # Re-read plan length AFTER drain/commit: a matching completion pops
         # the queue, so the pre-drain q_size is stale. The scheduler snapshot
         # must reflect the real current plan length.
-        q_size = self._get_plan_length()
+        plan = self._active_plan.snapshot()
+        q_size = plan.remaining
         self._queue_size_pub.publish(Int32(data=q_size))
         self._smoothing_enabled_pub.publish(Bool(data=self._smoothing_enabled))
 
         snapshot = SchedulerSnapshot(
             plan_length=q_size,
-            watermark=self._watermark,
+            watermark=plan.watermark,
             inference_in_progress=self._inference_in_progress,
             policy_reset_in_progress=self._policy_reset_in_progress,
-            has_last_action=self._last_action is not None,
         )
 
         # 3. Inference decision. Wait-for-feedback never overlaps inference and
@@ -731,22 +743,16 @@ class ActionDispatcherNode(Node):
             self._submit_next_action_wait_for_feedback()
         # WAIT: do nothing. Wait-for-feedback never holds the last action.
 
+    @_dispatch_locked
     def _submit_next_action_wait_for_feedback(self) -> None:
         """Peek the next action, build a context, submit exactly once."""
         # Peek (do not pop) so the logical plan length stays unchanged until
         # a matching completion arrives.
-        if self._smoother is not None:
-            peeked = self._smoother.peek_next_action()
-            if peeked is None:
-                return
-            if isinstance(peeked, torch.Tensor):
-                action_np = peeked.detach().cpu().numpy()
-            else:
-                action_np = np.array(peeked)
-        else:
-            if not self._queue:
-                return
-            action_np = np.array(self._queue[0])
+        reserved = self._active_plan.reserve()
+        if reserved is None:
+            return
+        reservation, action_np = reserved
+        plan = self._active_plan.snapshot()
 
         correlation_id = uuid.uuid4().hex[:8]
         # benchmark episode controller: inject environment-owned episode_id and expected_step_id from
@@ -761,8 +767,8 @@ class ActionDispatcherNode(Node):
             episode_id=self._episode.episode_id if has_goal else None,
             expected_step_id=self._episode.expected_step_id if has_goal else None,
             metadata={
-                "request_id": self._active_request_id,
-                "execute_index": self._actions_executed_from_active_request,
+                "request_id": plan.source.request_id if plan.source is not None else "",
+                "execute_index": plan.next_position if plan.next_position is not None else -1,
                 "queue_size": self._get_plan_length(),
                 "action_reservation_monotonic_ns": time.monotonic_ns(),
             },
@@ -772,10 +778,16 @@ class ActionDispatcherNode(Node):
         submitted_ns = time.monotonic_ns()
         self._scheduler.on_submission(context, receipt, submitted_ns)
 
+        if not receipt.accepted and receipt.immediate_completion is None:
+            if self._active_goal_handle is not None and self._episode.is_gate_open:
+                self._abort_episode(TERMINATION_EXECUTION_REJECTED)
+            return
+
         # Record the reservation so a later matching completion can validate
         # that the plan has not been replaced underneath us.
         self._reservation_context = context
-        self._reservation_plan_generation = self._plan_generation
+        self._plan_reservation = reservation
+        self._reserved_action = action_np
 
         # If the executor returns an immediate completion (e.g. TopicExecutor),
         # process it exactly once here. The executor's drain must not return it
@@ -784,6 +796,7 @@ class ActionDispatcherNode(Node):
             transition = self._scheduler.on_completion(receipt.immediate_completion)
             self._apply_completion_transition_wait_for_feedback(transition, receipt.immediate_completion)
 
+    @_dispatch_locked
     def _apply_completion_transition_wait_for_feedback(
         self,
         transition,
@@ -814,12 +827,12 @@ class ActionDispatcherNode(Node):
             # submission and completion; fail-closed via the scheduler API
             # (not by mutating private fields). The fault persists until
             # reset; no pop, no retry.
-            if self._reservation_plan_generation != self._plan_generation:
-                self.get_logger().error(
-                    "wait_for_feedback commit rejected: plan generation mismatch "
-                    f"(reservation={self._reservation_plan_generation}, "
-                    f"current={self._plan_generation})"
-                )
+            if self._reservation_context is None:
+                return
+            if completion is not None and completion.correlation_id != self._reservation_context.correlation_id:
+                return
+            if not self._active_plan.is_current(self._plan_reservation):
+                self.get_logger().error("wait_for_feedback commit rejected: plan generation mismatch")
                 self._scheduler.mark_fault("plan_generation_mismatch")
                 self._reservation_context = None
                 # benchmark episode controller: abort the episode only when a RunPolicy goal is active.
@@ -846,19 +859,7 @@ class ActionDispatcherNode(Node):
                 # to prevent "episode committed but action not consumed" state.
                 # Atomic commit handling: entire commit+consume under _dispatch_lock.
                 with self._dispatch_lock:
-                    # Pre-check: if queue/smoother is empty, fail-closed
-                    # BEFORE calling try_commit_step (no half-committed state).
-                    if self._smoother is not None:
-                        if self._smoother.plan_length == 0:
-                            self.get_logger().error("[IBROBOT_EPISODE][COMMIT_NO_ACTION] smoother empty before commit")
-                            self._abort_episode(TERMINATION_EXECUTION_UNCERTAIN)
-                            return
-                    else:
-                        if len(self._queue) == 0:
-                            self.get_logger().error("[IBROBOT_EPISODE][COMMIT_NO_ACTION] queue empty before commit")
-                            self._abort_episode(TERMINATION_EXECUTION_UNCERTAIN)
-                            return
-
+                    # The owner reservation was validated under this same lock.
                     outcome = self._episode.try_commit_step(gen, step_data, time.monotonic_ns())
 
                     if outcome.identity_mismatch:
@@ -876,25 +877,19 @@ class ActionDispatcherNode(Node):
 
                     # applied=True: consume the reserved action.
                     # Queue/smoother non-emptiness verified above.
-                    if self._smoother is not None:
-                        action = self._smoother.get_next_action()
-                        if isinstance(action, torch.Tensor):
-                            action_np = action.detach().cpu().numpy()
-                        else:
-                            action_np = np.array(action)
-                    else:
-                        action_np = self._queue.popleft()
+                    self._active_plan.commit_reserved()
                     queue_after = self._get_plan_length()
                     _trace.info(
                         "[action_execute] request_id=%s index=%d source=commit queue_before=%d queue_after=%d",
-                        self._active_request_id,
-                        self._actions_executed_from_active_request,
+                        self._reservation_context.metadata["request_id"],
+                        self._reservation_context.metadata["execute_index"],
                         queue_before,
                         queue_after,
                     )
-                    self._last_action = action_np
-                    self._actions_executed_from_active_request += 1
+                    self._last_action = self._reserved_action
                     self._reservation_context = None
+                    self._plan_reservation = None
+                    self._reserved_action = None
 
                     # Publish feedback (non-blocking, allowed inside lock).
                     self._publish_step_feedback(step_data, queue_after)
@@ -909,25 +904,19 @@ class ActionDispatcherNode(Node):
                         self._close_episode_terminal(outcome.terminal_reason)
             else:
                 # No active goal (executor lifecycle isolation legacy path): pop as before.
-                if self._smoother is not None:
-                    action = self._smoother.get_next_action()
-                    if isinstance(action, torch.Tensor):
-                        action_np = action.detach().cpu().numpy()
-                    else:
-                        action_np = np.array(action)
-                else:
-                    action_np = self._queue.popleft()
+                self._active_plan.commit(self._plan_reservation)
                 queue_after = self._get_plan_length()
                 _trace.info(
                     "[action_execute] request_id=%s index=%d source=commit queue_before=%d queue_after=%d",
-                    self._active_request_id,
-                    self._actions_executed_from_active_request,
+                    self._reservation_context.metadata["request_id"],
+                    self._reservation_context.metadata["execute_index"],
                     queue_before,
                     queue_after,
                 )
-                self._last_action = action_np
-                self._actions_executed_from_active_request += 1
+                self._last_action = self._reserved_action
                 self._reservation_context = None
+                self._plan_reservation = None
+                self._reserved_action = None
             return
 
         if transition.decision is CompletionDecision.FAIL_CLOSED:
@@ -950,6 +939,7 @@ class ActionDispatcherNode(Node):
 
         # IGNORE: reservation stays in place (if any), nothing to do.
 
+    @_dispatch_locked
     def _goal_response_cb(self, future, request_id: str, request_generation: int, episode_goal_generation: int):
         if request_generation != self._request_generation:
             self._complete_inflight_request(request_id)
@@ -969,12 +959,49 @@ class ActionDispatcherNode(Node):
         )
 
     def _result_cb(self, future, request_id: str, request_generation: int, episode_goal_generation: int):
-        if request_generation != self._request_generation:
+        with self._dispatch_lock:
+            if request_generation != self._request_generation or request_id != self._inflight_request_id:
+                return
+        # Keep the request slot occupied during decoding, then recheck its source.
+        decode_start = time.perf_counter()
+        try:
+            result = future.result().result
+            batch = TensorMsgConverter.from_variant(result.action_chunk) if result.success else None
+            decoded = _normalize_action_chunk(batch["action"]) if result.success else None
+            decode_error = None
+        except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, MemoryError) as exc:
+            decoded = None
+            decode_error = exc
+        with self._dispatch_lock:
+            if request_generation != self._request_generation or request_id != self._inflight_request_id:
+                return
+            if self._is_benchmark and (
+                self._active_goal_handle is None
+                or not self._episode.is_gate_open
+                or episode_goal_generation != self._episode.goal_generation
+            ):
+                self._complete_inflight_request(request_id)
+                return
             self._complete_inflight_request(request_id)
-            self.get_logger().debug(f"Ignoring stale inference result: {request_id}")
-            return
-        self._complete_inflight_request(request_id)
-        result = future.result().result
+            if decode_error is not None:
+                self._reject_action_chunk(request_id, decode_error)
+                return
+            if decoded is not None:
+                _trace.info(
+                    "[dispatch_decode] request_id=%s chunk_size=%d decode_ms=%.2f",
+                    request_id,
+                    decoded[1].shape[0] if decoded[1].ndim else 0,
+                    (time.perf_counter() - decode_start) * 1000.0,
+                )
+            self._accept_result(result, request_id, request_generation, episode_goal_generation, decoded)
+
+    def _reject_action_chunk(self, request_id, error):
+        self.get_logger().error(f"rejecting invalid action chunk from request {request_id}: {error}")
+        if self._is_benchmark:
+            self._abort_episode(TERMINATION_INFERENCE_FAILED)
+
+    def _accept_result(self, result, request_id, request_generation, episode_goal_generation, decoded):
+        """Accept a decoded result after source recheck, with dispatch lock held."""
         req_id = request_id
         result_monotonic_ns = time.monotonic_ns()
         inference_timing = self._benchmark_inference_timings.setdefault(req_id, {})
@@ -1055,182 +1082,48 @@ class ActionDispatcherNode(Node):
             self.get_logger().info(f"Inference recovered (after {self._consecutive_failures} failures)")
             self._consecutive_failures = 0
 
-        # Atomic response handling: unified benchmark validity check + decode + refill under
-        # _dispatch_lock. This prevents reset/cancel/abort from inserting
-        # between the validity check and the queue refill.
-        # _dispatch_lock is NOT held while waiting for ROS Futures/Events;
-        # this callback is invoked by a completed Future, so we're already
-        # past the wait. The decode (TensorMsgConverter) and queue/smoother
-        # update are pure-Python and safe inside the lock.
-        # Continuous/topic mode keeps the existing behavior without lock.
-        if self._is_benchmark:
-            with self._dispatch_lock:
-                if self._active_goal_handle is None:
-                    self.get_logger().info(
-                        f"[IBROBOT_EPISODE][STALE_INFERENCE] no active goal — discarding (request_id={req_id})"
-                    )
-                    return
-                if not self._episode.is_gate_open:
-                    self.get_logger().info(
-                        f"[IBROBOT_EPISODE][STALE_INFERENCE] gate closed — discarding (request_id={req_id})"
-                    )
-                    return
-                if episode_goal_generation != self._episode.goal_generation:
-                    self.get_logger().info(
-                        f"[IBROBOT_EPISODE][STALE_INFERENCE] gen={episode_goal_generation} "
-                        f"current={self._episode.goal_generation} — discarding"
-                    )
-                    return
-                applied = self._episode.try_on_inference_success(episode_goal_generation)
-                if not applied:
-                    self.get_logger().info(
-                        f"[IBROBOT_EPISODE][STALE_INFERENCE] try_on_inference_success returned False "
-                        f"gen={episode_goal_generation} — discarding"
-                    )
-                    return
-
-                # All checks passed; decode and refill under the same lock.
-                self._dispatch_count += 1
-                self._total_inference_latency_ms += result.inference_latency_ms
-
-                decode_start = time.perf_counter()
-                batch = TensorMsgConverter.from_variant(result.action_chunk)
-                decode_ms = (time.perf_counter() - decode_start) * 1000.0
-                _trace.info(
-                    "[dispatch_decode] request_id=%s chunk_size=%d decode_ms=%.2f",
-                    req_id,
-                    result.chunk_size,
-                    decode_ms,
-                )
-                if "action" in batch:
-                    action_chunk_tensor, action_chunk_np = _normalize_action_chunk(batch["action"])
-                    current_plan_length = self._get_plan_length()
-                    actions_executed = max(0, self._plan_length_at_inference_start - current_plan_length)
-                    _trace.info(
-                        "[dispatch_result] request_id=%s success=True latency_ms=%.2f chunk_size=%d",
-                        req_id,
-                        result.inference_latency_ms,
-                        len(action_chunk_np),
-                    )
-                    if self._smoother is not None:
-                        new_length = self._smoother.update(action_chunk_tensor, actions_executed)
-                        self._active_request_id = req_id
-                        self._actions_executed_from_active_request = 0
-                        self._last_queue_refill_monotonic_ns = time.monotonic_ns()
-                        self._plan_generation += 1
-                        _trace.info(
-                            "[queue_refill] request_id=%s new=%d skipped=%d after=%d",
-                            req_id,
-                            len(action_chunk_np),
-                            actions_executed,
-                            new_length,
-                        )
-                        self.get_logger().debug(
-                            f"Smoothed update: {len(action_chunk_np)} new, skipped {actions_executed}, plan={new_length}"
-                        )
-                    else:
-                        relevant_actions = action_chunk_np[actions_executed:]
-                        self._queue.clear()
-                        self._queue.extend(relevant_actions)
-                        self._active_request_id = req_id
-                        self._actions_executed_from_active_request = 0
-                        self._last_queue_refill_monotonic_ns = time.monotonic_ns()
-                        self._plan_generation += 1
-                        _trace.info(
-                            "[queue_refill] request_id=%s new=%d skipped=%d after=%d",
-                            req_id,
-                            len(relevant_actions),
-                            actions_executed,
-                            len(self._queue),
-                        )
-                        self.get_logger().debug(
-                            f"Queue update: {len(relevant_actions)} actions "
-                            f"(skipped {actions_executed}), total={len(self._queue)}"
-                        )
-
-                    if self._dispatch_count == 1:
-                        self.get_logger().info(
-                            f"✓ First inference received: "
-                            f"chunk={len(action_chunk_np)}, "
-                            f"latency={result.inference_latency_ms:.1f}ms, "
-                            f"queue={self._get_plan_length()}"
-                        )
-                    self.get_logger().info(
-                        "[IBROBOT_BENCHMARK][INFERENCE_TIMING] "
-                        f"request={req_id} start_mono_ns={inference_timing.get('request_start_monotonic_ns', 0)} "
-                        f"result_mono_ns={result_monotonic_ns} "
-                        f"total_latency_ms={result.inference_latency_ms:.6f} "
-                        f"backend_latency_ms={result.backend_latency_ms:.6f}"
-                    )
+        try:
+            action_tensor, actions = decoded
+            executed = max(0, self._plan_length_at_inference_start - self._active_plan.snapshot().remaining)
+            candidate = self._chunk_planner.plan(actions, actions_executed=executed)
+            dimension = sum(len(spec.names) for spec in self._action_specs) or None
+            plan = self._active_plan.accept(
+                candidate,
+                PlanSource(req_id, request_generation),
+                action_dimension=dimension,
+                tensor_actions=action_tensor,
+            )
+        except (ValueError, TypeError, RuntimeError, MemoryError) as exc:
+            self._reject_action_chunk(req_id, exc)
             return
-
-        # Continuous/topic mode: existing behavior without lock.
+        if self._is_benchmark:
+            self._episode.try_on_inference_success(episode_goal_generation)
+            self.get_logger().info(
+                "[IBROBOT_BENCHMARK][INFERENCE_TIMING] "
+                f"request={req_id} start_mono_ns={inference_timing.get('request_start_monotonic_ns', 0)} "
+                f"result_mono_ns={result_monotonic_ns} "
+                f"total_latency_ms={result.inference_latency_ms:.6f} "
+                f"backend_latency_ms={result.backend_latency_ms:.6f}"
+            )
         self._dispatch_count += 1
         self._total_inference_latency_ms += result.inference_latency_ms
-
-        decode_start = time.perf_counter()
-        batch = TensorMsgConverter.from_variant(result.action_chunk)
-        decode_ms = (time.perf_counter() - decode_start) * 1000.0
+        self._last_queue_refill_monotonic_ns = time.monotonic_ns()
         _trace.info(
-            "[dispatch_decode] request_id=%s chunk_size=%d decode_ms=%.2f",
+            "[dispatch_result] request_id=%s success=True latency_ms=%.2f chunk_size=%d",
             req_id,
-            result.chunk_size,
-            decode_ms,
+            result.inference_latency_ms,
+            len(actions),
         )
-        if "action" in batch:
-            action_chunk_tensor, action_chunk_np = _normalize_action_chunk(batch["action"])
-            current_plan_length = self._get_plan_length()
-            actions_executed = max(0, self._plan_length_at_inference_start - current_plan_length)
-            _trace.info(
-                "[dispatch_result] request_id=%s success=True latency_ms=%.2f chunk_size=%d",
-                req_id,
-                result.inference_latency_ms,
-                len(action_chunk_np),
+        _trace.info(
+            "[queue_refill] request_id=%s new=%d skipped=%d after=%d", req_id, len(actions), executed, plan.remaining
+        )
+        if self._dispatch_count == 1:
+            self.get_logger().info(
+                f"First inference received: chunk={len(actions)}, "
+                f"latency={result.inference_latency_ms:.1f}ms, queue={plan.remaining}"
             )
-            if self._smoother is not None:
-                new_length = self._smoother.update(action_chunk_tensor, actions_executed)
-                self._active_request_id = req_id
-                self._actions_executed_from_active_request = 0
-                self._last_queue_refill_monotonic_ns = time.monotonic_ns()
-                self._plan_generation += 1
-                _trace.info(
-                    "[queue_refill] request_id=%s new=%d skipped=%d after=%d",
-                    req_id,
-                    len(action_chunk_np),
-                    actions_executed,
-                    new_length,
-                )
-                self.get_logger().debug(
-                    f"Smoothed update: {len(action_chunk_np)} new, skipped {actions_executed}, plan={new_length}"
-                )
-            else:
-                relevant_actions = action_chunk_np[actions_executed:]
-                self._queue.clear()
-                self._queue.extend(relevant_actions)
-                self._active_request_id = req_id
-                self._actions_executed_from_active_request = 0
-                self._last_queue_refill_monotonic_ns = time.monotonic_ns()
-                self._plan_generation += 1
-                _trace.info(
-                    "[queue_refill] request_id=%s new=%d skipped=%d after=%d",
-                    req_id,
-                    len(relevant_actions),
-                    actions_executed,
-                    len(self._queue),
-                )
-                self.get_logger().debug(
-                    f"Queue update: {len(relevant_actions)} actions "
-                    f"(skipped {actions_executed}), total={len(self._queue)}"
-                )
 
-            if self._dispatch_count == 1:
-                self.get_logger().info(
-                    f"✓ First inference received: "
-                    f"chunk={len(action_chunk_np)}, "
-                    f"latency={result.inference_latency_ms:.1f}ms, "
-                    f"queue={self._get_plan_length()}"
-                )
-
+    @_dispatch_locked
     def _reset_cb(self, request, response):
         self.get_logger().info("Resetting dispatcher state")
         # benchmark episode controller: if a benchmark episode goal is active, a legacy ~/reset call is
@@ -1253,9 +1146,7 @@ class ActionDispatcherNode(Node):
         # reset of dispatcher/executor state; it is NOT an environment episode
         # reset barrier and does NOT claim the remote action was cancelled.
         self._executor.invalidate_pending()
-        self._queue.clear()
-        if self._smoother is not None:
-            self._smoother.reset()
+        self._clear_plan()
         self._request_generation += 1
         self._inference_in_progress = False
         self._inflight_request_id = ""
@@ -1263,18 +1154,12 @@ class ActionDispatcherNode(Node):
         self._request_policy_reset()
         self._plan_length_at_inference_start = 0
         self._last_action = None
-        self._active_request_id = ""
-        self._actions_executed_from_active_request = 0
         self._last_queue_refill_monotonic_ns = 0
         self._current_request_id = ""
-        # Reset scheduler and reservation so old completions become stale.
-        # plan_generation bump is in addition to request_generation so any
-        # in-flight reservation whose plan was cleared by this reset can be
-        # detected at commit time.
-        self._scheduler.reset()
+        # The owner clear invalidated reservations; reset the scheduler as well.
+        if self._scheduler_mode == "wait_for_feedback":
+            self._scheduler.reset()
         self._reservation_context = None
-        self._reservation_plan_generation = 0
-        self._plan_generation += 1
         return response
 
     def _complete_inflight_request(self, request_id: str):
@@ -1322,6 +1207,7 @@ class ActionDispatcherNode(Node):
 
     def _request_policy_reset(self):
         """Reset policy-local runtime state for a new episode boundary."""
+        self._policy_reset_future = None
         service_name = self.get_parameter("inference_reset_service").value
         if not service_name:
             self._policy_reset_in_progress = False
@@ -1338,13 +1224,18 @@ class ActionDispatcherNode(Node):
         self._policy_reset_started_at = time.monotonic()
         try:
             future = self._policy_reset_client.call_async(Trigger.Request())
+            self._policy_reset_future = future
             future.add_done_callback(self._policy_reset_done_cb)
         except Exception as e:
             self._policy_reset_in_progress = False
             self._policy_reset_started_at = 0.0
             self.get_logger().warn(f"Policy reset request failed: {e}")
 
+    @_dispatch_locked
     def _policy_reset_done_cb(self, future):
+        if future is not self._policy_reset_future:
+            return
+        self._policy_reset_future = None
         self._policy_reset_in_progress = False
         self._policy_reset_started_at = 0.0
         try:
@@ -1359,15 +1250,49 @@ class ActionDispatcherNode(Node):
         except Exception as e:
             self.get_logger().warn(f"Policy reset request failed: {e}")
 
+    def _validate_blending_update(self, parameters):
+        for parameter in parameters:
+            if parameter.name == "blending_strategy":
+                if parameter is not self._blending_update:
+                    return SetParametersResult(successful=False, reason="Use ~/toggle_smoothing at runtime")
+                # Single-use object identity, not a flag that concurrent writes can inherit.
+                self._blending_update = None
+        return SetParametersResult(successful=True)
+
+    @_dispatch_locked
     def _toggle_smoothing_cb(self, request, response):
         """Toggle smoothing on/off at runtime (requires smoother to be initialized)."""
         if self._smoother is None:
             self.get_logger().warn("Cannot toggle smoothing: smoother not initialized")
             return response
 
-        self._smoothing_enabled = not self._smoothing_enabled
-        self._smoother._config.enabled = self._smoothing_enabled
-        self._smoother._smoother.config.enabled = self._smoothing_enabled
+        enabled = not self._smoothing_enabled
+        current = self._strategy_selection
+        try:
+            proposed = resolve_dispatch_strategies(
+                executor_type=current.executor_type,
+                scheduler_mode=current.scheduler_mode,
+                chunking=current.chunking,
+                blending="temporal_ensemble" if enabled else "none",
+                entrypoint="legacy",
+            )
+        except ValueError as exc:
+            self.get_logger().error(f"Cannot toggle smoothing: {exc}")
+            return response
+        from rclpy.parameter import Parameter
+
+        parameter = Parameter("blending_strategy", value=proposed.blending)
+        self._blending_update = parameter
+        try:
+            result = self.set_parameters_atomically([parameter])
+        finally:
+            self._blending_update = None
+        if not result.successful:
+            self.get_logger().error(f"Cannot toggle smoothing: {result.reason}")
+            return response
+        self._active_plan.set_smoothing_enabled(enabled)
+        self._strategy_selection = proposed
+        self._smoothing_enabled = proposed.blending == "temporal_ensemble"
 
         self.get_logger().info(f"Temporal smoothing {'ENABLED' if self._smoothing_enabled else 'DISABLED'}")
         return response
@@ -1388,6 +1313,7 @@ class ActionDispatcherNode(Node):
                 self.get_logger().info(f"Published zero base command to {topic}")
                 break
 
+    @_dispatch_locked
     def _start_nav_cb(self, request, response):
         """Start or resume dispatcher evaluation (idempotent clean restart).
 
@@ -1417,6 +1343,7 @@ class ActionDispatcherNode(Node):
         self.get_logger().info(response.message)
         return response
 
+    @_dispatch_locked
     def _stop_nav_cb(self, request, response):
         """Stop or pause dispatcher evaluation (idempotent).
 
@@ -1432,6 +1359,7 @@ class ActionDispatcherNode(Node):
             return response
         was_running = self._is_running
         self._is_running = False
+        self._request_generation += 1
         self._inference_in_progress = False
         self._inflight_request_id = ""
         self._inference_started_at = 0.0
@@ -1494,35 +1422,14 @@ class ActionDispatcherNode(Node):
         complete prepare N+1.
         """
         # 1. Atomically check + transition to PREPARING.
-        if not self._episode.try_begin_preparing():
-            response.success = False
-            response.message = f"cannot prepare: episode phase={self._episode.phase.value}"
-            response.preparation_id = 0
-            return response
-
-        self.get_logger().info("[IBROBOT_EPISODE][PREPARING] barrier started")
-
-        # 2. Invalidate executor pending/completions.
-        self._executor.invalidate_pending()
-
-        # 3. Invalidate old inference generation (best-effort cancel).
-        self._request_generation += 1
-        self._inference_in_progress = False
-        self._inflight_request_id = ""
-        self._inference_started_at = 0.0
-
-        # 4. Clear queue/smoother/last action/reservation/scheduler.
-        self._queue.clear()
-        if self._smoother is not None:
-            self._smoother.reset()
-        self._reservation_context = None
-        self._reservation_plan_generation = 0
-        self._plan_generation += 1
-        self._scheduler.reset()
-        self._last_action = None
-        self._active_request_id = ""
-        self._actions_executed_from_active_request = 0
-        self._last_queue_refill_monotonic_ns = 0
+        with self._dispatch_lock:
+            if not self._episode.try_begin_preparing():
+                response.success = False
+                response.message = f"cannot prepare: episode phase={self._episode.phase.value}"
+                response.preparation_id = 0
+                return response
+            self.get_logger().info("[IBROBOT_EPISODE][PREPARING] barrier started")
+            self._clear_episode_local_state(invalidate_executor=True, invalidate_inference=True)
 
         # 5. Strict policy reset request with per-prepare context.
         # Per-goal concurrency handling: creates a PrepareContext with its own Event.
@@ -1883,16 +1790,16 @@ class ActionDispatcherNode(Node):
             self._inference_in_progress = False
             self._inflight_request_id = ""
             self._inference_started_at = 0.0
-        self._queue.clear()
-        if self._smoother is not None:
-            self._smoother.reset()
-        self._reservation_context = None
-        self._reservation_plan_generation = 0
-        self._plan_generation += 1
+        self._clear_plan()
         self._scheduler.reset()
         self._last_action = None
-        self._active_request_id = ""
-        self._actions_executed_from_active_request = 0
+
+    def _clear_plan(self):
+        """Caller holds the dispatch lock; discard actions and metadata together."""
+        self._active_plan.clear()
+        self._reservation_context = None
+        self._plan_reservation = None
+        self._reserved_action = None
         self._last_queue_refill_monotonic_ns = 0
 
     # ------------------------------------------------------------------

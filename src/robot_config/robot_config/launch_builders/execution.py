@@ -7,6 +7,11 @@ import json
 from launch_ros.actions import Node
 
 from robot_config.benchmark_endpoints import resolve_benchmark_endpoints
+from robot_config.dispatch_strategies import (
+    reject_legacy_smoothing_config,
+    resolve_dispatch_strategies,
+    validate_executor_scheduler_pairing,
+)
 from robot_config.inference_config import (
     ControlModeInferenceConfig,
     InferenceConfigError,
@@ -111,31 +116,19 @@ class ExecutorSchedulerPairingError(ValueError):
 def _validate_executor_scheduler_pairing(executor_type: str, scheduler_mode: str) -> None:
     """Generic executor/scheduler pairing guard (launch-builder side).
 
-    Mirrors ``ActionDispatcherNode._validate_executor_scheduler_pairing`` so an
-    illegal combination fails fast at launch-plan construction time, before
-    the dispatcher node is even spawned. Unknown executor/scheduler strings
-    are NOT aliased, case-folded or fallback-corrected here; they pass through
-    so the registries can fail-fast with their own messages. The legacy
-    ``action`` string is preserved verbatim (not silently rewritten to ``topic``).
+    Delegates to the canonical ``robot_config.dispatch_strategies``
+    implementation so an illegal combination fails fast at launch-plan
+    construction time, before the dispatcher node is even spawned, and the
+    node-side defensive check (which imports the same canonical function)
+    cannot silently diverge from this one. Unknown executor/scheduler
+    strings are NOT aliased, case-folded or fallback-corrected here; they
+    pass through so the registries can fail-fast with their own messages.
 
     Legal combinations:
     - ``topic`` + ``continuous``
     - ``benchmark`` + ``wait_for_feedback``
-
-    Illegal:
-    - ``benchmark`` + ``continuous``
-    - ``wait_for_feedback`` + any executor other than ``benchmark``
     """
-    if executor_type == "benchmark" and scheduler_mode != "wait_for_feedback":
-        raise ExecutorSchedulerPairingError(
-            f"executor type 'benchmark' requires scheduler_mode 'wait_for_feedback'; "
-            f"got scheduler_mode={scheduler_mode!r}"
-        )
-    if scheduler_mode == "wait_for_feedback" and executor_type != "benchmark":
-        raise ExecutorSchedulerPairingError(
-            f"scheduler_mode 'wait_for_feedback' requires executor type 'benchmark'; "
-            f"got executor_type={executor_type!r}"
-        )
+    validate_executor_scheduler_pairing(executor_type, scheduler_mode)
 
 
 class BenchmarkEvaluationError(ValueError):
@@ -343,15 +336,34 @@ def _validate_executor_no_routing_keys(executor_config: dict) -> None:
             )
 
 
-def _resolve_dispatch_section(mode_config: dict) -> tuple[str, float]:
-    """Read scheduler_mode and execution_timeout_sec from a control mode.
+def _resolve_dispatch_section(mode_config: dict) -> tuple[str, float, str | None, str | None]:
+    """Read scheduler_mode, execution_timeout_sec and strategy selections.
 
     Defaults: ``continuous`` and ``30.0`` (matching the dispatcher node).
+    ``chunking``/``blending`` stay ``None`` when absent so the strategy
+    resolution can apply documented defaults.
     """
     dispatch = mode_config.get("dispatch", {}) or {}
+    reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})
     scheduler_mode = dispatch.get("scheduler", "continuous")
     execution_timeout_sec = float(dispatch.get("execution_timeout_sec", 30.0))
-    return scheduler_mode, execution_timeout_sec
+    chunking = dispatch.get("chunking")
+    blending = dispatch.get("blending")
+    return scheduler_mode, execution_timeout_sec, chunking, blending
+
+
+def _resolve_dispatch_strategies(
+    executor_config: dict,
+    chunking_yaml: object,
+    blending_yaml: object,
+) -> tuple[str, str]:
+    """Resolve the strategy names, rejecting the removed executor flag."""
+    reject_legacy_smoothing_config(executor_config)
+    selection = resolve_dispatch_strategies(
+        chunking=chunking_yaml,
+        blending=blending_yaml,
+    )
+    return selection.chunking, selection.blending
 
 
 def _resolve_benchmark_step_service(robot_config: dict) -> str:
@@ -495,9 +507,16 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
     # validating the executor/scheduler pairing and constructing the node.
     raw_executor_type = executor_config.get("type", "topic")
     executor_type, legacy_action = _resolve_executor_type(raw_executor_type)
-    scheduler_mode, execution_timeout_sec = _resolve_dispatch_section(mode_config)
-    _validate_executor_scheduler_pairing(executor_type, scheduler_mode)
+    scheduler_mode, execution_timeout_sec, chunking_yaml, blending_yaml = _resolve_dispatch_section(mode_config)
+    selection = resolve_dispatch_strategies(
+        executor_type=executor_type,
+        scheduler_mode=scheduler_mode,
+        chunking=chunking_yaml,
+        blending=blending_yaml,
+    )
+    executor_type, scheduler_mode = selection.executor_type, selection.scheduler_mode
     _validate_executor_no_routing_keys(executor_config)
+    chunking, blending = selection.chunking, selection.blending
 
     # production benchmark wiring: only benchmark executor resolves a step service endpoint. For
     # all other executors the parameter must be empty string. The customer
@@ -527,10 +546,11 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
         "watermark_threshold": executor_config.get("watermark_threshold", 20),
         "min_queue_size": executor_config.get("min_queue_size", 10),
         "control_frequency": executor_config.get("control_frequency", 100.0),
-        "temporal_smoothing_enabled": executor_config.get("temporal_smoothing_enabled", False),
         "temporal_ensemble_coeff": executor_config.get("temporal_ensemble_coeff", 0.01),
         "chunk_size": executor_config.get("chunk_size", 100),
         "smoothing_device": executor_config.get("smoothing_device", ""),
+        "chunking_strategy": chunking,
+        "blending_strategy": blending,
         "control_mode": control_mode,
         "interpolation_enabled": True,
         "interpolation_step": 0.1,
@@ -829,6 +849,16 @@ def generate_scheduled_action_dispatcher_node(
     inference = _validated_inference(robot_config, control_mode)
     mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
     executor_config = mode_config.get("executor", {}) or {}
+    scheduler_mode, _execution_timeout_sec, chunking_yaml, blending_yaml = _resolve_dispatch_section(mode_config)
+    executor_type, _legacy_action = _resolve_executor_type(executor_config.get("type"))
+    selection = resolve_dispatch_strategies(
+        executor_type=executor_type,
+        scheduler_mode=scheduler_mode,
+        chunking=chunking_yaml,
+        blending=blending_yaml,
+        entrypoint="scheduled",
+    )
+    chunking, blending = selection.chunking, selection.blending
     return Node(
         package="action_dispatch",
         executable="scheduled_action_dispatcher_node",
@@ -838,10 +868,11 @@ def generate_scheduled_action_dispatcher_node(
                 "queue_size": executor_config.get("queue_size", 100),
                 "watermark_threshold": executor_config.get("watermark_threshold", 20),
                 "control_frequency": executor_config.get("control_frequency", 100.0),
-                "temporal_smoothing_enabled": executor_config.get("temporal_smoothing_enabled", False),
                 "temporal_ensemble_coeff": executor_config.get("temporal_ensemble_coeff", 0.01),
                 "chunk_size": executor_config.get("chunk_size", 100),
                 "smoothing_device": executor_config.get("smoothing_device", ""),
+                "chunking_strategy": chunking,
+                "blending_strategy": blending,
                 "joint_state_topic": "/joint_states",
                 "robot_config_path": str(robot_config_path),
                 # Product callers only touch the Global Scheduler endpoints.

@@ -187,14 +187,45 @@ class TemporalSmoother:
 
         with self._lock:
             if self._smoothed_actions is None or self._smoothed_actions.shape[0] == 0 or not self.config.enabled:
-                self._smoothed_actions = relevant_new
-                self._action_counts = torch.ones((relevant_new.shape[0], 1), dtype=torch.long, device=device)
+                next_actions = relevant_new.clone()
+                next_counts = torch.ones((relevant_new.shape[0], 1), dtype=torch.long, device=device)
             else:
-                self._smoothed_actions, self._action_counts = self._apply_smoothing(
+                next_actions, next_counts = self._apply_smoothing(
                     self._smoothed_actions, self._action_counts, relevant_new, weights, weights_cumsum
                 )
-
+            self._smoothed_actions, self._action_counts = next_actions, next_counts
             return self._smoothed_actions.shape[0]
+
+    def prepare(self, selected_actions):
+        """Prepare owned, aligned storage without changing the current plan.
+
+        The owner serializes prepare/commit and consumption under its lock.
+        """
+        with self._lock:
+            if selected_actions.shape[0] == 0:
+                return None, None
+            device = self._get_device(selected_actions)
+            incoming = self._to_tensor(selected_actions, device).clone()
+            if incoming.ndim != 2 or not torch.isfinite(incoming).all():
+                raise ValueError("smoother actions must be finite and rank 2")
+            if self._smoothed_actions is None or not self.plan_length or not self.config.enabled:
+                counts = torch.ones((incoming.shape[0], 1), dtype=torch.long, device=device)
+                return incoming, counts
+            prepared = self._apply_smoothing(
+                self._smoothed_actions,
+                self._action_counts,
+                incoming,
+                self._weights.to(device),
+                self._weights_cumsum.to(device),
+            )
+            if not torch.isfinite(prepared[0]).all():
+                raise ValueError("smoothing produced non-finite actions")
+            return prepared
+
+    def commit(self, prepared):
+        """Swap only previously prepared references; no tensor allocations."""
+        with self._lock:
+            self._smoothed_actions, self._action_counts = prepared
 
     def _apply_smoothing(
         self,
@@ -243,14 +274,14 @@ class TemporalSmoother:
     def get_plan(self) -> torch.Tensor | None:
         """Get the current smoothed plan without modifying it."""
         with self._lock:
-            return self._smoothed_actions
+            return None if self._smoothed_actions is None else self._smoothed_actions.clone()
 
     def peek_next_action(self) -> torch.Tensor | None:
         """Peek at the next action without removing it."""
         with self._lock:
             if self._smoothed_actions is None or self._smoothed_actions.shape[0] == 0:
                 return None
-            return self._smoothed_actions[0]
+            return self._smoothed_actions[0].clone()
 
 
 class TemporalSmootherManager:
@@ -291,6 +322,12 @@ class TemporalSmootherManager:
     def reset(self):
         """Reset the smoother state."""
         self._smoother.reset()
+
+    def prepare(self, selected_actions):
+        return self._smoother.prepare(selected_actions)
+
+    def commit(self, prepared):
+        self._smoother.commit(prepared)
 
     def update(
         self,
