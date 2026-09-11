@@ -29,11 +29,26 @@ if [ -n "$CONDA_DEFAULT_ENV" ] && command -v conda &> /dev/null; then
 fi
 
 # 3. 激活虚拟环境
-if [ -f "venv/bin/activate" ]; then
-    source venv/bin/activate
+# Worktrees may intentionally reuse a main checkout venv: activate that venv
+# first, then source this file; the already-active Python 3.10 venv wins (see
+# .agents/skills/ibrobot-worktree-env). Otherwise use the workspace-local venv.
+# Never guess a venv from hardcoded user directories, and fail closed when the
+# local venv has the wrong Python version instead of silently skipping it.
+_IB_VENV_ACTIVATE=""
+if [ -n "${VIRTUAL_ENV:-}" ] && [ -f "${VIRTUAL_ENV}/bin/activate" ] && [ "$("${VIRTUAL_ENV}/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" = "3.10" ]; then
+    _IB_VENV_ACTIVATE="${VIRTUAL_ENV}/bin/activate"
+elif [ -f "venv/bin/activate" ]; then
+    if [ "$(venv/bin/python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')" != "3.10" ]; then
+        echo "ERROR: venv/bin/python is not Python 3.10; recreate the workspace venv via ./scripts/setup.sh" >&2
+        return 1 2>/dev/null || exit 1
+    fi
+    _IB_VENV_ACTIVATE="venv/bin/activate"
+fi
+if [ -n "${_IB_VENV_ACTIVATE}" ]; then
+    source "${_IB_VENV_ACTIVATE}"
     _IB_STEPS+=("Python venv")
 else
-    _IB_SKIPPED+=("Python venv (未找到 venv/bin/activate)")
+    _IB_SKIPPED+=("Python venv (未找到 venv/bin/activate; worktree 请先激活主仓库 venv 再 source 本脚本)")
 fi
 
 # 4. 禁用用户 site-packages，避免 ~/.local 与 workspace venv 混装
@@ -145,4 +160,4 @@ if [[ $- == *i* ]]; then
     echo -e "常用指令: ${YELLOW}cb${NC} (编译全部), ${YELLOW}cbp${NC} (编译指定包), ${YELLOW}src${NC} (刷新环境)"
     unset _s
 fi
-unset _IB_STEPS _IB_SKIPPED
+unset _IB_STEPS _IB_SKIPPED _IB_VENV_ACTIVATE

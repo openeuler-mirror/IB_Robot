@@ -21,7 +21,8 @@ robot:
   embodied:
     agent:
       execution_enabled: true
-      test_allowlist: [nod_yes]
+      test_allowlist:
+        - nod_yes
       ledger_path: /tmp/opencode/ibrobot-agent-so101-hardware/requests.sqlite3
       conversation_path: /tmp/opencode/ibrobot-agent-so101-hardware/conversation.sqlite3
       deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-hardware/agent.lock

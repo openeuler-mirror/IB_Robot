@@ -16,7 +16,7 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
 | 节点 / 入口 | 主要职责 |
 | --- | --- |
 | `ibrobot_agent_node` | Agent 组合根：transport 与生命周期；ROS-free 的 `AgentService` 通过注入的 port 工作 |
-| `chat_tui.py`（`scripts/run_agent_chat.sh`） | 交互式终端 UI：输入历史、异步事件渲染、`/stop` 与停止词旁路 |
+| `chat_tui.py`（`ibrobot_agent_chat` 入口 / `scripts/run_agent_chat.sh`） | 交互式终端 UI：输入历史、异步事件渲染、`/stop` 与停止词旁路；`--channel-id`/`--principal-id`/`--robot-scope` 覆盖会话身份以匹配 profile 的 `embodied.agent` 配置 |
 
 ## 调用链
 

@@ -10,7 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "prompt_toolkit>=3.0"],
     extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
@@ -20,6 +20,7 @@ setup(
     entry_points={
         "console_scripts": [
             "ibrobot_agent_node = ibrobot_agent.node:main",
+            "ibrobot_agent_chat = ibrobot_agent.chat_tui:main",
         ],
     },
 )

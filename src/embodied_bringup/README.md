@@ -105,7 +105,9 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 Agent 孵化 profile（`so101_agent_manual`、`so101_single_arm_agent_gazebo` 等）的
 `embodied.agent` 字段表与校验规则见 `robot_config` README；真机执行类 profile 必须
 由操作员现场显式开启 `authorize_motion` 并配置 vlm Planner（内置 RulePlanner 仅限
-仿真执行）。交互终端用 `scripts/run_agent_chat.sh` 连接到已启动的 Agent 节点。
+仿真执行）。交互终端用 `scripts/run_agent_chat.sh`（安装后亦可用 `ibrobot_agent_chat` 入口）连接到
+已启动的 Agent 节点；profile 的 `embodied.agent.channel_id` 非默认 `agent_cli` 时需加
+`--channel-id` 匹配，否则事件流会被终端静默过滤。
 
 ## 已知限制
 
