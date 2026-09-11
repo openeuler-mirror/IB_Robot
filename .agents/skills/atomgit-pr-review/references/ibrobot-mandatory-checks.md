@@ -44,7 +44,7 @@
 
 ### 审查输出要求
 
-- 提取上下文后，先查看 `.pr.mandatory_review_checks`。出现
+- 完成三步法的前两步并展示产出后，在第 3 步先查看 `.pr.mandatory_review_checks`。出现
   `lerobot_gitlink_changed` 时必须完成人工判定，不能直接给出"无问题"。
 - 对违规指针变更，issue 应定位到 `libs/lerobot`，标题明确说明"禁止直接提交 LeRobot
   submodule 指针"，并在 `fix_code` / 修复方案中给出恢复 gitlink 和导出 patch 的步骤。

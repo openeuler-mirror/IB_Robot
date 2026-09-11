@@ -502,16 +502,14 @@ def mode_extract_info(args, reviewer: CodeReviewer):
 
     mandatory_checks = pr_info["pr"].get("mandatory_review_checks", [])
     if mandatory_checks:
-        print("\n🚨 强制专项检查:")
-        for check in mandatory_checks:
-            print(f"   [{check['severity'].upper()}] {check['id']}: {check['message']}")
+        print(f"\n强制专项检查: {len(mandatory_checks)} 项，完成前两步后在第 3 步读取详情")
 
-    print("\n💡 下一步:")
-    print("  AI Agent 应该:")
-    print("  1. 读取此文件并进行代码审查")
-    print("  2. 先处理 mandatory_review_checks，再结合 changed_files、commits 和 comments 生成 issues.json")
-    print("  3. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
-    print("  4. 用户确认后，运行提交命令")
+    print("\n评审三步法（默认强制执行，无需用户提醒）:")
+    print("  禁止直接读取完整 info.json；前两步不得读取 changed_files、comments 或 PR head 源码")
+    print("  1. 仅读取 title、body、关联 Issue 和 commit message，展示问题与目标")
+    print("  2. 不看实现，展示自己的独立方案（职责边界、复用点、契约、验证场景）")
+    print("  3. 前两步展示后，处理 mandatory_review_checks，再读实现和评论，逐项对比方案")
+    print("  完成对比后生成 issues.json；展示具体结果并获得用户确认后才能提交")
     print(f"\n     python3 pr_review.py --pr {args.pr} --submit-review issues.json --ai-model <your-model-name>")
 
 

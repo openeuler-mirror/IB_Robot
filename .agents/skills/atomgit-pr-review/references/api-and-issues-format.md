@@ -2,9 +2,9 @@
 
 ## When to Read
 
-- 需要提取 PR 上下文（步骤 1）时
-- 需要构造 issues.json（步骤 2）时
-- 需要提交审查结果（步骤 4）时
+- 需要提取 PR 上下文或分阶段读取时
+- 完成三步法后需要构造 issues.json 时
+- 人类确认后需要提交审查结果时
 - 处理大文件 JSON 时
 
 ## ⚠️ 依赖准备
@@ -15,21 +15,22 @@
 
 ## ⚠️ 文件读取说明
 
-**输出文件位于项目 `./tmp` 目录**，AI Agent 应使用 shell 命令读取：
+**输出文件位于项目 `./tmp` 目录，包含实现与评论，前两步禁止整文件读取。**
+即使文件很小，也必须按主文档三步法分阶段投影：
 
 ```bash
-# 读取 review 上下文
-cat ./tmp/ib_robot_pr_123_info.json
+# 第 1 步：仅问题背景；不包含 changed_files、comments 或自动检查细节
+jq '{pr: (.pr | {number, title, body, head_sha}), commits: [.commits[] | {sha, message}]}' ./tmp/ib_robot_pr_123_info.json
 
-# 读取审查结果（提交前确认）
-cat ./tmp/ib_robot_pr_123_issues.json
+# 第 2 步：展示独立方案后，第 3 步才允许读取实现和评论
+jq '.pr.mandatory_review_checks, .pr.changed_files, .comments' ./tmp/ib_robot_pr_123_info.json
 ```
 
 **PR 正文**（AI 声明、Verification 等）在 `.pr.body` 字段。
 
 ### 大文件处理技巧
 
-当 PR 包含大量文件时，JSON 文件可能很大。使用 `jq` 提取特定文件信息：
+以下命令仅在第 3 步使用；大文件使用 `jq` 提取特定文件信息：
 
 ```bash
 # 列出所有变更文件
@@ -91,8 +92,8 @@ python3 pr_review.py --pr 123
 **⚠️ 重要**：提取的 JSON 文件已经包含了所有 diff（`patch`）、文件内容（`content`）以及已有 PR 评论。
 - **不需要** `git fetch` 或 `git diff`
 - **不需要** 切换分支或修改本地代码
-- 直接读取 JSON 文件中的 `changed_files`、`commits` 和 `comments` 进行审查即可
-- 先读取 `.pr.mandatory_review_checks`。如果包含 `lerobot_gitlink_changed`，必须按
+- 完成并展示问题陈述与独立方案后，第 3 步再读取 `changed_files` 和 `comments`
+- 第 3 步先读取 `.pr.mandatory_review_checks`。如果包含 `lerobot_gitlink_changed`，必须按
   `references/ibrobot-mandatory-checks.md` 验证其是否为完整、可获取、已迁移 patch stack 的上游基线升级
 - 审查时要结合变更文件判断是否需要 README / 文档联动，以及是否触发双平台 Docker Verification 门禁；标准 `[WIP]` 标题暂缓 Docker 证据检查，移除前缀后恢复。正式检视时默认只检查 PR 描述里的开发者验证声明，除非用户明确要求 agent 实际执行验证，否则不得调用 docker verification skills
 - 如果需要"回复某一条已有 review 意见"而不是提交新的审查结果，请切换到 `atomgit-review-resolution`，使用 `--reply-comment <comment_id>`；不要在本 skill 中伪造普通 PR 级评论。

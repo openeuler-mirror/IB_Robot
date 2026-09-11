@@ -8,6 +8,19 @@ license: MIT
 
 提取适合 review 的完整 PR 上下文，并提交代码审查评论到 AtomGit。
 
+## 默认执行协议：三步法是门禁，不是可选建议
+
+**每次代码评审都自动执行「理解问题 → 独立方案 → 实现对比」，无需用户强调“三步法”。**
+“快速看一下”“只找 Bug”、小 PR、无问题结论以及从其他 skill 转入，都不豁免该顺序；可以缩短产出，不能省略阶段。
+仅提取信息或提交已经确认的结果不算新一轮代码评审，不得借此声称完成了三步法。
+
+- 开始评审时建立三个顺序任务：理解问题、独立方案、实现对比；同时只推进一个阶段。
+- **读取实现前，必须先向用户展示「第 1 步：问题与目标」和「第 2 步：独立方案」的简短产出**，不能只在内部思考，也不能读完代码再倒填。两项可以合并在同一条进度消息中，无需等待确认即可进入第 3 步。
+- 前两步禁止读取 PR 的 patch、变更后源码、已有 review 评论，禁止启动读实现的子 agent；提取脚本把这些内容写入文件不等于允许读取。使用下方的字段投影，不要直接打开整个 `info.json`。
+- 第 3 步才处理专项门禁、读实现和评论。发现阻塞问题也不能用元数据检查替代代码评审；上下文不足则明确报告未完成范围。
+- 用户消息或先前上下文已暴露实现时，明确说明独立性受限，仍先写问题与候选方案，再开始对比；不得声称“未看实现”。中断恢复时保留已展示的前两步产出；缺失时先补齐并披露已读范围。
+- 本 skill 的 Agent 评审使用提取/人工确认/提交路径，不使用直接逐文件调用 LLM 的 `--auto` 路径代替三步法。
+
 在 IB_Robot 仓库中，只要用户提到 review / 审查 / 审阅 PR 且未明确指定 GitHub，默认视为 AtomGit PR 评审流程并优先使用本 skill。
 
 本 skill 支持对 **任意 AtomGit 仓库的 PR** 做通用代码审查：
@@ -39,48 +52,48 @@ Do not expose these references as separate skills.
 5. **openEuler AI 元数据检查（阻塞性）**：AI 参与时检查 PR 的 Tool/Model/Prompt Summary、人工审查、第三方材料/许可证披露，以及 Agent 工具字段是否为具体名称和版本、PR 模型集合是否覆盖所有 commit 的 AI `Co-Authored-By`。不同 commit 可以使用不同模型；人类 `Name <email>` trailer 不参与模型比较。
 6. **大型 PR 复用自查门禁（阻塞性）**：变更超过 2000 行（additions + deletions）的 PR 必须在描述中包含完整的结构化 `## Reuse Self-Check` 块（四个固定字段：`Reinvented workflows` / `Reused components` / `Reinvention justification` / `Architecture conformance`）；缺失、不完整或格式歧义分别由 `large_pr_reuse_self_check_missing` / `large_pr_reuse_self_check_incomplete` / `large_pr_reuse_self_check_invalid` 标记。`[WIP]` 不豁免本门禁。块存在且完整时，reviewer 还必须**对照 diff 审计四项声明是否属实**（是否真的没有重新发明 `libs/lerobot` 或仓库既有流程、架构是否确与同类功能一致），发现不实声明按阻塞性问题处理。
 
-## 快速使用
+## 评审三步法
+
+| 阶段 | 允许读取与执行 | 必须展示的产出 / 放行条件 |
+|------|----------------|-------------------------|
+| 第 1 步：问题与目标 | PR 标题、描述、关联 Issue、commit message；区分作者的问题陈述与实现主张 | 用一两句话说明问题、预期行为和成功标准；无法确定时先澄清，不进入下一步 |
+| 第 2 步：独立方案 | 基于目标提出自己的最小方案；需要背景时只读可确认属于目标分支基线的文档、接口或源码，记录来源，不读 PR head | 说明模块/职责边界、复用点、数据流或接口契约，以及关键验证场景；小修改可压缩成几句，不能仅写“按现有实现修改” |
+| 第 3 步：实现对比 | 先处理专项检查，再细读 patch、必要的完整源码、提交历史和已有评论；此时才可并行分配代码审查 | 对照第 2 步逐项判断：是否解决目标、差异及取舍、边界场景、验证缺口；给出有文件/行号证据的发现 |
+
+独立方案是比较基准，不是唯一正确答案。作者方案更优或同样合理时明确接受；纯方案偏好只作建议，不能直接判为 Bug。
+已有评论在第 3 步用于复核和去重，不能代替独立评审。委派时向子 agent 传递问题陈述与独立方案，主 agent 负责汇总对比。
+
+最终结果以发现为先，随后附简短的「方案对比」和验证/未覆盖范围；无发现时也必须说明对比结果，不能只写“LGTM”。
+生成 `issues.json` 时沿用现有字段，对比依据写入相关问题的描述/修复说明，不为凑三步法新增虚构问题或 JSON 字段。
+
+## 执行命令
+
+在目标工作区根目录运行；Python 命令前加载 `ibrobot-env`，worktree 中加载 `ibrobot-worktree-env`，并在同次调用中 `source .shrc_local`。
+以下以 PR 123 为例，URL / owner / repo 模式保持相同流程。
 
 ```bash
-# 步骤1: 提取 PR 信息
-python3 pr_review.py --pr 123
+# 准备：提取上下文到文件，不直接读取完整 JSON
+source .shrc_local && python3 .agents/skills/atomgit-pr-review/scripts/pr_review.py --pr 123
 
-# 直接从链接解析目标 PR
-python3 pr_review.py --url https://atomgit.com/some-org/some-repo/pull/123
+# 第 1 步：只投影问题背景，关联 Issue 需另外读取
+jq '{pr: (.pr | {number, title, body, head_sha}), commits: [.commits[] | {sha, message}]}' ./tmp/ib_robot_pr_123_info.json
 
-# 如只关注代码 diff，可显式跳过已有评论
-python3 pr_review.py --pr 123 --no-comments
+# 第 2 步：向用户展示问题与独立方案后，才可执行下列读取
 
-# 步骤2: 按下方「评审三步法」分析代码并生成 issues.json
+# 第 3 步：专项检查、实现与已有评论
+jq '.pr.mandatory_review_checks, .pr.changed_files, .comments' ./tmp/ib_robot_pr_123_info.json
 
-# 步骤3: 人类确认审查结果
+# 收尾：生成 issues.json，将结果展示给人类确认
 
-# 步骤4: 提交审查结果（⚠️ 必须指定 --ai-model）
-python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model glm-5.2
+# 仅在确认后提交；模型参数替换为真实模型名称
+source .shrc_local && python3 .agents/skills/atomgit-pr-review/scripts/pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model <your-model-name>
 ```
 
-## 评审三步法（步骤 2 的分析流程）
-
-分析 PR 时必须按以下顺序进行，不得跳步：
-
-1. **先搞清楚这个 PR 解决的问题是什么**：此阶段只读标题、描述、关联 Issue 与 commit
-   message，用一两句话复述问题陈述和预期目标；复述不出来就先向作者澄清，不进入下一步。
-2. **不看实现，先写自己的方案**：在细读 patch 之前，独立回答「要解决这个问题我会怎么实现」，
-   列出方案要点（模块/职责边界、数据流、接口或契约、验证方式）。此阶段禁止逐行阅读 diff，
-   避免被作者的实现锚定。
-3. **review 代码后对比自己的方案，给出审查结果**：细读 patch 与提交历史，把实际实现与
-   第 2 步的方案逐项对比——是否真正解决问题、差异点在哪、作者的取舍是否更优、有无遗漏
-   场景或更简单的路径。issues.json 中的审查意见应体现该对比结论；方案层面的分歧以讨论/
-   建议级意见提出并说明理由，而不是直接判错。
-
-IB_Robot 仓库的 6 项专项审查要求（gitlink、Verification、AI 元数据等）不受影响，在第 3 步
-随对比结论一并输出。
-
 **重要**: 
-- 在步骤3，你必须将审查结果展示给人类确认后再提交
-- **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `glm-5.2`、`glm-5.1`、`gpt-5.6-sol`、`gpt-5.6-terra`、`claude-fable-5`、`claude-opus-5`）
+- 提交前必须将具体审查结果展示给人类并获得确认；“review 这个 PR”不等于确认发布结果
+- **提交必须指定 `--ai-model` 参数**，使用你的真实模型名称
 - 文件名格式：`./tmp/{repo}_pr_{number}_issues.json`（例如：`./tmp/ib_robot_pr_123_issues.json`）
-- 进行 IB_Robot PR review 时，必须先处理 `.pr.mandatory_review_checks`，重点检查
+- 进行 IB_Robot PR review 时，必须在第 3 步开始时处理 `.pr.mandatory_review_checks`，重点检查
   `libs/lerobot` gitlink；此外还要检查 README / 文档是否应随变更同步，以及 PR 描述中的
   非 WIP PR 的 Verification 是否覆盖双平台，以及结构化 `## Docker Verification` 块是否有效；
   超过 2000 行的 PR 还要处理 `large_pr_reuse_self_check_*` 检查项并审计
