@@ -15,6 +15,7 @@ VERIFICATION_MODE_FULL = "full"
 VERIFICATION_MODE_REUSED = "reused-environment"
 VERIFICATION_POLICY_VERSION = "1"
 WIP_PREFIX = "[WIP]"
+_VERIFICATION_HEADING_RE = re.compile(r"^##[ \t]+Docker Verification[ \t]*\r?$", re.MULTILINE | re.IGNORECASE)
 _VERIFIED_TREE_RE = re.compile(
     rf"\*\*{VERIFIED_TREE_LABEL}:\*\*\s*`?([0-9a-f]{{40}})(?![0-9a-f])`?",
     re.IGNORECASE,
@@ -157,6 +158,8 @@ def extract_verified_tree(description: str) -> str | None:
 
 
 def extract_verification_metadata(description: str) -> dict | None:
+    if len(_VERIFICATION_HEADING_RE.findall(description or "")) > 1:
+        raise ValueError("description must contain exactly one '## Docker Verification' heading")
     mode_matches = _VERIFICATION_MODE_RE.findall(description or "")
     input_matches = _VERIFICATION_SHA_FIELDS[VERIFIED_INPUTS_LABEL].findall(description or "")
     tree_matches = _VERIFICATION_SHA_FIELDS[TESTED_SOURCE_TREE_LABEL].findall(description or "")
@@ -209,6 +212,8 @@ def upsert_verification_metadata(
     tested_tree: str,
     environment: str,
 ) -> str:
+    if len(_VERIFICATION_HEADING_RE.findall(description)) > 1:
+        raise ValueError("description must contain exactly one '## Docker Verification' heading")
     line_patterns = [
         rf"^(?:-\s+)?\*\*{re.escape(VERIFICATION_MODE_LABEL)}:\*\*.*(?:\n|$)",
         rf"^(?:-\s+)?\*\*{re.escape(VERIFIED_INPUTS_LABEL)}:\*\*.*(?:\n|$)",
@@ -219,7 +224,13 @@ def upsert_verification_metadata(
     cleaned = description
     for pattern in line_patterns:
         cleaned = re.sub(pattern, "", cleaned, flags=re.MULTILINE)
-    return f"{cleaned.rstrip()}\n\n{format_verification_metadata(mode, verified_inputs, tested_tree, environment)}\n"
+    block = format_verification_metadata(mode, verified_inputs, tested_tree, environment)
+    heading = _VERIFICATION_HEADING_RE.search(cleaned)
+    if heading:
+        before = cleaned[: heading.start()]
+        after = cleaned[heading.end() :].lstrip("\r\n")
+        return f"{before}{block}\n\n{after}".rstrip() + "\n"
+    return f"{cleaned.rstrip()}\n\n{block}\n"
 
 
 def validate_verification_metadata(

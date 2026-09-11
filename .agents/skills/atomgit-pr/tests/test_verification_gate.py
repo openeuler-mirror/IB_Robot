@@ -39,6 +39,34 @@ def _reused_block(old_tree, inputs):
     return format_verification_metadata("reused-environment", inputs, old_tree, _ENV)
 
 
+def test_verification_upsert_is_idempotent_and_preserves_results():
+    tree, inputs = "a" * 40, _inputs_sha()
+    description = (
+        f"## Summary\n\nChange.\n\n{_full_block(tree, inputs)}\n\n### Ubuntu\n\nPassed.\n\n## Risks\n\nNone.\n"
+    )
+    updated = upsert_verification_metadata(description, "full", inputs, tree, _ENV)
+    assert updated == description
+    assert upsert_verification_metadata(updated, "full", inputs, tree, _ENV) == updated
+    assert updated.count("## Docker Verification") == 1
+    validate_verification_metadata(updated, inputs, tree)
+
+
+def test_verification_upsert_reuses_heading_without_metadata():
+    tree, inputs = "a" * 40, _inputs_sha()
+    description = "## Docker Verification\n\n### Ubuntu\n\nPassed.\n"
+    updated = upsert_verification_metadata(description, "full", inputs, tree, _ENV)
+    assert updated == _full_block(tree, inputs) + "\n\n### Ubuntu\n\nPassed.\n"
+
+
+def test_verification_rejects_duplicate_headings_with_only_one_field_set():
+    tree, inputs = "a" * 40, _inputs_sha()
+    description = "## Docker Verification\n\nPlatform results.\n\n" + _full_block(tree, inputs)
+    with pytest.raises(ValueError, match="exactly one.*heading"):
+        validate_verification_metadata(description, inputs, tree)
+    with pytest.raises(ValueError, match="exactly one.*heading"):
+        upsert_verification_metadata(description, "full", inputs, tree, _ENV)
+
+
 def test_gate_detects_global_and_package_dependency_changes():
     assert file_triggers_dual_docker_gate("scripts/setup.sh")
     assert file_triggers_dual_docker_gate("requirements/ubuntu.txt")

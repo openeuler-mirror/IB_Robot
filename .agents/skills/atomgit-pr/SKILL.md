@@ -157,6 +157,8 @@ python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu \
 
 ### 生成/更新 PR 描述 (Agent 驱动)
 
+**Docker Verification 更新约束**：沿用现有唯一 `## Docker Verification` 章节，在同一章节中更新四个字段并保留两平台结果；禁止把新块追加在旧标题之后。发现历史描述含重复标题时，先核对证据并合并为一个章节，不得丢弃平台日志摘要或凭空刷新 tested tree。脚本必须保证重复更新不增加标题，且拒绝重复标题，即使四个字段只出现一次。更新后重新读取远端正文，确认标题唯一、字段与验证模式/证据一致；不能仅以 API 返回成功作为完成依据。
+
 当需要为已有 PR 生成高质量描述时，遵循以下 Agent 工作流：
 
 **步骤 1: 提取 PR 上下文**
