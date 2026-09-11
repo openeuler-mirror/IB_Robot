@@ -170,6 +170,7 @@ def launch_setup(context, *_args, **_kwargs):
 
     active_control_mode = config.get("default_control_mode", "moveit_planning")
     motion_authorized = parse_bool(authorize_motion_str, default=False)
+    use_sim = parse_bool(context.launch_configurations.get("use_sim", "false"), default=False)
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"
     requested_moveit = context.launch_configurations.get("with_moveit", "")
     if (
@@ -183,6 +184,7 @@ def launch_setup(context, *_args, **_kwargs):
         "robot_config": robot_config_name,
         "config_path": config_path_override,
         "use_sim": context.launch_configurations.get("use_sim", "false"),
+        "sim_platform": context.launch_configurations.get("sim_platform", ""),
         "use_mock": context.launch_configurations.get("use_mock", "false"),
         "auto_start_controllers": context.launch_configurations.get("auto_start_controllers", "true"),
         "control_mode": active_control_mode,
@@ -211,6 +213,7 @@ def launch_setup(context, *_args, **_kwargs):
             motion_authorized=motion_authorized,
             include_motion=False,
             include_perception=visual_games_enabled,
+            use_sim=use_sim,
         )
         actions.extend(visual_actions)
         runtime_actions = []
@@ -224,9 +227,9 @@ def launch_setup(context, *_args, **_kwargs):
                 motion_authorized=motion_authorized,
                 include_visual_games=False,
                 include_perception=not visual_games_enabled,
+                use_sim=use_sim,
             )
         )
-        use_sim = parse_bool(base_launch_arguments["use_sim"], default=False)
         auto_start = parse_bool(base_launch_arguments["auto_start_controllers"], default=True)
         ready_waiter = _controller_ready_waiter(config, active_control_mode, use_sim, auto_start)
         if ready_waiter is None:
@@ -263,6 +266,7 @@ def generate_launch_description():
             DeclareLaunchArgument("robot_config", default_value="so101_single_arm"),
             DeclareLaunchArgument("config_path", default_value=""),
             DeclareLaunchArgument("use_sim", default_value="false"),
+            DeclareLaunchArgument("sim_platform", default_value=""),
             DeclareLaunchArgument("use_mock", default_value="false"),
             DeclareLaunchArgument("auto_start_controllers", default_value="true"),
             DeclareLaunchArgument("control_mode", default_value=""),

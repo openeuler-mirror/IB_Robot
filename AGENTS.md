@@ -17,6 +17,7 @@ IB_Robot/
 │   ├── so101_hardware/     # SO-101 硬件接口
 │   ├── lekiwi_hardware/    # LeKiwi 硬件接口
 │   ├── ibrobot_msgs/       # 自定义消息/服务定义
+│   ├── ibrobot_agent/      # 自然语言 Agent 孵化运行时（entry_mode=agent）
 │   ├── sim_models/         # 仿真模型
 │   ├── model_utils/        # 模型工具
 │   ├── dataset_tools/      # 数据集工具

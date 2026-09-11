@@ -22,6 +22,7 @@ def bridge_rig():
     _assert_isolated_ros_domain()
     import rclpy
     from rclpy.action import ActionServer, CancelResponse, GoalResponse
+    from rclpy.context import Context
     from rclpy.executors import MultiThreadedExecutor
 
     from ibrobot_msgs.action import SkillCommand
@@ -34,8 +35,8 @@ def bridge_rig():
         ValidateSkill,
     )
 
-    if not rclpy.ok():
-        rclpy.init()
+    server_context = Context()
+    rclpy.init(context=server_context)
     suffix = f"cli_{os.getpid()}_{uuid.uuid4().hex}"
     names = {
         "status": f"/{suffix}/gateway_status",
@@ -48,7 +49,11 @@ def bridge_rig():
     requests = []
     status_control = {"delay_sec": 0.0, "queries": {}}
     action_control = {"reject": False, "goal_ids": [], "goals": [], "delay_sec": 0.0}
-    server_node = rclpy.create_node(f"robot_skill_cli_test_server_{suffix}")
+    server_node = rclpy.create_node(
+        f"robot_skill_cli_test_server_{suffix}",
+        context=server_context,
+        use_global_arguments=False,
+    )
 
     def get_status(request, response):
         if status_control["delay_sec"]:
@@ -165,7 +170,7 @@ def bridge_rig():
         goal_callback=goal_callback,
         cancel_callback=cancel_callback,
     )
-    executor = MultiThreadedExecutor(num_threads=2)
+    executor = MultiThreadedExecutor(num_threads=2, context=server_context)
     executor.add_node(server_node)
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
@@ -182,12 +187,13 @@ def bridge_rig():
     yield bridge, names, requests, status_control, action_control
 
     bridge.close()
+    action_server.destroy()
+    executor.remove_node(server_node)
     executor.shutdown()
     spin_thread.join(timeout=2.0)
-    action_server.destroy()
     server_node.destroy_node()
-    if rclpy.ok():
-        rclpy.shutdown()
+    if server_context.ok():
+        rclpy.shutdown(context=server_context)
 
 
 def test_bridge_context_can_be_recreated_in_one_process() -> None:
@@ -505,8 +511,9 @@ def test_cancel_task_targets_active_goal_by_deterministic_uuid(bridge_rig):
         "timeout_sec": 12.0,
     }
 
+    assert bridge.wait_for_skill_server(timeout_sec=2.0)
     send_future = bridge.send_skill_goal(payload, task_id="task-cancel", feedback_callback=None)
-    assert bridge.wait_future(send_future, timeout_sec=1.0) is True
+    assert bridge.wait_future(send_future, timeout_sec=5.0) is True
     goal_handle = send_future.result()
     result_future = goal_handle.get_result_async()
 

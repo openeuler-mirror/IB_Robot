@@ -1,0 +1,80 @@
+# Manual SO-101 Agent profile. The robot configuration remains inherited from
+# so101_single_arm; only the Agent channel/runtime settings are overridden.
+robot:
+  name: so101_single_arm
+  base_config: so101_single_arm.yaml
+  audio_io:
+    enabled: false
+  voice_asr:
+    enabled: false
+  voice_tts:
+    enabled: false
+  peripherals:
+    - name: top
+      type: camera
+      driver: opencv
+      index: 0
+      width: 640
+      height: 480
+      fps: 30
+      frame_id: camera_top_frame
+      disabled: true
+    - name: wrist
+      type: camera
+      driver: opencv
+      index: 2
+      width: 640
+      height: 480
+      fps: 60
+      frame_id: camera_wrist_frame
+      disabled: true
+    - name: front
+      type: camera
+      driver: realsense
+      width: 640
+      height: 480
+      fps: 30
+      frame_id: camera_front_link
+      disabled: true
+  embodied:
+    enabled: true
+    entry_mode: agent
+    perception:
+      enabled: false
+    visual_games:
+      sorting_hat:
+        enabled: false
+    agent:
+      enabled: true
+      incubation: true
+      execution_enabled: false
+      request_topic: /agent/request
+      response_topic: /agent/response
+      event_topic: /agent/event
+      control_topic: /agent/control
+      channel_id: agent_cli
+      principal_id: local_operator
+      test_allowlist:
+        - open_gripper_skill
+        - close_gripper_skill
+        - recover_safe_pose
+        - recover_zero_pose
+        - nod_yes
+        - shake_no
+        - wave_hello
+      ledger_path: /tmp/opencode/ibrobot-agent-so101-manual/requests.sqlite3
+      conversation_path: /tmp/opencode/ibrobot-agent-so101-manual/conversation.sqlite3
+      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-manual/agent.lock
+      max_session_turns: 12
+      clarification_ttl_sec: 300.0
+      event_queue_size: 128
+      # Kimi/Coding planner. Supply KIMICODE_API_KEY in the launch shell.
+      planner:
+        mode: vlm
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-for-coding
+        timeout_sec: 120.0
+        # kimi-for-coding accepts only temperature=1.
+        temperature: 1.0

@@ -157,6 +157,7 @@ class EmbodiedConfig:
 
     enabled: bool = False
     entry_mode: str = "hermes"
+    agent: dict[str, Any] = field(default_factory=dict)
     debug_tracing: bool = True
     task_input_topic: str = "/voice_command"
     task_command_topic: str = "/embodied/task_command"

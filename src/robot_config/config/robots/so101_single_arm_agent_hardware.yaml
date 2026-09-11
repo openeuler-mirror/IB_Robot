@@ -1,0 +1,36 @@
+# SO-101 Agent hardware trial. Only use after the no-motion hardware gate.
+robot:
+  name: so101_single_arm
+  base_config: so101_single_arm_agent_test.yaml
+  audio_io:
+    enabled: false
+  voice_asr:
+    enabled: false
+  voice_tts:
+    enabled: false
+  peripherals:
+    - name: top
+      type: camera
+      disabled: true
+    - name: wrist
+      type: camera
+      disabled: true
+    - name: front
+      type: camera
+      disabled: true
+  embodied:
+    agent:
+      execution_enabled: true
+      test_allowlist: [nod_yes]
+      ledger_path: /tmp/opencode/ibrobot-agent-so101-hardware/requests.sqlite3
+      conversation_path: /tmp/opencode/ibrobot-agent-so101-hardware/conversation.sqlite3
+      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-hardware/agent.lock
+      planner:
+        mode: vlm
+        provider: openai_compatible
+        base_url: http://127.0.0.1:18080/v1
+        api_key_env: ""
+        model: deterministic-so101-e2e
+        timeout_sec: 5.0
+        temperature: 0.0
+        api_protocol: chat_completions

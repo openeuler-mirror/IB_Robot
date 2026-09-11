@@ -256,6 +256,94 @@ def test_launch_dict_enabled_game_with_perception_is_accepted_in_hermes_mode():
     assert errors == []
 
 
+def test_launch_dict_accepts_incubating_agent_entry():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "agent": {
+                "enabled": True,
+                "incubation": True,
+                "execution_enabled": False,
+                "test_allowlist": ["wave_hello"],
+                "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+                "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+                "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+            },
+        }
+    }
+
+    assert validate_embodied_launch_dict(config) == []
+
+
+def test_launch_dict_rejects_agent_execution_without_allowlist():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "agent": {
+                "enabled": True,
+                "incubation": True,
+                "execution_enabled": True,
+                "test_allowlist": [],
+                "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+                "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+                "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+            },
+        }
+    }
+
+    errors = validate_embodied_launch_dict(config)
+    assert "embodied.agent.test_allowlist must be non-empty when execution is enabled" in errors
+
+
+def test_launch_dict_rejects_agent_without_incubation_marker():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "agent": {
+                "enabled": True,
+                "execution_enabled": False,
+                "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+                "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+                "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+            },
+        }
+    }
+
+    errors = validate_embodied_launch_dict(config)
+    assert "embodied.agent.incubation must be true for the incubating Agent entry" in errors
+
+
+def test_launch_dict_rejects_literal_agent_planner_api_key():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "entry_mode": "agent",
+            "agent": {
+                "enabled": True,
+                "incubation": True,
+                "execution_enabled": False,
+                "test_allowlist": ["wave_hello"],
+                "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+                "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+                "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+                "planner": {
+                    "mode": "vlm",
+                    "provider": "openai_compatible",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "sk-literal-secret",
+                    "model": "test-model",
+                },
+            },
+        }
+    }
+
+    errors = validate_embodied_launch_dict(config)
+    assert "embodied.agent.planner must not contain a literal api_key; use api_key_env instead" in errors
+
+
 def test_launch_dict_rejects_removed_visual_game_trigger_mode():
     config = {
         "embodied": {

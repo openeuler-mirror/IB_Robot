@@ -1,0 +1,27 @@
+# Manual SO-101 Agent profile with Kimi/Coding Planner.
+# Enable only after the no-motion manual profile has reached READY.
+robot:
+  name: so101_single_arm
+  base_config: so101_agent_manual.yaml
+  embodied:
+    agent:
+      execution_enabled: true
+      test_allowlist:
+        - open_gripper_skill
+        - close_gripper_skill
+        - recover_safe_pose
+        - nod_yes
+        - shake_no
+        - wave_hello
+      ledger_path: /tmp/opencode/ibrobot-agent-so101-manual-hardware/requests.sqlite3
+      conversation_path: /tmp/opencode/ibrobot-agent-so101-manual-hardware/conversation.sqlite3
+      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-manual-hardware/agent.lock
+      planner:
+        mode: vlm
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-for-coding
+        timeout_sec: 120.0
+        # kimi-for-coding accepts only temperature=1.
+        temperature: 1.0

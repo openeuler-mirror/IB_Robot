@@ -317,6 +317,8 @@ def test_prepare_then_confirm_presentation_and_nl_grammar(rig):
     assert presentation["plan_digest"] == "pdig"
     assert presentation["task_id"] == "id-2"
     assert presentation["execution_mode"] == "interactive_confirmation"
+    assert presentation["plan_kind"] == 1
+    assert presentation["proposed_task_budget_sec"] == 90.0
 
     # Open grammar must not confirm.
     with pytest.raises(ic.NotConfirmedError):
@@ -378,6 +380,41 @@ def test_run_executes_immediately_after_required_presentation(rig):
     assert "confirm_agent_plan" in methods
     assert "send_agent_plan_goal" in methods
     assert "get_agent_plan_result" in methods
+
+
+def test_run_rejects_changed_expected_registry_identity_before_planning(rig):
+    controller, bridge = rig
+
+    with pytest.raises(ic.InteractiveControlError, match="registry identities differ"):
+        controller.run(
+            "点个头",
+            [_step("nod_yes")],
+            expected_registry_identity=("stale-epoch", 1, "stale-digest"),
+            presentation_callback=lambda _presentation: None,
+        )
+
+    methods = [method for method, _ in bridge.calls]
+    assert "plan_agent_command" not in methods
+    assert "send_agent_plan_goal" not in methods
+    assert controller.state == ic.DISCOVERED
+
+
+def test_submission_callback_failure_blocks_goal_submission(rig):
+    _controller, bridge = rig
+    controller = ic.InteractiveController(
+        bridge,
+        timeout_policy={"rpc_timeout_sec": 5.0},
+        submission_callback=lambda _detail: (_ for _ in ()).throw(OSError("disk full")),
+        view_resolver=lambda _snapshot, _status: _capability_view(),
+    )
+    bridge.result_future = FakeFuture(None, done=True)
+    bridge.goal_future = FakeFuture(FakeGoalHandle(result_future=bridge.result_future), done=True)
+
+    result = controller.run("点个头", [_step("nod_yes")], presentation_callback=lambda _presentation: None)
+
+    assert result["state"] == ic.FAILED
+    assert result["error_code"] == "SUBMISSION_PERSISTENCE_FAILED"
+    assert "send_agent_plan_goal" not in [method for method, _ in bridge.calls]
 
 
 def test_run_uses_explicit_immediate_execution_mode(rig):

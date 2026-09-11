@@ -14,6 +14,7 @@ from robot_config.loader import (
     robot_config_digest,
     robot_context_schema_version,
     robot_supported_control_modes,
+    validate_agent_entry_config,
     validate_navigation_endpoint_contract,
 )
 from robot_config.logger_utils import get_colored_logger
@@ -72,6 +73,7 @@ def generate_embodied_nodes(
     include_motion: bool = True,
     include_visual_games: bool = True,
     include_perception: bool = True,
+    use_sim: bool = False,
 ) -> list[Node]:
     """Generate embodied minimum-closure nodes from robot_config YAML."""
     embodied_config = robot_config.get("embodied", {})
@@ -98,8 +100,11 @@ def generate_embodied_nodes(
     if not isinstance(hri_runtime, dict):
         raise ValueError("embodied.imitate_human_motion must be a mapping")
     entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
-    if entry_mode != "hermes":
-        raise ValueError("embodied.entry_mode must be hermes")
+    if entry_mode not in {"hermes", "agent"}:
+        raise ValueError("embodied.entry_mode must be hermes or agent")
+    launch_errors = validate_agent_entry_config(embodied_config)
+    if launch_errors:
+        raise ValueError("; ".join(launch_errors))
     endpoint_errors = validate_navigation_endpoint_contract(robot_config)
     if endpoint_errors:
         raise ValueError("; ".join(endpoint_errors))
@@ -389,6 +394,54 @@ def generate_embodied_nodes(
             ],
         ),
     ]
+    if entry_mode == "agent":
+        agent_config = embodied_config.get("agent", {})
+        if not isinstance(agent_config, dict) or agent_config.get("enabled", True) is not True:
+            raise ValueError("embodied.agent.enabled must be true for entry_mode=agent")
+        nodes.append(
+            Node(
+                package="ibrobot_agent",
+                executable="ibrobot_agent_node",
+                name="ibrobot_agent_node",
+                output="screen",
+                parameters=[
+                    {
+                        "request_topic": agent_config.get("request_topic", "/agent/request"),
+                        "event_topic": agent_config.get("event_topic", "/agent/event"),
+                        "response_topic": agent_config.get("response_topic", "/agent/response"),
+                        "control_topic": agent_config.get("control_topic", "/agent/control"),
+                        "robot_scope": str(robot_config.get("name", "unknown")),
+                        "channel_id": agent_config.get("channel_id", "agent_incubation"),
+                        "principal_id": agent_config.get("principal_id", "local_operator"),
+                        "ledger_path": agent_config.get("ledger_path", ""),
+                        "conversation_path": agent_config.get("conversation_path", ""),
+                        "deployment_lock_path": agent_config.get("deployment_lock_path", ""),
+                        "execution_enabled": agent_config.get("execution_enabled", False),
+                        "max_session_turns": agent_config.get("max_session_turns", 12),
+                        "clarification_ttl_sec": agent_config.get("clarification_ttl_sec", 300.0),
+                        "event_queue_size": agent_config.get("event_queue_size", 128),
+                        "allowed_skills_json": json.dumps(list(agent_config.get("test_allowlist", []))),
+                        "simulation_mode": bool(use_sim),
+                        "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                        "task_budget_sec": timeout_policy["task_budget_sec"],
+                        "planner_config_json": json.dumps(agent_config.get("planner", {"mode": "rule"})),
+                        "gateway_status_service": common_params["skill_gateway_status_service"],
+                        "gateway_validate_skill_service": common_params["validate_skill_service"],
+                        "gateway_skill_action": common_params["skill_action_name"],
+                        "gateway_plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                        "gateway_validate_plan_service": embodied_config.get(
+                            "validate_plan_service", "/embodied/validate_agent_plan"
+                        ),
+                        "gateway_confirm_plan_service": embodied_config.get(
+                            "confirm_plan_service", "/embodied/confirm_agent_plan"
+                        ),
+                        "gateway_execute_plan_action": embodied_config.get(
+                            "execute_plan_action", "/embodied/execute_agent_plan"
+                        ),
+                    }
+                ],
+            )
+        )
     if hri_runtime.get("enabled", False):
         nodes.append(
             Node(

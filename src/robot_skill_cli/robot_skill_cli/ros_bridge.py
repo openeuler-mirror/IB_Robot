@@ -127,7 +127,11 @@ class RosBridge:
             self._context = Context()
             rclpy.init(context=self._context)
             suffix = f"{os.getpid()}_{uuid.uuid4().hex[:8]}"
-            self._node = rclpy.create_node(f"robot_skill_cli_{suffix}", context=self._context)
+            self._node = rclpy.create_node(
+                f"robot_skill_cli_{suffix}",
+                context=self._context,
+                use_global_arguments=False,
+            )
             callback_group = ReentrantCallbackGroup()
             self._status_client = self._node.create_client(
                 GetSkillGatewayStatus,

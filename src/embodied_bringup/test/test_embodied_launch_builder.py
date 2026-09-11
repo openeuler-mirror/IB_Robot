@@ -401,14 +401,69 @@ def test_development_catalog_resolves_from_source_module_when_config_is_installe
     assert resolved == (Path(__file__).parents[3] / "src/skill_catalog").resolve()
 
 
-def test_non_hermes_entry_mode_is_rejected():
+def test_unknown_entry_mode_is_rejected():
     import pytest
 
-    with pytest.raises(ValueError, match="entry_mode must be hermes"):
+    with pytest.raises(ValueError, match="entry_mode must be hermes or agent"):
         generate_embodied_nodes(
             {"embodied": {"enabled": True, "entry_mode": "voice"}},
             active_control_mode="moveit_planning",
         )
+
+
+def test_agent_entry_mode_adds_only_agent_entry_node():
+    nodes = generate_embodied_nodes(
+        {
+            "name": "so101_single_arm",
+            "embodied": {
+                "enabled": True,
+                "entry_mode": "agent",
+                "agent": {
+                    "enabled": True,
+                    "incubation": True,
+                    "execution_enabled": False,
+                    "test_allowlist": ["wave_hello"],
+                    "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+                    "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+                    "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+                },
+            },
+        },
+        active_control_mode="moveit_planning",
+    )
+
+    nodes_by_name = {vars(node)["_Node__node_name"]: node for node in nodes}
+    assert {"safety_guard_node", "skill_executor_node", "agent_plan_node", "ibrobot_agent_node"} <= set(nodes_by_name)
+    params = _normalize_launch_param_mapping(vars(nodes_by_name["ibrobot_agent_node"])["_Node__parameters"][0])
+    assert _decode_launch_string(params["robot_scope"]) == "so101_single_arm"
+    assert params["execution_enabled"] is False
+    assert _decode_launch_json_string(_decode_launch_string(params["allowed_skills_json"])) == ["wave_hello"]
+    assert params["simulation_mode"] is False
+
+
+def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
+    agent_config = {
+        "enabled": True,
+        "incubation": True,
+        "execution_enabled": False,
+        "test_allowlist": ["wave_hello"],
+        "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
+        "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
+        "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+    }
+
+    nodes = generate_embodied_nodes(
+        {
+            "name": "so101_single_arm",
+            "embodied": {"enabled": True, "entry_mode": "agent", "agent": agent_config},
+        },
+        active_control_mode="moveit_planning",
+        use_sim=True,
+    )
+
+    nodes_by_name = {vars(node)["_Node__node_name"]: node for node in nodes}
+    params = _normalize_launch_param_mapping(vars(nodes_by_name["ibrobot_agent_node"])["_Node__parameters"][0])
+    assert params["simulation_mode"] is True
 
 
 def test_non_moveit_game_launches_only_gateway_and_perception():
@@ -749,6 +804,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
         include_motion=True,
         include_visual_games=True,
         include_perception=True,
+        use_sim=False,
     ):
         generated.append(
             {
@@ -758,6 +814,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
                 "include_motion": include_motion,
                 "include_visual_games": include_visual_games,
                 "include_perception": include_perception,
+                "use_sim": use_sim,
             }
         )
         return []
@@ -800,6 +857,7 @@ def test_moveit_visual_closure_starts_perception_before_controller_readiness(mon
         include_motion=True,
         include_visual_games=True,
         include_perception=True,
+        use_sim=False,
     ):
         generated.append(
             {

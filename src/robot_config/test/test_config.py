@@ -1300,7 +1300,7 @@ def test_validate_embodied_relative_motion_direction_mapping():
     assert any("missing directions: down" in error for error in errors)
 
 
-def test_validate_embodied_requires_hermes_entry_mode():
+def test_validate_embodied_rejects_removed_skill_templates():
     config = RobotConfig(
         name="test_robot",
         type="so101",

@@ -42,6 +42,8 @@ def generate_camera_nodes(robot_config, use_sim=False):
     peripherals = robot_config.get("peripherals", [])
     logger.info(f"Generating nodes for {len(peripherals)} peripherals (use_sim={is_sim})")
     for periph in peripherals:
+        if periph.get("disabled", False):
+            continue
         periph_type = periph.get("type")
 
         # Skip virtual cameras in first pass

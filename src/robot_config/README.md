@@ -1056,6 +1056,7 @@ robot:
 
   embodied:
     enabled: false              # 默认关闭；通过 embodied_bringup launch 临时开启
+    entry_mode: hermes          # hermes（默认）| agent（自然语言 Agent 孵化入口）
     debug_tracing: true
 
     timeouts:
@@ -1126,7 +1127,62 @@ robot:
         observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
         grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+
+    # entry_mode: agent 时的孵化 Agent 运行时（由 embodied_bringup 注入
+    # ibrobot_agent_node 参数；字段约束见下方「Agent 孵化入口」一节）
+    agent:
+      enabled: true
+      incubation: true            # 孵化期强制标记，必须为 true
+      execution_enabled: false    # 运动默认关闭；开启需非空 test_allowlist
+      channel_id: agent_cli
+      principal_id: local_operator
+      request_topic: /agent/request
+      response_topic: /agent/response
+      event_topic: /agent/event
+      control_topic: /agent/control
+      test_allowlist: [wave_hello, nod_yes]   # 执行白名单；execution_enabled=true 时必须非空
+      ledger_path: /tmp/ibrobot-agent/requests.sqlite3        # 请求 ledger（SQLite WAL）
+      conversation_path: /tmp/ibrobot-agent/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent/agent.lock     # 部署锁，防双实例
+      max_session_turns: 12       # 会话记忆滚动窗口
+      clarification_ttl_sec: 300.0  # 一次性澄清上下文有效期
+      event_queue_size: 128
+      planner:
+        mode: vlm                 # rule（仅仿真执行）| vlm
+        provider: kimicode        # kimicode | openai_compatible
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY   # 密钥只允许环境变量名；字面 api_key 会被校验拒绝
+        model: kimi-for-coding
+        temperature: 1.0          # kimi-for-coding 强制 temperature=1
 ```
+
+#### Agent 孵化入口（entry_mode: agent）
+
+`embodied.entry_mode: agent` 由 `validate_agent_entry_config()`（`robot_config.loader`）
+在 raw-dict launch 门禁与 typed `validate_config()` 两层统一校验，字段约束：
+
+| 字段 | 约束 |
+| --- | --- |
+| `embodied.entry_mode` | `hermes` 或 `agent`；其他值报错 |
+| `agent.enabled` | `entry_mode=agent` 时必须为 `true` |
+| `agent.incubation` | 必须为 `true`（孵化期强制标记） |
+| `agent.execution_enabled` | 布尔；为 `true` 时 `test_allowlist` 必须非空 |
+| `agent.test_allowlist` | 非空字符串列表；执行白名单 |
+| `agent.request_topic` / `agent.event_topic` | 必须是以 `/` 开头的绝对 ROS topic 名 |
+| `agent.ledger_path` / `conversation_path` / `deployment_lock_path` | 非空路径 |
+| `agent.max_session_turns` / `event_queue_size` | 正整数 |
+| `agent.clarification_ttl_sec` | 正数 |
+| `agent.planner.mode` | `rule` 或 `vlm` |
+| `agent.planner.provider` | vlm 模式下 `kimicode` 或 `openai_compatible` |
+| `agent.planner.base_url` / `model` | vlm 模式下必填非空 |
+| `agent.planner.api_key_env` | kimicode 必填；密钥只允许环境变量名，**字面 `api_key` 字段会被直接拒绝** |
+| `agent.planner.temperature` | `kimi-for-coding` 模型强制 `1` |
+
+仓库自带 SO-101 孵化 profile：`so101_agent_manual`（真机手动无运动）、
+`so101_agent_manual_hardware`（真机手动执行）、`so101_single_arm_agent_test`
+（rule Planner 无运动测试）、`so101_single_arm_agent_gazebo`（Gazebo 执行）、
+`so101_single_arm_agent_hardware`（真机执行）、`so101_single_arm_agent_hardware_stop`
+（真机停止验证）。运行时行为与安全边界见 `ibrobot_agent` README。
 
 #### Capability Gateway 接线契约
 
@@ -1401,6 +1457,11 @@ python3 src/robot_config/robot_config/scripts/validate_config.py \
 ```
 
 ## 相机驱动
+
+`peripherals[]` 条目支持 `disabled: true` 标志：设置后该外设在 `load_robot_config()`
+与 perception launch builder 中被整体跳过（不加载配置、不生成相机节点）。用于
+Agent 孵化等无视觉 profile 显式关闭继承自 base config 的相机。注意统一的禁用开关
+是 `disabled`（极性为 true=禁用），不要使用 `enabled: false`（该键不被识别）。
 
 ### USB 相机（通过 `usb_cam`）
 

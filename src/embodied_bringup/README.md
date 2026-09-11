@@ -1,7 +1,8 @@
 # embodied_bringup 架构契约
 
-`embodied_bringup` 是 Hermes-only 具身运行时的启动编排包。它消费 `robot_config`
-SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知和抓取执行服务。
+`embodied_bringup` 是具身运行时的启动编排包，支持 `hermes`（默认）与 `agent`（孵化）两种
+`embodied.entry_mode` 入口。它消费 `robot_config` SSOT YAML，启动 Agent plan、安全校验、
+Skill Gateway 以及可选感知和抓取执行服务。
 
 可选的 `sound_orientation_node` 由 `embodied.idle_behaviors.sound_orientation.enabled` 控制。它订阅最终 ASR 文本和 `SpeechDirection`，只通过 `/embodied/execute_skill` 调用 `nav_turn`；默认关闭，不进入视觉游戏的 controller-independent closure。正常自动启动 controller 时，它与 Gateway 节点共享 readiness barrier。
 
@@ -14,6 +15,8 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 - 提供 `embodied_pipeline.launch.py` 公开入口。
 - 从 `robot_config` 加载机器人配置并向下游注入参数。
 - 启动 `agent_plan_node`、`safety_guard_node` 和 `skill_executor_node`。
+- 当 `embodied.entry_mode: agent` 时，额外启动 `ibrobot_agent_node`（自然语言 Agent
+  孵化入口），其全部参数来自 `embodied.agent` 配置块；运动仍经同一条 Gateway 链路授权。
 - 按配置启动低优先级 `sound_orientation_node`，但不为其提供运动旁路、排队或自动重试。
 - 按配置启动独立 `perception_service` 与抓取执行依赖。
 - 按配置启动 launch-managed HRI runtime。
@@ -32,7 +35,10 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 - 绕过 `skill_library` / `safety_guard` 发布运动命令。
 
 规则 Planner ROS 节点和 `vlm_task_planner` 包已经移除。普通 `/voice_command`
-流水线不再启动；当前唯一合法入口模式为 `embodied.entry_mode: hermes`。
+流水线不再启动；当前合法入口模式为 `embodied.entry_mode: hermes` 或 `agent`。
+`agent` 模式启动的 `ibrobot_agent_node` 使用进程内 Planner 库适配器（rule/vlm，
+见 `ibrobot_agent` README），不是独立 Planner ROS 节点，也不恢复 `vlm_task_planner`
+路线；`entry_mode: agent` 要求 `embodied.agent.incubation: true`（孵化期强制标记）。
 
 ## 依赖方向
 
@@ -40,6 +46,7 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 embodied_bringup
     -> robot_config
     -> embodied_agent        # Agent plan 生命周期
+    -> ibrobot_agent         # entry_mode=agent 时的自然语言 Agent 孵化入口
     -> safety_guard          # 只读校验
     -> skill_library         # 唯一物理执行 Gateway
     -> perception_service    # 可选独立感知服务
@@ -76,11 +83,29 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 | `control_mode` | 空 | 默认继承所选 robot config/stage 的 `default_control_mode` |
 | `nav_stage` | 空 | 配置声明的工作阶段；导航配置支持 `mapping`/`navigation`，移动抓取统一配置还支持 `grasp` |
 | `use_sim` | `false` | 是否启动仿真路径 |
+| `sim_platform` | 空 | 覆盖 robot YAML `simulation.platform` 的 CLI 透传参数 |
+| `entry_mode` | 空 | 覆盖 `embodied.entry_mode`（hermes/agent）；agent 模式需 `embodied.agent` 块校验通过 |
 | `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |
 | `with_embodied` | 空 | 默认启动具身运行时；`nav_stage=mapping` 时默认关闭，可显式覆盖 |
 | `with_perception` | 空 | 覆盖 `robot.embodied.perception.enabled` |
 | `authorize_motion` | `false` | 操作员运动授权；唯一运行时授权来源 |
+
+`entry_mode: agent` 的孵化启动示例（SO-101 手动无运动 profile）：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_agent_manual \
+  control_mode:=moveit_planning \
+  entry_mode:=agent \
+  authorize_motion:=false
+```
+
+Agent 孵化 profile（`so101_agent_manual`、`so101_single_arm_agent_gazebo` 等）的
+`embodied.agent` 字段表与校验规则见 `robot_config` README；真机执行类 profile 必须
+由操作员现场显式开启 `authorize_motion` 并配置 vlm Planner（内置 RulePlanner 仅限
+仿真执行）。交互终端用 `scripts/run_agent_chat.sh` 连接到已启动的 Agent 节点。
 
 ## 已知限制
 

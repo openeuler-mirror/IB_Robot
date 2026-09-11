@@ -13,6 +13,7 @@
   <depend>embodied_common</depend>
   <depend>robot_config</depend>
   <exec_depend>embodied_agent</exec_depend>
+  <exec_depend>ibrobot_agent</exec_depend>
   <exec_depend>skill_library</exec_depend>
   <exec_depend>safety_guard</exec_depend>
   <exec_depend>perception_service</exec_depend>

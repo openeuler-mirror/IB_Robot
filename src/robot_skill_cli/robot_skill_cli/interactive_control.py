@@ -149,8 +149,10 @@ class InteractiveController:
         sleep: Callable[[float], None] = time.sleep,
         view_resolver: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] | None = None,
         execution_mode: str = INTERACTIVE_CONFIRMATION,
+        submission_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._bridge = bridge
+        self._submission_callback = submission_callback
         self._rpc_timeout_sec = max(
             float(timeout_policy.get("rpc_timeout_sec", _RPC_TIMEOUT_FLOOR_SEC)), _RPC_TIMEOUT_FLOOR_SEC
         )
@@ -315,6 +317,10 @@ class InteractiveController:
             "raw_command": raw_command,
             "steps": plan_steps,
             "registry_identity": plan_identity,
+            "registry_epoch": plan_identity[0],
+            "registry_generation": plan_identity[1],
+            "registry_digest": plan_identity[2],
+            "expected_step_count": len(plan_steps),
             "task_id": task_id,
         }
         with self._state_lock:
@@ -373,6 +379,8 @@ class InteractiveController:
             },
             "task_id": self._pending["task_id"],
             "execution_mode": self._execution_mode,
+            "plan_kind": self._pending["plan_kind"],
+            "proposed_task_budget_sec": float(self._fresh_status["task_budget_sec"]),
         }
 
     def confirm_plan(self) -> dict[str, Any]:
@@ -480,6 +488,7 @@ class InteractiveController:
         steps: list[dict[str, Any]],
         *,
         request_id: str | None = None,
+        expected_registry_identity: tuple[str, int, str] | None = None,
         presentation_callback: Callable[[dict[str, Any]], None],
         authorization_callback: Callable[[dict[str, Any]], None] | None = None,
         stop_event: threading.Event | None = None,
@@ -524,6 +533,14 @@ class InteractiveController:
                     self._clear_operation()
                     self._state = IDLE
                 raise
+        if expected_registry_identity is not None and self._fresh_identity != expected_registry_identity:
+            with self._state_lock:
+                self._clear_operation()
+                self._state = DISCOVERED if self._fresh_view is not None else IDLE
+            raise InteractiveControlError(
+                "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+                "planning and execution registry identities differ",
+            )
         try:
             presentation = self.prepare_workflow(raw_command, steps, request_id=request_id)
         except Exception:
@@ -602,6 +619,25 @@ class InteractiveController:
             if self._stop_requested_now():
                 return self._record_local_stop(task_id, "stopped before goal admission")
             self._submission_started = True
+            submission_detail = {
+                "task_id": task_id,
+                "plan_id": self._pending["plan_id"],
+                "plan_digest": self._pending["plan_digest"],
+                "registry_epoch": self._pending["registry_epoch"],
+                "registry_generation": self._pending["registry_generation"],
+                "registry_digest": self._pending["registry_digest"],
+                "expected_step_count": self._pending["expected_step_count"],
+            }
+        if self._submission_callback is not None:
+            try:
+                self._submission_callback(submission_detail)
+            except Exception:
+                return self._record_terminal(
+                    task_id,
+                    FAILED,
+                    "SUBMISSION_PERSISTENCE_FAILED",
+                    "goal submission was blocked because durable state could not be recorded",
+                )
         try:
             goal_future = self._bridge.send_agent_plan_goal(
                 plan_token=plan_token,
