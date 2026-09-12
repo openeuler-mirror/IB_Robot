@@ -57,6 +57,7 @@ KNOWN_BUNDLES = {
     "pi05",
     "smolvla",
     "sam2.1_hiera_tiny",
+    "sam2.1_hiera_tiny_prompt_ascend",
     "ram_plus_swin_large_14m",
     "siglip2_so400m_patch14_384",
     "grounding_dino_swint_seq8_1280x720",
@@ -72,11 +73,17 @@ REPOSITORY_ALIASES = {
     "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
     "graspgen": "graspgen",
 }
+# Repositories whose manifest bundle.name is not unique across the
+# organization (e.g. sam2.1_hiera_tiny and sam2.1_hiera_tiny_prompt_ascend
+# both declare bundle.name "sam2.1_hiera_tiny") must pin their local
+# directory explicitly, otherwise the fallback below collides.
 RUNTIME_DIRECTORIES = {
     "IB_Robot_ACT_banana_pick_distill": "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
     "fullsubnet": "fullsubnet",
     "graspgen": "graspgen",
     "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny": "sam2.1_hiera_tiny",
+    "sam2.1_hiera_tiny_prompt_ascend": "sam2.1_hiera_tiny_prompt_ascend",
 }
 LEGACY_REPOSITORIES = {
     "IB_Robot_ACT_banana_pick": "IB_Robot_ACT_banana_pick",
@@ -102,6 +109,17 @@ class BundlePlan:
     @property
     def artifact_count(self) -> int:
         return sum(1 for path in self.patterns if path in self.verify_map)
+
+
+@dataclass
+class ResolvedBundle:
+    """A bundle resolved against the local directory map, ready to download."""
+
+    name: str
+    local_name: str
+    plan: BundlePlan | None = None
+    conflict_with: str | None = None
+    duplicate: bool = False
 
 
 @dataclass
@@ -386,6 +404,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def resolve_bundles(
+    names: list[str],
+    repository_files: dict[str, list[str]] | None,
+    dest_root: Path,
+    targets: list[str],
+    deployments: list[str],
+) -> tuple[list[ResolvedBundle], int]:
+    """Resolve every requested bundle before touching the destination.
+
+    Resolving up front lets conflicting local directories fail loudly instead
+    of letting a later download silently overwrite an earlier one (issue #132).
+    """
+    resolved: list[ResolvedBundle] = []
+    failures = 0
+    for name in names:
+        try:
+            if name in LEGACY_REPOSITORIES or (
+                repository_files and MANIFEST_FILENAME not in repository_files.get(name, [])
+            ):
+                resolved.append(ResolvedBundle(name=name, local_name=LEGACY_REPOSITORIES.get(name, name)))
+                continue
+            manifest = fetch_manifest(DEFAULT_ORG, name, dest_root)
+            bundle_name = manifest.get("bundle", {}).get("name") or name
+            local_name = runtime_directory(name, bundle_name)
+            plan = build_plan(local_name, DEFAULT_ORG, manifest, targets, deployments, repo_name=name)
+            resolved.append(ResolvedBundle(name=name, local_name=local_name, plan=plan))
+        except Exception as exc:  # noqa: BLE001 - report per-bundle, keep going
+            failures += 1
+            print(f"[error] {name}: {exc}", file=sys.stderr)
+
+    owners: dict[str, str] = {}
+    seen: set[str] = set()
+    for record in resolved:
+        if record.name in seen:
+            record.duplicate = True
+            continue
+        seen.add(record.name)
+        previous = owners.setdefault(record.local_name, record.name)
+        if previous == record.name:
+            continue
+        record.conflict_with = previous
+        failures += 1
+        print(
+            f"[error] {record.name}: local directory '{record.local_name}' is already taken by "
+            f"'{previous}'; add an explicit RUNTIME_DIRECTORIES entry so each repository "
+            f"downloads into its own directory",
+            file=sys.stderr,
+        )
+    return resolved, failures
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.list:
@@ -396,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     available: list[str] | None = None
-    repository_files: dict[str, list[str]] = {}
+    repository_files: dict[str, list[str]] | None = None
     if args.models.strip().lower() == "all":
         api = HfApi(token=args.token)
         models = sorted(api.list_models(author=DEFAULT_ORG, full=True), key=lambda item: item.id.lower())
@@ -405,28 +474,25 @@ def main(argv: list[str] | None = None) -> int:
     names = resolve_names(args.models, available)
     targets = split_csv(args.target)
     deployments = split_csv(args.deployment)
-    failures = 0
-    for name in names:
+    records, failures = resolve_bundles(names, repository_files, args.dest, targets, deployments)
+    for record in records:
+        if record.conflict_with or record.duplicate:
+            continue
+        name = record.name
         try:
-            if name in LEGACY_REPOSITORIES or (
-                repository_files and MANIFEST_FILENAME not in repository_files.get(name, [])
-            ):
+            if record.plan is None:
                 download_legacy_repo(name, args.dest, args.dry_run)
                 continue
-            manifest = fetch_manifest(DEFAULT_ORG, name, args.dest)
-            bundle_name = manifest.get("bundle", {}).get("name") or name
-            local_name = runtime_directory(name, bundle_name)
-            plan = build_plan(local_name, DEFAULT_ORG, manifest, targets, deployments, repo_name=name)
             if args.dry_run:
-                artifacts = plan.artifact_count
+                artifacts = record.plan.artifact_count
                 print(
-                    f"[dry-run] {plan.repo_id}: {artifacts} artifact file(s), "
-                    f"{len(plan.patterns) - artifacts} shared file(s), deployments: "
-                    f"{', '.join(plan.matched_deployments)}"
+                    f"[dry-run] {record.plan.repo_id}: {artifacts} artifact file(s), "
+                    f"{len(record.plan.patterns) - artifacts} shared file(s), deployments: "
+                    f"{', '.join(record.plan.matched_deployments)}"
                 )
                 continue
-            download_bundle(plan, args.dest)
-            print(f"[done] {plan.repo_id} -> {args.dest / local_name}")
+            download_bundle(record.plan, args.dest)
+            print(f"[done] {record.plan.repo_id} -> {args.dest / record.local_name}")
         except Exception as exc:  # noqa: BLE001 - report per-bundle, keep going
             failures += 1
             print(f"[error] {name}: {exc}", file=sys.stderr)

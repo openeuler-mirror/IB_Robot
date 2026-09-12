@@ -59,6 +59,31 @@ def _pi05_like_manifest() -> dict:
     }
 
 
+def _named_bundle_manifest(bundle_name: str) -> dict:
+    """Manifest whose bundle.name may differ from the repository it is fetched from."""
+    manifest = _pi05_like_manifest()
+    manifest["bundle"]["name"] = bundle_name
+    return manifest
+
+
+def _snapshot_writing_manifests(repos_by_repo_id: dict[str, dict]):
+    """Fake snapshot_download that materializes manifest + shared files per repo."""
+
+    def fake_snapshot(repo_id, local_dir, allow_patterns):
+        local = Path(local_dir)
+        manifest = repos_by_repo_id[repo_id]
+        for relative in allow_patterns:
+            target = local / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if relative == dm.MANIFEST_FILENAME:
+                target.write_text(json.dumps(manifest))
+            else:
+                target.write_text(repo_id)
+        return str(local)
+
+    return fake_snapshot
+
+
 def test_target_keyword_matches_soc_aliases():
     plan = build_plan_default(_sam_like_manifest(), targets=["310p"])
     assert plan.matched_deployments == ["ascend_310p"]
@@ -195,6 +220,57 @@ def test_end_to_end_download_with_fake_hub(monkeypatch, tmp_path):
     assert from_file == expected_digest
 
 
+def test_main_downloads_same_bundle_name_repos_into_separate_directories(monkeypatch, tmp_path):
+    """Issue #132: two repositories may publish manifests with the same bundle.name."""
+    repos = {
+        "openEuler/sam2.1_hiera_tiny": _named_bundle_manifest("sam2.1_hiera_tiny"),
+        "openEuler/sam2.1_hiera_tiny_prompt_ascend": _named_bundle_manifest("sam2.1_hiera_tiny"),
+    }
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, dest_root: repos[f"{org}/{name}"])
+    monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(repos))
+
+    code = dm.main(["--models", "sam2.1_hiera_tiny,sam2.1_hiera_tiny_prompt_ascend", "--dest", str(tmp_path)])
+    assert code == 0
+
+    first = tmp_path / "sam2.1_hiera_tiny"
+    second = tmp_path / "sam2.1_hiera_tiny_prompt_ascend"
+    assert (first / dm.MANIFEST_FILENAME).is_file()
+    assert (second / dm.MANIFEST_FILENAME).is_file()
+    assert (first / "model.safetensors").read_text() == "openEuler/sam2.1_hiera_tiny"
+    assert (second / "model.safetensors").read_text() == "openEuler/sam2.1_hiera_tiny_prompt_ascend"
+
+
+def test_main_rejects_colliding_runtime_directories(monkeypatch, tmp_path, capsys):
+    manifests = {
+        "openEuler/alpha": _named_bundle_manifest("alpha"),
+        "openEuler/beta": _named_bundle_manifest("alpha"),
+    }
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, dest_root: manifests[f"{org}/{name}"])
+    monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(manifests))
+
+    code = dm.main(["--models", "alpha,beta", "--dest", str(tmp_path)])
+    assert code == 1
+
+    captured = capsys.readouterr()
+    assert "beta" in captured.err and "alpha" in captured.err and "RUNTIME_DIRECTORIES" in captured.err
+    bundle = tmp_path / "alpha"
+    assert (bundle / dm.MANIFEST_FILENAME).read_text() == json.dumps(manifests["openEuler/alpha"])
+    assert (bundle / "model.safetensors").read_text() == "openEuler/alpha"
+    assert not (tmp_path / "beta").exists()
+
+
+def test_main_deduplicates_repeated_model_names(monkeypatch, tmp_path, capsys):
+    manifest = _named_bundle_manifest("alpha")
+    manifests = {"openEuler/alpha": manifest}
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, dest_root: manifests[f"{org}/{name}"])
+    monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(manifests))
+
+    code = dm.main(["--models", "alpha,alpha", "--dest", str(tmp_path)])
+    assert code == 0
+    assert "already taken" not in capsys.readouterr().err
+    assert (tmp_path / "alpha" / "model.safetensors").read_text() == "openEuler/alpha"
+
+
 def test_split_csv_and_resolve_names():
     assert dm.split_csv(["310p, cpu", "cuda"]) == ["310p", "cpu", "cuda"]
     assert dm.resolve_names("pi05, fullsubnet") == ["pi05", "fullsubnet"]
@@ -212,6 +288,11 @@ def test_repository_aliases_and_runtime_directories():
     assert (
         dm.runtime_directory("grounding_dino_swint_seq8_1280x720", "grounding_dino_swint_seq8_1280x720")
         == "grounding_dino_swint_seq8_1280x720"
+    )
+    assert dm.runtime_directory("sam2.1_hiera_tiny", "sam2.1_hiera_tiny") == "sam2.1_hiera_tiny"
+    assert (
+        dm.runtime_directory("sam2.1_hiera_tiny_prompt_ascend", "sam2.1_hiera_tiny")
+        == "sam2.1_hiera_tiny_prompt_ascend"
     )
     assert dm.resolve_names("all", ["pi05", "zipvoice"]) == ["pi05", "zipvoice"]
 
