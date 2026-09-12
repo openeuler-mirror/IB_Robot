@@ -101,7 +101,7 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         **Reinvention justification:** 无（未重新发明现有流程）
         **Architecture conformance:** 对齐 inference_service 的模型 bundle + manifest 架构；配置一律来自 robot_config，未新增配置来源
         ```
-5.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。人工审查确认（`--human-reviewed`）以用户在当前对话中明确提交/创建/更新 PR 的请求为准，不发起阻塞式交互确认。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
+5.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。人工审查确认（`--human-reviewed`）以用户在当前对话中明确提交/创建/更新 PR 的请求为准，不发起阻塞式交互确认。提交/更新前，coding agent 必须自行执行实际工具的 `<tool> --version`（或等价版本命令），并将工具名和版本传给 `--agent-tool`；仓库不维护工具白名单，也不替未知工具执行命令，脚本只校验结构、占位符和注入字符。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀；同一 PR 使用多个模型时以逗号分隔并完整列出。脚本要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查 PR 披露覆盖所有 commit 实际记录的 AI 模型；**模型集合的定义域是 PR 的全部 commit**——其他会话或其他 agent 向同一分支推送新 commit 后，披露必须合并新增 commit 的模型，并在 push 后立即通过 `--update-pr` 刷新（脚本对照远端 PR commits 校验，缺失即拒绝更新）；不同 commit 可以使用不同模型，纯人工 commit 也不要求添加 AI trailer。人类共同作者应使用 `Co-Authored-By: Name <email>`，不会被当作 AI 模型。缺失、未披露或无法验证的工具/模型信息会阻止提交。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
     *   **披露块由脚本统一生成，禁止手写**：PR 描述文件（`--description-file` / `description.json`）中**不得**包含任何手写的 AI 披露内容（如「AI 披露」「当前PR是否有AI参与」「希望检视人员了解」等章节）。`pr_creation.py` / `pr_management.py` 会根据 CLI 参数自动在描述**头部**生成/替换带机器标记（`<!-- openEuler-ai-disclosure:start/end -->`）的标准披露块，并在披露块与正文之间自动插入 `---` 分隔线。披露块固定放头部：reviewer 打开 PR 第一眼即可看到 AI 参与勾选框，符合 openEuler 披露可见性要求；放尾部容易被长正文淹没。手写披露会与自动块重复，脚本检测到标记块之外的披露内容会直接拒绝创建/更新。
 
 ```bash
@@ -179,6 +179,8 @@ Agent 分析完 Diff 后，会生成一份 `description.json`:
   "description": "详细的变更逻辑说明..."
 }
 ```
+**更新前必须确认模型集合**：`--ai-model` 必须是 PR 全部 commit `Co-Authored-By` 模型的并集（含其他会话或其他 agent 推送的 commit）。脚本更新时会抓取远端 PR commits 并校验覆盖情况，缺失任何 commit 模型都会直接拒绝；即使本次只改披露信息，也要走完整更新流程并在更新后回读远端正文确认。
+
 然后运行同步命令：
 ```bash
 python3 pr_management.py --pr 123 --update-pr description.json \
@@ -265,7 +267,7 @@ PR 描述通常应包含与本次提交最相关的内容，而不是固定模�
 
 1. **分支命名**: 建议使用 `feat/`, `fix/`, `docs/`, `refactor/` 等前缀
 2. **提交历史规范的唯一入口**: 创建或更新 PR 前，必须调用 `ibrobot-git-flow` 执行 commit hygiene 检查。提交格式、commit 数量、review 修复应折回已有 commit 还是作为独立新 commit，以及历史重写/推送方式，均以该 skill 的当前规则和例外为唯一事实来源；本 skill 不复制或覆盖这些判定。
-3. **AI 元数据完整性**: PR 的模型信息必须覆盖所有 AI-assisted commit 的 `Co-Authored-By`；不同 commit 可记录不同模型，未披露模型才是阻塞错误。
+3. **AI 元数据完整性**: PR 的模型信息必须覆盖所有 AI-assisted commit 的 `Co-Authored-By`；模型集合的定义域是 PR 的全部 commit，包括其他会话推送到同一分支的 commit——push 新 commit 后必须刷新披露。不同 commit 可记录不同模型，未披露模型才是阻塞错误，脚本在创建和更新时都会强制校验。
 4. **代码审查**: 创建 PR 后等待代码审查
 5. **CI 检查**: 确保 CI 通过后再合并
 6. **跨仓库前提**: 创建 PR 时当前本地 worktree 仍需与目标仓库代码相匹配；`--owner/--repo/--url` 只负责切换 AtomGit API 目标，不会替你切换本地 Git 工作区

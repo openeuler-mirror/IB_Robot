@@ -81,6 +81,10 @@ Must strictly follow this structure with exactly one blank line between sections
 - **Keep PR metadata complete**: Before push or PR creation, collect the AI model from every AI-assisted commit and
   ensure the PR disclosure lists the complete model set. Different commits may use different models; a model present
   in a commit but absent from the PR disclosure is a blocking error. Purely human commits need no AI trailer.
+  The model set is defined over **all commits of the PR**: when pushing new commits to a branch that already has an
+  open PR — including commits authored in another session or by another agent — merge the new commit models into the
+  disclosure. After the push, immediately refresh the PR description via `pr_management.py --update-pr`; the script
+  re-validates coverage against the remote PR commits and rejects any missing model.
 - **Verify Agent tool provenance**: Before invoking the PR workflow, the coding agent must run the actual tool's
   `--version` (or equivalent) command and pass the observed tool name/version as `--agent-tool`. The repository
   must not maintain an exhaustive tool allowlist or execute arbitrary unknown tools; the workflow only validates
@@ -194,7 +198,10 @@ For root repository:
    - **If an existing PR is found**: The PR description is now stale. You **must** synchronize it:
      1. Run `python3 pr_management.py --pr <NUM> --fetch-info` to get full PR context (all commits + diff).
      2. Analyze all commits in the PR and regenerate a complete PR description (Chinese by default) covering all changes.
-     3. If the PR context triggers the verification gate, ask for WIP/review stage. For WIP, keep `[WIP]` and skip Docker. For review, run both Docker skills against the latest remote head tree and include the structured `## Docker Verification` block. When inputs unchanged, the workflow auto-inserts a `reused-environment` block.
+     3. Before updating, collect the `Co-Authored-By` models from **every** PR commit (including commits pushed by
+        other sessions or agents) and pass the full union via `--ai-model`; the update script validates coverage
+        against the remote PR commits and rejects missing models.
+     4. If the PR context triggers the verification gate, ask for WIP/review stage. For WIP, keep `[WIP]` and skip Docker. For review, run both Docker skills against the latest remote head tree and include the structured `## Docker Verification` block. When inputs unchanged, the workflow auto-inserts a `reused-environment` block.
      4. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json --pr-stage <wip|review>`.
    - **If no existing PR**: Generate AtomGit PR link: `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>` and compose PR description from commit message body.
 

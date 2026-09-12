@@ -158,6 +158,10 @@ def validate_commit_ai_model(commits: list[dict], ai_model: str) -> None:
         problems.append("no AI-assisted commit contains Co-Authored-By model metadata")
     missing = commit_models - disclosed_models
     if missing:
-        problems.append(f"PR disclosure does not include commit models: {', '.join(sorted(missing))}")
+        problems.append(
+            f"PR disclosure does not include commit models: {', '.join(sorted(missing))}; re-fetch the "
+            "PR commits and pass the union of every commit's Co-Authored-By model as --ai-model "
+            "(commits pushed from other sessions count too)"
+        )
     if problems:
         raise ValueError("AI commit metadata check failed; " + "; ".join(problems))

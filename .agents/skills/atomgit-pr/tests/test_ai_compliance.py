@@ -146,8 +146,9 @@ def test_validate_commit_ai_model_rejects_missing_disclosed_model():
         {"sha": "b" * 40, "commit": {"message": "docs: mismatch\n\nCo-Authored-By: other-model"}},
     ]
 
-    with pytest.raises(ValueError, match="AI commit metadata check failed"):
+    with pytest.raises(ValueError, match="union of every commit's Co-Authored-By model") as excinfo:
         validate_commit_ai_model(commits, "gpt-5.6-sol")
+    assert "other-model" in str(excinfo.value)
 
 
 def test_ai_model_rejects_provider_prefix():
