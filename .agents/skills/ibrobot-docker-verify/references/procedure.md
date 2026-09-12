@@ -170,6 +170,13 @@ docker exec \
     locale-gen en_US.UTF-8 >/dev/null
   '
 
+# 2.3b Pre-register the workspace as a git safe.directory for the container user.
+#      docker cp preserves host UIDs; without this, every later git probe (e.g.
+#      the Phase 6 `git rev-parse HEAD HEAD^{tree}` provenance line) fails with
+#      "dubious ownership in repository" instead of producing evidence.
+docker exec -u testuser -e HOME=/home/testuser "${CONTAINER}" \
+  git config --global --add safe.directory /home/testuser/IB_Robot
+
 # 2.4 Fail fast unless the actual setup user can use the mounted cache. A root
 # check would produce a false positive for host directories owned by another
 # UID. Creating a file verifies both traversal and write permissions.

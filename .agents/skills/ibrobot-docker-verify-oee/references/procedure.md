@@ -79,10 +79,13 @@ docker exec verify-oee bash -c \
 docker exec verify-oee bash -c \
   'mkdir -p /root/openeuler_rootfs/var/volatile/log'
 
-# 2.5 Fix git safe.directory for UID mismatch after docker cp
+# 2.5 Fix git safe.directory for UID mismatch after docker cp.
+#     Use the wildcard: docker cp preserves host UIDs, and EVERY submodule is a
+#     separate git repository, so enumerating paths (e.g. only /root/IB_Robot and
+#     libs/lerobot) fails later on the first submodule setup.sh touches
+#     (observed: libs/Livox-SDK2 aborted a setup run in the submodule stage).
 docker exec verify-oee bash -c \
-  'chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot
-   chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot/libs/lerobot'
+  'chroot /root/openeuler_rootfs git config --global --replace-all safe.directory "*"'
 ```
 
 **Why --privileged:** chroot 和 qemu-user binfmt 模拟需要 privileged 权限。
@@ -181,8 +184,54 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
 维护者。
 
 **何时扩展：** 当 setup.sh 因其他包出现类似"RPM DB 标称版本 vs 磁盘实际版本
-不一致"失败时，把该包加入上表，并在步骤 1 的 `for pkg in ...` 列表与步骤 2
-的 `dnf reinstall` 命令中追加对应包名。lz4 是已知示例，不是封闭列表。
+不一致"失败时，把该包加入上表，并在步骤 1 的 `for pkg in ...` 列表与步骤 2 的
+`dnf reinstall` 命令中追加对应包名。lz4 是已知示例，不是封闭列表。
+
+> **⚠️ 本 Phase 探测通过 ≠ 一劳永逸（2026-09 实测教训）：** 一次真实验证中
+> Phase 3.5 探测完全干净，但 setup.sh 的 dnf 事务（rosdep 安装 `flann-devel`
+> → `lz4-devel`，同时从 repo 拉入旧版 `lz4`）**重新引入**了不一致，导致
+> build 在 `livox_ros_driver2` 链接阶段失败（`No rule to make target
+> '/usr/lib64/liblz4.so'`），浪费约 1.5 小时 qemu 构建时间。因此 Phase 5.5
+> 的 post-setup 门禁是**必须执行**的，不能因为 Phase 3.5 干净就跳过。
+
+## Phase 5.5 — Post-Setup Integrity Gate (MUST run before build)
+
+> **必须在 setup.sh 完成之后、build.sh 启动之前执行。** 成本为秒级；跳过它
+> 的代价是构建在链接阶段失败（实测一次失败浪费约 1.5 小时 qemu 构建时间）。
+> setup 的 dnf 事务可能拉入与磁盘内容冲突的基础包版本，即使 Phase 3.5
+> 探测干净，此门禁也可能失败——这正是它存在的意义。
+
+```bash
+docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
+  set -e
+  # Probe every known-fragile pair that is installed at this point.
+  broken=0
+  for pkg in lz4 lz4-devel; do
+    if rpm -q \"\$pkg\" >/dev/null 2>&1; then
+      rpm -V \"\$pkg\" || broken=1
+    fi
+  done
+  # The devel soname symlink is what C++ linking actually consumes.
+  if [ -e /usr/lib64/liblz4.so ]; then
+    echo \"liblz4.so present\"
+  else
+    echo \"liblz4.so MISSING\"; broken=1
+  fi
+  if [ \"\$broken\" -ne 0 ]; then
+    echo \"Integrity gate FAILED; realigning disk with RPM DB\"
+    dnf reinstall -y --nogpgcheck lz4 lz4-devel
+    rpm -V lz4 lz4-devel
+    test -e /usr/lib64/liblz4.so
+  fi
+  echo \"post-setup integrity gate OK\"
+"'
+```
+
+若重装后仍失败（`rpm -V` 持续报错或缺文件），按 Fatal 错误上报并停止：
+基础镜像/仓库状态超出修复范围，不要带着已知损坏状态启动多小时构建。
+
+**何时扩展：** 构建若因其他 `lib<name>.so` 缺失失败，把 `<name> <name>-devel`
+加入本门禁与 Phase 3.5 的探测/重装列表（同一根因：dnf 事务引入的版本回退）。
 
 ## Phase 4 — Prepare Workspace
 
@@ -315,6 +364,8 @@ Wait until the log ends with:
 ```
 Setup complete! Run ./scripts/build.sh to build the workspace.
 ```
+
+**Phase 5 完成后必须执行 Phase 5.5 的 post-setup integrity gate，再进入 Phase 6。**
 
 ## Phase 6 — Run build.sh
 

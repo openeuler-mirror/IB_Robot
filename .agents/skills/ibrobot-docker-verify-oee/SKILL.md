@@ -129,14 +129,22 @@ openEuler Embedded rootfs。当镜像构建过程中基础包升级但 RPM DB �
   dnf 事务创建指向不存在的 `liblz4.so.1.9.4` 的 `/usr/lib64/liblz4.so`，导致
   后续链接错误
 
-**处理策略：** 在 setup.sh 启动**之前**对已知易损坏包用 `rpm -V` 探测，
-若发现不一致就在 chroot 中用 `dnf reinstall -y --nogpgcheck <pkg> <pkg>-devel`
-重装。`reinstall` 不是"安装新软件"，而是把磁盘内容重新对齐到 RPM DB 已声明
-的状态——属于环境修复，不违反 Core Principle。完整流程见 Phase 3.5。
+**处理策略（两道门禁，缺一不可）：**
 
-**扩展规则：** lz4 是首个已知示例，不是封闭列表。当 setup.sh 因其他包出现
-"RPM DB 标称版本 vs 磁盘实际版本不一致"失败时，把该包加入 Phase 3.5 的
-易损坏包表，并追加对应的 `rpm -V` 检测与 `dnf reinstall` 修复步骤。
+1. **Pre-flight（Phase 3.5，setup 之前）：** 对已知易损坏包用 `rpm -V` 探测，
+   若发现不一致就在 chroot 中用 `dnf reinstall -y --nogpgcheck <pkg> <pkg>-devel`
+   重装。`reinstall` 不是"安装新软件"，而是把磁盘内容重新对齐到 RPM DB 已声明
+   的状态——属于环境修复，不违反 Core Principle。
+2. **Post-setup 门禁（Phase 5.5，build 之前，必须执行）：** 2026-09 实测教训：
+   一次验证中 pre-flight 探测完全干净，但 setup.sh 的 dnf 事务（rosdep 安装
+   `flann-devel` → `lz4-devel`，并从 repo 拉入旧版 `lz4`）**重新引入**不一致，
+   build 在 `livox_ros_driver2` 链接阶段失败，浪费约 1.5 小时 qemu 构建时间。
+   因此 setup 完成后必须重跑探测并检查 `/usr/lib64/liblz4.so` 存在，失败则
+   reinstall 修复后再启动 build。
+
+**扩展规则：** lz4 是首个已知示例，不是封闭列表。当 setup.sh 或 build.sh 因其他包出现
+"RPM DB 标称版本 vs 磁盘实际版本不一致"失败时，把该包加入 Phase 3.5 与
+Phase 5.5 的易损坏包列表，并追加对应的 `rpm -V` 检测与 `dnf reinstall` 修复步骤。
 
 ## Error Classification
 
@@ -160,12 +168,13 @@ corresponding phase section.
 |-------|---------|------------|
 | **0** | Check host prerequisites (docker, qemu-user-static) | Pass/fail |
 | **1** | Ensure `:env` image is fresh (pull if >30 days old) | Image ready |
-| **2** | Start container, verify aarch64 emulation, fix chroot env (DNS, /var/log, git safe.directory) | Container ready |
+| **2** | Start container, verify aarch64 emulation, fix chroot env (DNS, /var/log, git safe.directory wildcard for all submodules) | Container ready |
 | **3** | Inspect chroot environment (git, python3, dnf, ROS 2) | Environment confirmed |
 | **3.5** | Verify & repair base image integrity (RPM DB vs on-disk binary mismatch) — see [Base Image Integrity Pre-flight](#base-image-integrity-pre-flight) | Base packages consistent |
 | **4** | Prepare workspace — **choose one mode** (docker cp or git clone) | `SOURCE_MODE` |
 | **4.5** | ROS source-switch pre-clean (conditional) — remove all `ros-humble-*` in chroot when the change switches the ROS source | No ROS packages left |
 | **5** | Run `setup.sh --yes --no-sudo`, capture log (20-40 min under qemu) | `/tmp/setup.log` |
+| **5.5** | Post-setup integrity gate (MUST run before build): re-probe fragile pairs, repair via `dnf reinstall` | Gate OK before build |
 | **6** | Run `build.sh`, capture log | `/tmp/build.log` |
 | **7** | Collect ERROR lines, clean up container | Final report |
 
