@@ -48,6 +48,11 @@ def test_node_binds_runtime_identity_and_answers_read_only(tmp_path):
         ready = node._ready_callback(Trigger.Request(), Trigger.Response())
         assert ready.success
 
+        node._service._quarantined = True
+        ready = node._ready_callback(Trigger.Request(), Trigger.Response())
+        assert not ready.success
+        node._service._quarantined = False
+
         message = String()
         message.data = json.dumps(
             {

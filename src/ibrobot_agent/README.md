@@ -16,7 +16,7 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
 | 节点 / 入口 | 主要职责 |
 | --- | --- |
 | `ibrobot_agent_node` | Agent 组合根：transport 与生命周期；ROS-free 的 `AgentService` 通过注入的 port 工作 |
-| `chat_tui.py`（`ibrobot_agent_chat` 入口 / `scripts/run_agent_chat.sh`） | 交互式终端 UI：输入历史、异步事件渲染、`/stop` 与停止词旁路；`--channel-id`/`--principal-id`/`--robot-scope` 覆盖会话身份以匹配 profile 的 `embodied.agent` 配置 |
+| `chat_tui.py`（`ros2 run ibrobot_agent ibrobot_agent_chat` / `scripts/run_agent_chat.sh`） | 交互式终端 UI：输入历史、异步事件渲染、`/stop` 与停止词旁路；`--channel-id`/`--principal-id`/`--robot-scope` 覆盖会话身份以匹配 profile 的 `embodied.agent` 配置 |
 
 ## 调用链
 
@@ -42,17 +42,19 @@ RECEIVED -> PLANNING -> PROPOSAL_READY -> PREPARING -> MAY_EXECUTE -> RUNNING
 终态未知:   -> UNKNOWN（触发 robot-scope quarantine）
 ```
 
-- 单 robot-scope 同一时间只接受一个活动请求，重复 request_id 幂等去重。
+- 单 robot-scope 同一时间只接受一个活动请求，重复 request_id 幂等去重；BUSY 是终态，重试必须生成新的 request_id。
 - stop 以 generation 防竞态；执行前后取消分别落到 `CANCELLED_BEFORE_EXECUTION` / `CANCELLED`。
 - 请求、事件序列与会话记忆持久化在 SQLite（WAL + FULL sync）ledger 中。
 
 ## Topic / 服务契约（孵化期临时契约）
 
 `/agent/request`、`/agent/response`、`/agent/event`、`/agent/control` 当前使用
-`std_msgs/String` 承载 JSON，由节点本地严格解析（重复 key、NaN/Infinity、围栏文本、
-tool call 均拒绝）。这是**孵化期的有意决策**：契约稳定前不把不成熟接口固化进
-`ibrobot_msgs`。计划在孵化期结束后迁移为 `ibrobot_msgs` 的类型化消息；在此之前，
-外部集成方不应把这些 topic 当作稳定 API。Gateway 服务侧调用保持既有类型化契约不变。
+`std_msgs/String` 承载 JSON。入站请求与控制消息由节点做构造器级 schema 校验
+（`schema_version`、字段类型与非空检查）；重复 key、NaN/Infinity、围栏文本、
+tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py`）。这是
+**孵化期的有意决策**：契约稳定前不把不成熟接口固化进 `ibrobot_msgs`。计划在孵化期
+结束后迁移为 `ibrobot_msgs` 的类型化消息；在此之前，外部集成方不应把这些 topic
+当作稳定 API。Gateway 服务侧调用保持既有类型化契约不变。
 
 节点另提供 `~/health` 与 `~/ready`（`std_srvs/Trigger`）。
 
@@ -95,3 +97,6 @@ ibrobot_agent
 - 孵化期包（`incubation: true` 强制标记），String JSON topic 契约尚未类型化。
 - 会话记忆为有界滚动窗口，不做长期记忆检索。
 - `chat_tui` 为单操作员本地终端，不提供多通道并发接入。
+- `immediate_after_presentation` 模式下，`MAY_EXECUTE` 事件发布后即可提交执行 goal；本地 TUI 的渲染与
+  运动启动之间没有硬同步 flush 屏障，弱于 `robot-skill run-workflow` 的「展示并 flush 后再执行」语义，
+  依赖执行中停止词（别动/停止）与 `/agent/control` 取消兜底。

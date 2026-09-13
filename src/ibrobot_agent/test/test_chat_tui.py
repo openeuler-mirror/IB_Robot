@@ -44,6 +44,24 @@ def test_chat_state_returns_empty_stop_target_when_idle():
     assert ChatState("session-1").stop_target() == ""
 
 
+def test_cancelled_before_execution_is_terminal_for_chat_state():
+    state = ChatState("session-1")
+    state.register("request-1")
+    event = {
+        "request_key": {
+            "request_id": "request-1",
+            "channel_id": "agent_cli",
+            "principal_id": "local_operator",
+            "robot_scope": "so101_single_arm",
+        },
+        "state": "CANCELLED_BEFORE_EXECUTION",
+    }
+
+    assert _event_matches_session(event, state)
+    state.finish(event["request_key"]["request_id"])
+    assert state.stop_target() == ""
+
+
 def test_chat_state_does_not_register_unknown_response_as_active():
     state = ChatState("session-1")
     state.register("request-1")
@@ -90,6 +108,23 @@ def test_event_filter_respects_identity_overrides_for_non_default_profiles():
     assert _event_matches_session(event, state)
     event["request_key"]["channel_id"] = "agent_cli"
     assert not _event_matches_session(event, state)
+
+
+def test_identity_mismatch_is_rejected_without_finishing_request():
+    state = ChatState("session-1")
+    state.register("request-1")
+    event = {
+        "request_key": {
+            "request_id": "request-1",
+            "channel_id": "other",
+            "principal_id": "operator-2",
+            "robot_scope": "so101",
+        },
+        "state": "FAILED",
+    }
+
+    assert not _event_matches_session(event, state)
+    assert state.stop_target() == "request-1"
 
 
 def test_main_passes_identity_overrides_to_run_chat(monkeypatch):
@@ -152,7 +187,17 @@ def test_chat_output_uses_prompt_toolkit_synchronized_printer():
 
     from ibrobot_agent import chat_tui
 
-    assert "print(line, flush=True)" in inspect.getsource(chat_tui._write_terminal_line)
+    source = inspect.getsource(chat_tui._write_terminal_line)
+    assert "patch_stdout" in source
+    assert "print(line, flush=True)" in source
+
+
+def test_chat_prompt_loop_uses_prompt_toolkit_stdout_patch():
+    import inspect
+
+    from ibrobot_agent import chat_tui
+
+    assert "with patch_stdout()" in inspect.getsource(chat_tui.run_chat)
 
 
 def test_chat_output_formats_all_message_kinds_as_strings(monkeypatch):

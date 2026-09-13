@@ -43,6 +43,18 @@ def test_rule_planner_preserves_ordered_so101_workflow():
     assert [step.skill_name for step in outcome.steps] == ["recover_safe_pose", "nod_yes"]
 
 
+@pytest.mark.parametrize("text", ["please nod", "不同意", "再见"])
+def test_rule_planner_does_not_match_aliases_inside_other_words(text):
+    outcome = RulePlanner().plan(_request(text), {}, {}, threading.Event())
+
+    if text == "please nod":
+        assert [step.skill_name for step in outcome.steps] == ["nod_yes"]
+    elif text == "不同意":
+        assert [step.skill_name for step in outcome.steps] == ["shake_no"]
+    else:
+        assert outcome.kind == "rejected"
+
+
 def test_rule_planner_asks_for_a_specific_skill():
     outcome = RulePlanner().plan(_request("帮我做一个动作"), {}, {}, threading.Event())
 

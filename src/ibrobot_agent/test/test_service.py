@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
-from ibrobot_agent.contracts import AgentRequest, PlannerIdentity
+from ibrobot_agent.contracts import AgentRequest, ExecutionResult, PlannerIdentity, PlannerOutcome
 from ibrobot_agent.planner import RulePlanner
 from ibrobot_agent.request_store import SQLiteRequestStore
 from ibrobot_agent.service import AgentService
@@ -72,6 +72,16 @@ class Events:
     def publish(self, event):
         self.items.append(event)
         self.ready.set()
+
+
+class FailingEvents(Events):
+    def publish(self, event):
+        raise RuntimeError("event transport unavailable")
+
+
+class FailingFinishStore(SQLiteRequestStore):
+    def finish(self, *args, **kwargs):
+        raise RuntimeError("ledger unavailable")
 
 
 class FakeExecution:
@@ -249,6 +259,30 @@ def test_second_motion_request_is_rejected_while_planning(tmp_path):
         second = service.send_message(_request("r2"))
         assert not second.accepted
         assert second.reason_code == "BUSY"
+        record = service.get_request(_request("r2").to_key())
+        assert record.state == "FAILED"
+        assert record.terminal.status == "failed"
+        assert record.terminal.error_code == "BUSY"
+        retry = service.send_message(_request("r2"))
+        assert not retry.accepted
+        assert retry.reason_code == "BUSY"
+    finally:
+        planner.release.set()
+        service.close()
+
+
+def test_busy_request_is_idempotent_and_requires_new_request_id(tmp_path):
+    planner = BlockingPlanner(PlannerOutcome(kind="conversation", user_message="ok"))
+    service = AgentService(
+        planner=planner, catalog=FakeCatalog(), store=SQLiteRequestStore(tmp_path / "requests.sqlite3")
+    )
+    try:
+        assert service.send_message(_request("r1")).accepted
+        assert planner.started.wait(2)
+        busy = service.send_message(_request("r2"))
+        assert not busy.accepted and busy.reason_code == "BUSY"
+        replay = service.send_message(_request("r2"))
+        assert not replay.accepted and replay.reason_code == "BUSY"
     finally:
         planner.release.set()
         service.close()
@@ -416,6 +450,78 @@ def test_unknown_execution_quarantines_robot_scope(tmp_path):
         assert second.reason_code == "ROBOT_QUARANTINED"
     finally:
         service.close()
+
+
+def test_unknown_quarantine_survives_service_restart(tmp_path):
+    path = tmp_path / "requests.sqlite3"
+    store = SQLiteRequestStore(path)
+    key = _request().to_key()
+    store.admit(key, input_hash="hash", session_id="session-1")
+    store.begin_planning(key, expected_generation=0)
+    store.quarantine(key, expected_generation=1, reason="x" * 301)
+    assert store.is_robot_quarantined(key.robot_scope)
+    store.close()
+
+    restarted = SQLiteRequestStore(path)
+    assert restarted.is_robot_quarantined(key.robot_scope)
+    record = restarted.get_request(key)
+    assert record.state == "UNKNOWN"
+    assert record.terminal.error_code == "ROBOT_QUARANTINED"
+    assert len(record.terminal.message) == 300
+    restarted.close()
+
+
+def test_terminal_state_is_persisted_when_event_transport_fails(tmp_path):
+    service = AgentService(
+        planner=FakePlanner(PlannerOutcome(kind="conversation", user_message="ok")),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "requests.sqlite3"),
+        event_sink=FailingEvents(),
+    )
+    try:
+        request = _request()
+        assert service.send_message(request).accepted
+        for _ in range(100):
+            if service.get_request(request.to_key()).state == "ANSWERED":
+                break
+            time.sleep(0.01)
+        assert service.get_request(request.to_key()).state == "ANSWERED"
+    finally:
+        service.close()
+
+
+def test_terminal_persistence_failure_quarantines_service(tmp_path):
+    service = AgentService(
+        planner=FakePlanner(PlannerOutcome(kind="conversation", user_message="ok")),
+        catalog=FakeCatalog(),
+        store=FailingFinishStore(tmp_path / "requests.sqlite3"),
+    )
+    try:
+        assert service.send_message(_request()).accepted
+        for _ in range(100):
+            if not service.healthy:
+                break
+            time.sleep(0.01)
+        assert not service.healthy
+        rejected = service.send_message(_request("r2"))
+        assert not rejected.accepted
+        assert rejected.reason_code == "STORAGE_UNAVAILABLE"
+    finally:
+        service.close()
+
+
+def test_quarantine_rejects_terminal_request(tmp_path):
+    store = SQLiteRequestStore(tmp_path / "request.sqlite3")
+    key = _request().to_key()
+    store.admit(key, input_hash="hash", session_id="session-1")
+    store.finish(
+        key,
+        expected_generation=0,
+        result=ExecutionResult(status="succeeded", task_ref=None, error_code="", message="done", detail={}),
+    )
+    with pytest.raises(Exception, match="terminal"):
+        store.quarantine(key, expected_generation=0, reason="late unknown")
+    store.close()
 
 
 def test_clarification_reply_is_bound_and_consumed(tmp_path):

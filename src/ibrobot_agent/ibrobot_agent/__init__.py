@@ -1,7 +1,8 @@
-"""Lightweight natural-language Agent package for IB-Robot.
+"""Natural-language Agent incubation runtime for IB-Robot.
 
-The initial package is intentionally a non-operational skeleton. Runtime motion
-must remain behind the existing robot-skill and Capability Gateway contracts.
+All robot execution is delegated to the existing Capability Gateway chain;
+this package owns no skill catalog, motion authorization, or physical
+execution.
 """
 
 __version__ = "0.1.0"

@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Any
 
 from embodied_common.canon import to_canonical_json
-from ibrobot_agent.contracts import ExecutionResult, Presentation, RequestKey, RequestRecord, RequestStore, TaskRef
+from ibrobot_agent.contracts import (
+    TERMINAL_REQUEST_STATES,
+    ExecutionResult,
+    Presentation,
+    RequestKey,
+    RequestRecord,
+    RequestStore,
+    TaskRef,
+)
 
 _ACTIVE_STATES = {
     "RECEIVED",
@@ -378,11 +386,14 @@ class SQLiteRequestStore(RequestStore):
             if row is None:
                 raise RequestStoreError("REQUEST_NOT_FOUND", "request is not known")
             self._ensure_generation(row, expected_generation)
+            if row["state"] in TERMINAL_REQUEST_STATES:
+                raise RequestStoreError("ILLEGAL_STATE", f"cannot quarantine terminal request in state {row['state']}")
+            reason = reason[:300]
             now = self._clock()
             terminal = ExecutionResult(
                 status="unknown",
                 task_ref=_task_ref_from_json(row["task_ref_json"]),
-                error_code="QUARANTINED",
+                error_code="ROBOT_QUARANTINED",
                 message=reason,
                 detail={"reason": reason},
             )

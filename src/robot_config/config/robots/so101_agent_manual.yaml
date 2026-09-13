@@ -62,9 +62,9 @@ robot:
         - nod_yes
         - shake_no
         - wave_hello
-      ledger_path: /tmp/opencode/ibrobot-agent-so101-manual/requests.sqlite3
-      conversation_path: /tmp/opencode/ibrobot-agent-so101-manual/conversation.sqlite3
-      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-manual/agent.lock
+      ledger_path: /tmp/ibrobot-agent-so101-manual/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-manual/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-manual/agent.lock
       max_session_turns: 12
       clarification_ttl_sec: 300.0
       event_queue_size: 128
@@ -78,3 +78,5 @@ robot:
         timeout_sec: 120.0
         # kimi-for-coding accepts only temperature=1.
         temperature: 1.0
+  contract:
+    observations: []

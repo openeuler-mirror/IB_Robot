@@ -13,9 +13,9 @@ robot:
         - nod_yes
         - shake_no
         - wave_hello
-      ledger_path: /tmp/opencode/ibrobot-agent-so101-manual-hardware/requests.sqlite3
-      conversation_path: /tmp/opencode/ibrobot-agent-so101-manual-hardware/conversation.sqlite3
-      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-manual-hardware/agent.lock
+      ledger_path: /tmp/ibrobot-agent-so101-manual-hardware/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-manual-hardware/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-manual-hardware/agent.lock
       planner:
         mode: vlm
         provider: kimicode
@@ -25,3 +25,5 @@ robot:
         timeout_sec: 120.0
         # kimi-for-coding accepts only temperature=1.
         temperature: 1.0
+  contract:
+    observations: []

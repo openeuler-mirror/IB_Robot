@@ -154,6 +154,34 @@ class RulePlanner:
         (("回安全位", "回到安全位", "回 home", "回home", "safe pose"), "recover_safe_pose"),
         (("回零位", "回到零位", "zero pose"), "recover_zero_pose"),
     )
+    _ASCII_WORD = re.compile(r"[a-z]+")
+
+    @classmethod
+    def _alias_hit(cls, alias: str, text: str) -> bool:
+        if alias.isascii():
+            return alias.casefold() in cls._ASCII_WORD.findall(text.casefold())
+        return alias.casefold() in text.casefold()
+
+    @classmethod
+    def _find_skills(cls, text: str) -> list[CanonicalWorkflowStep]:
+        folded = text.casefold()
+        matches = []
+        all_aliases = [(alias.casefold(), skill_name) for aliases, skill_name in cls._RULES for alias in aliases]
+        for aliases, skill_name in cls._RULES:
+            if any(cls._alias_hit(alias, folded) for alias in aliases):
+                # Prefer a longer Chinese alias, so "不同意" does not also mean "同意".
+                if any(
+                    longer_skill != skill_name
+                    and len(longer) > len(alias.casefold())
+                    and alias.casefold() in longer
+                    and cls._alias_hit(longer, folded)
+                    for longer, longer_skill in all_aliases
+                    for alias in aliases
+                    if not longer.isascii() and not alias.isascii()
+                ):
+                    continue
+                matches.append(CanonicalWorkflowStep(1, skill_name))
+        return matches
 
     def plan(self, request, context, catalog, cancel_token):
         if cancel_token.is_set():
@@ -183,17 +211,14 @@ class RulePlanner:
                 missing_fields=("skill_name",),
             )
 
-        steps = []
-        for aliases, skill_name in self._RULES:
-            if any(alias.casefold() in folded for alias in aliases):
-                steps.append(CanonicalWorkflowStep(1, skill_name))
+        steps = self._find_skills(folded)
         if any(separator in text for separator in ("然后", "再", "之后", "接着")):
             # Rules above are checked against the complete text, preserving the
             # user's order by matching each clause rather than the alias table.
             clauses = [part.strip() for part in re.split(r"然后|再|之后|接着", text) if part.strip()]
             ordered = []
             for clause in clauses:
-                clause_steps = self._find_skills(clause.casefold())
+                clause_steps = self._find_skills(clause)
                 if clause_steps:
                     ordered.extend(clause_steps)
             if ordered:
@@ -210,13 +235,6 @@ class RulePlanner:
         return PlannerOutcome(
             kind="workflow", user_message=f"准备执行：{summary}。", summary=summary, steps=tuple(steps)
         )
-
-    def _find_skills(self, text: str) -> list[CanonicalWorkflowStep]:
-        return [
-            CanonicalWorkflowStep(1, skill_name)
-            for aliases, skill_name in self._RULES
-            if any(alias.casefold() in text for alias in aliases)
-        ]
 
 
 __all__ = [

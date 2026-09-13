@@ -20,12 +20,13 @@ robot:
       disabled: true
   embodied:
     agent:
+      channel_id: agent_cli
       execution_enabled: true
       test_allowlist:
         - nod_yes
-      ledger_path: /tmp/opencode/ibrobot-agent-so101-hardware/requests.sqlite3
-      conversation_path: /tmp/opencode/ibrobot-agent-so101-hardware/conversation.sqlite3
-      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-hardware/agent.lock
+      ledger_path: /tmp/ibrobot-agent-so101-hardware/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-hardware/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-hardware/agent.lock
       planner:
         mode: vlm
         provider: openai_compatible
@@ -35,3 +36,5 @@ robot:
         timeout_sec: 5.0
         temperature: 0.0
         api_protocol: chat_completions
+  contract:
+    observations: []

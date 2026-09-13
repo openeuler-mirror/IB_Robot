@@ -75,7 +75,7 @@ def main() -> None:
         assert terminal["state"] == "SUCCEEDED"
         assert {item["event_type"] for item in relevant} >= {"proposal_ready", "presentation", "terminal"}
 
-        connection = sqlite3.connect("/tmp/opencode/ibrobot-agent-so101-gazebo/requests.sqlite3")
+        connection = sqlite3.connect("/tmp/ibrobot-agent-so101-gazebo/requests.sqlite3")
         row = connection.execute(
             "SELECT state, may_have_submitted, task_ref_json FROM requests WHERE request_id = ?",
             (request_id,),
@@ -94,7 +94,7 @@ def main() -> None:
             lambda: sum(item.get("request_id") == request_id for item in responses) >= 2,
             10.0,
         )
-        connection = sqlite3.connect("/tmp/opencode/ibrobot-agent-so101-gazebo/requests.sqlite3")
+        connection = sqlite3.connect("/tmp/ibrobot-agent-so101-gazebo/requests.sqlite3")
         submission_count = connection.execute(
             "SELECT COUNT(*) FROM request_events WHERE request_id = ? AND event_type = 'mark_submitted'",
             (request_id,),
@@ -125,7 +125,7 @@ def main() -> None:
         )
         submission_deadline = time.monotonic() + 30.0
         while time.monotonic() < submission_deadline:
-            connection = sqlite3.connect("/tmp/opencode/ibrobot-agent-so101-gazebo/requests.sqlite3")
+            connection = sqlite3.connect("/tmp/ibrobot-agent-so101-gazebo/requests.sqlite3")
             submitted = connection.execute(
                 "SELECT may_have_submitted FROM requests WHERE request_id = ?",
                 (stop_request_id,),

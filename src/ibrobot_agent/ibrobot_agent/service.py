@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 import time
 from collections.abc import Mapping
@@ -30,6 +31,8 @@ from ibrobot_agent.contracts import (
     request_hash_text,
 )
 from ibrobot_agent.planner import RulePlanner
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -160,6 +163,10 @@ class AgentService:
     def execution_enabled(self) -> bool:
         return self._execution_enabled
 
+    @property
+    def healthy(self) -> bool:
+        return not self._quarantined
+
     def close(self) -> None:
         with self._queue_condition:
             self._stop = True
@@ -193,10 +200,10 @@ class AgentService:
             )
         if record.state in {"SUCCEEDED", "FAILED", "CANCELLED", "CANCELLED_BEFORE_EXECUTION", "ANSWERED", "UNKNOWN"}:
             terminal = record.terminal
-            if terminal is not None and terminal.error_code == "BUSY":
-                return AcceptedResponse(False, request.request_id, "BUSY", "BUSY", terminal.message)
             if terminal is not None and terminal.error_code == "ROBOT_QUARANTINED":
                 return AcceptedResponse(False, request.request_id, "UNKNOWN", "ROBOT_QUARANTINED", terminal.message)
+            if terminal is not None and terminal.error_code == "BUSY":
+                return AcceptedResponse(False, request.request_id, "BUSY", "BUSY", terminal.message)
             return AcceptedResponse(True, request.request_id, record.state)
         if record.state != "RECEIVED":
             return AcceptedResponse(True, request.request_id, record.state)
@@ -214,7 +221,23 @@ class AgentService:
                 self._queue_condition.notify()
         if rejection is not None:
             reason_code, state, message = rejection
-            self._finish_answered(key, 0, message, error_code=reason_code, event_type=reason_code.lower())
+            try:
+                self._store.finish(
+                    key,
+                    expected_generation=0,
+                    result=ExecutionResult(
+                        status="failed",
+                        task_ref=None,
+                        error_code=reason_code,
+                        message=message,
+                        detail={"admission": False},
+                    ),
+                )
+            except Exception:
+                self._quarantined = True
+                _LOGGER.exception("Could not persist Agent admission rejection for %s", request.request_id)
+                return AcceptedResponse(False, request.request_id, "UNKNOWN", "STORAGE_UNAVAILABLE", message)
+            self._emit(key, reason_code.lower(), state, message)
             return AcceptedResponse(False, request.request_id, state, reason_code, message)
         self._conversation.append(request)
         return AcceptedResponse(True, request.request_id, "RECEIVED")
@@ -226,10 +249,7 @@ class AgentService:
                 event.set()
         try:
             record = self._store.get_request(key)
-            if record.state == "RECEIVED":
-                stopped_record = self._store.mark_stop(key, expected_generation=record.planning_generation)
-            else:
-                stopped_record = self._store.mark_stop(key, expected_generation=record.planning_generation)
+            stopped_record = self._store.mark_stop(key, expected_generation=record.planning_generation)
             if self._execution is not None:
                 with contextlib.suppress(Exception):
                     self._execution.request_stop(key)
@@ -250,7 +270,28 @@ class AgentService:
                 if self._stop:
                     return
                 request = self._queue.pop(0)
-            self._plan_one(request)
+            try:
+                self._plan_one(request)
+            except Exception:
+                _LOGGER.exception("Agent planner worker failed for request %s", request.request_id)
+                self._recover_worker_failure(request)
+
+    def _recover_worker_failure(self, request: AgentRequest) -> None:
+        key = request.to_key()
+        try:
+            record = self._store.get_request(key)
+            if record.state not in {
+                "SUCCEEDED",
+                "FAILED",
+                "CANCELLED",
+                "CANCELLED_BEFORE_EXECUTION",
+                "ANSWERED",
+                "UNKNOWN",
+            }:
+                self._finish_failure(key, record, "Agent planner worker failed")
+        except Exception:
+            self._quarantined = True
+            _LOGGER.exception("Could not persist planner worker failure for request %s", request.request_id)
 
     def _plan_one(self, request: AgentRequest) -> None:
         key = request.to_key()
@@ -366,7 +407,6 @@ class AgentService:
                 self._conversation.append_assistant(request, execution_result.message)
                 self._emit(key, "terminal", self._request_state_for_result(execution_result), execution_result.message)
         except Exception as exc:
-            self._emit(key, "failed", "FAILED", _safe_error_message(exc))
             try:
                 record = self._store.get_request(key)
                 if record.may_have_submitted:
@@ -376,7 +416,8 @@ class AgentService:
                 else:
                     self._finish_failure(key, record, _safe_error_message(exc))
             except Exception:
-                pass
+                self._quarantined = True
+                _LOGGER.exception("Could not persist Agent request failure for %s", request.request_id)
         finally:
             with self._active_lock:
                 self._active.pop(key, None)
@@ -522,11 +563,13 @@ class AgentService:
                 status="failed", task_ref=record.task_ref, error_code="AGENT_FAILED", message=message, detail={}
             ),
         )
+        self._emit(key, "failed", "FAILED", message)
 
     def _finish_unknown(self, key: RequestKey, record: Any, message: str) -> None:
+        reason = (message or "unknown execution outcome")[:300]
+        self._store.quarantine(key, expected_generation=record.planning_generation, reason=reason)
         self._quarantined = True
-        self._store.quarantine(key, expected_generation=record.planning_generation, reason=message)
-        self._emit(key, "quarantined", "UNKNOWN", message)
+        self._emit(key, "quarantined", "UNKNOWN", reason)
 
     @staticmethod
     def _request_state_for_result(result: Any) -> str:
@@ -557,14 +600,19 @@ class AgentService:
             state=state,
             detail_json=json.dumps({"message": message}, ensure_ascii=False, sort_keys=True),
         )
-        self._events.publish(
-            AgentEvent(
-                schema_version=1,
-                request_key=key,
-                sequence=sequence,
-                event_type=event_type,
-                state=state,
-                user_message=message,
-                created_at=datetime.now(timezone.utc).isoformat(),
+        try:
+            self._events.publish(
+                AgentEvent(
+                    schema_version=1,
+                    request_key=key,
+                    sequence=sequence,
+                    event_type=event_type,
+                    state=state,
+                    user_message=message,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                )
             )
-        )
+        except Exception:
+            # The ledger is authoritative; a broken transport must not reopen
+            # the request through the outer failure handler.
+            _LOGGER.exception("Could not publish Agent event for %s", key.request_id)

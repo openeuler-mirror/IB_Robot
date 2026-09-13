@@ -16,6 +16,7 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.styles import Style
 from rclpy.context import Context
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
@@ -23,7 +24,8 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-TERMINAL_STATES = {"ANSWERED", "SUCCEEDED", "FAILED", "CANCELLED", "UNKNOWN"}
+from ibrobot_agent.contracts import TERMINAL_REQUEST_STATES as TERMINAL_STATES
+
 STOP_WORDS = {"停止", "别动", "停", "stop", "halt"}
 
 
@@ -39,6 +41,7 @@ class ChatState:
     active_request_ids: set[str] = field(default_factory=set)
     known_request_ids: set[str] = field(default_factory=set)
     connected: bool = False
+    identity_warned: bool = False
 
     def register(self, request_id: str) -> None:
         self.last_request_id = request_id
@@ -83,6 +86,10 @@ class AgentChatNode(Node):
         self._event_subscription = self.create_subscription(String, topics["event"], self._on_event, 10)
         self._ready_client = self.create_client(Trigger, "/ibrobot_agent_node/ready")
         self._ros_spin = ros_spin
+
+    @property
+    def request_topic(self) -> str:
+        return self._request_publisher.topic_name
 
     def wait_ready(self, timeout_sec: float = 60.0) -> None:
         deadline = time.monotonic() + timeout_sec
@@ -157,6 +164,19 @@ class AgentChatNode(Node):
             or key.get("principal_id") != self.state.principal_id
             or key.get("robot_scope") != self.state.robot_scope
         ):
+            if not self.state.identity_warned and key.get("request_id") in self.state.known_request_ids:
+                self.state.identity_warned = True
+                self._output.put(
+                    (
+                        "system",
+                        {
+                            "message": (
+                                "Agent 事件身份不匹配，已忽略；请检查 channel_id/principal_id/robot_scope "
+                                f"（当前期望 {self.state.channel_id}/{self.state.principal_id}/{self.state.robot_scope}）"
+                            )
+                        },
+                    )
+                )
             return
         request_id = str(key.get("request_id", ""))
         if payload.get("state") in TERMINAL_STATES:
@@ -176,7 +196,8 @@ def _print_output(kind: str, payload: dict[str, Any]) -> None:
 
 
 def _write_terminal_line(line: str) -> None:
-    print(line, flush=True)
+    with patch_stdout(raw=True):
+        print(line, flush=True)
 
 
 def _event_matches_session(payload: dict[str, Any], state: ChatState) -> bool:
@@ -192,8 +213,7 @@ def _event_matches_session(payload: dict[str, Any], state: ChatState) -> bool:
 
 def _print_startup_diagnostics(node: AgentChatNode, state: ChatState) -> None:
     print(
-        f"Agent 会话已就绪：{state.session_id} | "
-        f"agent_event订阅已建立 | 输入通道：{node._request_publisher.topic_name}",
+        f"Agent 会话已就绪：{state.session_id} | agent_event订阅已建立 | 输入通道：{node.request_topic}",
         flush=True,
     )
 
@@ -291,37 +311,38 @@ def run_chat(
         print("输入自然语言；/stop 停止；/status 查询状态；/skills 查询技能；/help 帮助；/quit 退出。", flush=True)
         output_thread = threading.Thread(target=render_output, name="agent-chat-output", daemon=True)
         output_thread.start()
-        while context.ok():
-            try:
-                text = session.prompt(
-                    HTML("<prompt>小智&gt; </prompt>"),
-                    key_bindings=_build_key_bindings(node),
-                    style=Style.from_dict({"prompt": "ansicyan bold"}),
-                    multiline=False,
-                    mouse_support=False,
-                )
-            except (EOFError, KeyboardInterrupt):
-                if node.stop():
-                    continue
-                break
-            command, _ = parse_local_command(text)
-            stripped = text.strip()
-            if command in {"quit", "exit"} or stripped in {"退出", "exit", "quit"}:
-                break
-            if command == "help":
-                print("快捷命令：/stop /status /skills /clear /help /quit；Ctrl-C 停止当前请求。")
-            elif command == "clear":
-                session.history = InMemoryHistory()
-                print("已清空本次输入历史。")
-            elif command == "stop" or stripped in STOP_WORDS:
-                node.stop()
-            elif command == "status":
-                node.send("当前状态")
-            elif command == "skills":
-                node.send("当前有哪些技能")
-            elif stripped:
-                request_id = node.send(stripped)
-                print(f"[{request_id}] 已提交，等待 Agent 处理。", flush=True)
+        with patch_stdout():
+            while context.ok():
+                try:
+                    text = session.prompt(
+                        HTML("<prompt>小智&gt; </prompt>"),
+                        key_bindings=_build_key_bindings(node),
+                        style=Style.from_dict({"prompt": "ansicyan bold"}),
+                        multiline=False,
+                        mouse_support=False,
+                    )
+                except (EOFError, KeyboardInterrupt):
+                    if node.stop():
+                        continue
+                    break
+                command, _ = parse_local_command(text)
+                stripped = text.strip()
+                if command in {"quit", "exit"} or stripped in {"退出", "exit", "quit"}:
+                    break
+                if command == "help":
+                    print("快捷命令：/stop /status /skills /clear /help /quit；Ctrl-C 停止当前请求。")
+                elif command == "clear":
+                    session.history = InMemoryHistory()
+                    print("已清空本次输入历史。")
+                elif command == "stop" or stripped in STOP_WORDS:
+                    node.stop()
+                elif command == "status":
+                    node.send("当前状态")
+                elif command == "skills":
+                    node.send("当前有哪些技能")
+                elif stripped:
+                    request_id = node.send(stripped)
+                    print(f"[{request_id}] 已提交，等待 Agent 处理。", flush=True)
     finally:
         output_stop.set()
         spin_stop.set()

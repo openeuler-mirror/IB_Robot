@@ -21,7 +21,10 @@ robot:
       disabled: true
   embodied:
     agent:
+      channel_id: agent_cli
       execution_enabled: true
-      ledger_path: /tmp/opencode/ibrobot-agent-so101-gazebo/requests.sqlite3
-      conversation_path: /tmp/opencode/ibrobot-agent-so101-gazebo/conversation.sqlite3
-      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-gazebo/agent.lock
+      ledger_path: /tmp/ibrobot-agent-so101-gazebo/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-gazebo/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-gazebo/agent.lock
+  contract:
+    observations: []

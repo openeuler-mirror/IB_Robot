@@ -69,6 +69,25 @@ def test_default_loader_uses_robot_config_environment_path(monkeypatch):
     assert config["_config_path"] == str(config_path.resolve())
 
 
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "so101_agent_manual",
+        "so101_agent_manual_hardware",
+        "so101_single_arm_agent_test",
+        "so101_single_arm_agent_gazebo",
+        "so101_single_arm_agent_hardware",
+        "so101_single_arm_agent_hardware_stop",
+    ],
+)
+def test_agent_profiles_drop_disabled_peripherals_from_all_contract_views(config_name):
+    config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
+    config = load_robot_config_dict(config_path)
+
+    assert all(not item.get("disabled", False) for item in config.get("peripherals", []))
+    assert config.get("contract", {}).get("observations", []) == []
+
+
 @pytest.mark.parametrize("required_control_mode", ["unknown_mode", 1])
 def test_loader_rejects_invalid_global_skill_required_control_mode(tmp_path, required_control_mode):
     config_path = tmp_path / "robot.yaml"
@@ -274,6 +293,17 @@ def test_launch_dict_accepts_incubating_agent_entry():
     }
 
     assert validate_embodied_launch_dict(config) == []
+
+
+def test_validate_config_rejects_unknown_typed_entry_mode():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config(config_path)
+
+    config.embodied.enabled = True
+    config.embodied.entry_mode = "voice"
+
+    errors = validate_config(config)
+    assert "embodied.entry_mode must be hermes or agent" in errors
 
 
 def test_launch_dict_rejects_agent_execution_without_allowlist():

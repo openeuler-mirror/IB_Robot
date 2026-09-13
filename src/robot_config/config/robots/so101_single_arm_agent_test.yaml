@@ -14,7 +14,7 @@ robot:
       event_topic: /agent/event
       response_topic: /agent/response
       control_topic: /agent/control
-      channel_id: agent_incubation
+      channel_id: agent_cli
       principal_id: local_operator
       planner:
         mode: rule
@@ -26,9 +26,9 @@ robot:
         - nod_yes
         - shake_no
         - wave_hello
-      ledger_path: /tmp/opencode/ibrobot-agent-so101-test/requests.sqlite3
-      conversation_path: /tmp/opencode/ibrobot-agent-so101-test/conversation.sqlite3
-      deployment_lock_path: /tmp/opencode/ibrobot-agent-so101-test/agent.lock
+      ledger_path: /tmp/ibrobot-agent-so101-test/requests.sqlite3
+      conversation_path: /tmp/ibrobot-agent-so101-test/conversation.sqlite3
+      deployment_lock_path: /tmp/ibrobot-agent-so101-test/agent.lock
       max_session_turns: 12
       clarification_ttl_sec: 300.0
       event_queue_size: 128

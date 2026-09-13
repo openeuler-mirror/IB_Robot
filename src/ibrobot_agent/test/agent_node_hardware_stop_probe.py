@@ -12,7 +12,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-LEDGER_PATH = "/tmp/opencode/ibrobot-agent-so101-hardware-stop/requests.sqlite3"
+LEDGER_PATH = "/tmp/ibrobot-agent-so101-hardware-stop/requests.sqlite3"
 
 
 def _spin_until(node: Node, predicate, timeout_sec: float) -> None:

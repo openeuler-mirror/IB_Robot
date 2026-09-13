@@ -114,7 +114,7 @@ def main() -> None:
         assert all(event["request_key"]["robot_scope"] == "so101_single_arm" for event in relevant)
         assert all(event["request_key"]["channel_id"] == "agent_incubation" for event in relevant)
         assert all(event["request_key"]["principal_id"] == "local_operator" for event in relevant)
-        connection = sqlite3.connect("/tmp/opencode/ibrobot-agent-so101-test/requests.sqlite3")
+        connection = sqlite3.connect("/tmp/ibrobot-agent-so101-test/requests.sqlite3")
         rows = connection.execute(
             "SELECT request_id, state, may_have_submitted, terminal_json FROM requests "
             "WHERE request_id IN (?, ?) ORDER BY request_id",

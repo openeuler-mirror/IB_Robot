@@ -101,6 +101,8 @@ def _build_cameras_urdf_from_yaml(
     for periph in peripherals:
         if periph.get("type") != "camera":
             continue
+        if periph.get("disabled", False):
+            continue
         if (periph.get("simulation") or {}).get("embedded_sensor", False):
             continue
         if periph.get("skip_urdf_without_transform", False) and not periph.get("transform"):

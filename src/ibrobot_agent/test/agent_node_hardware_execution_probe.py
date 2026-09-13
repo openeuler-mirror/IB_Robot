@@ -103,7 +103,7 @@ def main() -> None:
         terminal = next(item for item in relevant if item.get("event_type") == "terminal")
         assert terminal["state"] == "SUCCEEDED"
         assert {item["event_type"] for item in relevant} >= {"proposal_ready", "presentation", "terminal"}
-        connection = sqlite3.connect("/tmp/opencode/ibrobot-agent-so101-hardware/requests.sqlite3")
+        connection = sqlite3.connect("/tmp/ibrobot-agent-so101-hardware/requests.sqlite3")
         row = connection.execute(
             "SELECT state, may_have_submitted, task_ref_json FROM requests WHERE request_id = ?",
             (request_id,),

@@ -1705,6 +1705,11 @@ def load_robot_config_dict(
         resolve_robot_config_path(config_path=config_path)
     )
     robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    peripherals = robot_config.get("peripherals", [])
+    if isinstance(peripherals, list):
+        robot_config["peripherals"] = [
+            item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
+        ]
     for mode_name, mode_config in (robot_config.get("control_modes", {}) or {}).items():
         try:
             reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})

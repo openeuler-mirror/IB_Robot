@@ -164,8 +164,8 @@ def _execution_result_from_controller(value: dict, presentation: Presentation | 
         task_ref=(
             None if presentation is None or bool(value.get("stopped_before_execution")) else presentation.task_ref
         ),
-        error_code=str(value.get("error_code", "")),
-        message=str(value.get("message", "")),
+        error_code=str(value.get("error_code", ""))[:64],
+        message=str(value.get("message", ""))[:300],
         detail=value,
     )
 
@@ -393,9 +393,11 @@ class IncubationAgentNode(Node):
         return response
 
     def _ready_callback(self, _request, response):
-        response.success = self._gateway_ready and self._planner_ready
+        response.success = self._gateway_ready and self._planner_ready and self._service.healthy
         response.message = (
-            "Gateway adapter is ready" if response.success else "Gateway adapter or planner is unavailable"
+            "Gateway adapter is ready"
+            if response.success
+            else "Gateway adapter, planner, or Agent ledger is unavailable"
         )
         return response
 
