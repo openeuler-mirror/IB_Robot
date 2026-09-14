@@ -266,6 +266,28 @@ robot:
 
   perception_services:
     services:
+      - id: hri_yolox_person
+        enabled: true
+        required: true
+        bundle_path: models/yolox_x_640
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:YoloXPersonDetectPlugin
+        service_type: ibrobot_msgs/srv/YoloXDetect
+        endpoint: /perception/hri/yolox_detect
+        node_name: hri_yolox_detect
+        runtime_options:
+          device_id: 0
+      - id: hri_pear_parameters
+        enabled: true
+        required: true
+        bundle_path: models/pear_parameter_network
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:PearParameterPredictPlugin
+        service_type: ibrobot_msgs/srv/PearParameterPredict
+        endpoint: /perception/hri/pear_parameters
+        node_name: hri_pear_parameters
+        runtime_options:
+          device_id: 0
       - id: grasp_grounding
         enabled: true
         required: true
@@ -912,9 +934,10 @@ robot:
             - joint_state_broadcaster
             - arm_joint_state_broadcaster
             - base_velocity_controller
-      # Online semantic mapping and all six model services (two grasp, four
-      # semantic) are inherited from the top level. The default hybrid runtime
-      # is query-only until dynamic semantic mapping is explicitly re-enabled.
+      # Online semantic mapping and all eight model services (two grasp, four
+      # semantic, two HRI) are inherited from the top level. The default
+      # hybrid runtime is query-only until dynamic semantic mapping is
+      # explicitly re-enabled.
       semantic_mapping:
         query_only: true
       embodied:
@@ -1096,6 +1119,14 @@ robot:
       enabled: true
       action_name: /hri/imitate_human_motion
       startup_warmup: true
+      person_confidence_threshold: 0.30
+      # The remapped wrist camera topic, matching placement_execution above.
+      # /camera/wrist_camera/color/image_raw is the RealSense driver's own name
+      # before the bringup remap, so it does not exist on the running graph.
+      rgb_topic: /camera/wrist/image_raw
+      yolox_detect_service: /perception/hri/yolox_detect
+      pear_parameters_service: /perception/hri/pear_parameters
+      yolox_refresh_interval_sec: 0.25
     default_target_name: ""
     default_place_name: home
     timeouts:
