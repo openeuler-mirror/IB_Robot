@@ -1,0 +1,9 @@
+sensor_msgs/Image image
+float32 confidence_threshold
+float32 nms_threshold
+---
+DetectionArray detections
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

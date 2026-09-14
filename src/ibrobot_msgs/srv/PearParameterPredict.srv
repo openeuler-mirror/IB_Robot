@@ -1,0 +1,16 @@
+sensor_msgs/Image image
+DetectionArray detections
+---
+std_msgs/Header header
+float32[] smplx_pose_raw
+float32[] smplx_scale
+float32[] smplx_shape
+float32[] smplx_expression
+float32[] flame_pose
+float32[] flame_shape
+float32[] flame_expression
+float32[] camera_raw
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

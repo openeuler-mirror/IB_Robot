@@ -244,6 +244,35 @@ image embedding 比较；持久对象 embedding 仍是语义地图私有数据�
 `RecognizeTags` 在 masks 为空时维持整图识别语义，即使 `include_image=false`，以兼容原有整图调用方；
 有 masks 时调用方可关闭整图识别，仅请求局部候选。
 
+### HRI 人体感知服务
+
+`YoloXDetect` 和 `PearParameterPredict` 是 HRI 人体链的两个强类型服务，同样只接受显式图像输入，不订阅
+相机 topic。两者都复用 `DetectionArray` / `Detection2D`，不另立一套检测消息。
+
+**`YoloXDetect`**（`/perception/hri/yolox_detect`）
+
+| 方向 | 字段 | 说明 |
+| --- | --- | --- |
+| 请求 | `image` | 源帧整图；letterbox 与通道顺序由 adapter 负责，调用方不做预处理 |
+| 请求 | `confidence_threshold` / `nms_threshold` | 解码后过滤参数，上游 YOLOX 默认为 `0.01` / `0.65` |
+| 响应 | `detections` | 已解码、已 NMS、已映射回**源图坐标**的框；HRI 调用方按 `label == "person"` 过滤 |
+| 响应 | `model` / `inference_time_ms` / `success` / `message` | 与其余模型服务一致的 runtime 投影与失败语义 |
+
+**`PearParameterPredict`**（`/perception/hri/pear_parameters`）
+
+| 方向 | 字段 | 说明 |
+| --- | --- | --- |
+| 请求 | `image` | 与 `YoloXDetect` 同一张源帧整图，**不是**已裁剪的人体 patch |
+| 请求 | `detections` | 人体框，源图坐标；编译部署为 batch 1，一次只接受一个框 |
+| 响应 | `smplx_pose_raw` [312] | `0:6` global_orient、`6:132` body_pose(21x6D)、`132:222` 左手、`222:312` 右手；6D 值不是欧拉角 |
+| 响应 | `smplx_scale` [6] / `smplx_shape` [200] / `smplx_expression` [50] | SMPL-X 尺度与形状参数 |
+| 响应 | `flame_pose` [14] / `flame_shape` [300] / `flame_expression` [50] | FLAME 头部参数 |
+| 响应 | `camera_raw` [3] | 相对/模型坐标，不是绝对相机 XYZ |
+| 响应 | `model` / `inference_time_ms` / `success` / `message` | 同上 |
+
+姿态输出是 SMPL-X 局部关节旋转，不是机器人电机角；裁剪几何与通道契约见 `perception_service`
+README §11。
+
 ### `GraspCandidate.msg`
 
 机器人无关的抓取候选，用于 manipulation service 与执行脚本之间传递 GraspGen 结果。

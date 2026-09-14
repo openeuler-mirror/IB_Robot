@@ -111,6 +111,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/EncodeText.srv"
   "srv/DetectSegment.srv"
   "srv/GroundingDetect.srv"
+  "srv/YoloXDetect.srv"
+  "srv/PearParameterPredict.srv"
   "srv/SegmentDetections.srv"
   "srv/PlanGrasp.srv"
   "srv/VerifyGrasp.srv"
