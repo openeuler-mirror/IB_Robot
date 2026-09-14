@@ -2,7 +2,42 @@
 
 `manipulation_execution` 是抓取、放置和 HRI 模拟执行的闭环执行层。它把一次 `PickObject` action 请求编排为
 GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证；
-`ImitateHumanMotion` 则提供不含 RGB-D/人体算法的最小 delegated Mock 生命周期。
+`ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。该 executor 只消费视频，不产生任何运动输出。
+
+### HRI RGB 输入与人体感知链
+
+HRI executor 复用统一 pipeline 和 `qos_profile_sensor_data` 订阅配置，不启动或管理 RealSense 设备。
+输入 topic 和两个模型服务端点都是 ROS 参数，由 launch 从 `embodied.imitate_human_motion` 注入：
+
+| 参数 | LeKiwi 取值 | 未配置时的回退 |
+| --- | --- | --- |
+| `rgb_topic` | `/camera/wrist/image_raw` | `embodied.perception.scene_sources.wrist_camera_topic` |
+| `yolox_detect_service` | `/perception/hri/yolox_detect` | 同名默认值 |
+| `pear_parameters_service` | `/perception/hri/pear_parameters` | 同名默认值 |
+| `person_confidence_threshold` | `0.30` | 同名默认值；必须是 `[0, 1]` 内有限数 |
+| `yolox_refresh_interval_sec` | `0.25` | `0.25`；必须是正的有限数 |
+
+`rgb_topic` 必须写 bringup remap **之后**的名字。`/camera/wrist_camera/color/image_raw` 是 RealSense
+驱动自己的名字，remap 之后在运行图上并不存在。
+
+感知链把 `person_confidence_threshold` 同时传给 YOLOX，并在响应上防御性地过滤非 `person`、
+非有限置信度和低于阈值的框；有候选时取置信度最高的一个。有合格 person 时，executor 缓存该框并让 PEAR
+使用最新整帧；YOLOX 成功但没有合格 person 时，executor 构造图像中心方框，
+边长为 `min(width, height) / 1.25`，再用恰好一个框调用 PEAR。任务首次完成 YOLOX 成功响应前不调用
+PEAR；之后的 YOLOX 刷新失败继续使用任务内最近一次成功结果。服务不可用、RPC 超时、模型失败和无效图像
+不会创建初始 fallback。像素处理仍全部在 perception adapter 内，本节点不含 `cv2`，也不使用 PEAR 输出驱动关节。
+
+任务 deadline 是相机计数和视觉推理的硬边界：边界后的帧不计数、不入队，worker 不提交过期
+请求，边界后返回的响应也不计入任务。每次调用分别跟踪 RPC deadline 和任务 deadline；只有
+`rpc_timeout_sec` 先到才增加 `vision_failed`，任务预算先到只取消或忽略该工作。reset/recovery
+可以继续使用既有 cleanup budget，但不能延长 RGB 统计窗口。
+
+result 的 message 继续附带 `rgb_input` JSON；feedback 不附带该 JSON。JSON 还包含 `yolox_calls` 与
+`pear_calls`，用于观察低频检测和持续 PEAR 推理。`vision_ok` 是 detected 与 fallback
+两条路径的有效 PEAR 响应总数，`vision_detected` 和 `vision_fallback` 分别记录来源，并始终满足
+`vision_ok == vision_detected + vision_fallback`；`vision_failed` 只记录真实服务、模型、RPC、图像或
+输出校验失败。`vision_sample` 增加 `source=yolox` 或 `source=center_fallback`，便于区分真实检测框和
+中心 fallback。
 
 `PickObject` 是 delegated action：goal 必须携带 `dispatch_binding`（`DispatchBinding`，含同一 root 的
 共享 `task_budget` 和 exact registry identity）以及 `expected_executor`（`DelegatedExecutorIdentity`）；
@@ -98,7 +133,7 @@ catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求
 
 ## 配置
 
-HRI 模拟执行由 `robot.embodied.imitate_human_motion` 启用。关节顺序来自 `robot.joints.arm`，
+HRI 执行由 `robot.embodied.imitate_human_motion` 启用，`rgb_topic` 与两个模型服务端点见上文表格。关节顺序来自 `robot.joints.arm`，
 prepare 起点来自 `robot.ros2_control.reset_positions`，限位来自
 `robot.teleoperation.safety.joint_limits`；这些值由 `embodied_bringup` 注入，执行器不维护第二份机器人配置。
 
