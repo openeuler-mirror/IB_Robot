@@ -6,9 +6,13 @@ from pathlib import Path
 import pytest
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+INFERENCE_MANIFEST_SRC = Path(__file__).resolve().parents[1] / "src" / "inference_manifest"
 sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(INFERENCE_MANIFEST_SRC))
 
 import download_models as dm  # noqa: E402 - scripts dir is not a package
+
+from inference_manifest import CANONICAL_MODEL_MAPPING  # noqa: E402
 
 
 def _sam_like_manifest() -> dict:
@@ -18,6 +22,7 @@ def _sam_like_manifest() -> dict:
     enc_b = hashlib.sha256(b"om-b-enc").hexdigest()
     return {
         "schema_version": 3,
+        "model": {"interface": "tensor_model", "model_type": "sam2", "operation": "automatic"},
         "bundle": {
             "files": [
                 {"path": "assets/adapter.json"},
@@ -46,6 +51,7 @@ def _pi05_like_manifest() -> dict:
     """pi05-style: torch deployments without artifacts, weights only in bundle.files."""
     return {
         "schema_version": 3,
+        "model": {"interface": "policy", "model_type": "pi05", "operation": "predict"},
         "bundle": {
             "files": [
                 {"path": "model.safetensors"},
@@ -66,10 +72,22 @@ def _named_bundle_manifest(bundle_name: str) -> dict:
     return manifest
 
 
+def _allowlisted_bundle_manifest(bundle_name: str, source: dm.BundleSource) -> dict:
+    """Manifest matching one allowlist entry's declared model identity."""
+    manifest = _named_bundle_manifest(bundle_name)
+    manifest["model"] = {
+        "interface": source.interface,
+        "model_type": source.model_type,
+        "operation": source.operation,
+    }
+    return manifest
+
+
 def _snapshot_writing_manifests(repos_by_repo_id: dict[str, dict]):
     """Fake snapshot_download that materializes manifest + shared files per repo."""
 
-    def fake_snapshot(repo_id, local_dir, allow_patterns):
+    def fake_snapshot(repo_id, local_dir, allow_patterns, token=None):
+        del token
         local = Path(local_dir)
         manifest = repos_by_repo_id[repo_id]
         for relative in allow_patterns:
@@ -112,6 +130,32 @@ def test_torch_deployment_matches_name_and_backend_keywords():
         assert had_filter
     matched, _ = dm.filter_deployments(dm.collect_deployments(_pi05_like_manifest()), ["cpu"])
     assert [info.name for info in matched] == ["torch-cpu"]
+
+
+def test_target_keyword_matches_profile_device_and_role_profile():
+    manifest = {
+        "deployments": {
+            "host": {
+                "runtime_profile": {
+                    "backend": "onnx",
+                    "target": {"runtime": "onnx"},
+                    "profile": {"device": "cpu"},
+                }
+            },
+            "heterogeneous": {
+                "role_runtime_profiles": {
+                    "encoder": {
+                        "backend": "ascend",
+                        "target": {"runtime": "acl", "soc": "Ascend310P1"},
+                        "profile": {"device": "npu"},
+                    }
+                }
+            },
+        }
+    }
+    infos = dm.collect_deployments(manifest)
+    assert [info.name for info in dm.filter_deployments(infos, ["cpu"])[0]] == ["host"]
+    assert [info.name for info in dm.filter_deployments(infos, ["310p"])[0]] == ["heterogeneous"]
 
 
 def test_no_filter_downloads_every_artifact():
@@ -185,19 +229,19 @@ def test_end_to_end_download_with_fake_hub(monkeypatch, tmp_path):
     stored: dict[str, bytes] = {}
     for relative, content in {
         "inference_manifest.json": json.dumps(manifest).encode(),
+        "assets/adapter.json": b"{}",
         "assets/sam2.1_hiera_tiny.pt": b"pt-weights",
         "artifacts/ascend_310p/encoder.om": b"om-enc",
         "artifacts/ascend_310p/decoder.om": b"om-dec",
     }.items():
         stored[relative] = content
 
-    def fake_fetch(org, name, dest_root):
-        bundle_dir = dest_root / name
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        (bundle_dir / dm.MANIFEST_FILENAME).write_bytes(stored[dm.MANIFEST_FILENAME])
-        return dm.load_manifest(bundle_dir / dm.MANIFEST_FILENAME)
+    def fake_fetch(org, name, token=None):
+        del org, token
+        return json.loads(stored[dm.MANIFEST_FILENAME])
 
-    def fake_snapshot(repo_id, local_dir, allow_patterns):
+    def fake_snapshot(repo_id, local_dir, allow_patterns, token=None):
+        del token
         local = Path(local_dir)
         for relative in allow_patterns:
             if relative in stored:
@@ -223,10 +267,14 @@ def test_end_to_end_download_with_fake_hub(monkeypatch, tmp_path):
 def test_main_downloads_same_bundle_name_repos_into_separate_directories(monkeypatch, tmp_path):
     """Issue #132: two repositories may publish manifests with the same bundle.name."""
     repos = {
-        "openEuler/sam2.1_hiera_tiny": _named_bundle_manifest("sam2.1_hiera_tiny"),
-        "openEuler/sam2.1_hiera_tiny_prompt_ascend": _named_bundle_manifest("sam2.1_hiera_tiny"),
+        "openEuler/sam2.1_hiera_tiny": _allowlisted_bundle_manifest(
+            "sam2.1_hiera_tiny", dm.bundle_source("sam2.1_hiera_tiny")
+        ),
+        "openEuler/sam2.1_hiera_tiny_prompt_ascend": _allowlisted_bundle_manifest(
+            "sam2.1_hiera_tiny", dm.bundle_source("sam2.1_hiera_tiny_prompt_ascend")
+        ),
     }
-    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, dest_root: repos[f"{org}/{name}"])
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, token=None: repos[f"{org}/{name}"])
     monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(repos))
 
     code = dm.main(["--models", "sam2.1_hiera_tiny,sam2.1_hiera_tiny_prompt_ascend", "--dest", str(tmp_path)])
@@ -245,14 +293,14 @@ def test_main_rejects_colliding_runtime_directories(monkeypatch, tmp_path, capsy
         "openEuler/alpha": _named_bundle_manifest("alpha"),
         "openEuler/beta": _named_bundle_manifest("alpha"),
     }
-    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, dest_root: manifests[f"{org}/{name}"])
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, token=None: manifests[f"{org}/{name}"])
     monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(manifests))
 
     code = dm.main(["--models", "alpha,beta", "--dest", str(tmp_path)])
     assert code == 1
 
     captured = capsys.readouterr()
-    assert "beta" in captured.err and "alpha" in captured.err and "RUNTIME_DIRECTORIES" in captured.err
+    assert "beta" in captured.err and "alpha" in captured.err and "MODEL_BUNDLE_ALLOWLIST" in captured.err
     bundle = tmp_path / "alpha"
     assert (bundle / dm.MANIFEST_FILENAME).read_text() == json.dumps(manifests["openEuler/alpha"])
     assert (bundle / "model.safetensors").read_text() == "openEuler/alpha"
@@ -262,7 +310,7 @@ def test_main_rejects_colliding_runtime_directories(monkeypatch, tmp_path, capsy
 def test_main_deduplicates_repeated_model_names(monkeypatch, tmp_path, capsys):
     manifest = _named_bundle_manifest("alpha")
     manifests = {"openEuler/alpha": manifest}
-    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, dest_root: manifests[f"{org}/{name}"])
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, token=None: manifests[f"{org}/{name}"])
     monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(manifests))
 
     code = dm.main(["--models", "alpha,alpha", "--dest", str(tmp_path)])
@@ -294,7 +342,7 @@ def test_repository_aliases_and_runtime_directories():
         dm.runtime_directory("sam2.1_hiera_tiny_prompt_ascend", "sam2.1_hiera_tiny")
         == "sam2.1_hiera_tiny_prompt_ascend"
     )
-    assert dm.resolve_names("all", ["pi05", "zipvoice"]) == ["pi05", "zipvoice"]
+    assert dm.resolve_names("all") == [source.repository for source in dm.MODEL_BUNDLE_ALLOWLIST]
 
 
 def test_build_plan_separates_repository_from_local_directory():
@@ -339,27 +387,99 @@ def test_legacy_download_uses_filtered_snapshot(monkeypatch, tmp_path):
 
 
 def test_main_reports_failure_per_bundle_without_aborting(monkeypatch, tmp_path):
-    def boom(org, name, dest_root):
-        raise RuntimeError(f"repo not found: {name}")
-
     calls = []
 
-    def ok_fetch(org, name, dest_root):
+    def ok_fetch(org, name, token=None):
+        del org, token
         calls.append(name)
-        bundle_dir = dest_root / name
-        bundle_dir.mkdir(parents=True, exist_ok=True)
-        (bundle_dir / dm.MANIFEST_FILENAME).write_text(json.dumps({"schema_version": 3}))
-        return {"schema_version": 3, "bundle": {"files": []}, "deployments": {}}
+        return {
+            "schema_version": 3,
+            "model": {"interface": "policy", "model_type": "smolvla", "operation": "predict"},
+            "bundle": {"name": "smolvla", "files": []},
+            "deployments": {},
+        }
 
     state = {"first": True}
 
-    def fetch(org, name, dest_root):
+    def fetch(org, name, token=None):
         if state["first"]:
             state["first"] = False
             raise RuntimeError("network down")
-        return ok_fetch(org, name, dest_root)
+        return ok_fetch(org, name, token)
 
     monkeypatch.setattr(dm, "fetch_manifest", fetch)
-    code = dm.main(["--models", "badone,pi05", "--dest", str(tmp_path)])
+    code = dm.main(["--models", "badone,smolvla", "--dry-run", "--dest", str(tmp_path)])
     assert code == 1
-    assert calls == ["pi05"]
+    assert calls == ["smolvla"]
+
+
+def test_allowlist_covers_wired_hf_bundles_and_excludes_unwired_repositories():
+    names = {source.name for source in dm.MODEL_BUNDLE_ALLOWLIST}
+    assert {
+        "zipvoice",
+        "fullsubnet",
+        "silero-vad",
+        "sam2.1_hiera_tiny_prompt_ascend",
+        "pear_parameter_network",
+        "yolox_x_640",
+    } <= names
+    assert {
+        "IB_Robot_ACT_banana_pick",
+        "IB_Robot_ACT_dual_arm_banana_pick",
+        "witty-tune-model",
+        "sherpa-kws",
+        "vits-csmsc",
+    }.isdisjoint(names)
+
+
+def test_allowlist_covers_every_canonical_weight_bearing_model_service():
+    allowlisted = {(source.interface, source.model_type, source.operation) for source in dm.MODEL_BUNDLE_ALLOWLIST}
+    canonical = {
+        (spec["interface"], model_type, operation)
+        for model_type, spec in CANONICAL_MODEL_MAPPING.items()
+        for operation in spec["operations"]
+    }
+    non_downloadable_or_weightless = {
+        ("tensor_model", "dummy_echo", "echo"),
+        ("tensor_model", "speech_direction", "enhance_and_vad"),
+        ("tensor_model", "sherpa_onnx", "recognize"),
+    }
+    approved_pre_registration_bundles = {
+        ("tensor_model", "pear_parameter_network", "predict_parameters"),
+        ("tensor_model", "yolox_person", "detect"),
+    }
+    assert allowlisted == (canonical - non_downloadable_or_weightless) | approved_pre_registration_bundles
+
+
+def test_manifest_identity_must_match_allowlist():
+    source = dm.bundle_source("sam2.1_hiera_tiny_prompt_ascend")
+    assert source is not None
+    manifest = _sam_like_manifest()
+    with pytest.raises(dm.DownloadError, match="allowlist expects tensor_model/sam2/prompt"):
+        dm.validate_manifest_identity(source, manifest)
+    manifest["model"]["operation"] = "prompt"
+    dm.validate_manifest_identity(source, manifest)
+
+
+def test_all_skips_allowlisted_bundles_without_requested_target(monkeypatch, tmp_path, capsys):
+    manifests = {
+        source.repository: {
+            "schema_version": 3,
+            "model": {
+                "interface": source.interface,
+                "model_type": source.model_type,
+                "operation": source.operation,
+            },
+            "bundle": {"name": source.name, "files": []},
+            "deployments": {},
+        }
+        for source in dm.MODEL_BUNDLE_ALLOWLIST
+    }
+    monkeypatch.setattr(dm, "fetch_manifest", lambda org, name, token=None: manifests[name])
+    monkeypatch.setattr(dm, "snapshot_download", _snapshot_writing_manifests(manifests))
+
+    code = dm.main(["--models", "all", "--target", "310p", "--dest", str(tmp_path)])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "[skip]" in captured.out
+    assert "[error]" not in captured.err

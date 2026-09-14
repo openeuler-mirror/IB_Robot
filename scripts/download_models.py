@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+    from huggingface_hub import hf_hub_download, snapshot_download
 except ModuleNotFoundError as exc:  # pragma: no cover - depends on env
     raise SystemExit(
         "Error: huggingface_hub is required. Install the project environment first with ./scripts/setup.sh."
@@ -52,39 +52,102 @@ except ModuleNotFoundError as exc:  # pragma: no cover - depends on env
 DEFAULT_ORG = "openEuler"
 MANIFEST_FILENAME = "inference_manifest.json"
 
-KNOWN_BUNDLES = {
-    "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
-    "pi05",
-    "smolvla",
-    "sam2.1_hiera_tiny",
-    "sam2.1_hiera_tiny_prompt_ascend",
-    "ram_plus_swin_large_14m",
-    "siglip2_so400m_patch14_384",
-    "grounding_dino_swint_seq8_1280x720",
-    "graspgen",
-    "fullsubnet",
-}
 
-# Hugging Face repository names are not always the paths consumed by the
-# runtime. Keep this mapping explicit so repository renames do not silently
-# move an installed model bundle.
-REPOSITORY_ALIASES = {
-    "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515": "IB_Robot_ACT_banana_pick_distill",
-    "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
-    "graspgen": "graspgen",
-}
-# Repositories whose manifest bundle.name is not unique across the
-# organization (e.g. sam2.1_hiera_tiny and sam2.1_hiera_tiny_prompt_ascend
-# both declare bundle.name "sam2.1_hiera_tiny") must pin their local
-# directory explicitly, otherwise the fallback below collides.
-RUNTIME_DIRECTORIES = {
-    "IB_Robot_ACT_banana_pick_distill": "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
-    "fullsubnet": "fullsubnet",
-    "graspgen": "graspgen",
-    "grounding_dino_swint_seq8_1280x720": "grounding_dino_swint_seq8_1280x720",
-    "sam2.1_hiera_tiny": "sam2.1_hiera_tiny",
-    "sam2.1_hiera_tiny_prompt_ascend": "sam2.1_hiera_tiny_prompt_ascend",
-}
+@dataclass(frozen=True)
+class BundleSource:
+    """Allowlisted Hugging Face bundle and its local runtime identity."""
+
+    name: str
+    repository: str
+    directory: str
+    interface: str
+    model_type: str
+    operation: str
+
+
+# Allowlisted model bundles are the trusted registry of this downloader: an
+# entry pins the Hugging Face repository, the local runtime directory and the
+# schema-v3 model identity, and is the sole source for ``--models all`` and
+# ``--list``. Repositories in the openEuler organization are not automatically
+# trusted as IB-Robot runtime bundles; add an entry only after its schema-v3
+# identity is wired in-tree. Manually requested repositories outside this
+# registry are still downloadable with a warning (no identity to validate).
+MODEL_BUNDLE_ALLOWLIST = (
+    BundleSource(
+        "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
+        "IB_Robot_ACT_banana_pick_distill",
+        "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515",
+        "policy",
+        "act",
+        "predict",
+    ),
+    BundleSource("pi05", "pi05", "pi05", "policy", "pi05", "predict"),
+    BundleSource("smolvla", "smolvla", "smolvla", "policy", "smolvla", "predict"),
+    BundleSource(
+        "ram_plus_swin_large_14m",
+        "ram_plus_swin_large_14m",
+        "ram_plus_swin_large_14m",
+        "tensor_model",
+        "ram_plus",
+        "recognize_tags",
+    ),
+    BundleSource(
+        "sam2.1_hiera_tiny",
+        "sam2.1_hiera_tiny",
+        "sam2.1_hiera_tiny",
+        "tensor_model",
+        "sam2",
+        "automatic",
+    ),
+    BundleSource(
+        "sam2.1_hiera_tiny_prompt_ascend",
+        "sam2.1_hiera_tiny_prompt_ascend",
+        "sam2.1_hiera_tiny_prompt_ascend",
+        "tensor_model",
+        "sam2",
+        "prompt",
+    ),
+    BundleSource(
+        "siglip2_so400m_patch14_384",
+        "siglip2_so400m_patch14_384",
+        "siglip2_so400m_patch14_384",
+        "tensor_model",
+        "siglip2",
+        "encode",
+    ),
+    BundleSource(
+        "grounding_dino_swint_seq8_1280x720",
+        "grounding_dino_swint_seq8_1280x720",
+        "grounding_dino_swint_seq8_1280x720",
+        "tensor_model",
+        "grounding_dino",
+        "detect",
+    ),
+    BundleSource("graspgen", "graspgen", "graspgen", "tensor_model", "graspgen", "generate_grasps"),
+    BundleSource("zipvoice", "zipvoice", "zipvoice", "tensor_model", "zipvoice", "synthesize"),
+    BundleSource("fullsubnet", "fullsubnet", "fullsubnet", "tensor_model", "fullsubnet", "enhance"),
+    BundleSource("silero-vad", "silero-vad", "silero-vad", "tensor_model", "silero_vad", "vad"),
+    BundleSource(
+        "pear_parameter_network",
+        "pear_parameter_network",
+        "pear_parameter_network",
+        "tensor_model",
+        "pear_parameter_network",
+        "predict_parameters",
+    ),
+    BundleSource("yolox_x_640", "yolox_x_640", "yolox_x_640", "tensor_model", "yolox_person", "detect"),
+)
+
+for _attr in ("name", "repository", "directory"):
+    _values = [getattr(source, _attr) for source in MODEL_BUNDLE_ALLOWLIST]
+    _duplicates = sorted({value for value in _values if _values.count(value) > 1})
+    if _duplicates:
+        raise RuntimeError(f"duplicate bundle {_attr} in MODEL_BUNDLE_ALLOWLIST: {_duplicates}")
+del _attr, _values, _duplicates
+
+_BUNDLE_BY_NAME = {source.name: source for source in MODEL_BUNDLE_ALLOWLIST}
+_BUNDLE_BY_REPOSITORY = {source.repository: source for source in MODEL_BUNDLE_ALLOWLIST}
+
 LEGACY_REPOSITORIES = {
     "IB_Robot_ACT_banana_pick": "IB_Robot_ACT_banana_pick",
     "IB_Robot_ACT_dual_arm_banana_pick": "IB_Robot_ACT_dual_arm_banana_pick",
@@ -96,6 +159,10 @@ class DownloadError(RuntimeError):
     """Raised for bundle selection, planning or verification failures."""
 
 
+class NoMatchingDeploymentError(DownloadError):
+    """Raised when an allowlisted bundle has no requested deployment."""
+
+
 @dataclass
 class BundlePlan:
     """Resolved download plan for one bundle."""
@@ -103,12 +170,13 @@ class BundlePlan:
     name: str
     repo_id: str
     patterns: list[str]
+    artifact_paths: list[str]
     verify_map: dict[str, str]
     matched_deployments: list[str]
 
     @property
     def artifact_count(self) -> int:
-        return sum(1 for path in self.patterns if path in self.verify_map)
+        return len(self.artifact_paths)
 
 
 @dataclass
@@ -129,11 +197,12 @@ class DeploymentInfo:
     name: str
     backend: str
     soc: str
+    match_terms: list[str] = field(default_factory=list)
     artifact_paths: list[str] = field(default_factory=list)
 
     @property
     def haystack(self) -> str:
-        return f"{self.name} {self.backend} {self.soc}".lower()
+        return " ".join((self.name, self.backend, self.soc, *self.match_terms)).lower()
 
     def describe(self) -> str:
         detail = f"backend={self.backend}, soc={self.soc}"
@@ -160,12 +229,39 @@ def collect_deployments(manifest: dict[str, Any]) -> list[DeploymentInfo]:
         target = profile.get("target", {}) or {}
         backend = str(profile.get("backend") or target.get("runtime") or "")
         soc = str(target.get("soc") or "")
+        profiles = [profile, *(deployment.get("role_runtime_profiles", {}) or {}).values()]
+        match_terms = []
+        for runtime_profile in profiles:
+            if not isinstance(runtime_profile, dict):
+                continue
+            runtime_target = runtime_profile.get("target", {}) or {}
+            runtime_options = runtime_profile.get("profile", {}) or {}
+            match_terms.extend(
+                str(value)
+                for value in (
+                    runtime_profile.get("backend"),
+                    runtime_target.get("runtime"),
+                    runtime_target.get("runtime_abi"),
+                    runtime_target.get("soc"),
+                    runtime_options.get("device"),
+                    runtime_options.get("target_name"),
+                )
+                if value not in (None, "")
+            )
         artifacts = [
             spec["path"]
             for spec in (deployment.get("artifacts", {}) or {}).values()
             if isinstance(spec, dict) and spec.get("path")
         ]
-        infos.append(DeploymentInfo(name=name, backend=backend, soc=soc, artifact_paths=artifacts))
+        infos.append(
+            DeploymentInfo(
+                name=name,
+                backend=backend,
+                soc=soc,
+                match_terms=match_terms,
+                artifact_paths=artifacts,
+            )
+        )
     return infos
 
 
@@ -208,13 +304,15 @@ def build_plan(
     if (had_target_filter or exact) and not selected:
         available = "; ".join(info.describe() for info in infos)
         wanted = ", ".join(targets + deployments)
-        raise DownloadError(f"no deployment of '{name}' matches [{wanted}]. Available: {available}")
+        raise NoMatchingDeploymentError(f"no deployment of '{name}' matches [{wanted}]. Available: {available}")
 
     verify_map: dict[str, str] = {}
     patterns: set[str] = {MANIFEST_FILENAME, *shared_paths}
+    artifact_paths: set[str] = set()
     for info in selected:
         for artifact_path in info.artifact_paths:
             patterns.add(artifact_path)
+            artifact_paths.add(artifact_path)
             digest = _artifact_digest(manifest, info.name, artifact_path)
             if digest:
                 verify_map[artifact_path] = digest.lower()
@@ -226,6 +324,7 @@ def build_plan(
         name=name,
         repo_id=f"{org}/{repo_name or name}",
         patterns=sorted(patterns),
+        artifact_paths=sorted(artifact_paths),
         verify_map=verify_map,
         matched_deployments=[info.name for info in selected],
     )
@@ -249,7 +348,10 @@ def sha256_of(path: Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def verify_downloads(bundle_dir: Path, verify_map: dict[str, str]) -> None:
+def verify_downloads(bundle_dir: Path, verify_map: dict[str, str], required_paths: list[str] | None = None) -> None:
+    for relative_path in sorted(required_paths or []):
+        if not (bundle_dir / relative_path).is_file():
+            raise DownloadError(f"missing after download: {relative_path}")
     for relative_path, expected in sorted(verify_map.items()):
         candidate = bundle_dir / relative_path
         if not candidate.is_file():
@@ -268,12 +370,33 @@ def prune_hf_cache(bundle_dir: Path) -> None:
         print(f"[clean] removed snapshot transfer metadata: {bundle_dir / '.cache'}")
 
 
+def bundle_source(name: str) -> BundleSource | None:
+    return _BUNDLE_BY_NAME.get(name) or _BUNDLE_BY_REPOSITORY.get(name)
+
+
 def runtime_directory(repo_name: str, bundle_name: str | None = None) -> str:
-    return RUNTIME_DIRECTORIES.get(repo_name, bundle_name or repo_name)
+    source = bundle_source(repo_name)
+    if source is not None:
+        return source.directory
+    return bundle_name or repo_name
 
 
 def repository_for_name(name: str) -> str:
-    return REPOSITORY_ALIASES.get(name, name)
+    source = bundle_source(name)
+    return source.repository if source is not None else name
+
+
+def validate_manifest_identity(source: BundleSource, manifest: dict[str, Any]) -> None:
+    model = manifest.get("model")
+    if not isinstance(model, dict):
+        raise DownloadError(f"{source.repository} manifest has no model identity")
+    actual = (model.get("interface"), model.get("model_type"), model.get("operation"))
+    expected = (source.interface, source.model_type, source.operation)
+    if actual != expected:
+        raise DownloadError(
+            f"{source.repository} manifest identity is {'/'.join(str(value) for value in actual)}; "
+            f"allowlist expects {'/'.join(expected)}"
+        )
 
 
 def materialize_runtime_aliases(repo_name: str, bundle_dir: Path) -> None:
@@ -287,7 +410,7 @@ def materialize_runtime_aliases(repo_name: str, bundle_dir: Path) -> None:
     return
 
 
-def download_bundle(plan: BundlePlan, dest_root: Path, dry_run: bool = False) -> Path:
+def download_bundle(plan: BundlePlan, dest_root: Path, dry_run: bool = False, token: str | None = None) -> Path:
     bundle_dir = dest_root / plan.name
     if dry_run:
         return bundle_dir
@@ -295,14 +418,14 @@ def download_bundle(plan: BundlePlan, dest_root: Path, dry_run: bool = False) ->
     print(f"[plan] {plan.repo_id}: {len(plan.patterns)} paths (deployments: {', '.join(plan.matched_deployments)})")
     for pattern in plan.patterns:
         print(f"       - {pattern}")
-    snapshot_download(repo_id=plan.repo_id, local_dir=str(bundle_dir), allow_patterns=plan.patterns)
-    verify_downloads(bundle_dir, plan.verify_map)
+    snapshot_download(repo_id=plan.repo_id, local_dir=str(bundle_dir), allow_patterns=plan.patterns, token=token)
+    verify_downloads(bundle_dir, plan.verify_map, plan.patterns)
     prune_hf_cache(bundle_dir)
     materialize_runtime_aliases(plan.repo_id.rsplit("/", 1)[-1], bundle_dir)
     return bundle_dir
 
 
-def download_legacy_repo(repo_name: str, dest_root: Path, dry_run: bool = False) -> Path:
+def download_legacy_repo(repo_name: str, dest_root: Path, dry_run: bool = False, token: str | None = None) -> Path:
     """Download a published repository that predates the manifest contract."""
     bundle_dir = dest_root / LEGACY_REPOSITORIES.get(repo_name, repo_name)
     if dry_run:
@@ -314,51 +437,36 @@ def download_legacy_repo(repo_name: str, dest_root: Path, dry_run: bool = False)
         repo_id=f"{DEFAULT_ORG}/{repo_name}",
         local_dir=str(bundle_dir),
         ignore_patterns=[".gitattributes", "README*", "*.mp4"],
+        token=token,
     )
     prune_hf_cache(bundle_dir)
     return bundle_dir
 
 
-def fetch_manifest(org: str, name: str, dest_root: Path) -> dict[str, Any]:
+def fetch_manifest(org: str, name: str, token: str | None = None) -> dict[str, Any]:
     """Fetch a manifest through the HF cache without mutating the destination."""
-    del dest_root
-    local = hf_hub_download(repo_id=f"{org}/{name}", filename=MANIFEST_FILENAME)
+    local = hf_hub_download(repo_id=f"{org}/{name}", filename=MANIFEST_FILENAME, token=token)
     return load_manifest(Path(local))
 
 
-def list_bundles(api_token: str | None) -> None:
-    api = HfApi(token=api_token)
-    try:
-        models = sorted(api.list_models(author=DEFAULT_ORG, full=True), key=lambda item: item.id.lower())
-    except Exception as exc:
-        raise DownloadError(f"could not list Hugging Face organization {DEFAULT_ORG}: {exc}") from exc
-    print(f"Models published by {DEFAULT_ORG}:")
-    for model in models:
-        repo_name = model.id.split("/", 1)[1]
-        try:
-            files = api.list_repo_files(model.id, repo_type="model")
-            has_manifest = MANIFEST_FILENAME in files
-        except Exception as exc:
-            print(f"  {repo_name} -> {runtime_directory(repo_name)} (probe failed: {exc})")
-            continue
-        kind = "manifest" if has_manifest else "legacy"
-        print(f"  {repo_name} -> {runtime_directory(repo_name)} [{kind}]")
+def list_bundles() -> None:
+    print(f"Allowlisted IB-Robot model bundles (org={DEFAULT_ORG}):")
+    for source in MODEL_BUNDLE_ALLOWLIST:
+        identity = f"{source.interface}/{source.model_type}/{source.operation}"
+        print(f"  {source.name} -> {DEFAULT_ORG}/{source.repository} -> models/{source.directory} [{identity}]")
 
 
-def resolve_names(requested: str, available: list[str] | None = None) -> list[str]:
+def resolve_names(requested: str) -> list[str]:
     names = [item.strip() for item in requested.split(",") if item.strip()]
     if not names:
         raise DownloadError("--models requires at least one bundle name (see --list)")
-    if names == ["all"]:
-        if available is None:
-            raise DownloadError("--models all requires querying the Hugging Face organization")
-        return available
-    available_set = set(available or ()) | KNOWN_BUNDLES | set(REPOSITORY_ALIASES)
+    if len(names) == 1 and names[0].lower() == "all":
+        return [source.repository for source in MODEL_BUNDLE_ALLOWLIST]
     resolved = [repository_for_name(name) for name in names]
-    unknown = [name for name in names if name not in available_set]
+    unknown = [name for name in names if bundle_source(name) is None]
     if unknown:
         preview = ", ".join(unknown)
-        print(f"[warn] not in the known-bundle registry; assuming repo id {DEFAULT_ORG}/<name>: {preview}")
+        print(f"[warn] not in the allowlist registry; assuming repo id {DEFAULT_ORG}/<name>: {preview}")
     return resolved
 
 
@@ -379,7 +487,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"HF_ENDPOINT can point to a mirror; default org is {DEFAULT_ORG}."
         ),
     )
-    parser.add_argument("--list", action="store_true", help="list all model repositories in the organization and exit")
+    parser.add_argument("--list", action="store_true", help="list allowlisted IB-Robot model bundles and exit")
     parser.add_argument("--models", help="comma-separated repository/bundle names, or 'all'")
     parser.add_argument(
         "--target",
@@ -406,30 +514,39 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def resolve_bundles(
     names: list[str],
-    repository_files: dict[str, list[str]] | None,
     dest_root: Path,
     targets: list[str],
     deployments: list[str],
+    token: str | None = None,
+    skip_unmatched: bool = False,
 ) -> tuple[list[ResolvedBundle], int]:
     """Resolve every requested bundle before touching the destination.
 
     Resolving up front lets conflicting local directories fail loudly instead
-    of letting a later download silently overwrite an earlier one (issue #132).
+    of letting a later download silently overwrite an earlier one (issue #132),
+    and validates the declared model identity of allowlisted bundles.
     """
     resolved: list[ResolvedBundle] = []
     failures = 0
     for name in names:
         try:
-            if name in LEGACY_REPOSITORIES or (
-                repository_files and MANIFEST_FILENAME not in repository_files.get(name, [])
-            ):
+            source = bundle_source(name)
+            if name in LEGACY_REPOSITORIES and source is None:
                 resolved.append(ResolvedBundle(name=name, local_name=LEGACY_REPOSITORIES.get(name, name)))
                 continue
-            manifest = fetch_manifest(DEFAULT_ORG, name, dest_root)
+            manifest = fetch_manifest(DEFAULT_ORG, name, token)
+            if source is not None:
+                validate_manifest_identity(source, manifest)
             bundle_name = manifest.get("bundle", {}).get("name") or name
             local_name = runtime_directory(name, bundle_name)
             plan = build_plan(local_name, DEFAULT_ORG, manifest, targets, deployments, repo_name=name)
             resolved.append(ResolvedBundle(name=name, local_name=local_name, plan=plan))
+        except NoMatchingDeploymentError as exc:
+            if skip_unmatched:
+                print(f"[skip] {name}: {exc}")
+                continue
+            failures += 1
+            print(f"[error] {name}: {exc}", file=sys.stderr)
         except Exception as exc:  # noqa: BLE001 - report per-bundle, keep going
             failures += 1
             print(f"[error] {name}: {exc}", file=sys.stderr)
@@ -448,8 +565,8 @@ def resolve_bundles(
         failures += 1
         print(
             f"[error] {record.name}: local directory '{record.local_name}' is already taken by "
-            f"'{previous}'; add an explicit RUNTIME_DIRECTORIES entry so each repository "
-            f"downloads into its own directory",
+            f"'{previous}'; pin an explicit directory in MODEL_BUNDLE_ALLOWLIST so each "
+            f"repository downloads into its own directory",
             file=sys.stderr,
         )
     return resolved, failures
@@ -458,30 +575,28 @@ def resolve_bundles(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if args.list:
-        list_bundles(args.token)
+        list_bundles()
         return 0
     if not args.models:
         print("Error: --models is required (or use --list)", file=sys.stderr)
         return 2
 
-    available: list[str] | None = None
-    repository_files: dict[str, list[str]] | None = None
-    if args.models.strip().lower() == "all":
-        api = HfApi(token=args.token)
-        models = sorted(api.list_models(author=DEFAULT_ORG, full=True), key=lambda item: item.id.lower())
-        available = [model.id.split("/", 1)[1] for model in models]
-        repository_files = {name: api.list_repo_files(f"{DEFAULT_ORG}/{name}", repo_type="model") for name in available}
-    names = resolve_names(args.models, available)
+    try:
+        names = resolve_names(args.models)
+    except DownloadError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+    download_all = args.models.strip().lower() == "all"
     targets = split_csv(args.target)
     deployments = split_csv(args.deployment)
-    records, failures = resolve_bundles(names, repository_files, args.dest, targets, deployments)
+    records, failures = resolve_bundles(names, args.dest, targets, deployments, args.token, skip_unmatched=download_all)
     for record in records:
         if record.conflict_with or record.duplicate:
             continue
         name = record.name
         try:
             if record.plan is None:
-                download_legacy_repo(name, args.dest, args.dry_run)
+                download_legacy_repo(name, args.dest, args.dry_run, args.token)
                 continue
             if args.dry_run:
                 artifacts = record.plan.artifact_count
@@ -491,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"{', '.join(record.plan.matched_deployments)}"
                 )
                 continue
-            download_bundle(record.plan, args.dest)
+            download_bundle(record.plan, args.dest, token=args.token)
             print(f"[done] {record.plan.repo_id} -> {args.dest / record.local_name}")
         except Exception as exc:  # noqa: BLE001 - report per-bundle, keep going
             failures += 1
