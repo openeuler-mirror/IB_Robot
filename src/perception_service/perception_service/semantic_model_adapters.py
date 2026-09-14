@@ -11,34 +11,13 @@ from PIL import Image
 
 from inference_service.unified_runtime import ModelResult
 
+from .adapter_support import output_tensor as _output
+from .adapter_support import read_adapter_identity as _read_adapter_identity
 from .grounding_dino_tokenizer import BertWordPieceTokenizer
 from .model_contracts import MAX_MASK_BATCH, MAX_TEXT_BATCH
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
 _BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
-
-
-def _read_adapter_identity(root: Path, expected: AdapterIdentity) -> None:
-    import json
-
-    path = root / "assets" / "adapter.json"
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"cannot load adapter identity {path}: {exc}") from exc
-    required = {
-        "interface": "tensor_model",
-        "model_type": expected.model_type,
-        "preprocessing": expected.preprocessing,
-        "postprocessing": expected.postprocessing,
-    }
-    if any(value.get(name) != expected_value for name, expected_value in required.items()):
-        raise ValueError(f"{expected.model_type} adapter identity mismatch: expected {required}, got {value}")
-    declared_operation = value.get("operation")
-    if declared_operation != expected.operation:
-        raise ValueError(
-            f"{expected.model_type} adapter operation mismatch: expected {expected.operation!r}, got {declared_operation!r}"
-        )
 
 
 def _load_siglip2_tokenizer(model_path: Path):
@@ -47,16 +26,6 @@ def _load_siglip2_tokenizer(model_path: Path):
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError("SigLIP2 requires transformers for bundle-local tokenization") from exc
     return AutoTokenizer.from_pretrained(model_path, local_files_only=True)
-
-
-def _output(result: ModelResult, semantic: str, dtype=np.float32) -> np.ndarray:
-    try:
-        value = np.asarray(result.outputs[semantic], dtype=dtype)
-    except KeyError as exc:
-        raise RuntimeError(f"runtime result is missing {semantic!r}") from exc
-    if not np.isfinite(value).all():
-        raise RuntimeError(f"runtime output {semantic!r} contains non-finite values")
-    return value
 
 
 def _normalize(rows: np.ndarray, dimension: int) -> np.ndarray:

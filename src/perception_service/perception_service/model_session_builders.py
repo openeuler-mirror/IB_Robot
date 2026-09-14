@@ -121,6 +121,8 @@ def register_perception_session_builders(registry: SessionBuilderRegistry | None
         ("sam2", "prompt"),
         ("siglip2", "encode"),
         ("grounding_dino", "detect"),
+        ("yolox_person", "detect"),
+        ("pear_parameter_network", "predict_parameters"),
     ):
         for backend in ("torch", "ascend"):
             key = ("tensor_model", model_type, operation, backend)

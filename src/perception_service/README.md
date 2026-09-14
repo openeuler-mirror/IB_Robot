@@ -473,3 +473,67 @@ PointNet++ 采样几何变更都会 bump 该版本号，避免旧图编出的 OM
 板端实机推理不在本仓库的自动化测试范围内；`test_graspgen_session.py` /
 `test_graspgen_plugin.py` 用 fake `AclModel` 驱动八个角色，manifest 与 packager 保持真实，
 因此 binding 写错会在这里失败而不是在设备上。
+
+## 11. HRI 人体感知（YOLOX + PEAR）
+
+HRI 链使用两个独立的 generic `model_service_node` 进程，与语义建图服务同构：一个 typed endpoint
+对应一个 named deployment，不共享进程。
+
+| id | service type | endpoint | plugin | bundle / deployment |
+| --- | --- | --- | --- | --- |
+| `hri_yolox_person` | `ibrobot_msgs/srv/YoloXDetect` | `/perception/hri/yolox_detect` | `model_service_plugins:YoloXPersonDetectPlugin` | `models/yolox_x_640` / `ascend_310p` |
+| `hri_pear_parameters` | `ibrobot_msgs/srv/PearParameterPredict` | `/perception/hri/pear_parameters` | `model_service_plugins:PearParameterPredictPlugin` | `models/pear_parameter_network` / `ascend_310p` |
+
+两个 bundle 都是仓库外的外部模型件（`models/` 下由下载获得），与 SAM2 / SigLIP2 一样通过 schema-v3
+manifest 的 named deployment 进入 shared `AscendOmModelSession`。两条都是 `required: true`：bundle 缺失
+或 deployment 不可用时服务在加载期直接失败，不进入"起来了但推不了"的状态。
+
+### 11.1 预处理归属
+
+**调用方传原始图像和框，不碰像素。** `YoloXDetect` 收整帧 `sensor_msgs/Image`，
+`PearParameterPredict` 收同一张整帧加一个 `DetectionArray`；letterbox、通道顺序、裁剪、缩放、
+归一化全部在 adapter 内。这与 §8 的分工一致（adapter 拥有模型语义预处理和后处理），也意味着
+执行侧节点里不出现 `cv2`。
+
+`YoloXAdapter`：
+
+```text
+源帧 RGB → BGR          （通道反转，在任何几何操作之前）
+ratio = min(640/H, 640/W)，按 ratio 缩放，贴到 640×640 画布左上角，pad 114
+```
+
+通道反转是必须的：图是按上游 YOLOX demo 路径（`cv2.imread` 的 BGR 序）导出的。喂 RGB 不会报错，
+但会导致检测框和后续人体参数产生系统性偏移。
+输出为未解码的 head 输出（`[1,8400,85]`，无 grid/stride 解码），解码、NMS、按 `person` 过滤和
+按 `ratio` 反映射回源图坐标都在 adapter 里；反映射只除 `ratio`，letterbox 没有居中偏移。
+
+`PearParameterAdapter`：
+
+```text
+person bbox xyxy（源图坐标）
+→ 中心 (cx, cy)，side = max(w, h) × 1.25
+→ 方形仿射裁剪（INTER_LINEAR / BORDER_CONSTANT 0）→ 256×256 → BGR → NCHW float32 / 255
+```
+
+仿射的目标角是 **255 不是 256**：`cv2.getAffineTransform` 映射的是像素中心，写 256 会把每个 crop
+整体缩放 256/255 并静默移动回归出的姿态。ImageNet 归一化和 `[:, :, :, 32:-32]` 宽度切片**在导出图
+内部**，调用方再做一遍等于归一化两次，得到看起来合理但错误的姿态。
+
+编译后的 PEAR 部署是 batch 1：一次请求只处理一个人体框，请求里给多于一个框会被拒绝。退化框
+（宽或高非正、非有限）同样直接拒绝而不是裁剪修正——OpenCV 对退化框不报错，它返回一块均匀填充的
+patch，网络会照样回归出一个姿态，形状/有限性/`success` 三道检查全都能通过。
+
+### 11.2 输出语义
+
+`PearParameterPredict` 按固定顺序返回八个张量：`smplx_pose_raw` [312]、`smplx_scale` [6]、
+`smplx_shape` [200]、`smplx_expression` [50]、`flame_pose` [14]、`flame_shape` [300]、
+`flame_expression` [50]、`camera_raw` [3]。`smplx_pose_raw` 切分为
+`0:6` global_orient、`6:132` body_pose(21×6D)、`132:222` 左手、`222:312` 右手；6D 值不是欧拉角，
+需要先解码成旋转矩阵。这些是 SMPL-X 局部关节旋转，**不是机器人电机角**；`camera_raw` 是相对/模型
+坐标，没有真实内参和根节点深度时不能当作绝对相机 XYZ。EHM / SMPL-X LBS、网格生成与渲染都不在
+bundle 内。
+
+### 11.3 测试
+
+`test/test_hri_perception_adapters.py` 覆盖 YOLOX 的通道与 letterbox/decode 契约、PEAR 的通道与裁剪几何、
+输出尺寸以及无效输入校验。板端实机推理不在本包的自动化测试范围内。

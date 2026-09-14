@@ -31,6 +31,7 @@ from .model_contracts import (
     validate_mask_batch,
     validate_text_batch,
 )
+from .pear_adapter import PearParameterAdapter
 from .ram_plus_adapter import RAMPlusAdapter, masked_image_crop, select_mask_tags
 from .semantic_model_adapters import (
     GroundingDINOAdapter,
@@ -40,6 +41,7 @@ from .semantic_model_adapters import (
     SigLIP2ImageAdapter,
     SigLIP2TextAdapter,
 )
+from .yolox_adapter import YoloXAdapter
 
 
 def _detection_array(bridge, header, records) -> DetectionArray:
@@ -363,6 +365,56 @@ class GroundingDetectPlugin(_SessionPlugin):
         )
         response.detections = _detection_array(self.bridge, request.image.header, records)
         return f"confirmed {len(records)} detections"
+
+
+class YoloXPersonDetectPlugin(_SessionPlugin):
+    service_type = "ibrobot_msgs/srv/YoloXDetect"
+    model_type = "yolox_person"
+    operation = "detect"
+    adapter_class = YoloXAdapter
+
+    def handle(self, request, response) -> str:
+        confidence_threshold = float(request.confidence_threshold)
+        nms_threshold = float(request.nms_threshold)
+        if not np.isfinite(confidence_threshold) or not 0.0 <= confidence_threshold <= 1.0:
+            raise ValueError("confidence_threshold must be finite and within [0, 1]")
+        if not np.isfinite(nms_threshold) or not 0.0 <= nms_threshold <= 1.0:
+            raise ValueError("nms_threshold must be finite and within [0, 1]")
+        image = self.image_rgb(request.image)
+        result = self._infer(self.adapter.preprocess(image))
+        records = rank_detections(
+            [
+                record
+                for record in self.adapter.postprocess(result, image_shape=image.shape[:2], nms_threshold=nms_threshold)
+                if record.confidence >= confidence_threshold
+            ]
+        )
+        response.detections = _detection_array(self.bridge, request.image.header, records)
+        return f"detected {len(records)} persons"
+
+
+class PearParameterPredictPlugin(_SessionPlugin):
+    service_type = "ibrobot_msgs/srv/PearParameterPredict"
+    model_type = "pear_parameter_network"
+    operation = "predict_parameters"
+    adapter_class = PearParameterAdapter
+
+    def handle(self, request, response) -> str:
+        detections = list(request.detections.detections)
+        validate_detection_batch(detections)
+        image = self.image_rgb(request.image)
+        result = self._infer(self.adapter.preprocess((image, [detection.bbox for detection in detections])))
+        values = self.adapter.postprocess(result)
+        response.header = request.image.header
+        response.smplx_pose_raw = values.smplx_pose_raw.tolist()
+        response.smplx_scale = values.smplx_scale.tolist()
+        response.smplx_shape = values.smplx_shape.tolist()
+        response.smplx_expression = values.smplx_expression.tolist()
+        response.flame_pose = values.flame_pose.tolist()
+        response.flame_shape = values.flame_shape.tolist()
+        response.flame_expression = values.flame_expression.tolist()
+        response.camera_raw = values.camera_raw.tolist()
+        return "predicted PEAR parameters"
 
 
 class GroundingDINORawDetectPlugin(_SessionPlugin):

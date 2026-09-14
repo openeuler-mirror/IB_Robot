@@ -380,6 +380,8 @@ CANONICAL_MODEL_MAPPING: dict[str, dict[str, Any]] = {
     "sam2": {"interface": "tensor_model", "operations": ("prompt", "automatic")},
     "siglip2": {"interface": "tensor_model", "operations": ("encode",)},
     "grounding_dino": {"interface": "tensor_model", "operations": ("detect",)},
+    "yolox_person": {"interface": "tensor_model", "operations": ("detect",)},
+    "pear_parameter_network": {"interface": "tensor_model", "operations": ("predict_parameters",)},
     "graspgen": {"interface": "tensor_model", "operations": ("generate_grasps",)},
     "dummy_echo": {"interface": "tensor_model", "operations": ("echo",)},
     "zipvoice": {"interface": "tensor_model", "operations": ("synthesize",)},
