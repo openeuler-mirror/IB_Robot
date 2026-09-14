@@ -262,6 +262,38 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 
 
+def test_hybrid_profile_projects_hri_person_confidence_threshold():
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    config = load_robot_config_dict(config_path)
+
+    nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
+    hri_node = next(
+        node for node in nodes if vars(node).get("_Node__node_name") == "imitate_human_motion_executor_node"
+    )
+    params = _normalize_launch_param_mapping(hri_node._Node__parameters[0])
+
+    assert params["person_confidence_threshold"] == pytest.approx(0.30)
+    assert params["yolox_refresh_interval_sec"] == pytest.approx(0.25)
+
+
+def test_hri_projection_defaults_person_confidence_threshold_when_omitted():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "imitate_human_motion": {"enabled": True},
+        }
+    }
+
+    nodes = generate_embodied_nodes(config, active_control_mode="moveit_planning")
+    hri_node = next(
+        node for node in nodes if vars(node).get("_Node__node_name") == "imitate_human_motion_executor_node"
+    )
+    params = _normalize_launch_param_mapping(hri_node._Node__parameters[0])
+
+    assert params["person_confidence_threshold"] == pytest.approx(0.30)
+    assert params["yolox_refresh_interval_sec"] == pytest.approx(0.25)
+
+
 def test_navigation_endpoint_missing_action_name_raises():
     import pytest
 

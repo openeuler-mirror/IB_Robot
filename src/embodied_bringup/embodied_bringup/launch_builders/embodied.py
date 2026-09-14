@@ -464,6 +464,16 @@ def generate_embodied_nodes(
                         "primitive_action_name": common_params["primitive_action_name"],
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                         "startup_warmup": hri_runtime.get("startup_warmup", True),
+                        "rgb_topic": hri_runtime.get(
+                            "rgb_topic",
+                            perception_scene_sources.get("wrist_camera_topic", "/camera/wrist/image_raw"),
+                        ),
+                        "yolox_detect_service": hri_runtime.get("yolox_detect_service", "/perception/hri/yolox_detect"),
+                        "pear_parameters_service": hri_runtime.get(
+                            "pear_parameters_service", "/perception/hri/pear_parameters"
+                        ),
+                        "yolox_refresh_interval_sec": hri_runtime.get("yolox_refresh_interval_sec", 0.25),
+                        "person_confidence_threshold": hri_runtime.get("person_confidence_threshold", 0.30),
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "reset_positions_json": json.dumps(
                             robot_config.get("ros2_control", {}).get("reset_positions", {})

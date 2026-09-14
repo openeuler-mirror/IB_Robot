@@ -146,5 +146,8 @@ Agent 孵化 profile（`so101_agent_manual`、`so101_single_arm_agent_gazebo` �
 - `lekiwi_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
 - `lekiwi_nav_grasp` hybrid stage 启用 `embodied.imitate_human_motion` 时，bringup 会把 arm 关节顺序、
   reset positions 和 joint limits 从同一份 `robot_config` 注入 HRI runtime，并在启动时默认尝试一次 warmup。
+  同时注入 `rgb_topic` 与两个 HRI 模型服务端点（`yolox_detect_service` / `pear_parameters_service`）；
+  `rgb_topic` 未显式配置时回退到 `embodied.perception.scene_sources.wrist_camera_topic`，即 remap
+  之后的腕部相机名，而不是 RealSense 驱动自己的 topic。
 - 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
   `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。
