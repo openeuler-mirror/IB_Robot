@@ -221,6 +221,7 @@ def generate_embodied_nodes(
         "placement_execution_json": json.dumps(placement_execution),
         "imitate_human_motion_action_name": hri_runtime.get("action_name", "/hri/imitate_human_motion"),
         "imitate_human_motion_enabled": hri_runtime.get("enabled", False),
+        "sound_following_service": "/sound_orientation_node/set_following",
         "move_configuration_service": execution.get(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
@@ -354,6 +355,9 @@ def generate_embodied_nodes(
     sound_orientation = idle_behaviors.get("sound_orientation", {}) if isinstance(idle_behaviors, dict) else {}
     if not isinstance(sound_orientation, dict):
         sound_orientation = {}
+    common_params["sound_following_enabled"] = bool(
+        sound_orientation.get("enabled", False) and sound_orientation.get("mode", "keyword") == "periodic"
+    )
 
     nodes = [
         Node(
@@ -481,6 +485,7 @@ def generate_embodied_nodes(
                 "gateway_status_service": common_params["skill_gateway_status_service"],
                 "skill_action_name": common_params["skill_action_name"],
                 "debug_tracing": common_params["debug_tracing"],
+                "default_active": bool(sound_orientation.get("default_active", False)),
             }
         )
         nodes.append(

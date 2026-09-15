@@ -25,6 +25,11 @@ class StreamingPipelineParams:
     processing_samples: int = 256
     model_batch_samples: int = 512
     srp_update_interval_hops: int = 2
+    early_direction_min_scores: int = 2
+    raw_activity_gate_enabled: bool = True
+    raw_activity_start_rms: float = 0.026
+    raw_activity_stop_rms: float = 0.020
+    raw_activity_tail_samples: int = 8000
     input_channels: tuple[int, int, int, int] = (1, 2, 3, 4)
     srp_frame_samples: int = 4096
     srp_hop_samples: int = 512
@@ -104,6 +109,10 @@ class StreamingSpeechDirectionPipeline:
         self._input_pending = np.zeros((0, 4), np.float32)
         self._pending_raw_start: int | None = None
         self._model_hop_count = 0
+        self._early_direction_emitted = False
+        self._raw_active = not self.params.raw_activity_gate_enabled
+        self._raw_quiet_samples = 0
+        self._backend_reset_requested = False
 
     def process_block(self, data: np.ndarray, *, capture_start_sample: int | None = None) -> HopResult:
         """处理一个[6,256] tick；两个tick合并后调用一次T=2 stateful 模型。"""
@@ -130,6 +139,37 @@ class StreamingSpeechDirectionPipeline:
         model_raw_start = self._pending_raw_start
         self._input_pending = self._input_pending[self.model_batch_samples :]
         self._pending_raw_start = model_raw_start + self.model_batch_samples if self._input_pending.shape[0] else None
+
+        raw_rms = float(np.sqrt(np.mean(model_input.astype(np.float64) ** 2)) + 1e-12)
+        if self.params.raw_activity_gate_enabled and not self._raw_active:
+            if raw_rms < self.params.raw_activity_start_rms:
+                self.vad_state.update(
+                    0.0,
+                    False,
+                    raw_rms,
+                    False,
+                    (model_raw_start + self.model_batch_samples) / self.sr,
+                )
+                return HopResult(
+                    raw_start_sample=raw_start,
+                    enh_start_sample=None,
+                    session_sample=model_raw_start,
+                    hop_t=model_raw_start / self.sr,
+                )
+            self._srp_history = np.zeros((0, 4), np.float32)
+            self._state = "IDLE"
+            self._scores = []
+            self._rms = []
+            self._candidate_score = None
+            self._early_direction_emitted = False
+            self._model_hop_count = 0
+            self._raw_active = True
+            self._raw_quiet_samples = 0
+        elif self.params.raw_activity_gate_enabled:
+            if raw_rms < self.params.raw_activity_stop_rms:
+                self._raw_quiet_samples += self.model_batch_samples
+            else:
+                self._raw_quiet_samples = 0
         fullnet_start = time.perf_counter()
         enhanced_full = self.fullnet.process_4ch(model_input)
         fullnet_ms = (time.perf_counter() - fullnet_start) * 1000.0
@@ -175,6 +215,26 @@ class StreamingSpeechDirectionPipeline:
             decision=decision,
             score=score,
         )
+        if (
+            self.params.raw_activity_gate_enabled
+            and self._raw_active
+            and self._raw_quiet_samples >= self.params.raw_activity_tail_samples
+            and self._state == "IDLE"
+        ):
+            # The current block has completed segment finalization.  Reset
+            # only after that boundary so no active utterance is truncated.
+            self._srp_history = np.zeros((0, 4), np.float32)
+            self._model_hop_count = 0
+            self._raw_active = False
+            self._raw_quiet_samples = 0
+            self._backend_reset_requested = True
+            self.vad_state.update(
+                0.0,
+                False,
+                raw_rms,
+                False,
+                output_end / self.sr,
+            )
         self.vad_state.update(
             decision.vad_prob,
             decision.is_speech,
@@ -283,11 +343,21 @@ class StreamingSpeechDirectionPipeline:
             self._append_score(self._candidate_score, self._candidate_rms)
             self._append_score(score, decision.rms)
             self._candidate_score = None
+            self._early_direction_emitted = False
             return None
 
         if decision.gate_state == "ACTIVE" and decision.is_gray:
             self._last_gray_end = decision.frame_end_sample
             self._append_score(score, decision.rms)
+            if (
+                not self._early_direction_emitted
+                and len(self._scores) >= self.params.early_direction_min_scores
+                and self._rms
+                and max(self._rms) >= self.params.segment_max_rms_threshold
+            ):
+                early_output = self._emit_segment("voice_begin", decision.frame_end_sample)
+                self._early_direction_emitted = early_output is not None
+                return early_output
             if self._last_gray_end - self._segment_start >= self.params.max_accum_samples:
                 return self._emit_segment("mid_long_seg", decision.frame_end_sample)
             return None
@@ -304,8 +374,7 @@ class StreamingSpeechDirectionPipeline:
                 and max(self._rms) >= self.params.segment_max_rms_threshold
             ):
                 result = self._emit_segment("seg_end", decision.frame_end_sample)
-            self._scores = []
-            self._rms = []
+            self._early_direction_emitted = False
             return result
         return None
 
@@ -341,6 +410,35 @@ class StreamingSpeechDirectionPipeline:
         self._samples_processed = int(next_capture_sample)
         self._model_hop_count = 0
 
+    def reset_for_activity(self, *, next_capture_sample: int) -> None:
+        """Reset host and recurrent state at a completed quiet boundary.
+
+        The caller invokes this only after the enclosing runtime step has
+        returned, so resetting the stateful Session is no longer re-entrant.
+        Unlike ``reset()``, the absolute capture timeline and output history
+        remain continuous for diagnostics and consumer de-duplication.
+        """
+
+        if next_capture_sample < 0:
+            raise ValueError("next_capture_sample不能为负数")
+        if self._closed:
+            raise RuntimeError("流式 speech_direction pipeline 已关闭")
+        self._reset_temporal_context()
+        self._samples_processed = int(next_capture_sample)
+        self._model_hop_count = 0
+
+    def consume_backend_reset_request(self) -> bool:
+        """Return and clear a deferred recurrent-state reset request.
+
+        Stateful backend resets must happen between runtime ``step`` calls;
+        invoking a Session reset from inside ``process_block`` would mutate
+        the same exclusive state bank while the enclosing step is active.
+        """
+
+        requested = self._backend_reset_requested
+        self._backend_reset_requested = False
+        return requested
+
     def reset(self) -> None:
         with self._lock:
             if self._closed:
@@ -352,6 +450,7 @@ class StreamingSpeechDirectionPipeline:
             self._segment_seq = 0
             self._history = []
             self._block_latency_ms.clear()
+            self._backend_reset_requested = False
 
     def close(self, *, close_backends: bool = True) -> None:
         """best-effort terminal 关闭：尽力释放 enhancer 与 Silero，一个失败仍继续关闭另一个，末尾汇总异常。

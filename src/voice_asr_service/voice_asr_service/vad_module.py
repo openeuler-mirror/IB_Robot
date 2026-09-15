@@ -22,6 +22,9 @@ _VOICE_ASR_SAMPLE_RATE = 16000
 _VOICE_ASR_FRAME_SIZE = 512
 
 _MIN_ENERGY_GATE = 1e-4
+# STARTING 状态允许的连续非语音帧数（~3×32ms）：置信度在自适应阈值附近
+# 抖动时提供迟滞，避免单帧丢失重置语音起点检测。
+_STARTING_MAX_MISS_FRAMES = 3
 
 
 class VADConfigurationError(ValueError):
@@ -89,6 +92,7 @@ class VADModule:
         self._speech_start_sample: int = 0
         self._speech_frames: int = 0
         self._silence_frames: int = 0
+        self._starting_miss_frames: int = 0
         self._total_samples: int = 0
 
         self._pre_roll_buffer: list[np.ndarray] = []
@@ -205,17 +209,24 @@ class VADModule:
                 self._speech_start_sample = self._total_samples
                 self._speech_frames = 1
                 self._silence_frames = 0
+                self._starting_miss_frames = 0
 
         elif self.state == VADState.STARTING:
             if is_speech:
                 self._speech_frames += 1
+                self._starting_miss_frames = 0
                 speech_duration = self._speech_frames * self.config.frame_size / self.config.sample_rate
 
                 if speech_duration >= self.config.min_speech_duration:
                     self.state = VADState.SPEAKING
             else:
-                self.state = VADState.SILENCE
-                self._speech_frames = 0
+                # 噪声环境下置信度会在阈值附近抖动；单帧丢失不应重置整个
+                # 语音起点检测，允许短暂回落（~96ms）后再确认。
+                self._starting_miss_frames += 1
+                if self._starting_miss_frames >= _STARTING_MAX_MISS_FRAMES:
+                    self.state = VADState.SILENCE
+                    self._speech_frames = 0
+                    self._starting_miss_frames = 0
 
         elif self.state == VADState.SPEAKING:
             if is_speech:
@@ -332,6 +343,7 @@ class VADModule:
         self._speech_start_sample = 0
         self._speech_frames = 0
         self._silence_frames = 0
+        self._starting_miss_frames = 0
         self._total_samples = 0
         self._post_roll_frames = 0
         self._pre_roll_buffer = []

@@ -26,6 +26,9 @@ class AudioConfig:
     chunk_size: int = 512
     buffer_seconds: float = 5.0
     input_channel: int = 0
+    # VAD 独立输入通道（如 ReSpeaker 的 ch0 板载处理通道）。
+    # None 表示与 input_channel 相同，保持单通道行为。
+    vad_input_channel: int | None = None
 
 
 class RingBuffer:
@@ -56,19 +59,23 @@ class RingBuffer:
                 self.write_pos = end_pos
                 self.size = min(self.size + n, self.max_samples)
 
+    def _read_all_locked(self) -> np.ndarray:
+        # 调用方必须已持有 self.lock。
+        if self.size == 0:
+            return np.array([], dtype=np.float32)
+        if self.size < self.max_samples:
+            return self.buffer[: self.size].copy()
+        # Buffer is full; chronological data starts at write_pos
+        return np.concatenate([self.buffer[self.write_pos :], self.buffer[: self.write_pos]])
+
     def read_all(self) -> np.ndarray:
         with self.lock:
-            if self.size == 0:
-                return np.array([], dtype=np.float32)
-            if self.size < self.max_samples:
-                return self.buffer[: self.size].copy()
-            # Buffer is full; chronological data starts at write_pos
-            return np.concatenate([self.buffer[self.write_pos :], self.buffer[: self.write_pos]])
+            return self._read_all_locked()
 
     def read_last(self, n_samples: int) -> np.ndarray:
         with self.lock:
             if n_samples >= self.size:
-                return self.read_all()
+                return self._read_all_locked()
             start_pos = (self.write_pos - n_samples) % self.max_samples
             if start_pos < self.write_pos:
                 return self.buffer[start_pos : self.write_pos].copy()
@@ -96,6 +103,12 @@ class AudioCaptureModule:
 
         self._on_error_callback: Callable[[str], None] | None = None
         self._pending_shared_audio = np.empty(0, dtype=np.float32)
+        self._vad_channel = (
+            self.config.input_channel if self.config.vad_input_channel is None else int(self.config.vad_input_channel)
+        )
+        # 双通道模式：chunk 形状为 (n, 2)，[:, 0]=VAD 通道，[:, 1]=ASR 通道。
+        self._dual_channel = self._vad_channel != self.config.input_channel
+        self._pending_vad_audio = np.empty(0, dtype=np.float32)
 
     def set_error_callback(self, callback: Callable[[str], None]):
         self._on_error_callback = callback
@@ -149,31 +162,68 @@ class AudioCaptureModule:
         """Feed one interleaved audio_common PCM frame into the ASR queue."""
         if self._pause_event.is_set():
             return False
-        if isinstance(data, bytes | bytearray):
-            values = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-            if channels > 1:
-                frames = values[: values.size - values.size % channels].reshape(-1, channels)
-                channel = min(max(int(self.config.input_channel), 0), channels - 1)
-                values = frames[:, channel]
-        else:
-            values = np.asarray(data, dtype=np.float32)
-            if values.ndim == 2:
-                if values.shape[1] == channels:
-                    values = values[:, min(max(int(self.config.input_channel), 0), channels - 1)]
-                else:
-                    values = values[:, 0]
-            values = values.reshape(-1)
-        if values.size == 0:
+        asr_values, vad_values = self._extract_channels(data, channels)
+        if asr_values.size == 0:
             return False
+        if self._dual_channel:
+            return self._feed_dual_channel(vad_values, asr_values)
         if self._pending_shared_audio.size:
-            values = np.concatenate((self._pending_shared_audio, values))
+            asr_values = np.concatenate((self._pending_shared_audio, asr_values))
         frame_size = max(1, int(self.config.chunk_size))
-        complete_size = values.size - values.size % frame_size
-        self._pending_shared_audio = values[complete_size:]
+        complete_size = asr_values.size - asr_values.size % frame_size
+        self._pending_shared_audio = asr_values[complete_size:]
         accepted = False
         for start in range(0, complete_size, frame_size):
-            chunk = values[start : start + frame_size]
+            chunk = asr_values[start : start + frame_size]
             self._ring_buffer.write(chunk)
+            try:
+                self._audio_queue.put_nowait(chunk)
+                accepted = True
+            except queue.Full:
+                self._handle_error("Shared audio queue is full; dropping ASR frame")
+                break
+        return accepted
+
+    def _extract_channels(self, data: bytes | np.ndarray, channels: int) -> tuple[np.ndarray, np.ndarray]:
+        """Extract the ASR channel and (dual mode) the VAD channel as float32."""
+        if isinstance(data, bytes | bytearray):
+            values = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            if channels <= 1:
+                return values, values
+            frames = values[: values.size - values.size % channels].reshape(-1, channels)
+        else:
+            values = np.asarray(data, dtype=np.float32)
+            if values.ndim != 2 or values.shape[1] != channels:
+                flat = values.reshape(-1)
+                return flat, flat
+            frames = values
+        asr_channel = min(max(int(self.config.input_channel), 0), channels - 1)
+        asr_values = frames[:, asr_channel]
+        if not self._dual_channel:
+            return asr_values, asr_values
+        vad_channel = min(max(int(self._vad_channel), 0), channels - 1)
+        return asr_values, frames[:, vad_channel]
+
+    def _feed_dual_channel(self, vad_values: np.ndarray, asr_values: np.ndarray) -> bool:
+        """Assemble paired (chunk_size, 2) chunks: [:, 0]=VAD, [:, 1]=ASR."""
+        if self._pending_shared_audio.size:
+            asr_values = np.concatenate((self._pending_shared_audio, asr_values))
+        if self._pending_vad_audio.size:
+            vad_values = np.concatenate((self._pending_vad_audio, vad_values))
+        # 两个通道来自同一消息流，样本数始终一致；防御性对齐取较短者。
+        usable = min(vad_values.size, asr_values.size)
+        vad_values, asr_values = vad_values[:usable], asr_values[:usable]
+        frame_size = max(1, int(self.config.chunk_size))
+        complete_size = usable - usable % frame_size
+        self._pending_shared_audio = asr_values[complete_size:]
+        self._pending_vad_audio = vad_values[complete_size:]
+        accepted = False
+        for start in range(0, complete_size, frame_size):
+            chunk = np.stack(
+                (vad_values[start : start + frame_size], asr_values[start : start + frame_size]),
+                axis=1,
+            )
+            self._ring_buffer.write(chunk[:, 1])
             try:
                 self._audio_queue.put_nowait(chunk)
                 accepted = True
@@ -185,6 +235,7 @@ class AudioCaptureModule:
     def clear_buffer(self):
         self._ring_buffer.clear()
         self._pending_shared_audio = np.empty(0, dtype=np.float32)
+        self._pending_vad_audio = np.empty(0, dtype=np.float32)
         while not self._audio_queue.empty():
             try:
                 self._audio_queue.get_nowait()

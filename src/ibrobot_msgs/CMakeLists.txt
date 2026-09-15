@@ -120,6 +120,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/StartTracking.srv"
   "srv/StopTracking.srv"
   "srv/GetTrackState.srv"
+  "srv/SetSoundFollowing.srv"
   "srv/ResetBenchmark.srv"
   "srv/StepBenchmark.srv"
   "srv/PreparePolicyEpisode.srv"

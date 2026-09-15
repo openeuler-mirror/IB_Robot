@@ -20,7 +20,7 @@ from embodied_common.dispatch_binding import new_binding
 from embodied_common.skill_request import skill_goal_uuid
 from ibrobot_msgs.action import SkillCommand
 from ibrobot_msgs.msg import SpeechDirection
-from ibrobot_msgs.srv import GetSkillGatewayStatus
+from ibrobot_msgs.srv import GetSkillGatewayStatus, SetSoundFollowing
 
 from .sound_orientation_policy import (
     DecisionKind,
@@ -39,11 +39,14 @@ _UNKNOWN_TERMINAL_CODES = {
 
 
 class SoundOrientationNode(Node):
-    """Trigger one guarded ``nav_turn`` from an exact ASR phrase."""
+    """Route exact-phrase or session-gated sound orientation through the Gateway."""
 
     def __init__(self, parameter_overrides=None) -> None:
         super().__init__("sound_orientation_node", parameter_overrides=parameter_overrides)
         self.declare_parameter("trigger_phrases", ["转向我"])
+        self.declare_parameter("mode", "keyword")
+        self.declare_parameter("periodic_interval_sec", 10.0)
+        self.declare_parameter("default_active", False)
         self.declare_parameter("direction_topic", "/voice/speech_direction")
         self.declare_parameter("command_topic", "/voice_command")
         self.declare_parameter("gateway_status_service", "/embodied/get_skill_gateway_status")
@@ -87,9 +90,19 @@ class SoundOrientationNode(Node):
                 direction_wait_sec=float(self.get_parameter("direction_wait_sec").value),
                 cooldown_sec=float(self.get_parameter("cooldown_sec").value),
                 max_turn_deg=float(self.get_parameter("max_turn_deg").value),
+                mode=str(self.get_parameter("mode").value),
+                periodic_interval_sec=float(self.get_parameter("periodic_interval_sec").value),
+                default_active=bool(self.get_parameter("default_active").value),
             )
         )
         self._debug = bool(self.get_parameter("debug_tracing").value)
+        if self._debug:
+            self.get_logger().info(
+                "sound orientation policy: "
+                f"max_age={self._policy.config.max_direction_age_sec}s "
+                f"wait={self._policy.config.direction_wait_sec}s "
+                f"cooldown={self._policy.config.cooldown_sec}s"
+            )
         self._lock = threading.RLock()
         self._status_future = None
         self._status_request_generation = 0
@@ -135,9 +148,16 @@ class SoundOrientationNode(Node):
         )
         self._timer = self.create_timer(0.05, self._timer_callback, callback_group=callback_group)
         self._reset_service = self.create_service(Trigger, "~/reset_fault", self._reset_fault_callback)
+        self._following_service = self.create_service(
+            SetSoundFollowing, "~/set_following", self._set_following_callback
+        )
+
+        if self._policy.session_state.value == "active":
+            self.get_logger().info("sound following session ACTIVE (default_active)")
 
         self.get_logger().info(
-            f"sound orientation ready: triggers={list(self._policy.config.trigger_phrases)}, skill={self._skill_name}"
+            f"sound orientation ready: triggers={list(self._policy.config.trigger_phrases)}, skill={self._skill_name}, "
+            f"mode={self._policy.config.mode}, session={self._policy.session_state.value}"
         )
 
     def _now_sec(self) -> float:
@@ -150,6 +170,8 @@ class SoundOrientationNode(Node):
             stamp_sec=stamp_sec,
             azimuth_rad=float(msg.azimuth_rad),
             frame_id=str(msg.header.frame_id),
+            segment_id=int(msg.segment_id),
+            direction_type=str(msg.direction_type),
         )
         with self._lock:
             if self._policy.state.value == "fault_unknown":
@@ -177,10 +199,16 @@ class SoundOrientationNode(Node):
     def _timer_callback(self) -> None:
         with self._lock:
             now = self._now_sec()
-            tick_decision = self._policy.tick(now_sec=now)
+            tick_decision = (
+                self._policy.periodic_tick(now_sec=now)
+                if self._policy.config.mode == "periodic"
+                else self._policy.tick(now_sec=now)
+            )
             self._consume_decision(tick_decision)
             if tick_decision.reason == "DIRECTION_WAIT_TIMEOUT":
                 self._status_needed = False
+            if tick_decision.kind is DecisionKind.WAITING and tick_decision.reason == "WAITING_FOR_GATEWAY":
+                self._status_needed = True
             if (
                 (self._status_needed or self._policy.state.value == "fault_unknown")
                 and self._status_future is None
@@ -222,11 +250,15 @@ class SoundOrientationNode(Node):
             gateway = self._gateway_snapshot(status)
             self._last_gateway_snapshot = gateway
             self._last_status_monotonic = time.monotonic()
-            decision = self._policy.try_dispatch(now_sec=self._now_sec(), gateway=gateway)
+            decision = (
+                self._policy.periodic_tick(now_sec=self._now_sec(), gateway=gateway)
+                if self._policy.config.mode == "periodic"
+                else self._policy.try_dispatch(now_sec=self._now_sec(), gateway=gateway)
+            )
             self._consume_decision(decision)
-            self._status_needed = decision.kind is DecisionKind.WAITING
-            if decision.kind is DecisionKind.WAITING and decision.reason == "WAITING_FOR_DIRECTION":
-                self._status_needed = False
+            # keyword mode reports WAITING_FOR_DIRECTION while a fresh direction
+            # is still missing; that wait does not need further status polling.
+            self._status_needed = decision.kind is DecisionKind.WAITING and decision.reason != "WAITING_FOR_DIRECTION"
             if decision.kind is DecisionKind.DISPATCH:
                 self._send_turn_goal(decision, status)
 
@@ -426,6 +458,22 @@ class SoundOrientationNode(Node):
             self._policy.reset_fault()
             response.success = True
             response.message = "sound orientation fault reset"
+            return response
+
+    def _set_following_callback(self, request, response):
+        response.schema_version = 1
+        with self._lock:
+            decision = self._policy.activate_following() if request.enable else self._policy.deactivate_following()
+            response.success = decision.kind is DecisionKind.STATE_CHANGED or decision.reason in {
+                "ALREADY_ACTIVE",
+                "ALREADY_INACTIVE",
+            }
+            response.current_state = self._policy.session_state.value
+            response.message = decision.reason
+            level = self.get_logger().info if response.success else self.get_logger().warning
+            level(
+                f"sound following set enable={request.enable}: state={response.current_state} reason={decision.reason}"
+            )
             return response
 
     def _finish_known_action(self, reason: str) -> None:

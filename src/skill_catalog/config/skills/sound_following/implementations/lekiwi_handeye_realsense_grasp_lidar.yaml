@@ -1,0 +1,7 @@
+schema_version: 2
+kind: delegated_executor
+robot: lekiwi_handeye_realsense_grasp_lidar
+executor: sound_following
+required_args:
+- motion_direction
+timeout_sec: 10.0

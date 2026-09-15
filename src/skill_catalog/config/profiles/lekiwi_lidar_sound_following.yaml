@@ -1,0 +1,16 @@
+schema_version: 1
+name: lekiwi_lidar_sound_following
+robot_name: lekiwi_lidar
+enabled_skills:
+- name: nav_abs_coordinate
+  implementation: lekiwi_navigation_v2
+  planner_visible: true
+- name: nav_straight
+  implementation: lekiwi_navigation_v2
+  planner_visible: true
+- name: nav_turn
+  implementation: lekiwi_navigation_v2
+  planner_visible: true
+- name: sound_following
+  implementation: lekiwi_navigation_v2
+  planner_visible: true

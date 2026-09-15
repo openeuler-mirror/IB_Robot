@@ -97,7 +97,7 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert hybrid["nav_stage"] == "hybrid"
     assert hybrid["default_control_mode"] == "base_navigation"
     assert hybrid["skill_required_control_mode"] == "moveit_planning"
-    assert hybrid["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp_lidar"
+    assert hybrid["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp_lidar_sound_following"
     assert hybrid["navigation"]["enabled"] is True
     assert hybrid["navigation"]["command_server"]["enabled"] is True
     assert hybrid["mid360_mount_file"].endswith("lekiwi_mid360_mount.yaml")

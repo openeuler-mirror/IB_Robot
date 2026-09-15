@@ -30,6 +30,12 @@ schema 版本一致（由 `robot_context.context_schema_version` 决定，详见
 
 ## 1. 消息定义（msg/）
 
+### `SpeechDirection.msg`
+
+声源方向事件使用 REP-103 的 `azimuth_rad`，并以 `segment_id` 关联同一语音段的 `voice_begin`、
+`mid_long_seg` 和 `seg_end` 输出；`seq_id` 仍是逐事件递增的去重序号。新增字段会改变 ROS type hash，
+升级时必须原子重建并部署 `voice_asr_service`、`embodied_agent` 和所有订阅者，不得混跑旧二进制。
+
 ### `MHandProFrame.msg` / `HumanHandState.msg`
 
 `MHandProFrame` 是可选的 mHandPro 厂商原始数据边界，保存左右侧、帧序号、设备电量、
@@ -656,6 +662,13 @@ Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
 ---
 
 ## 3. 服务定义（srv/）
+
+### `SetSoundFollowing.srv`
+
+`sound_orientation_node` 的会话开关。`enable=true` 清除激活前缓存并进入 `active`；`enable=false` 停止新
+派发，若已有 `nav_turn` 则先进入 `shutting_down`，终态回调后返回 `inactive`；若终态未知，动作层仍保持
+`FAULT_UNKNOWN`，不能重新激活。用户入口必须经过
+catalog 中的 `sound_following` Skill，不能把该内部 service 作为运动授权旁路。
 
 ### `GetSemanticObjects.srv`
 

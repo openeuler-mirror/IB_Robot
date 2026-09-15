@@ -5,8 +5,13 @@ speech_direction_node:
     audio_channels: 6
     sample_rate: 16000
     channel_indices: [1, 2, 3, 4]
-    # FullSubNet/VAD remain continuous; SRP-PHAT updates every two model hops.
+    # FullSubNet/VAD remain continuous; SRP-PHAT updates every two model hops (64 ms).
     srp_update_interval_hops: 2
+    early_direction_min_scores: 2
+    raw_activity_gate_enabled: true
+    raw_activity_start_rms: 0.026
+    raw_activity_stop_rms: 0.020
+    raw_activity_tail_sec: 0.5
 
     # 阵列安装偏角和四麦二维坐标；ROS 2 参数使用一维浮点数组。
     mount_yaw_deg: 0.0

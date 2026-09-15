@@ -172,6 +172,9 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
     node_params["audio_input_channel"] = int(
         voice_asr_config.get("audio_input_channel", voice_asr_defaults.get("audio_input_channel", 1))
     )
+    # VAD 独立输入通道（如 ReSpeaker ch0 板载处理通道）；未配置时与 ASR 通道一致。
+    vad_input_channel = voice_asr_config.get("vad_input_channel")
+    node_params["vad_input_channel"] = -1 if vad_input_channel is None else int(vad_input_channel)
 
     node_name = voice_asr_config.get("node_name", "voice_asr_node")
     logger.info(f"Voice ASR enabled, launching node '{node_name}'")

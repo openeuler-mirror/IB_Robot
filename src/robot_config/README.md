@@ -12,9 +12,17 @@ ros2_control 和外设的统一机器人配置系统。
 
 目标是建立机器人硬件配置的单一数据源，消除不同配置系统之间的重复。
 
-固定触发词声源转向由 `robot.embodied.idle_behaviors.sound_orientation` 管理。配置默认关闭，仅支持移动底盘的 `nav_turn`，并要求 Voice ASR、speech direction、`base_navigation` 与导航 command server 同时可用。该配置只决定是否启动 `embodied_agent/sound_orientation_node`；运动授权仍只能由 `authorize_motion` launch 参数提供。
+声源转向由 `robot.embodied.idle_behaviors.sound_orientation` 管理，schema 默认关闭，仅支持移动底盘的
+`nav_turn`。`mode: keyword` 使用配置中的完整 ASR 短语触发一次转向；`mode: periodic` 忽略 ASR 文本，
+由 `sound_following` Skill 在 `inactive` / `active` 会话之间切换，并按 `periodic_interval_sec` 消费新的
+`SpeechDirection.segment_id`。`enabled` 只决定是否启动节点，`default_active` 才决定 periodic 会话初始状态；
+运动授权仍只能由 `authorize_motion` launch 参数提供。`lekiwi_nav_grasp` 的 hybrid stage 默认启用
+periodic（会话仍为 inactive，需显式激活）；其他 stage 与其余机器人 profile 保持关闭，可经
+`lekiwi_nav_grasp_sound_real` overlay 显式开启。periodic 模式只消费 `SpeechDirection`，校验上不要求
+`voice_asr.enabled`；keyword 模式仍要求 ASR 与 speech direction 同时可用。
 
-当前 `VoiceASRNode` 和 `speech_direction_node` 各自拥有音频采集，不共享设备流。生产配置不得在未验证同一麦克风并发读取前默认开启此行为。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
+`VoiceASRNode` 和 `speech_direction_node` 都订阅 `audio_io` 发布的共享音频话题，不直接竞争打开 ReSpeaker
+设备。完整状态机、Gateway binding、watchdog 和 reset 契约见 `docs/idle_sound_orientation_design_zh.md`。
 
 通用机器人 profile 不固化具体设备实例的相机序列号。多设备部署应通过部署侧 instance
 override 注入序列号，避免把某一台实物设备绑定到所有同型号 profile。

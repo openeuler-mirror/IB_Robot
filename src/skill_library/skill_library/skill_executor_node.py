@@ -64,6 +64,7 @@ from ibrobot_msgs.srv import (
     GetSkillSnapshot,
     MoveToConfiguration,
     ReloadSkillCatalog,
+    SetSoundFollowing,
     ValidatePrimitive,
     ValidateSkill,
 )
@@ -378,6 +379,8 @@ class SkillExecutorNode(Node):
         self.declare_parameter("place_action_name", "/manipulation/execute_place")
         self.declare_parameter("imitate_human_motion_action_name", "/hri/imitate_human_motion")
         self.declare_parameter("imitate_human_motion_enabled", False, descriptor=startup_descriptor)
+        self.declare_parameter("sound_following_service", "/sound_orientation_node/set_following")
+        self.declare_parameter("sound_following_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -458,6 +461,8 @@ class SkillExecutorNode(Node):
             self.get_parameter("imitate_human_motion_action_name").get_parameter_value().string_value
         )
         self._imitate_human_motion_enabled = self.get_parameter("imitate_human_motion_enabled").value
+        self._sound_following_enabled = self.get_parameter("sound_following_enabled").value
+        self._sound_following_service = self.get_parameter("sound_following_service").get_parameter_value().string_value
         self._grasp_execution = load_json_mapping(self.get_parameter("grasp_execution_json").value)
         self._placement_execution = load_json_mapping(self.get_parameter("placement_execution_json").value)
         self._semantic_map_target_service = self.get_parameter("semantic_map_target_service").value
@@ -674,6 +679,9 @@ class SkillExecutorNode(Node):
             self._imitate_human_motion_action_name,
             callback_group=callback_group,
         )
+        self._sound_following_client = self.create_client(
+            SetSoundFollowing, self._sound_following_service, callback_group=callback_group
+        )
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
             self._move_configuration_service,
@@ -818,6 +826,13 @@ class SkillExecutorNode(Node):
                 "imitate_human_motion configuration mismatch: "
                 f"runtime enabled={runtime_enabled}, catalog enabled={catalog_enabled}"
             )
+        sound_runtime_enabled = bool(getattr(self, "_sound_following_enabled", False))
+        sound_catalog_enabled = "sound_following" in snapshot.enabled_skill_names
+        if sound_runtime_enabled != sound_catalog_enabled:
+            raise ValueError(
+                "sound_following configuration mismatch: "
+                f"runtime enabled={sound_runtime_enabled}, catalog enabled={sound_catalog_enabled}"
+            )
 
     def _delegated_executor_descriptors(self):
         descriptors = {}
@@ -840,11 +855,25 @@ class SkillExecutorNode(Node):
             configured_executors.add("placement_pipeline")
         if getattr(self, "_imitate_human_motion_enabled", False):
             configured_executors.add("imitate_human_motion")
+        if getattr(self, "_sound_following_enabled", False):
+            configured_executors.add("sound_following")
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
             configured_executors.add("semantic_map_query")
         for name in sorted(configured_executors):
+            if name == "sound_following":
+                endpoint_name = self._sound_following_service
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_service",
+                        configuration={},
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
             if name == "semantic_map_query":
                 endpoint_name = self._semantic_map_target_service
                 if not endpoint_name:
@@ -880,6 +909,72 @@ class SkillExecutorNode(Node):
             )
             descriptors[descriptor.name] = descriptor
         return descriptors
+
+    def _execute_sound_following_skill(self, goal_handle, *, effective_timeout_sec: float | None = None):
+        result = SkillCommand.Result()
+        request = goal_handle.request
+        mode = str(request.motion_direction or "").strip().lower()
+        mode = {"forward": "enable", "backward": "disable"}.get(mode, mode)
+        if mode not in {"enable", "disable"}:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SOUND_FOLLOWING_INVALID_MODE",
+                f"motion_direction must be enable or disable, got: {request.motion_direction!r}",
+            )
+        timeout_sec = float(effective_timeout_sec or request.timeout_sec or self._rpc_timeout)
+        if not self._sound_following_client.wait_for_service(timeout_sec=min(timeout_sec, self._rpc_timeout)):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SOUND_FOLLOWING_SERVICE_UNAVAILABLE",
+                f"sound following service unavailable: {self._sound_following_service}",
+            )
+
+        service_request = SetSoundFollowing.Request()
+        service_request.schema_version = 1
+        service_request.enable = mode == "enable"
+        future = self._sound_following_client.call_async(service_request)
+        if not self._wait_for_future(future, timeout_sec, cancel_requested=lambda: goal_handle.is_cancel_requested):
+            if goal_handle.is_cancel_requested:
+                return self._cancel_skill(result, goal_handle, [], request.skill_name)
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SOUND_FOLLOWING_TIMEOUT",
+                "sound following toggle timed out",
+            )
+        try:
+            response = future.result()
+        except Exception as exc:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SOUND_FOLLOWING_FAILED",
+                f"sound following toggle failed: {exc}",
+            )
+        if response is None or not response.success:
+            message = str(getattr(response, "message", "")).strip()
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SOUND_FOLLOWING_FAILED",
+                message or "sound following toggle failed",
+            )
+
+        result.success = True
+        result.error_code = ""
+        result.message = f"sound_following {mode}: state={response.current_state}"
+        result.executed_primitives = [f"sound_following:{mode}"]
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
 
     def _execute_semantic_map_query(self, goal_handle, *, effective_timeout_sec: float | None = None):
         result = SkillCommand.Result()
@@ -4789,6 +4884,11 @@ class SkillExecutorNode(Node):
             return self._execute_imitate_human_motion_skill(
                 goal_handle,
                 template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == "sound_following":
+            return self._execute_sound_following_skill(
+                goal_handle,
                 effective_timeout_sec=effective_timeout_sec,
             )
         if str(template.get("executor", "")).strip() == "semantic_map_query":

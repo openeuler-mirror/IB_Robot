@@ -184,6 +184,12 @@ def validate_skill_request(
             return False, f"container_name is not accepted by {skill_name}"
         if place_name:
             return False, f"place_name is not accepted by {skill_name}"
+        if executor_name == "sound_following":
+            if motion_direction not in {"forward", "backward"}:
+                return False, "sound following direction must be forward or backward"
+            if motion_distance:
+                return False, "motion_distance is not accepted by sound_following"
+            return True, ""
         if motion_direction or motion_distance:
             return False, f"motion parameters are not accepted by {skill_name}"
         return True, ""

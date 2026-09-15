@@ -474,6 +474,16 @@ class SpeechDirectionRuntime:
                         ),
                         ExecutionContext(f"speech-direction-step-{item.start_sample}"),
                     )
+                    consume_reset = getattr(self.pipeline, "consume_backend_reset_request", None)
+                    if callable(consume_reset) and consume_reset():
+                        # The activity gate requests a recurrent reset only
+                        # after the completed step.  Use the gap-aware reset
+                        # so the next block keeps the absolute capture time;
+                        # the generic stream reset would rewind it to zero.
+                        reset_for_gap = getattr(self.pipeline, "reset_for_activity", None)
+                        if not callable(reset_for_gap):
+                            raise RuntimeError("pipeline does not support activity-gate state reset")
+                        reset_for_gap(next_capture_sample=item.end_sample)
                     expected_sample = item.end_sample
                 except Exception as e:
                     reason = f"pipeline 处理异常: {e}"
@@ -610,6 +620,7 @@ class SpeechDirectionRuntime:
         # 方向类型(mid_long_seg/seg_end),供 node 按类型构造 stamp:
         # 长语音中间方向用发布时刻(age≈0),段末方向用来源真实 age
         direction_type = meta.get("type")
+        segment_id = int(meta.get("seg_seq", 0))
         now = time.time()
         age_ms = max(0.0, (now - ts) * 1000.0)
 
@@ -625,6 +636,7 @@ class SpeechDirectionRuntime:
             "age_ms": age_ms,
             "seq_id": int(seq_id),
             "type": direction_type,
+            "segment_id": segment_id,
         }
 
 

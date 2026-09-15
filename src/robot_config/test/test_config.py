@@ -1141,12 +1141,14 @@ def test_load_voice_asr_config_preserves_bundle_identity():
             "active_mode": "continuous",
             "bundle_path": "models/voice_asr/demo",
             "deployment": "torch_cpu",
+            "vad_input_channel": 0,
         }
     )
 
     assert config.bundle_path == "models/voice_asr/demo"
     assert config.deployment == "torch_cpu"
     assert config.audio_input_channel == 1
+    assert config.vad_input_channel == 0
     assert config.exit_on_init_failure is True
 
 

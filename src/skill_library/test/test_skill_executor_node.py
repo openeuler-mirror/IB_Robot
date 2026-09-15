@@ -285,15 +285,16 @@ def test_runtime_snapshot_uses_configured_context_schema(monkeypatch, context_sc
     node._skill_catalog_source_root = "."
     node._skill_catalog_profile = "unused"
     node._delegated_executor_descriptors = lambda: {}
+    snapshot = SimpleNamespace(enabled_skill_names=())
 
     def compile_catalog(_compiler, _source, *, profile_name, context):
         captured["profile_name"] = profile_name
         captured["context"] = context
-        return "snapshot"
+        return snapshot
 
     monkeypatch.setattr(skill_executor_node.SkillCatalogCompiler, "compile", compile_catalog)
 
-    assert node._compile_runtime_snapshot() == "snapshot"
+    assert node._compile_runtime_snapshot() is snapshot
     robot_context = captured["context"].robot
     assert robot_context.context_schema_version == context_schema_version
     assert ("navigation_action" in robot_context.execution_endpoints) is has_navigation
@@ -334,6 +335,54 @@ def test_semantic_map_executor_is_registered_before_templates_are_loaded():
     node._semantic_map_stand_off_distance_m = 0.3
 
     assert "semantic_map_query" in node._delegated_executor_descriptors()
+
+
+def test_sound_following_executor_is_registered_when_enabled():
+    node = object.__new__(SkillExecutorNode)
+    node._skill_templates = {}
+    node._grasp_execution = {}
+    node._placement_execution = {}
+    node._pick_action_name = "/manipulation/execute_pick"
+    node._place_action_name = "/manipulation/execute_place"
+    node._semantic_map_target_service = ""
+    node._sound_following_enabled = True
+    node._sound_following_service = "/sound_orientation_node/set_following"
+
+    descriptor = node._delegated_executor_descriptors()["sound_following"]
+
+    assert descriptor.endpoint_kind == "ros_service"
+    assert descriptor.endpoint_name == "/sound_orientation_node/set_following"
+
+
+def test_sound_following_executor_uses_direction_parameter():
+    node = object.__new__(SkillExecutorNode)
+    node._sound_following_service = "/sound_orientation_node/set_following"
+    node._rpc_timeout = 1.0
+    captured = []
+
+    class Client:
+        @staticmethod
+        def wait_for_service(**_kwargs):
+            return True
+
+        @staticmethod
+        def call_async(request):
+            captured.append(request)
+            return _Future(done=True, result=SimpleNamespace(success=True, current_state="active", message="ok"))
+
+    node._sound_following_client = Client()
+    node._set_result_catalog_identity = lambda _result: None
+    node._wait_for_future = lambda future, *_args, **_kwargs: future.done()
+    node._abort_skill = lambda result, _handle, _primitives, code, message: SimpleNamespace(
+        success=False, error_code=code, message=message
+    )
+    goal = SimpleNamespace(motion_direction="forward", timeout_sec=1.0, skill_name="sound_following")
+    handle = SimpleNamespace(request=goal, is_cancel_requested=False, succeed=lambda: None)
+
+    result = node._execute_sound_following_skill(handle)
+
+    assert result.success is True
+    assert captured[0].enable is True
 
 
 def test_semantic_map_query_calls_resolve_target_service_and_returns_pose_json():

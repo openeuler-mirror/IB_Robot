@@ -65,6 +65,7 @@ def test_voice_direction_uses_explicit_reliable_qos_and_message_type(monkeypatch
 
     def _fake_run(cmd, *a, **k):
         captured["cmd"] = cmd
+        captured["timeout"] = k["timeout"]
         return _ok_run("---\nazimuth_rad: 0.5236\nseq_id: 42\n")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
@@ -88,6 +89,7 @@ def test_voice_direction_uses_explicit_reliable_qos_and_message_type(monkeypatch
         "/voice/speech_direction",
         "ibrobot_msgs/msg/SpeechDirection",
     ]
+    assert captured["timeout"] == 60
 
 
 def test_voice_direction_does_not_load_robot_config(monkeypatch, tmp_path) -> None:
@@ -108,6 +110,7 @@ def test_arm_joint_position_resolves_so101_default_topic(monkeypatch, tmp_path) 
 
     def _fake_run(cmd, *a, **k):
         captured["cmd"] = cmd
+        captured["timeout"] = k["timeout"]
         return _ok_run("---\nname: ['1', '2']\nposition: [0.12, -0.31]\n")
 
     monkeypatch.setattr(subprocess, "run", _fake_run)
@@ -117,6 +120,7 @@ def test_arm_joint_position_resolves_so101_default_topic(monkeypatch, tmp_path) 
 
     assert code == 0
     assert captured["cmd"][-1] == "/joint_states"
+    assert captured["timeout"] == 5
 
 
 def test_arm_joint_position_resolves_lekiwi_arm_topic(monkeypatch, tmp_path) -> None:

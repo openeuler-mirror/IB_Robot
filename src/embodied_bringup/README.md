@@ -4,9 +4,14 @@
 `embodied.entry_mode` 入口。它消费 `robot_config` SSOT YAML，启动 Agent plan、安全校验、
 Skill Gateway 以及可选感知和抓取执行服务。
 
-可选的 `sound_orientation_node` 由 `embodied.idle_behaviors.sound_orientation.enabled` 控制。它订阅最终 ASR 文本和 `SpeechDirection`，只通过 `/embodied/execute_skill` 调用 `nav_turn`；默认关闭，不进入视觉游戏的 controller-independent closure。正常自动启动 controller 时，它与 Gateway 节点共享 readiness barrier。
+可选的 `sound_orientation_node` 由 `embodied.idle_behaviors.sound_orientation.enabled` 控制。keyword 模式订阅
+最终 ASR 文本和 `SpeechDirection`；periodic 模式忽略 ASR 文本，通过 catalog 中的 `sound_following` delegated
+executor 调用 `~/set_following` 管理会话。两种模式都只通过 `/embodied/execute_skill` 调用 `nav_turn`；schema
+默认关闭，正常自动启动 controller 时与 Gateway 节点共享 readiness barrier。
 
-启用前必须同时具备 `voice_asr.enabled`、`speech_direction.enabled`、`base_navigation`、导航 command server 和包含 `nav_turn` 的 catalog profile。当前 Voice ASR 与 speech direction 是两个独立采集进程，部署侧未验证同一 ReSpeaker 可并发读取时必须保持该行为关闭。
+启用前必须同时具备 `voice_asr.enabled`、`speech_direction.enabled`、`base_navigation`、导航 command server 和
+包含 `nav_turn` 的 catalog profile；periodic 模式还要求 profile 暴露 `sound_following`。Voice ASR 与 speech
+direction 订阅同一 `audio_io` capture topic，不直接打开麦克风设备。
 
 ## 职责边界
 

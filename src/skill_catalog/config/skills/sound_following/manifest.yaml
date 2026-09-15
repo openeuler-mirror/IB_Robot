@@ -1,0 +1,51 @@
+schema_version: 2
+name: sound_following
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Enable or disable the periodic sound-following orientation session.
+  category: human_robot_interaction
+  when_to_use:
+  - enable the robot to keep turning toward the latest sound source
+  - disable sound following so other voice commands control the robot
+  do_not_use:
+  - condition: turn once toward a sound source right now
+    instead_use: nav_turn
+  aliases_zh:
+  - 开启声源跟随
+  - 开始声源跟随
+  - 声源跟随
+  - 停止声源跟随
+  - 关闭声源跟随
+  aliases_en:
+  - enable sound following
+  - start sound following
+  - disable sound following
+  - stop sound following
+  motion_scope:
+  - base
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 2.0
+  requires_motion_params: false
+capability:
+  schema_version: 2
+  summary: Toggle the resident sound-following session on or off.
+  domain: human_robot_interaction
+  moves_robot: false
+  required_control_mode: base_navigation
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      motion_direction:
+        type: string
+        enum:
+        - forward
+        - backward
+    required:
+    - motion_direction
+  recovery_policy: ask_user
+implementations:
+  lekiwi_navigation_v2: implementations/lekiwi_navigation_v2.yaml
+  lekiwi_handeye_realsense_grasp_lidar: implementations/lekiwi_handeye_realsense_grasp_lidar.yaml

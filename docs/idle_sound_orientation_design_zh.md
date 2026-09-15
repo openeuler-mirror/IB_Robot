@@ -1,4 +1,4 @@
-# 固定触发词声源转向设计
+# 声源转向设计
 
 状态：已接入 ROS launch，默认关闭；启用前必须在目标机器人配置中显式打开。
 
@@ -6,20 +6,25 @@
 `audio_capture_node` 采集并发布 `AudioDataStamped`，两个节点只订阅该话题，不直接打开音频设备。
 目标机器人配置仍应显式设置 `sound_orientation.enabled`，生产启用前需完成本节点的终态和故障恢复验证。
 
-本文定义“机器人收到固定触发词后，依据最近的新鲜声源方向执行一次底盘转向”的实现契约，供后续代码实现和大模型协作使用。
+本文定义两种互斥运行模式：`keyword` 在机器人收到配置中的完整固定短语后执行一次转向；`periodic`
+由 `sound_following` Skill 管理常驻会话，并按固定周期消费新的语音段方向。两种模式共享同一 Gateway、
+`nav_turn`、故障收敛和运动授权契约。
 
 ## 1. 目标
 
 本功能满足以下行为：
 
-- 机器人只在收到明确的固定触发词时执行声源转向。
-- 普通说话或普通机器人 Skill 语句不会触发声源转向。
+- keyword 模式只在收到明确的完整固定触发词时执行声源转向。
+- keyword 模式下，普通说话或普通机器人 Skill 语句不会触发声源转向；periodic 活跃会话按语音段方向转向。
 - 转向请求必须通过现有 Skill Gateway 和 `nav_turn` Skill。
 - `nav_turn` 获得 root lease 后，转向期间状态为 busy，不能并行执行其他 root Skill。
 - Gateway 已忙时，当前转向请求直接丢弃，不进入等待队列，不自动重试。
 - `nav_turn` 终态未知时，停止自动派发，等待人工恢复。
 - Action 取消不等于底盘已稳定停止；取消终态进入 `FAULT_UNKNOWN`，必须通过 reset service 和新鲜 Gateway 状态人工恢复。
 - 一次触发最多执行一个转向动作，转向完成后进入 cooldown，避免重复微调。
+- periodic 会话默认 `inactive`；激活时清除旧方向，同一 `segment_id` 最多派发一次。
+- periodic 每个派发周期先查询新鲜 Gateway status；不得使用缓存快照构造 registry binding。
+- 停用 periodic 会话时不取消正在执行的转向，而是进入 `shutting_down` 等待终态；若终态未知，动作层仍锁定在 `FAULT_UNKNOWN`。
 
 默认固定触发词为：
 
@@ -34,13 +39,13 @@
 第一版不实现以下能力：
 
 - 不经过 LLM、Hermes 或 `agent_plan_node` 做自然语言规划。
-- 不把所有 `SpeechDirection` 事件自动转换为转向动作。
+- keyword 模式不把所有 `SpeechDirection` 事件自动转换为转向动作。
 - 不创建跨 Skill 的通用等待队列。
-- 不缓存转向期间产生的旧方向，转向完成后不执行旧方向。
+- keyword 模式不缓存转向期间的方向。periodic 模式可缓存新段，但不在转向或 cooldown 期间派发。
 - 不抢占正在执行的前台 Skill。
 - 不直接调用 `/navigation/execute`、`/cmd_vel`、MoveIt、controller 或 `/task_executor/*`。
 - 不实现唤醒词模型；“固定触发词”是 ASR 文本上的确定性路由规则。
-- 不解决当前 ASR 文本和方向消息缺少共同 `speech_segment_id` 的结构性问题。
+- 不为 keyword 模式声明 ASR 文本和方向消息之间的严格 segment 关联。
 
 ## 3. 当前架构定位
 
@@ -56,6 +61,7 @@ speech_direction_node
   -> sound_orientation_node
 
 sound_orientation_node
+  <- sound_following -> SetSoundFollowing (periodic session)
   -> /embodied/get_skill_gateway_status
   -> /embodied/execute_skill (SkillCommand: nav_turn)
   -> skill_executor_node
@@ -64,7 +70,7 @@ sound_orientation_node
   -> Nav2 / base
 ```
 
-该节点不经过：
+每次自动转向的派发不经过以下入口；periodic 会话的开启/关闭仍通过 Hermes 的正常 Skill 调用链：
 
 ```text
 Hermes / LLM
@@ -92,13 +98,14 @@ nav_turn catalog contract
 | 接口 | 文件 | 用途 |
 | --- | --- | --- |
 | `/voice/speech_direction` | `src/ibrobot_msgs/msg/SpeechDirection.msg` | 声源方向事件，`base_link` 下的 `azimuth_rad` |
+| `~/set_following` | `src/ibrobot_msgs/srv/SetSoundFollowing.srv` | periodic 会话进入/退出 |
 | `/embodied/get_skill_gateway_status` | `src/ibrobot_msgs/srv/GetSkillGatewayStatus.srv` | Gateway 状态和 registry identity |
 | `/embodied/execute_skill` | `src/ibrobot_msgs/action/SkillCommand.action` | 受保护的单 Skill 执行入口 |
 | `nav_turn` | `src/skill_catalog/config/skills/nav_turn/manifest.yaml` | 底盘原地转向 Skill |
 
 ## 4. 触发和方向关联
 
-当前 `SpeechDirection` 只有 `seq_id` 和方向产生时间，没有与 `/voice_command` 共享的语音段 ID。因此第一版采用受限的近似关联：
+keyword 模式使用受限的时间窗近似关联：
 
 1. 节点持续缓存最近一条有效 `SpeechDirection`。
 2. 节点收到固定触发词时，只接受 `max_direction_age_sec` 内的方向。
@@ -107,7 +114,10 @@ nav_turn catalog contract
 5. 不使用超过新鲜度窗口的历史方向。
 6. 同一 `(seq_id, header.stamp)` 只允许消费一次。
 
-第一版不声称这能严格证明方向和文本来自同一语音段。后续若需要严格语义，应在 ASR 文本和方向消息中增加共同的 `speech_segment_id` 或 `interaction_id`，并将关联改为 ID 精确匹配。
+该近似不声称能严格证明方向和文本来自同一语音段。periodic 模式不消费 ASR 文本，而是使用
+`SpeechDirection.segment_id` 关联同一语音段的 `voice_begin`、`mid_long_seg` 和 `seg_end`，按该顺序提高
+稳定性等级，并只保留每段当前最稳定的估计。超龄方向从缓存淘汰，方向缓存最多保留 256 段。
+已消费段 ID 独立保留最近 256 项，防止长语音的早期估计过期后，其段末结果再次触发动作；停用/重新激活时清空。
 
 方向转换契约：
 
@@ -194,7 +204,20 @@ FAULT_UNKNOWN
     --人工 reset--> IDLE_LISTENING
 ```
 
-`TURNING` 和 `COOLDOWN` 期间到达的方向消息必须丢弃，不能更新下一次请求的缓存。这样可以避免在转向完成后重新使用转向期间的旧方向。
+keyword 模式在 `TURNING` 和 `COOLDOWN` 期间丢弃方向消息。periodic 模式可缓存这些时刻的新语音段，
+但必须在 cooldown 结束、周期到期后重新检查方向年龄和 Gateway 准入，不能绕过时间窗口执行旧方向。
+
+periodic 模式在动作状态机外增加会话状态：
+
+```text
+INACTIVE --sound_following(enable)--> ACTIVE
+ACTIVE --disable while idle--> INACTIVE
+ACTIVE --disable while DISPATCHING/TURNING--> SHUTTING_DOWN
+SHUTTING_DOWN --known/unknown terminal--> INACTIVE
+```
+
+`ACTIVE` 只表示允许在下一个周期申请派发，不是运动授权。每个周期有新段时，节点先请求新鲜 Gateway
+status，随后在同一 callback 中决定并提交 `nav_turn`；定时器不得直接消费 DISPATCH 决策。
 
 ## 7. 推荐参数
 
@@ -203,6 +226,9 @@ FAULT_UNKNOWN
 | 参数 | 建议值 | 约束 |
 | --- | ---: | --- |
 | `enabled` | `false` | 默认关闭，需显式启用 |
+| `mode` | `keyword` | `keyword` 或 `periodic` |
+| `periodic_interval_sec` | `10.0` | periodic 检查周期，大于 0 |
+| `default_active` | `false` | periodic 会话安全默认值 |
 | `trigger_phrases` | `["转向我"]` | 至少一个非空完整短语 |
 | `direction_topic` | `/voice/speech_direction` | 使用现有消息契约 |
 | `command_topic` | `/voice_command` | 使用现有 ASR 文本 |
@@ -294,13 +320,16 @@ embodied:
   idle_behaviors:
     sound_orientation:
       enabled: true
+      mode: periodic
+      default_active: false
+      periodic_interval_sec: 10.0
       trigger_phrases: ["转向我"]
       direction_topic: /voice/speech_direction
       command_topic: /voice_command
       skill_name: nav_turn
       direction_frame: base_link
       deadband_deg: 15.0
-      max_direction_age_sec: 1.3
+      max_direction_age_sec: 12.0
       direction_wait_sec: 0.5
       cooldown_sec: 1.5
       max_turn_deg: 180.0
@@ -310,19 +339,20 @@ embodied:
 
 配置还必须同时满足：
 
-- `voice_asr.enabled: true`，因为固定触发词来自 `/voice_command`。
+- `voice_asr.enabled: true`；keyword 使用 `/voice_command`，periodic 部署仍保留统一 Hermes 语音入口。
 - `speech_direction.enabled: true`，因为转向角来自 `/voice/speech_direction`。
 - 当前 profile 中存在 `control_modes.base_navigation`。
 - 当前导航 stage 提供 `navigation.command_server.action_name`。
+- periodic 模式的 catalog profile 还必须暴露 `sound_following` delegated executor。
 - 运行时启动时设置 `authorize_motion:=true` 才会实际允许运动；节点不能自行开启授权。
-- 已验证 Voice ASR 和 speech direction 可以并发读取部署的麦克风设备；否则保持本行为关闭。
+- `audio_io.enabled: true`，Voice ASR 与 speech direction 消费同一个 capture topic。
 
 典型启动形式：
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && \
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=lekiwi_nav_grasp \
+  robot_config:=lekiwi_nav_grasp_sound_real \
   nav_stage:=hybrid \
   with_embodied:=true \
   authorize_motion:=true
@@ -330,7 +360,12 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 如果需要先验证发现、状态和拒绝路径，使用 `authorize_motion:=false`。此时节点可以启动和监听，但 Gateway 对 `nav_turn` 返回 `MOTION_NOT_AUTHORIZED`，不会产生物理运动。
 
-`with_embodied:=true` 只打开 embodied runtime 总开关，不会覆盖 `sound_orientation.enabled`。关闭该行为时只需将其设为 `false`，不需要删除节点代码或修改 launch 文件。
+`with_embodied:=true` 只打开 embodied runtime 总开关，不会覆盖 `sound_orientation.enabled`。
+会话暂时停用通过 `sound_following(backward)`；彻底停用节点时将 `enabled` 设为 `false`，并选择匹配的 catalog。
+
+`lekiwi_nav_grasp_sound_real` 的 navigation/hybrid stage 选择 `lekiwi_lidar_sound_following` catalog，
+并显式启用 periodic 节点、保持会话 inactive。共享 `lekiwi_lidar` 和通用抓取 profile 不暴露该会话开关。
+更换为 keyword 或停用节点时应同时选择不含 `sound_following` 的 profile，以保持 catalog/runtime 一致。
 
 ## 11. 实现拆分
 
@@ -355,8 +390,8 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 ## 12. 验收标准
 
 - 未启用配置时不启动 `sound_orientation_node`。
-- 普通文本不生成任何 `nav_turn` 请求。
-- 只有完整匹配固定触发词的文本才进入方向等待或派发。
+- keyword 模式下普通文本不生成任何 `nav_turn` 请求。
+- keyword 模式只有完整匹配固定触发词的文本才进入方向等待或派发；periodic 模式忽略所有 ASR 文本。
 - 触发词后没有新鲜方向时不派发。
 - 小于 deadband 的角度不派发。
 - 正角度转换为 `left`，负角度转换为 `right`。
@@ -369,6 +404,9 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 - `~/reset_fault` 只在 fresh Gateway status 且 `busy=false` 时恢复，恢复时清理旧请求状态。
 - direct `SkillCommand` 始终通过 `/embodied/execute_skill`，不直接调用导航或 controller 接口。
 - 含“转向 + 其他 Skill”意图的句子不会被固定转向节点拆成两个 root request。
+- periodic 默认 inactive，激活前缓存不会触发动作；每个 segment 最多派发一次且过期缓存会被回收。
+- periodic 每次派发使用本周期新读取的 Gateway status；连续两个 segment 均能独立派发，不会卡在 DISPATCHING。
+- periodic 停用在 idle 时立即进入 inactive，在动作中进入 shutting_down 并于终态后进入 inactive。
 
 ## 13. 给后续代码 Agent 的执行说明
 

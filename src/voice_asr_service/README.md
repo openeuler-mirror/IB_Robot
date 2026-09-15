@@ -151,7 +151,7 @@ source .shrc_local && speech_direction_report \
 | 显式对照 | `torch` | `SpeechGate`（Top-2 hop 级） | `SpeechDirectionPipeline` | hop=2048、enh_block=8192 |
 
 - 生产部署用 `ascend` 或 `stateful_torch_*`，走 `StreamingSpeechDirectionPipeline` + `TemporalSpeechGate`；`torch` 仅作显式对照保留，启动时按后端名严格选择，**不会从 stateful 静默回退到对照链路**，后端与路径错配会在 `_build_and_start` 抛 `ValueError`。
-- 两套 pipeline 都消费同一组 `VadState` / `DoaState`，但调用节奏不同：streaming 每 256 样本 tick 一次 `vad_state.update`（两个 tick 合并为一次 T=2 模型推理），legacy 每 2048 样本 hop 一次。两者都向 `DoaState.update` 写段级 DOA，`meta.type` 取值相同（`mid_long_seg` / `seg_end`），但 `mid_long_seg` 的触发条件不同——streaming 按 `max_accum_samples`（样本计数），legacy 按 `max_accum_dur_s`（墙钟时长）。`node._poll_and_publish` 按 `result["type"]` 区分段末与中间方向，上游消费者无需感知链路分叉。
+- 两套 pipeline 都消费同一组 `VadState` / `DoaState`，但调用节奏不同：streaming 每 256 样本 tick 一次 `vad_state.update`（两个 tick 合并为一次 T=2 模型推理），legacy 每 2048 样本 hop 一次。两者都向 `DoaState.update` 写段级 DOA；streaming 还会在累计足够稳定分数后发出 `voice_begin`，两条链路都可产生 `mid_long_seg` / `seg_end`。`node._poll_and_publish` 按 `result["type"]` 构造事件，上游通过 `segment_id` 关联同段结果。
 - `SpeechGate` 的 Top-2 选择对 hop_size 敏感（旧值 2048 vs 新值 512 会改变 Top-2 候选），故 legacy 链路固定用 2048 hop，不沿用 stateful 的 512；两套链路的时序参数各自独立，不共享。
 
 ### 发布契约、坐标与故障语义
@@ -160,13 +160,19 @@ source .shrc_local && speech_direction_report \
 - `header.frame_id` 为 `base_link`；`azimuth_rad` 遵循 REP-103：`0` 为前、`+π/2` 为左、`-π/2` 为右，左转为正。
 - `header.stamp` 按方向类型分流构造，承载方向的"真年龄"信息，而非固定取发布时刻：
   - 段末方向（`seg_end`）：`stamp = 发布时刻的 ROS 时钟 − age`，还原段结束时刻，使消费者按 `now − stamp` 判过期时得到真实年龄，executor 积压/DDS 延迟不会被盖掉；
+  - 早期方向（`voice_begin`）：streaming pipeline 至少累计 `early_direction_min_scores` 个稳定分数后发布，用于降低交互首响应延迟；
   - 中间方向（`mid_long_seg`）：`stamp = 发布时刻的 ROS 时钟`，`age≈0`，符合"立即响应正在说话"的低延迟设计，由 QoS `KEEP_LAST(1)` 与 `seq_id` 去重兜底，不额外设过期上限。
   - 方向的 `age` 在 `runtime` 内部用墙钟（`time.time()`）计算；`stamp` 在 `node` 用 ROS 时钟（`get_clock().now()`）构造。**当前部署 `use_sim_time=false`，ROS 时钟与墙钟同属系统时钟域，二者差值有效**，上述分流在实车上正确。`use_sim_time=true`（仿真/Bag 回放）下 ROS 时钟与墙钟不同步，本 PR 不解决该混合时钟域；如需在仿真或回放场景消费方向，应使用 `use_sim_time=false`，或后续单独统一为单一时钟域。
-- 长语音累计达到 `max_accum_dur_s` 时发布一次中间方向并清理本轮累积，避免持续讲话时等待整段结束才响应；语音段结束时再发布当前累积窗口的段末方向。两类输出都是有效方向事件。
-- 每次中间方向或段末方向都有独立递增的 `seq_id`，消费者按输出事件去重；`seq_id` 不表示“一段语音只对应一个序号”。
+- 长语音累计达到上限时发布中间方向并清理本轮累积（streaming 使用 `max_accum_samples`，legacy 使用 `max_accum_dur_s`）；语音段结束时发布当前窗口的段末方向。streaming 的早期、中间和段末三类输出都是有效方向事件。
+- `voice_begin` / `mid_long_seg` / `seg_end` 各自有独立递增的 `seq_id`；同一语音段共享 `segment_id`，消费者可按事件去重并按段选择更稳定的结果。
+- stateful 生产链路在原始 RMS 低于 start/stop 阈值并完成 quiet tail 后暂停后端推理，并在 step 边界重置 recurrent state；该 gate 不改变绝对 capture timeline。
 - 节点只在取得新的有效方向事件时发布；无人声、结果过期或降级时不发布方向。
 - 参数缺失、参数非法或配置的模型资产不存在时，节点启动失败。其中模型资产缺失会提示运行 `python3 scripts/verify_speech_direction_assets.py` 校验资产清单（脚本只校验不下载，资产需从 NAS 手动获取）。
 - 模型资产已存在但模型加载、音频设备打开或运行时推理失败时，节点保持运行、不发布方向，并通过 `/diagnostics` 持续报告降级状态。
+
+Voice ASR 的 `audio_input_channel` 和可选 `vad_input_channel` 由 `robot_config.voice_asr` 注入；
+省略 VAD 通道时与 ASR 共用，显式配置时二者必须引用同一麦克风的有效通道。双通道 chunk 同步组装，
+pre-roll 始终取 ASR 通道。VAD 的 STARTING 状态在连续 3 帧未命中后返回 SILENCE，避免单帧抖动重置起点。
 
 #### 坐标系与安装偏角
 

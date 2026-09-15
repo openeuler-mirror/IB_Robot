@@ -264,6 +264,31 @@ def test_validate_relative_skill_direction():
     assert reason == ""
 
 
+def test_validate_sound_following_toggle_direction():
+    templates = {
+        "sound_following": {
+            "executor": "sound_following",
+            "required_args": ["motion_direction"],
+            "capability": {"schema_version": 2},
+        }
+    }
+
+    allowed, reason = validate_skill_request(
+        "sound_following",
+        "",
+        "",
+        "forward",
+        0.0,
+        {},
+        {},
+        templates,
+        schema_version=2,
+    )
+
+    assert allowed
+    assert reason == ""
+
+
 def test_validate_relative_skill_rejects_non_finite_distance():
     allowed, reason = validate_skill_request(
         "move_relative_ee",

@@ -150,6 +150,59 @@ def test_sound_orientation_requires_voice_and_navigation_inputs(tmp_path):
     assert any("voice_asr.enabled" in error for error in errors)
 
 
+def test_periodic_sound_orientation_does_not_require_voice_asr(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    embodied = copied_config["robot"]["embodied"]
+    embodied["enabled"] = True
+    embodied["idle_behaviors"] = {"sound_orientation": {"enabled": True, "mode": "periodic", "default_active": False}}
+    copied_config["robot"]["voice_asr"]["enabled"] = False
+    copied_config["robot"]["speech_direction"]["enabled"] = False
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    errors = _validate_sound_orientation_config(copied_config["robot"])
+
+    assert any("speech_direction.enabled" in error for error in errors)
+    assert not any("voice_asr.enabled" in error for error in errors)
+
+
+def _hermetic_lekiwi_nav_grasp_copy(tmp_path):
+    """Copy of the base config with the local calibration gap neutralized.
+
+    Unit-test checkouts carry the shared model bundles but no approved camera
+    calibration; clearing the artifact keeps the peripheral's inline transform
+    so the semantic camera parent-frame check passes. The stage-merge behavior
+    under test is unaffected.
+    """
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    copied = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    copied["robot"]["sensor_calibration"]["artifacts"]["base_to_front_camera"] = ""
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied), encoding="utf-8")
+    return config_path
+
+
+def test_lekiwi_hybrid_stage_ships_periodic_sound_following_inactive(tmp_path):
+    config = load_robot_config_dict(_hermetic_lekiwi_nav_grasp_copy(tmp_path), nav_stage="hybrid")
+    sound_orientation = config["embodied"]["idle_behaviors"]["sound_orientation"]
+
+    assert sound_orientation["enabled"] is True
+    assert sound_orientation["mode"] == "periodic"
+    assert sound_orientation["default_active"] is False
+    assert sound_orientation["periodic_interval_sec"] == 10.0
+    assert config["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp_lidar_sound_following"
+    assert config["embodied"]["imitate_human_motion"]["enabled"] is True
+
+
+def test_lekiwi_non_hybrid_stages_keep_sound_orientation_disabled(tmp_path):
+    config_path = _hermetic_lekiwi_nav_grasp_copy(tmp_path)
+
+    for stage in ("grasp", "mapping", "navigation"):
+        config = load_robot_config_dict(config_path, nav_stage=stage)
+        assert config["embodied"]["idle_behaviors"]["sound_orientation"]["enabled"] is False
+
+
 @pytest.mark.parametrize(
     ("value", "field"),
     [

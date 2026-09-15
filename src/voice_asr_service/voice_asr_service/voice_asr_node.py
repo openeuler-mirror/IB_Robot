@@ -178,6 +178,7 @@ class VoiceASRNode(Node):
         self.declare_parameter("audio_topic", "/audio/capture_stamped")
         self.declare_parameter("audio_channels", 6)
         self.declare_parameter("audio_input_channel", VOICE_ASR_DEFAULTS["audio_input_channel"])
+        self.declare_parameter("vad_input_channel", -1)
         self.declare_parameter("exit_on_init_failure", VOICE_ASR_DEFAULTS["exit_on_init_failure"])
 
         self._active_mode = self.get_parameter("active_mode").value
@@ -197,6 +198,9 @@ class VoiceASRNode(Node):
         self._audio_topic = str(self.get_parameter("audio_topic").value)
         self._audio_channels = int(self.get_parameter("audio_channels").value)
         self._audio_input_channel = int(self.get_parameter("audio_input_channel").value)
+        vad_input_channel_raw = int(self.get_parameter("vad_input_channel").value)
+        # -1 表示未配置，VAD 与 ASR 共用输入通道。
+        self._vad_input_channel = None if vad_input_channel_raw < 0 else vad_input_channel_raw
         self._exit_on_init_failure = self.get_parameter("exit_on_init_failure").value
 
     def _init_modules(self):
@@ -209,11 +213,16 @@ class VoiceASRNode(Node):
             chunk_size=self._chunk_size,
             buffer_seconds=self._buffer_seconds,
             input_channel=self._audio_input_channel,
+            vad_input_channel=self._vad_input_channel,
         )
         self._audio_capture = AudioCaptureModule(audio_config)
         self._audio_capture.set_error_callback(self._on_audio_error)
 
-        self.get_logger().info(f"Voice ASR using shared audio_common topic {self._audio_topic!r}")
+        vad_channel_desc = str(self._vad_input_channel) if self._vad_input_channel is not None else "same as ASR"
+        self.get_logger().info(
+            f"Voice ASR using shared audio_common topic {self._audio_topic!r} "
+            f"(asr_ch={self._audio_input_channel}, vad_ch={vad_channel_desc})"
+        )
 
         self._file_input = FileInputModule()
         self._file_input.set_progress_callback(self._on_file_progress)
@@ -367,7 +376,15 @@ class VoiceASRNode(Node):
             return
 
         self._last_audio_chunk_time = time.monotonic()
-        vad_result = self._vad.process(audio_chunk)
+        # 双通道 chunk 形状为 (n, 2)：[:, 0]=VAD 通道，[:, 1]=ASR 通道；
+        # 单通道 chunk 为一维数组，VAD 与 ASR 共用。
+        if audio_chunk.ndim == 2:
+            vad_chunk = audio_chunk[:, 0]
+            asr_chunk = audio_chunk[:, 1]
+        else:
+            vad_chunk = audio_chunk
+            asr_chunk = audio_chunk
+        vad_result = self._vad.process(vad_chunk)
         # 语音活动期间（含开始、持续、结束缓冲）都向 ASR 喂数据
         if vad_result.state in (VADState.STARTING, VADState.SPEAKING, VADState.ENDING):
             if not self._state_machine.is_recognizing():
@@ -396,8 +413,8 @@ class VoiceASRNode(Node):
                     return
 
                 pre_roll = self._audio_capture.get_pre_roll_audio(self._realtime_pre_roll_seconds)
-                if len(pre_roll) > len(audio_chunk):
-                    pre_roll = pre_roll[: -len(audio_chunk)]
+                if len(pre_roll) > len(asr_chunk):
+                    pre_roll = pre_roll[: -len(asr_chunk)]
                 max_pre_roll_samples = int(self._sample_rate * _MAX_STREAMING_PREROLL_SECONDS)
                 if len(pre_roll) > max_pre_roll_samples:
                     pre_roll = pre_roll[-max_pre_roll_samples:]
@@ -405,7 +422,7 @@ class VoiceASRNode(Node):
                 if len(pre_roll) > 0:
                     self._asr.accept_waveform(pre_roll)
 
-            result = self._asr.accept_waveform(audio_chunk)
+            result = self._asr.accept_waveform(asr_chunk)
 
             if result and self._publish_partial and result.text != self._last_partial_text:
                 self._publish_partial_result(result.text)

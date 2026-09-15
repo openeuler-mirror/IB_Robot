@@ -283,8 +283,10 @@ LeKiwi 的底盘能力不改变这个限制。
 用户说“转向我”时，这是感知驱动具身任务：先用
 `ibrobot-perceive --source voice_direction --field azimuth_rad`
 读取用户当前角度，把该字面量注入基座旋转 Skill 的参数（如 `nav_turn` 的 `direction` 和 `degree`），
-再走 plan/validate/confirm/execute。该 source 是事件型，取到的是单次点时值，可能已过期；感知失败、
-超时或字段缺失时不得编造角度，直接回答“无法感知你的位置”并停止。单臂机器人（如 so101）无基座
+再走 plan/validate/confirm/execute。调用 `ibrobot-perceive` 读取 `voice_direction` 时，必须为该次
+工具调用设置至少 70 秒的超时（包装器内部最长等待 60 秒下一条声源事件），并在调用前提示用户在窗口
+期内对机器人发声。该 source 是事件型，取到的是单次点时值，可能已过期；感知失败、超时或字段缺失时
+不得编造角度，直接回答“无法感知你的位置”并停止。单臂机器人（如 so101）无基座
 旋转，应说明做不到并请用户换一个请求；不要用 `rotate_gripper_cw`/`rotate_gripper_ccw` 冒充转向。
 
 用户询问“机械臂当前电机角度”或“当前关节角度”时，这是只读状态查询：使用

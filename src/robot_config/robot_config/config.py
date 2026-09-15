@@ -132,7 +132,7 @@ class SkillGatewayRuntimeConfig:
 
 @dataclass
 class SoundOrientationConfig:
-    """Fixed-trigger idle sound-orientation behavior."""
+    """Keyword or session-gated sound-orientation behavior."""
 
     enabled: bool = False
     trigger_phrases: tuple[str, ...] = ("转向我",)
@@ -145,6 +145,9 @@ class SoundOrientationConfig:
     direction_wait_sec: float = 0.5
     cooldown_sec: float = 1.5
     max_turn_deg: float = 180.0
+    mode: str = "keyword"
+    periodic_interval_sec: float = 10.0
+    default_active: bool = False
     turn_timeout_sec: float = 10.0
     action_acceptance_timeout_sec: float = 2.0
     status_retry_sec: float = 0.5
@@ -217,6 +220,7 @@ class VoiceASRConfig:
     chunk_size: int = 512
     buffer_seconds: float = 5.0
     audio_input_channel: int = 1
+    vad_input_channel: int | None = None
     exit_on_init_failure: bool = True
 
 

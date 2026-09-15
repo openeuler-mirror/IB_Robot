@@ -103,6 +103,113 @@ def test_non_navigation_profile_keeps_v1_robot_context():
     assert "navigation_action" not in snapshot.robot_context.execution_endpoints
 
 
+@pytest.mark.parametrize("stage", ["navigation", "hybrid"])
+def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
+    from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+    from robot_config.loader import load_voice_asr_config
+    from robot_skill_cli.catalog import compile_local_snapshot
+    from skill_library.skill_executor_node import SkillExecutorNode
+
+    path = CONFIG_PATH.parent / "lekiwi_nav_grasp_sound_real.yaml"
+    config = load_robot_config_dict(path, nav_stage=stage)
+    voice = load_voice_asr_config(config["voice_asr"])
+    assert voice.enabled
+    assert voice.bundle_path.endswith("sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
+    assert voice.deployment == "torch_cpu"
+    assert voice.vad_input_channel == 1
+
+    nodes = generate_embodied_nodes(config, active_control_mode="base_navigation")
+    executor_node = next(node for node in nodes if vars(node).get("_Node__node_name") == "skill_executor_node")
+    parameters = {key[0].text: value for key, value in executor_node._Node__parameters[0].items()}
+    assert parameters["sound_following_enabled"] is True
+
+    snapshot = compile_local_snapshot(config, path)
+    assert set(snapshot.enabled_skill_names) == {"nav_turn", "nav_straight", "nav_abs_coordinate", "sound_following"}
+    runtime = object.__new__(SkillExecutorNode)
+    # Project the real launch parameters instead of hand-picking flags: the
+    # runtime/catalog consistency check must catch a stage that inherits an
+    # executor (e.g. imitate_human_motion from the base profile) that its
+    # navigation catalog profile does not expose.
+    runtime._imitate_human_motion_enabled = parameters["imitate_human_motion_enabled"]
+    runtime._sound_following_enabled = parameters["sound_following_enabled"]
+    runtime._sound_following_service = "/sound_orientation_node/set_following"
+    runtime._skill_templates = {}
+    runtime._pick_action_name = ""
+    runtime._place_action_name = ""
+    runtime._grasp_execution = {}
+    runtime._placement_execution = {}
+    runtime._semantic_map_target_service = ""
+    runtime._validate_hri_runtime_catalog_consistency(snapshot)
+    assert (
+        snapshot.delegated_executors["sound_following"] == runtime._delegated_executor_descriptors()["sound_following"]
+    )
+
+
+def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tmp_path):
+    from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+    from robot_skill_cli.catalog import compile_local_snapshot
+    from skill_library.skill_executor_node import SkillExecutorNode
+
+    # Hermetic copy: the checkout shares the model bundles but has no approved
+    # camera calibration (clearing the artifact keeps the inline transform),
+    # and the catalog source root must stay absolute for a tmp path.
+    copied = yaml.safe_load((CONFIG_PATH.parent / "lekiwi_nav_grasp.yaml").read_text(encoding="utf-8"))
+    robot = copied["robot"]
+    robot["sensor_calibration"]["artifacts"]["base_to_front_camera"] = ""
+    robot["embodied"]["skill_catalog_source_root"] = str(Path(__file__).resolve().parents[2] / "skill_catalog")
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied), encoding="utf-8")
+
+    config = load_robot_config_dict(config_path, nav_stage="hybrid")
+
+    nodes = generate_embodied_nodes(config, active_control_mode="base_navigation")
+    executor_node = next(node for node in nodes if vars(node).get("_Node__node_name") == "skill_executor_node")
+    parameters = {key[0].text: value for key, value in executor_node._Node__parameters[0].items()}
+    assert parameters["sound_following_enabled"] is True
+    assert parameters["imitate_human_motion_enabled"] is True
+
+    snapshot = compile_local_snapshot(config, config_path)
+    skill_names = set(snapshot.enabled_skill_names)
+    # The hybrid profile keeps the full mobile-manipulator set and adds the
+    # session toggle; the runtime flags must match the catalog exposure.
+    for skill in (
+        "sound_following",
+        "imitate_human_motion",
+        "pick_object",
+        "place_in_container",
+        "open_gripper_skill",
+        "nav_turn",
+        "nav_straight",
+        "nav_abs_coordinate",
+    ):
+        assert skill in skill_names
+
+    runtime = object.__new__(SkillExecutorNode)
+    runtime._imitate_human_motion_enabled = parameters["imitate_human_motion_enabled"]
+    runtime._sound_following_enabled = parameters["sound_following_enabled"]
+    runtime._sound_following_service = "/sound_orientation_node/set_following"
+    runtime._skill_templates = {}
+    runtime._pick_action_name = ""
+    runtime._place_action_name = ""
+    runtime._grasp_execution = {}
+    runtime._placement_execution = {}
+    runtime._semantic_map_target_service = ""
+    runtime._validate_hri_runtime_catalog_consistency(snapshot)
+    assert (
+        snapshot.delegated_executors["sound_following"] == runtime._delegated_executor_descriptors()["sound_following"]
+    )
+
+
+def test_hybrid_switch_test_overlay_disables_inherited_sound_following():
+    from robot_skill_cli.catalog import compile_local_snapshot
+
+    path = CONFIG_PATH.parent / "lekiwi_hybrid_switch_test.yaml"
+    config = load_robot_config_dict(path, nav_stage="hybrid")
+
+    assert config["embodied"]["idle_behaviors"]["sound_orientation"]["enabled"] is False
+    assert "sound_following" not in compile_local_snapshot(config, path).enabled_skill_names
+
+
 def test_catalog_import_does_not_load_rclpy(monkeypatch):
     original_import = builtins.__import__
 

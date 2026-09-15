@@ -74,6 +74,7 @@ PERCEPTION_ALLOWLIST: dict[str, dict[str, Any]] = {
 
 LOG_PATH = Path("/tmp/hermes-perceive.log")
 TIMEOUT_SEC = 5
+_VOICE_DIRECTION_TIMEOUT_SEC = 60
 _DEFAULT_ARM_JOINT_TOPIC = "/joint_states"
 _VOICE_DIRECTION_TYPE = "ibrobot_msgs/msg/SpeechDirection"
 
@@ -175,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     topic = _resolve_topic(args.source, robot_config)
+    timeout_sec = _VOICE_DIRECTION_TIMEOUT_SEC if args.source == "voice_direction" else TIMEOUT_SEC
     command = ["ros2", "topic", "echo", "--once"]
     if args.source == "voice_direction":
         command.extend(
@@ -199,12 +201,12 @@ def main(argv: list[str] | None = None) -> int:
             command,
             capture_output=True,
             text=True,
-            timeout=TIMEOUT_SEC,
+            timeout=timeout_sec,
             check=False,
         )
     except subprocess.TimeoutExpired:
         _log(args.source, args.field, "timeout")
-        print(f"ERROR: timed out reading {topic} ({TIMEOUT_SEC}s)", file=sys.stderr)
+        print(f"ERROR: timed out reading {topic} ({timeout_sec}s)", file=sys.stderr)
         return 1
 
     if result.returncode != 0:

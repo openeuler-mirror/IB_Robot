@@ -490,6 +490,12 @@ late-cleanup 规则，转发到内部 `/hri/imitate_human_motion` Action。内�
 `PrimitiveCommand` 执行 Mock 动画和 `move_to_named_pose(home)` 恢复；Agent 不直接调用该 Action，
 也不读取 warmup 状态。
 
+`sound_following` 同样注册为 delegated executor，但端点是 `SetSoundFollowing` ROS service。Gateway 只接受
+catalog 声明的 `motion_direction=forward|backward`，分别映射为 enable/disable；
+`sound_following_enabled` 必须与当前 catalog snapshot 是否暴露该技能一致，`sound_following_service` 默认是
+`/sound_orientation_node/set_following`。该切换本身不直接运动，后续每次 `nav_turn` 仍重新经过 Gateway
+admission、root lease 和 safety_guard。
+
 ### 8.6 导航 action dispatch
 
 `nav_straight` / `nav_turn` / `nav_abs_coordinate` 三个 primitive（V2 request schema，V2/V3 context

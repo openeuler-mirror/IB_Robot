@@ -42,6 +42,11 @@ class PipelineConfig:
     processing_hop_samples: int = 256
     model_batch_samples: int = 512
     srp_update_interval_hops: int = 2
+    early_direction_min_scores: int = 2
+    raw_activity_gate_enabled: bool = True
+    raw_activity_start_rms: float = 0.026
+    raw_activity_stop_rms: float = 0.020
+    raw_activity_tail_sec: float = 0.5
     frame_size: int = 4096  # 兼容旧调用方，语义等同 srp_frame_samples
     hop_size: int = 512  # 兼容旧调用方，语义等同 srp_hop_samples，禁止作为 processing tick
     fft_size: int = 4096

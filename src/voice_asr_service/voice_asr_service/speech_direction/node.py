@@ -9,7 +9,7 @@
     - 降级处理:设备打开失败 / FullSubNet 加载失败 → 不发布, diagnostic_msgs 报告, 不 crash
 
 发布契约(段级事件,无人声不发布):
-    - 一段人声结束时发布一次最终方向(段级能量加权累积结果)
+    - 人声开始后发布稳定初始方向,并在人声结束时发布最终方向
     - 无人声时不发布任何方向消息
 """
 
@@ -67,6 +67,11 @@ _PARAMETER_TYPES = {
     "audio_channels": Parameter.Type.INTEGER,
     "sample_rate": Parameter.Type.INTEGER,
     "srp_update_interval_hops": Parameter.Type.INTEGER,
+    "early_direction_min_scores": Parameter.Type.INTEGER,
+    "raw_activity_gate_enabled": Parameter.Type.BOOL,
+    "raw_activity_start_rms": Parameter.Type.DOUBLE,
+    "raw_activity_stop_rms": Parameter.Type.DOUBLE,
+    "raw_activity_tail_sec": Parameter.Type.DOUBLE,
     "mount_yaw_deg": Parameter.Type.DOUBLE,
     "angle_step_degree": Parameter.Type.INTEGER,
     "audio_topic": Parameter.Type.STRING,
@@ -165,6 +170,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if sample_rate != 16000:
         raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
     srp_update_interval_hops = _require_positive_int(values, "srp_update_interval_hops")
+    early_direction_min_scores = _require_positive_int(values, "early_direction_min_scores")
 
     channel_indices = _convert_int_list(values, "channel_indices")
     # 当前 FullSubNet、缓冲区和 SRP 阵列均固定处理四路麦克风信号。
@@ -199,6 +205,20 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     mount_yaw_deg = _convert_float(values, "mount_yaw_deg")
     if not math.isfinite(mount_yaw_deg):
         raise ValueError("参数 mount_yaw_deg 必须是有限浮点数")
+    raw_activity_gate_enabled = _require_bool(values, "raw_activity_gate_enabled")
+    raw_activity_start_rms = _convert_float(values, "raw_activity_start_rms")
+    raw_activity_stop_rms = _convert_float(values, "raw_activity_stop_rms")
+    raw_activity_tail_sec = _convert_float(values, "raw_activity_tail_sec")
+    if (
+        not math.isfinite(raw_activity_start_rms)
+        or raw_activity_start_rms < 0.0
+        or not math.isfinite(raw_activity_stop_rms)
+        or raw_activity_stop_rms < 0.0
+        or raw_activity_stop_rms > raw_activity_start_rms
+        or not math.isfinite(raw_activity_tail_sec)
+        or raw_activity_tail_sec < 0.0
+    ):
+        raise ValueError("raw activity gate parameters are invalid")
 
     # SRP-PHAT 扫描角度步长(度)，360 必须能被其整除，否则候选角度无法均匀覆盖整圈。
     angle_step_degree = _convert_int(values, "angle_step_degree")
@@ -222,6 +242,11 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.audio.sample_rate = sample_rate
     cfg.pipeline.sample_rate = sample_rate
     cfg.pipeline.srp_update_interval_hops = srp_update_interval_hops
+    cfg.pipeline.early_direction_min_scores = early_direction_min_scores
+    cfg.pipeline.raw_activity_gate_enabled = raw_activity_gate_enabled
+    cfg.pipeline.raw_activity_start_rms = raw_activity_start_rms
+    cfg.pipeline.raw_activity_stop_rms = raw_activity_stop_rms
+    cfg.pipeline.raw_activity_tail_sec = raw_activity_tail_sec
     cfg.vad.sample_rate = sample_rate
     cfg.doa.sample_rate = sample_rate
     if any(value >= cfg.audio.channels for value in channel_indices):
@@ -569,6 +594,11 @@ class SpeechDirectionNode(Node):
                 processing_samples=cfg.pipeline.processing_hop_samples,
                 model_batch_samples=cfg.pipeline.model_batch_samples,
                 srp_update_interval_hops=cfg.pipeline.srp_update_interval_hops,
+                early_direction_min_scores=cfg.pipeline.early_direction_min_scores,
+                raw_activity_gate_enabled=cfg.pipeline.raw_activity_gate_enabled,
+                raw_activity_start_rms=cfg.pipeline.raw_activity_start_rms,
+                raw_activity_stop_rms=cfg.pipeline.raw_activity_stop_rms,
+                raw_activity_tail_samples=round(cfg.pipeline.raw_activity_tail_sec * cfg.pipeline.sample_rate),
                 input_channels=tuple(cfg.pipeline.input_channels),
                 srp_frame_samples=cfg.doa.frame_size,
                 srp_hop_samples=cfg.doa.hop_size,
@@ -811,6 +841,8 @@ class SpeechDirectionNode(Node):
         msg.header.frame_id = "base_link"
         msg.azimuth_rad = float(ros_azimuth)
         msg.seq_id = int(seq_id)
+        msg.segment_id = int(result.get("segment_id", 0))
+        msg.direction_type = str(direction_type or "")
         self._direction_pub.publish(msg)
         # 段级 DOA 上报打印：类型/seq_id/阵列角/ROS方位角/age，便于与 sound_follow 侧对照
         self.get_logger().info(

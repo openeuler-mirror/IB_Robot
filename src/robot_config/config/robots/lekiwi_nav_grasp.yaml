@@ -105,11 +105,11 @@ robot:
       active_map_hash_topic: /slam/active_geometry_map_hash
       localization_ready_topic: /slam/localization_ready
       authoritative_map_odom_topic: /slam/authoritative_map_odom_ready
-      geometry_map_id: fastlio-lekiwi-newbag
-      geometry_map_hash: newbag-offline-hash-001
-      localization_session_id: newbag-offline-session-001
-      calibration_id: newbag-offline-calib-001
-      urdf_hash: newbag-offline-urdf-001
+      geometry_map_id: fast-lio-mid360
+      geometry_map_hash: ee12b9cede7aaa0ee63db840e3d98307c83cd3e2b688affdf770422387a112d5
+      localization_session_id: capture-20260910_172121
+      calibration_id: 5cd55a803133a8e4c1b92fda7a1951410a7c59229b2b3abcda089710456551a1
+      urdf_hash: unpinned-20260910_172121
       coordinate_convention: ros-rep-103-map-enu
       map_odom_authority: slam
     perception:
@@ -269,7 +269,7 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/grounding_dino_swint_seq8_1280x720
+        bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
@@ -317,7 +317,7 @@ robot:
       - id: semantic_siglip2_image
         enabled: true
         required: true
-        bundle_path: models/siglip2_so400m_patch14_384
+        bundle_path: models/siglip2_so400m_patch14_384_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SigLIP2EncodeEmbeddingsPlugin
         service_type: ibrobot_msgs/srv/EncodeEmbeddings
@@ -330,7 +330,7 @@ robot:
         # image service and must stay non-required per the role policy.
         enabled: true
         required: false
-        bundle_path: models/siglip2_so400m_patch14_384
+        bundle_path: models/siglip2_so400m_patch14_384_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SigLIP2EncodeTextPlugin
         service_type: ibrobot_msgs/srv/EncodeText
@@ -773,7 +773,7 @@ robot:
           - id: grasp_grounding
             enabled: true
             required: true
-            bundle_path: models/grounding_dino_swint_seq8_1280x720
+            bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
             deployment: ascend_310p
             adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
             service_type: ibrobot_msgs/srv/GroundingDetect
@@ -919,7 +919,18 @@ robot:
         query_only: true
       embodied:
         enabled: true
-        skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar
+        skill_catalog_profile: lekiwi_handeye_realsense_grasp_lidar_sound_following
+        # The default hybrid stage ships periodic sound following enabled but
+        # inactive: the node runs and the sound_following skill is callable,
+        # while the session stays inactive until explicitly activated. The
+        # other stages keep the top-level disabled default.
+        idle_behaviors:
+          sound_orientation:
+            enabled: true
+            mode: periodic
+            default_active: false
+            periodic_interval_sec: 10.0
+            max_direction_age_sec: 12.0
         timeouts:
           task_budget_sec: 1200.0
           default_skill_timeout_sec: 300.0
@@ -1055,9 +1066,9 @@ robot:
     debug_tracing: true
     idle_behaviors:
       sound_orientation:
-        # Disabled until concurrent VoiceASRNode + speech_direction_node access
-        # to the deployed ReSpeaker has been validated or a shared capture path
-        # is available. The ROS launch integration remains ready for opt-in.
+        # Safe default for the non-hybrid stages; the hybrid stage above
+        # enables the periodic session (still inactive until activated).
+        # ASR and speech direction share audio_io; motion remains separately authorized.
         enabled: false
         trigger_phrases: ["转向我"]
         direction_topic: /voice/speech_direction

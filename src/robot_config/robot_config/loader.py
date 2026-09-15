@@ -1485,15 +1485,22 @@ def _validate_sound_orientation_config(robot_config: dict[str, Any]) -> list[str
         return []
 
     errors: list[str] = []
+    mode = config.get("mode", "keyword")
+    if mode not in {"keyword", "periodic"}:
+        errors.append("embodied.idle_behaviors.sound_orientation.mode must be keyword or periodic")
     speech_direction = robot_config.get("speech_direction", {})
     voice_asr = robot_config.get("voice_asr", {})
     if not isinstance(speech_direction, dict) or not speech_direction.get("enabled", False):
         errors.append("sound orientation requires speech_direction.enabled=true")
-    if not isinstance(voice_asr, dict) or not voice_asr.get("enabled", False):
-        errors.append("sound orientation requires voice_asr.enabled=true")
+    # Keyword mode routes the fixed trigger phrase through ASR text; periodic
+    # mode consumes SpeechDirection events only and must not require ASR.
+    if mode == "keyword" and (not isinstance(voice_asr, dict) or not voice_asr.get("enabled", False)):
+        errors.append("keyword sound orientation requires voice_asr.enabled=true")
     skill_name = str(config.get("skill_name", "nav_turn")).strip()
     if skill_name != "nav_turn":
         errors.append("embodied.idle_behaviors.sound_orientation.skill_name must be nav_turn")
+    if not isinstance(config.get("default_active", False), bool):
+        errors.append("embodied.idle_behaviors.sound_orientation.default_active must be a boolean")
     trigger_phrases = config.get("trigger_phrases", ["转向我"])
     if (
         not isinstance(trigger_phrases, list)
@@ -1527,6 +1534,7 @@ def _validate_sound_orientation_config(robot_config: dict[str, Any]) -> list[str
         "status_retry_sec": (0.0, None, True),
         "action_acceptance_timeout_sec": (0.0, None, True),
         "reset_status_max_age_sec": (0.0, None, True),
+        "periodic_interval_sec": (0.0, None, True),
     }
     for field_name, (minimum, maximum, strict_minimum) in numeric_fields.items():
         value = config.get(field_name)
@@ -1912,6 +1920,7 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
         chunk_size=data.get("chunk_size", defaults.chunk_size),
         buffer_seconds=data.get("buffer_seconds", defaults.buffer_seconds),
         audio_input_channel=data.get("audio_input_channel", defaults.audio_input_channel),
+        vad_input_channel=data.get("vad_input_channel", defaults.vad_input_channel),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
     )
 
@@ -2022,6 +2031,9 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         direction_wait_sec=sound_data.get("direction_wait_sec", sound_defaults.direction_wait_sec),
         cooldown_sec=sound_data.get("cooldown_sec", sound_defaults.cooldown_sec),
         max_turn_deg=sound_data.get("max_turn_deg", sound_defaults.max_turn_deg),
+        mode=sound_data.get("mode", sound_defaults.mode),
+        periodic_interval_sec=sound_data.get("periodic_interval_sec", sound_defaults.periodic_interval_sec),
+        default_active=sound_data.get("default_active", sound_defaults.default_active),
         turn_timeout_sec=sound_data.get("turn_timeout_sec", sound_defaults.turn_timeout_sec),
         action_acceptance_timeout_sec=sound_data.get(
             "action_acceptance_timeout_sec", sound_defaults.action_acceptance_timeout_sec
@@ -2423,14 +2435,19 @@ def validate_config(config: RobotConfig) -> list[str]:
                 if sample_format != "S16LE":
                     errors.append("audio_io microphone params.sample_format must be S16LE")
                 if config.voice_asr.enabled and isinstance(channels, int) and not isinstance(channels, bool):
-                    input_channel = config.voice_asr.audio_input_channel
-                    if (
-                        isinstance(input_channel, bool)
-                        or not isinstance(input_channel, int)
-                        or input_channel < 0
-                        or input_channel >= channels
+                    for field_name, input_channel in (
+                        ("audio_input_channel", config.voice_asr.audio_input_channel),
+                        ("vad_input_channel", config.voice_asr.vad_input_channel),
                     ):
-                        errors.append("voice_asr.audio_input_channel must reference an available microphone channel")
+                        if field_name == "vad_input_channel" and input_channel is None:
+                            continue
+                        if (
+                            isinstance(input_channel, bool)
+                            or not isinstance(input_channel, int)
+                            or input_channel < 0
+                            or input_channel >= channels
+                        ):
+                            errors.append(f"voice_asr.{field_name} must reference an available microphone channel")
         if config.audio_io.playback_channels <= 0:
             errors.append("audio_io.playback_channels must be a positive integer")
         if config.audio_io.playback_sample_rate <= 0:
@@ -2491,6 +2508,9 @@ def validate_config(config: RobotConfig) -> list[str]:
                             "direction_wait_sec": config.embodied.sound_orientation.direction_wait_sec,
                             "cooldown_sec": config.embodied.sound_orientation.cooldown_sec,
                             "max_turn_deg": config.embodied.sound_orientation.max_turn_deg,
+                            "mode": config.embodied.sound_orientation.mode,
+                            "periodic_interval_sec": config.embodied.sound_orientation.periodic_interval_sec,
+                            "default_active": config.embodied.sound_orientation.default_active,
                             "turn_timeout_sec": config.embodied.sound_orientation.turn_timeout_sec,
                             "action_acceptance_timeout_sec": (
                                 config.embodied.sound_orientation.action_acceptance_timeout_sec

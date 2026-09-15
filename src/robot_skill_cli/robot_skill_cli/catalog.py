@@ -9,16 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from skill_catalog.compiler import compile_skill_catalog
-from skill_catalog.digest import (
-    derive_capability_digest,
-    derive_provenance_digest,
-    derive_registry_digest,
-    to_canonical_json,
-)
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
-
 from embodied_common.capability_view import project_capability_timeout_policy
 from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
 from embodied_common.primitive_contracts import primitive_contract_for_version
@@ -33,6 +23,15 @@ from robot_config.loader import (
     robot_supported_control_modes,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from skill_catalog.compiler import compile_skill_catalog
+from skill_catalog.digest import (
+    derive_capability_digest,
+    derive_provenance_digest,
+    derive_registry_digest,
+    to_canonical_json,
+)
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 
 _LIST_CAPABILITY_FIELDS = (
     "summary",
@@ -243,6 +242,18 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
                 name="imitate_human_motion",
                 endpoint_name=hri_runtime.get("action_name", "/hri/imitate_human_motion"),
                 configuration={"implementation": "mock_v1"},
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
+    sound_orientation = embodied.get("idle_behaviors", {}).get("sound_orientation", {})
+    if sound_orientation.get("enabled", False) and sound_orientation.get("mode", "keyword") == "periodic":
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="sound_following",
+                endpoint_name="/sound_orientation_node/set_following",
+                endpoint_kind="ros_service",
+                configuration={},
             )
         )
         delegated[descriptor.name] = descriptor

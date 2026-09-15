@@ -49,6 +49,7 @@ SUPPORTED_SKILL_EXECUTORS = {
     "placement_pipeline",
     "semantic_map_query",
     "imitate_human_motion",
+    "sound_following",
 }
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 

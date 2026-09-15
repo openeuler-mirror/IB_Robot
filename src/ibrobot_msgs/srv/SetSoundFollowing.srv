@@ -1,0 +1,20 @@
+# SetSoundFollowing.srv - Session-level switch for periodic sound orientation.
+#
+# Served by sound_orientation_node at ~/set_following. Only the skill executor
+# calls this service; user-facing on/off goes through the sound_following
+# catalog skill so Gateway admission, safety checks, and audit logs apply.
+#
+# enable=true transitions INACTIVE -> ACTIVE and clears cached directions so a
+# stale pre-activation segment cannot trigger an immediate turn. enable=false
+# stops scheduling new turns; an in-flight nav_turn still runs to a definite
+# terminal state before the node returns to INACTIVE.
+#
+# schema_version is 1 in v1.
+
+uint32 schema_version
+bool enable
+---
+uint32 schema_version
+bool success
+string current_state
+string message

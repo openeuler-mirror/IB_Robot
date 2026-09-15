@@ -27,6 +27,17 @@ ReSpeaker 麦克风
 
 本文只描述验证方案和执行步骤，**不代表已经执行验证**。
 
+本文原有触发词流程用于 `mode: keyword` 回归。周期模式应使用
+`lekiwi_nav_grasp_sound_real` 的 navigation/hybrid stage 与 `lekiwi_lidar_sound_following` catalog，
+不能用“转向我”作为周期模式已激活的证据。周期模式还需验证：
+
+- 会话默认 inactive，激活前语音段不会在激活后触发转向。
+- 通过 `sound_following` Skill 的 `motion_direction=forward` 激活，`backward` 停用。
+- 连续至少两个新语音段均可按周期执行 `nav_turn`，每次使用新鲜 Gateway status/binding。
+- 同段的 voice_begin/mid_long_seg/seg_end 最多引发一次转向；过期方向和 deadband 不触发。
+- idle 时停用立即 inactive；转向中停用进入 shutting_down，并在动作终态后 inactive。
+- 终态未知必须保留 `FAULT_UNKNOWN`，停用会话不能当作已证明底盘停止。
+
 ## 1. 验证范围
 
 ### 1.1 本次必须验证

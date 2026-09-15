@@ -32,6 +32,7 @@ class SpeechDirectionResult(TypedDict):
     age_ms: float
     seq_id: int
     type: str | None
+    segment_id: int
 
 
 __all__ = ["SpeechDirectionResult"]

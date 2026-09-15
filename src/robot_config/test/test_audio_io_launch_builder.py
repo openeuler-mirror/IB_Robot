@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from robot_config.audio_contract import find_microphone_params, is_audio_io_enabled
 from robot_config.config import PeripheralConfig, RobotConfig, Ros2ControlConfig
 from robot_config.launch_builders import audio_io, speech_direction, voice_asr
@@ -108,6 +110,30 @@ def test_audio_io_validation_accepts_a_real_microphone_peripheral():
     assert not any(error.startswith("audio_io.") for error in errors)
 
 
+@pytest.mark.parametrize("field_name", ["audio_input_channel", "vad_input_channel"])
+@pytest.mark.parametrize("value", [-1, 2, True, "0"])
+def test_asr_channels_must_reference_the_configured_microphone(field_name, value):
+    config = RobotConfig(
+        name="test_robot",
+        type="lekiwi",
+        robot_type="lekiwi",
+        ros2_control=Ros2ControlConfig(hardware_plugin="sts_hardware_interface/STSHardwareInterface", params={}),
+        peripherals=[
+            PeripheralConfig(
+                type="microphone",
+                name="respeaker",
+                driver="alsa",
+                params={"device": "hw:0,0", "channels": 2, "sample_rate": 16000, "sample_format": "S16LE"},
+            )
+        ],
+    )
+    config.audio_io.enabled = True
+    config.audio_io.microphone = "respeaker"
+    config.voice_asr.enabled = True
+    setattr(config.voice_asr, field_name, value)
+    assert f"voice_asr.{field_name} must reference an available microphone channel" in validate_config(config)
+
+
 def test_audio_io_builder_routes_independent_capture_and_playback_formats():
     actions = audio_io.generate_audio_io_actions(_audio_config())
 
@@ -187,6 +213,7 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
         "bundle_path": str(tmp_path),
         "deployment": "torch_cpu",
         "active_mode": "manual",
+        "vad_input_channel": 0,
     }
 
     node = voice_asr.generate_voice_asr_nodes(config)[0]
@@ -201,3 +228,4 @@ def test_voice_asr_uses_shared_stamped_topic_and_microphone_channels(monkeypatch
 
     assert parameters["audio_topic"] == "/shared/capture_stamped"
     assert parameters["audio_channels"] == 6
+    assert parameters["vad_input_channel"] == 0

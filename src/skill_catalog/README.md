@@ -14,7 +14,9 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 
 The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
-`lekiwi_handeye_realsense_grasp_lidar`, `so101_rtp_distributed`, and `lekiwi_lidar`.
+`lekiwi_handeye_realsense_grasp_lidar`,
+`lekiwi_handeye_realsense_grasp_lidar_sound_following`,
+`so101_rtp_distributed`, `lekiwi_lidar`, and `lekiwi_lidar_sound_following`.
 The `lekiwi_handeye_realsense_grasp_lidar` profile is the unified mobile-manipulator
 profile: it exposes manipulation, navigation, and approved social arm skills in one immutable snapshot.
 The shared stable
@@ -31,6 +33,13 @@ the Gateway. 310P binds grasping to the `ascend_310p` manifest deployment;
 the PC profile binds it to the `torch_cuda` manifest deployment. The unified
 `lekiwi_handeye_realsense_grasp_lidar` profile additionally exposes
 `imitate_human_motion` through its launch-managed delegated executor.
+`lekiwi_handeye_realsense_grasp_lidar_sound_following` is the hybrid profile used by
+the `lekiwi_nav_grasp` hybrid stage: it is the full mobile-manipulator skill set plus
+`sound_following`, matching the stage's enabled periodic sound-orientation runtime.
+`lekiwi_lidar_sound_following` is the opt-in navigation profile for the sound-real
+overlay: it additionally exposes `sound_following`, a session-toggle delegated
+executor. Actual periodic turns remain separate `nav_turn` root requests admitted
+by the Gateway. The ordinary profiles do not require the sound-following runtime.
 
 ## Source Modes
 

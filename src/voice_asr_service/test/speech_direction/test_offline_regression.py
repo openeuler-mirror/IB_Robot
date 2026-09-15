@@ -156,6 +156,7 @@ def _build_pipeline():
         sample_rate=cfg.pipeline.sample_rate,
         processing_samples=cfg.pipeline.processing_hop_samples,
         model_batch_samples=cfg.pipeline.model_batch_samples,
+        srp_update_interval_hops=cfg.pipeline.srp_update_interval_hops,
         input_channels=tuple(cfg.pipeline.input_channels),
         srp_frame_samples=cfg.doa.frame_size,
         srp_hop_samples=cfg.doa.hop_size,
