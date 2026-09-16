@@ -1,5 +1,0 @@
-<?xml version="1.0"?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-	<!-- SSOT wrapper: included content lives in so101_description. -->
-	<xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_gazebo.xacro" />
-</robot>

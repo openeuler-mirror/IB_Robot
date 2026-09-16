@@ -232,12 +232,17 @@ def resolve_observation_transport(
     camera_width: int | None = None,
     camera_height: int | None = None,
     camera_fps: float | None = None,
+    interface_source: Mapping[str, Any] | None = None,
 ) -> ObservationTransportSpec | None:
     if value is None or value.mode != "rtp":
         return value
     resize = (image or {}).get("resize")
     height = int(resize[0]) if resize and len(resize) == 2 else camera_height
     width = int(resize[1]) if resize and len(resize) == 2 else camera_width
+    if interface_source is not None:
+        # Public source geometry describes wire frames, not the model's image.resize.
+        profile = interface_source.get("profile") or {}
+        width, height, camera_fps = profile.get("width"), profile.get("height"), profile.get("fps")
     media = value.media or VideoMediaSpec()
     return replace(
         value,
@@ -394,7 +399,7 @@ def validate_robot_config_observation_transports(robot_config: Mapping[str, Any]
     for item in raw_observations or []:
         if not isinstance(item, Mapping):
             continue
-        camera = cameras.get(item.get("peripheral"))
+        camera = cameras.get(item.get("peripheral")) if item.get("_interface_source") is None else None
         image = item.get("image")
         if camera is not None and not image:
             image = {
@@ -407,6 +412,7 @@ def validate_robot_config_observation_transports(robot_config: Mapping[str, Any]
             camera_width=camera.get("width") if camera else None,
             camera_height=camera.get("height") if camera else None,
             camera_fps=camera.get("fps") if camera else None,
+            interface_source=item.get("_interface_source"),
         )
         observations.append(
             SimpleNamespace(

@@ -399,6 +399,20 @@ def generate_controller_spawners(
     ]
 
 
+def _calibration_tool_command(robot_config: dict, arm: str, port: str) -> str:
+    """Build the calibration tool command from the robot configuration.
+
+    The command is derived from ``robot.calibration.tool_command`` (a format
+    string with ``{arm}`` and ``{port}`` placeholders) instead of hardcoding
+    a specific robot package. When the key is absent, the proven default
+    tool is used.
+    """
+    template = (robot_config.get("calibration") or {}).get(
+        "tool_command"
+    ) or "ros2 run so101_hardware calibrate_arm --arm {arm} --port {port}"
+    return template.format(arm=arm, port=port)
+
+
 def generate_ros2_control_nodes(
     robot_config,
     use_sim,
@@ -449,11 +463,9 @@ def generate_ros2_control_nodes(
                 logger.error("")
                 logger.error("  Please run calibration first:")
                 calib_port = ros2_control_config.get("port", "/dev/ttyACM0")
-                logger.error("    ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port)
-                raise RuntimeError(
-                    f"Calibration file not found: {calib_file_resolved}. "
-                    f"Run: ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port
-                )
+                calib_command = _calibration_tool_command(robot_config, "follower", calib_port)
+                logger.error(f"    {calib_command}")
+                raise RuntimeError(f"Calibration file not found: {calib_file_resolved}. Run: {calib_command}")
 
     # Validate joint configuration
     validate_joint_config(robot_config)

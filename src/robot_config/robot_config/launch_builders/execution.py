@@ -521,6 +521,18 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
     if not robot_config_path:
         raise ValueError("robot_config dict is missing '_config_path'; load it through robot_config.loader")
 
+    # Robot-agnostic-core fail-fast checks (before any pipeline resolution
+    # so misconfiguration surfaces with the clearest error first).
+    robot_name = robot_config.get("name")
+    if not robot_name:
+        raise ValueError("robot.name is required: declare the robot name explicitly in the robot configuration")
+    robot_joints = robot_config.get("joints", {})
+    if robot_joints.get("all") is None:
+        raise ValueError(
+            "robot.joints.all is required: declare the joint list explicitly in the "
+            "robot configuration (see docs/robot_interface_schema.md)"
+        )
+
     inference = _validated_inference(robot_config, control_mode)
     pipeline = _selected_executor_pipeline(robot_config, control_mode, inference)
     mode_config = robot_config.get("control_modes", {}).get(control_mode, {})
@@ -555,17 +567,14 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
 
     # benchmark setup: resolve joint_names. When joints.all is an explicit empty list
     # (benchmark YAMLs with no joint consumer), omit the parameter entirely
-    # so it does not serialize as an invalid ROS empty tuple. The
-    # action_dispatcher_node does not declare joint_names; omitting it is
-    # safe and the node uses its internal default. Non-benchmark YAMLs
-    # either omit joints.all (gets the schema default) or provide a real
-    # joint list, so their behavior is unchanged.
-    joint_names = robot_joints.get("all", ["1", "2", "3", "4", "5", "6"])
+    # An explicitly empty joints.all is preserved as None for the
+    # dispatcher's internal default.
+    joint_names = robot_joints.get("all")
     if not joint_names:
         joint_names = None
 
     dispatcher_parameters: dict[str, object] = {
-        "robot_name": robot_config.get("name", "so101"),
+        "robot_name": robot_name,
         "queue_size": executor_config.get("queue_size", 100),
         "watermark_threshold": executor_config.get("watermark_threshold", 20),
         "min_queue_size": executor_config.get("min_queue_size", 10),

@@ -5,7 +5,7 @@
 
 robot:
   name: so101_arm_aero_hand
-  base_config: so101_single_arm
+  base_config: so101_single_arm_legacy
 
   joints:
     hand:

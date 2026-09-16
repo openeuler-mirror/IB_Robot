@@ -8,7 +8,9 @@ from robot_config.launch_builders import teleop
 
 
 def _robot_config() -> dict:
-    placo_config = Path(__file__).resolve().parents[2] / "robot_moveit" / "config" / "so101_placo_servo.yaml"
+    placo_config = (
+        Path(__file__).resolve().parents[2] / "robots" / "so101" / "so101_motion" / "config" / "so101_placo_servo.yaml"
+    )
     return {
         "joints": {"arm": ["1", "2"], "gripper": ["6"]},
         "ros2_control": {"reset_positions": {"1": 0.1, "2": -0.2}},

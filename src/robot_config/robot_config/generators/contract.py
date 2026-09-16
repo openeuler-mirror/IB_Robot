@@ -17,6 +17,7 @@ from robot_config.contract_utils import (
     TaskSpec,
     _as_align,
 )
+from robot_config.interface_binding import resolve_robot_interfaces
 from robot_config.observation_transport import (
     observation_transport_to_dict,
     parse_observation_transport,
@@ -58,6 +59,8 @@ def load_contract_with_robot_config(
     """
     # Load base contract
     contract_data = yaml.safe_load(Path(contract_path).read_text(encoding="utf-8")) or {}
+    # Standalone contracts must contain resolved endpoints, not unchecked logical IDs.
+    contract_data = resolve_robot_interfaces({"contract": contract_data})["contract"]
 
     # Resolve peripheral references if robot_config is provided
     if robot_config:
@@ -72,6 +75,7 @@ def load_contract_with_robot_config(
             camera_width=peripheral.get("width"),
             camera_height=peripheral.get("height"),
             camera_fps=peripheral.get("fps"),
+            interface_source=it.get("_interface_source"),
         )
         obs = ObservationSpec(
             key=it["key"],
@@ -82,6 +86,7 @@ def load_contract_with_robot_config(
             align=_as_align(it.get("align")),
             qos=it.get("qos"),
             transport=transport,
+            _interface_source=it.get("_interface_source"),
         )
         # Add peripheral metadata if available
         # if "_peripheral" in it:
@@ -102,6 +107,7 @@ def load_contract_with_robot_config(
             publish_qos=pub.get("qos"),
             publish_strategy=pub.get("strategy"),
             safety_behavior=sb,
+            _interface_source=pub.get("_interface_source"),
         )
 
     def _task(it: dict[str, Any]) -> Any:
@@ -167,7 +173,7 @@ def _resolve_peripheral_references(contract_data: dict, robot_config: Any) -> di
     # Resolve peripheral references in observations
     for obs in contract_data.get("observations", []):
         peripheral_name = obs.get("peripheral")
-        if peripheral_name and peripheral_name in peripherals:
+        if peripheral_name and peripheral_name in peripherals and obs.get("_interface_source") is None:
             # Add peripheral metadata
             obs["_peripheral"] = peripherals[peripheral_name]
 
@@ -205,7 +211,7 @@ def validate_contract_peripheral_consistency(
 
     for obs in contract_data.get("observations", []):
         peripheral_name = obs.get("peripheral")
-        if peripheral_name and peripheral_name not in peripheral_names:
+        if peripheral_name and obs.get("_interface_source") is None and peripheral_name not in peripheral_names:
             errors.append(f"Observation '{obs.get('key')}' references undefined peripheral: {peripheral_name}")
 
     return errors
@@ -213,6 +219,7 @@ def validate_contract_peripheral_consistency(
 
 def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contract:
     """Build a runtime ``Contract`` directly from raw robot_config dict data."""
+    robot_config = resolve_robot_interfaces(robot_config)
 
     def _camera_lookup(name: str) -> dict[str, Any] | None:
         for periph in robot_config.get("peripherals", []) or []:
@@ -233,7 +240,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
         topic_type = obs.get("type") or "sensor_msgs/msg/JointState"
         peripheral_name = obs.get("peripheral")
         camera = None
-        if peripheral_name:
+        if peripheral_name and obs.get("_interface_source") is None:
             topic_type = "sensor_msgs/msg/Image"
             camera = _camera_lookup(str(peripheral_name))
             if camera is None:
@@ -258,6 +265,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
             camera_width=int(camera.get("width")) if camera and camera.get("width") is not None else None,
             camera_height=int(camera.get("height")) if camera and camera.get("height") is not None else None,
             camera_fps=float(camera.get("fps")) if camera and camera.get("fps") is not None else None,
+            interface_source=obs.get("_interface_source"),
         )
         obs_specs.append(
             ObservationSpec(
@@ -269,6 +277,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
                 align=_as_align(obs.get("align")),
                 qos=obs.get("qos"),
                 transport=transport,
+                _interface_source=obs.get("_interface_source"),
             )
         )
 
@@ -290,6 +299,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
                 publish_qos=publish.get("qos"),
                 publish_strategy=publish.get("strategy"),
                 safety_behavior=safety_behavior,
+                _interface_source=publish.get("_interface_source"),
             )
         )
 
@@ -341,7 +351,7 @@ def generate_contract_from_robot_config(robot_config: Any) -> str:
             "type": obs.type or ("sensor_msgs/msg/Image" if obs.peripheral else "sensor_msgs/msg/JointState"),
         }
 
-        if obs.peripheral:
+        if obs.peripheral and obs._interface_source is None:
             obs_dict["peripheral"] = obs.peripheral
             # Image parameters
             if obs.image:
@@ -369,14 +379,20 @@ def generate_contract_from_robot_config(robot_config: Any) -> str:
 
         if obs.transport is not None:
             obs_dict["transport"] = observation_transport_to_dict(obs.transport)
+        if obs._interface_source is not None:
+            obs_dict["_interface_source"] = obs._interface_source
 
         contract["observations"].append(obs_dict)
 
     # Generate actions from contract extension config
     for action in robot_config.contract.actions:
+        publish = dict(action.publish)
+        if publish.get("_interface_source") is not None:
+            publish.pop("interface", None)
+            publish.pop("requires", None)
         action_dict = {
             "key": action.key,
-            "publish": action.publish,
+            "publish": publish,
             "safety_behavior": action.safety_behavior,
         }
 

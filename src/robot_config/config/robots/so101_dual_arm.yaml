@@ -64,7 +64,7 @@ robot:
   # Single ros2_control entry for Multi-Hardware
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101_dual.urdf.xacro
+    urdf_path: $(find so101_description)/urdf/lerobot/so101/so101_dual.urdf.xacro
     controllers_config: $(find so101_hardware)/config/so101_dual_controllers.yaml
     # Generic mapping: inject these directly into URDF xacro args
     xacro_args:

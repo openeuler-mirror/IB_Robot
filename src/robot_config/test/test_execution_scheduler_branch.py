@@ -22,7 +22,8 @@ from launch_ros.actions import Node
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.dispatch_strategies import DispatchStrategyError
 from robot_config.inference_config import InferenceConfigError
-from robot_config.launch_builders.execution import generate_execution_nodes
+from robot_config.launch_builders.execution import generate_action_dispatcher_node, generate_execution_nodes
+from robot_config.loader import build_contract_from_robot_config_dict, load_robot_config_dict
 from robot_config.runtime_target import RuntimeTarget
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
@@ -239,6 +240,50 @@ def test_absent_scheduler_produces_legacy_dispatcher_only(tmp_path: Path) -> Non
     assert "scheduler_enabled" not in _node_parameters(pipeline)
     assert "scheduled_action_dispatcher_node" not in executables
     assert "global_inference_scheduler_node" not in executables
+
+
+@pytest.mark.parametrize(
+    "filename,expected_joints",
+    [
+        ("test_single_arm_single_cam.yaml", ["1", "2", "3", "4", "5", "6"]),
+        ("dev_rtp_single_camera.yaml", []),
+        ("dev_rtp_multi_camera.yaml", []),
+    ],
+)
+def test_repository_configs_load_and_build_dispatcher(tmp_path, filename, expected_joints):
+    path = Path(__file__).resolve().parents[1] / "config" / "robots" / filename
+    config = load_robot_config_dict(path)
+    contract = build_contract_from_robot_config_dict(config)
+    assert config["joints"]["all"] == expected_joints
+    if expected_joints:
+        state = next(obs for obs in config["contract"]["observations"] if obs["key"] == "observation.state")
+        assert expected_joints == state["selector"]["names"]
+        assert len(contract.actions) == 2
+    else:
+        assert not contract.actions
+
+    # Supply a local bundle for the development placeholder or the contract-only profile.
+    bundle = _create_bundle(tmp_path / "bundle")
+    if "control_modes" not in config:
+        config["control_modes"] = _legacy_robot_config(path, bundle)["control_modes"]
+    else:
+        config["control_modes"]["model_inference"]["inference"]["pipelines"]["dev_policy"]["model_path"] = str(bundle)
+    nodes = generate_execution_nodes(config, "model_inference")
+    dispatcher = next(node for node in nodes if node.node_executable == "action_dispatcher_node")
+    params = _node_parameters(dispatcher)
+    if expected_joints:
+        assert params["joint_names"] == expected_joints
+    else:
+        assert "joint_names" not in params
+
+
+def test_missing_joint_list_error_links_to_existing_documentation(tmp_path):
+    config = {"name": "missing_joints", "_config_path": str(tmp_path / "robot.yaml")}
+    with pytest.raises(ValueError, match=r"robot\.joints\.all is required") as error:
+        generate_action_dispatcher_node(config, "model_inference")
+    docs_path = "docs/robot_interface_schema.md"
+    assert docs_path in str(error.value)
+    assert (Path(__file__).resolve().parents[3] / docs_path).is_file()
 
 
 def test_scheduler_enable_false_produces_legacy_dispatcher_only(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ Supports two recording modes:
 2. Episodic: Triggered episode-by-episode recording via episode_recorder Action Server
 """
 
+import json
 import os
 import re
 from datetime import datetime
@@ -18,6 +19,7 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
+from robot_config.interface_binding import required_interface_ids, resolve_robot_interfaces
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
     resolve_gripper_joints_from_config,
@@ -37,12 +39,20 @@ def _sanitize_dataset_name(value: str) -> str:
 logger = get_colored_logger("robot_config.recording")
 
 
-def build_semantic_preview_command() -> list[str]:
-    """Build the proven calibration preview command without launch-injected ROS arguments."""
+def build_semantic_preview_command(robot_config: dict | None = None) -> list[str]:
+    """Build the proven calibration preview command without launch-injected ROS arguments.
+
+    The preview provider package comes from configuration
+    (``recording.semantic_preview_package``); it defaults to the LeKiwi
+    sensor-calibration suite package, the only preview implementation today.
+    """
+    package = str(((robot_config or {}).get("recording") or {}).get("semantic_preview_package", "")).strip()
+    if not package:
+        package = "lekiwi_calibration"
     return [
         "ros2",
         "run",
-        "robot_calibration",
+        package,
         "calib_capture_preview",
         "--output-image-topic",
         "/semantic_mapping/preview/image/compressed",
@@ -165,7 +175,7 @@ def generate_continuous_recording_action(robot_config: dict) -> list[Node | Exec
                 )
             ),
             recording_action,
-            ExecuteProcess(cmd=build_semantic_preview_command(), output="screen"),
+            ExecuteProcess(cmd=build_semantic_preview_command(robot_config), output="screen"),
         ]
 
     logger.info("✓ Continuous recording action created")
@@ -349,6 +359,18 @@ def generate_episodic_recording_node(
             {"lerobot_norm_mode": lerobot_norm_mode},
             {"joint_names": joint_names},
             {"gripper_joints": gripper_joints},
+            {
+                "robot_model_json": json.dumps(robot_config.get("robot_model"), separators=(",", ":"))
+                if robot_config.get("robot_model")
+                else ""
+            },
+            {
+                "interface_description_json": json.dumps(
+                    (robot_config.get("runtime") or {}).get("interface_description"), separators=(",", ":")
+                )
+                if (robot_config.get("runtime") or {}).get("interface_description")
+                else ""
+            },
             {"max_cache_size": max_cache_size},
             {"storage_preset_profile": storage_preset_profile},
             {"storage_config_uri": storage_config_uri},
@@ -439,6 +461,8 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         >>> print(topics)
         ['/joint_states', '/arm_position_controller/commands', '/camera/cam0/image_raw', ...]
     """
+    robot_config = resolve_robot_interfaces(robot_config)
+    logical_bindings = bool(required_interface_ids(robot_config))
     recording = robot_config.get("recording", {})
     topics = []
 
@@ -456,7 +480,8 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         return topics
 
     # Always record joint states for ros2_control-backed robots.
-    _append("/joint_states")
+    if not logical_bindings:
+        _append("/joint_states")
 
     # Record contract-defined observations/actions first.
     contract = robot_config.get("contract", {})
@@ -465,8 +490,15 @@ def get_recording_topics(robot_config: dict) -> list[str]:
     for action in contract.get("actions", []):
         _append((action.get("publish") or {}).get("topic", ""))
 
-    # Add peripheral-specific auxiliary topics that contracts usually omit.
-    for peripheral in robot_config.get("peripherals", []):
+    if logical_bindings:
+        description = robot_config["runtime"]["interface_description"]
+        for interface in description["interfaces"].values():
+            if interface["kind"] == "topic" and interface["direction"] == "publish":
+                _append(interface["endpoint"])
+                _append(interface.get("camera_info_topic", ""))
+
+    # Legacy configs retain peripheral-specific auxiliary topic discovery.
+    for peripheral in [] if logical_bindings else robot_config.get("peripherals", []):
         ptype = peripheral.get("type")
         name = peripheral.get("name", "peripheral")
         if ptype == "camera":

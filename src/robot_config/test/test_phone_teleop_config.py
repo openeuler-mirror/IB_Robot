@@ -32,7 +32,9 @@ for module_name, original_module in _ORIGINAL_MODULES.items():
 
 
 def _robot_config():
-    placo_config = Path(__file__).resolve().parents[2] / "robot_moveit" / "config" / "so101_placo_servo.yaml"
+    placo_config = (
+        Path(__file__).resolve().parents[2] / "robots" / "so101" / "so101_motion" / "config" / "so101_placo_servo.yaml"
+    )
     return {
         "name": "phone_test",
         "joints": {"arm": ["1", "2", "3", "4", "5"], "gripper": ["6"]},
@@ -618,7 +620,7 @@ def test_lekiwi_rtp_distributed_profile_resolves_follower_calib(tmp_path, monkey
         "lekiwi_navi_hardware_only",
         "lekiwi_realsense_navigation",
         "so101_rtp_distributed",
-        "so101_single_arm",
+        "so101_single_arm_legacy",
         "so101_single_arm_rgbd",
         "so101_dual_arm",
     ],

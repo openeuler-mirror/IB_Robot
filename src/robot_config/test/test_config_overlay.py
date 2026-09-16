@@ -11,10 +11,13 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "config" / "robots"
 
 
 def test_so101_aero_profile_inherits_base_without_copying_unrelated_sections() -> None:
-    base_path, base = _load_robot_section(CONFIG_DIR / "so101_single_arm.yaml")
+    # The Aero Hand overlay stays on the provider-less legacy path; its base is
+    # the retained legacy single-arm configuration, not the migrated
+    # runtime-provider configuration.
+    base_path, base = _load_robot_section(CONFIG_DIR / "so101_single_arm_legacy.yaml")
     resolved_path, resolved = _load_robot_section(CONFIG_DIR / "so101_arm_aero_hand.yaml")
 
-    assert base_path.name == "so101_single_arm.yaml"
+    assert base_path.name == "so101_single_arm_legacy.yaml"
     assert resolved_path.name == "so101_arm_aero_hand.yaml"
     assert resolved["name"] == "so101_arm_aero_hand"
     assert resolved["joints"]["arm"] == base["joints"]["arm"]

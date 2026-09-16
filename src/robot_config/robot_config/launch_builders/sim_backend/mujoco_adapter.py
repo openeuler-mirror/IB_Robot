@@ -16,6 +16,7 @@ Camera convention:
 """
 
 import os
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -58,7 +59,7 @@ class MujocoAdapter(SimBackendAdapter):
                 logger.warning(f"could not load layout for '{scene_name}': {e}")
 
         peripherals = robot_config.get("peripherals", [])
-        robot_xml_path = self._generate_robot_mujoco_xml(robot_spawn, peripherals)
+        robot_xml_path = self._generate_robot_mujoco_xml(robot_spawn, peripherals, robot_config)
 
         # 2. Scene XML (no scene → use robot XML directly)
         if scene_name:
@@ -159,7 +160,7 @@ class MujocoAdapter(SimBackendAdapter):
             logger.warning("mujoco Python package not found; MUJOCO_PLUGIN_PATH will not be set")
         return ""
 
-    def _generate_robot_mujoco_xml(self, robot_spawn: dict, peripherals: list) -> str:
+    def _generate_robot_mujoco_xml(self, robot_spawn: dict, peripherals: list, robot_config: dict) -> str:
         """Generate /tmp/so101_mujoco.xml from the template with YAML-driven cameras.
 
         Steps:
@@ -167,17 +168,31 @@ class MujocoAdapter(SimBackendAdapter):
         2. Parse XML and inject <camera> elements for each opencv-driver peripheral.
         3. Write to /tmp/so101_mujoco.xml and return the path.
 
+        Template and mesh locations come from the robot's description package
+        (the ``$(find pkg)`` in ``ros2_control.urdf_path``), overridable via
+        ``simulation.mujoco.template`` / ``simulation.mujoco.meshes_dir``.
+
         Camera convention:
             If a real Gazebo override exists, convert its Gazebo camera frame
             into MuJoCo convention with gazebo_rpy_to_mujoco_rpy(). Otherwise,
             use the MuJoCo-native preset directly. Plain YAML transform values
             are treated as already matching the target backend convention.
         """
-        from ament_index_python.packages import get_package_share_directory
-
-        pkg = get_package_share_directory("robot_description")
-        meshes_dir = os.path.join(pkg, "meshes", "lerobot", "so101")
-        template_path = os.path.join(pkg, "mujoco", "so101.xml.template")
+        mujoco_cfg = (robot_config.get("simulation") or {}).get("mujoco") or {}
+        urdf_path = str((robot_config.get("ros2_control") or {}).get("urdf_path", "") or "")
+        match = re.search(r"\$\(find\s+(\w+)\)", urdf_path)
+        if not match and not (mujoco_cfg.get("template") and mujoco_cfg.get("meshes_dir")):
+            raise ValueError(
+                "[mujoco_adapter] cannot locate the robot description package: ros2_control.urdf_path must use "
+                "$(find <description_pkg>) or simulation.mujoco.template/meshes_dir must be set"
+            )
+        description_pkg = match.group(1) if match else ""
+        meshes_dir = resolve_ros_path(
+            str(mujoco_cfg.get("meshes_dir") or f"$(find {description_pkg})/meshes/lerobot/so101")
+        )
+        template_path = resolve_ros_path(
+            str(mujoco_cfg.get("template") or f"$(find {description_pkg})/mujoco/so101.xml.template")
+        )
 
         if not os.path.exists(template_path):
             raise FileNotFoundError(f"[mujoco_adapter] MuJoCo template not found: {template_path}")

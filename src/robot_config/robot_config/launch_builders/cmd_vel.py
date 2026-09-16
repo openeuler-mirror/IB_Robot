@@ -17,6 +17,7 @@ def generate_cmd_vel_nodes(
     motion_mode_config: dict[str, Any] | None = None,
     ekf_enabled: bool = False,
     use_sim: bool = False,
+    robot_config: dict[str, Any] | None = None,
 ) -> list:
     """Generate cmd_vel bridge nodes.
 
@@ -25,6 +26,7 @@ def generate_cmd_vel_nodes(
         motion_mode_config: shared arm/base command-authorization configuration
         ekf_enabled: whether EKF is enabled (disables bridge TF publishing)
         use_sim: simulation mode flag
+        robot_config: full robot config (to check runtime.provider)
 
     Returns:
         List of Node actions
@@ -33,6 +35,13 @@ def generate_cmd_vel_nodes(
 
     bridge_config = nav_config.get("cmd_vel_bridge", {})
     if not bridge_config.get("enabled", False):
+        return nodes
+
+    # Runtime provider path: the robot runtime's base node owns cmd_vel
+    # projection, odometry and navigation gating (lekiwi_robot/base_node);
+    # the generic bridge is only for in-config ros2_control bring-up.
+    if str(((robot_config or {}).get("runtime") or {}).get("provider", "") or "").strip():
+        logger.info("runtime.provider configured: cmd_vel bridge skipped (the runtime's base node owns it)")
         return nodes
 
     # Use publish_tf from config; default to False when EKF is enabled

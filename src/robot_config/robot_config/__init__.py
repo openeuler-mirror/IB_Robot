@@ -30,6 +30,7 @@ from robot_config.perception_runtime_config import (
 )
 
 _LAZY_EXPORTS = {
+    "bind_robot_interfaces": ("robot_config.interface_binding", "bind_robot_interfaces"),
     "build_contract_from_robot_config_dict": (
         "robot_config.loader",
         "build_contract_from_robot_config_dict",
@@ -92,6 +93,7 @@ __all__ = [
     "VideoBufferSpec",
     "VideoReadinessSpec",
     # Loaders
+    "bind_robot_interfaces",
     "load_robot_config",
     "load_robot_config_dict",
     "load_robot_section",

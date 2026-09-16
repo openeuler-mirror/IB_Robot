@@ -10,6 +10,7 @@ This will be fixed in T3.
 
 import copy
 import os
+import re
 from pathlib import Path
 
 from launch.actions import EmitEvent, IncludeLaunchDescription, RegisterEventHandler, SetEnvironmentVariable
@@ -26,6 +27,26 @@ from robot_config.utils import parse_bool, resolve_ros_path
 from .base_adapter import SimBackendAdapter
 
 logger = get_colored_logger("robot_config.sim_backend.gazebo")
+
+_FIND_PATTERN = re.compile(r"\$\(find\s+(\w+)\)")
+
+
+def _description_packages(robot_config: dict) -> list[str]:
+    """Packages whose share dir Gazebo needs for ``package://`` mesh URIs.
+
+    Derived from ``ros2_control.urdf_path`` plus any ``$(find pkg)`` the
+    top-level xacro includes (an assembled robot may pull its arm model from
+    another description package). Order is preserved, duplicates dropped.
+    """
+    urdf_path = str((robot_config.get("ros2_control") or {}).get("urdf_path", "") or "")
+    packages = _FIND_PATTERN.findall(urdf_path)
+    resolved = resolve_ros_path(urdf_path)
+    try:
+        if resolved and Path(resolved).is_file():
+            packages.extend(_FIND_PATTERN.findall(Path(resolved).read_text(encoding="utf-8")))
+    except OSError as e:
+        logger.info(f"WARNING: Could not scan {resolved} for description includes: {e}")
+    return list(dict.fromkeys(packages))
 
 
 def _start_actions_on_success(start_actions, success_message: str, failure_reason: str):
@@ -70,33 +91,30 @@ class GazeboAdapter(SimBackendAdapter):
         actions = []
 
         # ---- Environment variable setup ----
+        # Gazebo resolves ``package://<pkg>/meshes/...`` mesh URIs through
+        # GZ_SIM_RESOURCE_PATH. The description package is whatever the robot
+        # YAML's urdf_path points at (e.g. so101_description); the generic
+        # launch must not hardcode a robot.
         gazebo_resource_paths = []
         gazebo_model_paths = []
 
-        try:
-            install_share = os.path.dirname(FindPackageShare("robot_description").find("robot_description"))
-            gazebo_resource_paths.append(install_share)
-            gazebo_model_paths.append(install_share)
-            logger.info(f"Added install share path for Gazebo: {install_share}")
-
-            # Add lekiwi_description for chassis mesh resolution
+        for pkg_name in _description_packages(robot_config):
             try:
-                lekiwi_share = os.path.dirname(FindPackageShare("lekiwi_description").find("lekiwi_description"))
-                gazebo_resource_paths.append(lekiwi_share)
-                gazebo_model_paths.append(lekiwi_share)
-                logger.info(f"Added lekiwi_description share path for Gazebo: {lekiwi_share}")
-            except Exception:
-                pass  # lekiwi_description not installed, skip silently
-
-            robot_desc_share = FindPackageShare("robot_description").find("robot_description")
-            mesh_path = os.path.join(robot_desc_share, "meshes", "lerobot", "so101")
-            if Path(mesh_path).exists():
-                mesh_files = list(Path(mesh_path).glob("*.stl"))
-                logger.info(f"Verified {len(mesh_files)} mesh files at {mesh_path}")
+                pkg_share = FindPackageShare(pkg_name).find(pkg_name)
+            except Exception as e:
+                logger.info(f"WARNING: Could not find description package '{pkg_name}': {e}")
+                continue
+            install_share = os.path.dirname(pkg_share)
+            if install_share not in gazebo_resource_paths:
+                gazebo_resource_paths.append(install_share)
+                gazebo_model_paths.append(install_share)
+            logger.info(f"Added {pkg_name} share path for Gazebo: {install_share}")
+            mesh_root = Path(pkg_share) / "meshes"
+            if mesh_root.exists():
+                mesh_files = list(mesh_root.rglob("*.stl")) + list(mesh_root.rglob("*.dae"))
+                logger.info(f"Verified {len(mesh_files)} mesh files under {mesh_root}")
             else:
-                logger.info(f"WARNING: Mesh directory not found at {mesh_path}")
-        except Exception as e:
-            logger.info(f"WARNING: Could not find robot_description package: {e}")
+                logger.info(f"WARNING: Mesh directory not found at {mesh_root}")
 
         if gazebo_resource_paths:
             combined_resource = ":".join(gazebo_resource_paths)

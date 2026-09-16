@@ -1,54 +1,49 @@
-# SO-101 Single Arm Robot Configuration
-# This configuration defines the complete hardware setup for a single SO-101 arm
-# with cameras for imitation learning.
+# SO-101 single-arm application configuration (so101-runtime-migration).
+#
+# Runtime ownership: hardware ports, calibration, controller sets, motion
+# assets and physical cameras live in the so101_robot runtime profile
+# (so101_robot/profiles/so101_single_arm.yaml). This file selects that
+# runtime and binds the application contract to its public interfaces.
+# Operator input devices are declared in the runtime-owned input config
+# referenced by teleoperation.input_config.
 
 robot:
   name: so101_single_arm
   type: so101
   robot_type: so_101  # For LeRobot dataset metadata
-  # Gazebo：须与 config/worlds 里 <world name="..."> 一致；create 不传 -world 时会随机取 worlds 列表第一个
-  gazebo_world_name: demo
-  # Gazebo 实体创建现在基于 /clock ready 判定，不再依赖固定启动延时。
 
-  # Gazebo 窗口灰屏、实体树空但 /joint_states 正常时，日志常见：
-  #   libEGL warning: egl: failed to create dri2 screen
-  # 可保持下方为 true；若显卡正常、仅想开 GPU 加速，把 libgl_always_software 改为 false
-  gazebo_gui:
-    qt_platform: xcb
-    libgl_always_software: true
+  # Robot runtime provider (robot-runtime-packaging). simulation.platform=sdk
+  # selects the SDK simulated transport; Gazebo/MuJoCo/mock are not supported
+  # on the provider path.
+  simulation:
+    platform: sdk
 
-  # ============================================
-  # Unified joint definitions (Single Source of Truth)
-  # ============================================
-  joints:
-    arm:
-      - "1"
-      - "2"
-      - "3"
-      - "4"
-      - "5"
-    gripper:
-      - "6"
-    all: ["1", "2", "3", "4", "5", "6"]
+  runtime:
+    provider: so101_robot
+    profile: so101_single_arm
+    # The bound snapshot must carry the public model (groups/limits/frames/
+    # conversions); inference, recording and teleop consume it instead of
+    # private calibration files.
+    require_model: true
 
-  # ============================================
-  # MoveIt configuration
-  # ============================================
-  moveit:
-    # End-effector selection for MoveIt and Cartesian teleop.
-    # Default keeps the upstream gripper-origin path:
-    #   arm_group_name: arm
-    #   ee_link: gripper
-    # To target the jaw-center TCP instead, switch both lines to:
-    #   arm_group_name: arm_tcp
-    #   ee_link: tcp
-    arm_group_name: arm
-    base_link: base
-    ee_link: gripper
-    shoulder_link: shoulder
-    so101_placo_servo_config_path: $(find robot_moveit)/config/so101_placo_servo.yaml
+  capabilities:
+    requires:
+      - joint.state
+      - joint.position_stream
+      - joint.trajectory
+      - gripper.1d
+      - motion.fk
+      - motion.ik
+      - motion.move_to_joint
+      - motion.move_to_pose
+      - runtime.stop
 
-  # Control mode management
+  # Public-interface bindings for task execution (no controller-name guessing).
+  task_dispatch:
+    gripper_trajectory_interface: joint.trajectory_gripper
+
+  # Control mode management. Controller activation sets are runtime-owned;
+  # each mode selects the runtime mode it admits.
   default_control_mode: "model_inference"
   skill_required_control_mode: "moveit_planning"
   controller_startup_timeout:
@@ -56,14 +51,11 @@ robot:
     hardware: 30.0
 
   control_modes:
-    # Human teleoperation mode (direct control via leader arm/gamepad)
     teleop:
       description: "Human teleoperation mode (direct control)"
       description_cn: "人工遥操作模式（直接控制）"
-      controllers:
-        - joint_state_broadcaster
-        - arm_position_controller
-        - gripper_position_controller
+      # Teleop starts idle; the operator explicitly arms streaming.
+      runtime_mode: stream
       inference:
         enabled: false
       executor:
@@ -72,17 +64,12 @@ robot:
         queue_size: 100
         control_frequency: 50.0
 
-    # Model inference mode (ACT/pi0 end-to-end control)
     model_inference:
       description: "High-frequency end-to-end control mode (ACT/pi0)"
       description_cn: "高频端到端控制模式（ACT/pi0）"
-      controllers:
-        - joint_state_broadcaster
-        - arm_position_controller
-        - gripper_position_controller
-      # ============================================
-      # Inference configuration
-      # ============================================
+      # Policy owns a dedicated stream mode; it must admit from idle and
+      # never share the teleop stream mode.
+      runtime_mode: policy_stream
       inference:
         enabled: true
         pipelines:
@@ -92,11 +79,8 @@ robot:
             execution_mode: monolithic
             request_timeout: 120.0
             default_task: "pick up the banana"
-      # ============================================
-      # Executor configuration
-      # ============================================
       executor:
-        type: topic  # topic | action
+        type: topic
         mode: model_inference
         inference_pipeline: policy
         queue_size: 100
@@ -108,21 +92,16 @@ robot:
     moveit_planning:
       description: "MoveIt trajectory planning mode (VoxPoser/VLM)"
       description_cn: "MoveIt轨迹规划模式（VoxPoser/VLM）"
-      controllers:
-        - joint_state_broadcaster
-        - arm_trajectory_controller
-        - gripper_trajectory_controller
+      runtime_mode: trajectory
       inference:
-        enabled: false  # MoveIt模式不需要推理
+        enabled: false
       executor:
-        type: action
+        type: topic
         mode: moveit_planning
 
   # Voice ASR is configured here and injected by robot_config/robot.launch.py.
-  # The standalone voice_asr_service launch file is kept only for debugging.
   voice_asr:
     enabled: false
-    # 默认使用 continuous 监听模式；可通过 launch 参数临时覆盖是否启用。
     active_mode: continuous
     language: zh
     bundle_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
@@ -137,7 +116,6 @@ robot:
     output_topic: /voice_command
     exit_on_init_failure: true
 
-  # TTS playback is routed through the same audio_common path used on openEuler.
   audio_io:
     enabled: true
     playback_topic: /audio/play
@@ -146,10 +124,6 @@ robot:
     playback_channels: 1
     playback_sample_format: S16LE
 
-  # Voice TTS is enabled with the validated ZipVoice bundle and the ubuntu_onnx deployment.
-  # exit_on_init_failure is false so a missing/unbuilt bundle degrades gracefully:
-  # the node stays alive, /voice_tts/synthesize stays registered, and requests return
-  # MODEL_NOT_READY instead of crashing the pipeline.
   voice_tts:
     enabled: true
     bundle_path: "models/zipvoice"
@@ -213,17 +187,17 @@ robot:
       summary_topic: /embodied/perception_summary
       default_session_id: default
       scene_sources:
-        primary_camera_topic: /camera/front_camera/color/image_raw
-        primary_camera_info_topic: /camera/front_camera/color/camera_info
-        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
-        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        primary_camera_topic: /camera/front/image_raw
+        primary_camera_info_topic: /camera/front/camera_info
+        primary_aligned_depth_topic: /camera/front/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: ""
         wrist_camera_topic: ""
         wrist_camera_info_topic: ""
         wrist_aligned_depth_topic: ""
         wrist_pointcloud_topic: ""
         ee_pose_topic: /robot_status/ee_pose
         joint_state_topic: /joint_states
-        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_depth: false
         require_pointcloud: false
       vlm_api:
         provider: openai_compatible
@@ -234,11 +208,9 @@ robot:
         jpeg_quality: 70
       conversation:
         max_history_turns: 4
-    # 非运动视觉能力。handler 契约由统一 registry 提供；camera/VLM 与生命周期配置仍分别由
-    # embodied.perception / embodied.timeouts 管理。
     visual_games:
       sorting_hat:
-        enabled: false  # 趣味游戏默认关；现场启用需同时置 perception.enabled: true
+        enabled: false
         announce: true
         handler: sorting_hat_v1
         summary: 根据主相机中的人物形象判断其霍格沃茨学院
@@ -271,124 +243,7 @@ robot:
         position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
         orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
 
-  # ros2_control configuration
-  ros2_control:
-    hardware_plugin: so101_hardware/SO101SystemHardware
-    port: /dev/ttyACM0
-    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
-    joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Semantic rest pose for upper layers; hardware activation holds the measured position.
-    reset_positions:
-      "1": 0.0       # shoulder_pan:  centered
-      "2": -1.5854   # shoulder_lift: ~-90° (down)
-      "3": 1.5708    # elbow_flex:    ~+90° (folded)
-      "4": 0.7854    # wrist_flex:    ~+45° (tilted)
-      "5": 0.0       # wrist_roll:    centered
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
-
-    # Controllers configuration
-    # Path to the controllers configuration file (YAML format)
-    controllers_config: $(find so101_hardware)/config/so101_controllers.yaml
-
-    # List of controllers to auto-start
-    # These controllers will be automatically spawned when the robot launches
-    controllers:
-      - joint_state_broadcaster  # Publishes joint states to /joint_states
-      - arm_controller           # Controls the robot arm joints
-      - gripper_controller       # Controls the gripper
-
-  # Peripheral devices (cameras, microphones, etc.)
-  peripherals:
-    - type: camera
-      name: top
-      driver: opencv
-      index: 0
-      width: 640
-      height: 480
-      fps: 30
-      pixel_format: mjpeg2rgb
-      frame_id: camera_top_frame
-      optical_frame_id: camera_top_optical_frame
-      # use_default_transform: 启用仿真相机预设位姿。
-      # 为 true 时，下方 transform 和 fovy 被忽略，
-      # 根据相机名和当前仿真平台自动填入位姿与视场角。
-      use_default_transform: true
-      transform:
-        parent_frame: base
-        x: 0.0
-        y: 0.0
-        z: 0.0
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
-      fovy: 0
-      # camera_info_url: file://$(env HOME)/.ros/camera_info/top_camera.yaml
-
-    - type: camera
-      name: wrist
-      driver: opencv
-      index: 2
-      width: 640
-      height: 480
-      fps: 60
-      pixel_format: mjpeg2rgb
-      frame_id: camera_wrist_frame
-      optical_frame_id: camera_wrist_optical_frame
-      # use_default_transform: 启用仿真相机预设位姿。
-      # 为 true 时，下方 transform 和 fovy 被忽略，
-      # 根据相机名和当前仿真平台自动填入位姿与视场角。
-      use_default_transform: true
-      transform:
-        parent_frame: gripper
-        x: 0.0
-        y: 0.0
-        z: 0.0
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
-      fovy: 0
-      # camera_info_url: file://$(env HOME)/.ros/camera_info/wrist_camera.yaml
-
-    - type: camera
-      name: front
-      driver: realsense
-      serial_number: ""  # Optional: specific serial number
-      width: 640
-      height: 480
-      fps: 30
-      pixel_format: bgr8
-      enable_pointcloud: false
-      align_depth: true
-      frame_id: camera_front_link
-      optical_frame_id: camera_front_optical_frame
-      # use_default_transform: 启用仿真相机预设位姿。
-      # 为 true 时，下方 transform 和 fovy 被忽略，
-      # 根据相机名和当前仿真平台自动填入位姿与视场角。
-      use_default_transform: true
-      transform:
-        parent_frame: base
-        x: 0.0
-        y: 0.0
-        z: 0.0
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
-      fovy: 0
-
-
-  # ============================================
-  # Simulation Configuration
-  # ============================================
-  simulation:
-    platform: gazebo        # "gazebo" | "mujoco" | "mock"
-    scene: pick_banana      # null = 不加载场景；pick_banana = 香蕉抓取场景
-    robot_spawn:            # Robot spawn pose owned by robot_config SSOT
-      x: 0.0
-      y: 0.30
-      z: -0.03
-    sim_models_pkg: sim_models
-
-  # IB-Robot contract integration
+  # IB-Robot contract: logical bindings against the runtime public description.
   contract:
     base_contract: $(find robot_config)/config/contracts/act_grab_pan.yaml
     rate_hz: 20
@@ -396,9 +251,8 @@ robot:
 
     observations:
       - key: observation.images.front
-        topic: /camera/front/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: front
+        interface: camera.front.color
+        requires: {width: 640, height: 480, min_fps: 15}
         image:
           resize: [480, 640]
         align:
@@ -406,31 +260,10 @@ robot:
           stamp: header
           tol_ms: 1500
           max_age_ms: 500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
 
       - key: observation.images.top
-        topic: /camera/top/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: top  # References camera 'top' from peripherals above
-        image:
-          resize: [480, 640]  # height, width for LeRobot
-        align:
-          strategy: hold
-          stamp: header
-          tol_ms: 1500
-          max_age_ms: 500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
-
-      - key: observation.images.wrist
-        topic: /camera/wrist/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: wrist  # References camera 'wrist' from peripherals above
+        interface: camera.top.color
+        requires: {width: 640, height: 480, min_fps: 15}
         image:
           resize: [480, 640]
         align:
@@ -438,41 +271,37 @@ robot:
           stamp: header
           tol_ms: 1500
           max_age_ms: 500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
+
+      - key: observation.images.wrist
+        interface: camera.wrist.color
+        requires: {width: 640, height: 480, min_fps: 15}
+        image:
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
 
       - key: observation.state
-        topic: /joint_states
-        type: sensor_msgs/msg/JointState
+        interface: joint.state
         selector: { names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"] }
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
           max_age_ms: 500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 50
 
       - key: observation.current
-        topic: /so101_follower/joint_currents
-        type: ibrobot_msgs/msg/JointCurrent
+        interface: joint.current
         selector: { names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"] }
         align:
           strategy: hold
           stamp: header
           tol_ms: 1500
           max_age_ms: 500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 50
 
     actions:
-      # Arm joints (1-5) - uses same key "action" for consolidation
       - key: action
         selector:
           names:
@@ -482,147 +311,49 @@ robot:
             - "action.3"
             - "action.4"
         publish:
-          topic: /arm_position_controller/commands
-          type: std_msgs/msg/Float64MultiArray
-          layout: flat
-          qos:
-            reliability: best_effort
-            history: keep_last
-            depth: 10
-          strategy:
-            mode: nearest
-            tolerance_ms: 500
+          interface: joint.arm_stream
         safety_behavior: hold
 
-      # Gripper joint (6) - uses same key "action" for consolidation
       - key: action
         selector:
           names:
             - "action.5"
         publish:
-          topic: /gripper_position_controller/commands
-          type: std_msgs/msg/Float64MultiArray
-          layout: flat
-          qos:
-            reliability: best_effort
-            history: keep_last
-            depth: 10
-          strategy:
-            mode: nearest
-            tolerance_ms: 500
+          interface: joint.gripper_stream
         safety_behavior: hold
 
-  # ============================================
-  # Teleoperation Configuration (for human teleop mode)
-  # ============================================
+  # Teleoperation: input devices live in the runtime-owned input config; this
+  # section selects the active source, the public target interfaces and the
+  # application speed policy. Streaming is admitted explicitly (idle start).
   teleoperation:
     enabled: true
-    active_device: "so101_leader" # You can switch between "so101_leader", "xbox_controller", "phone_teleop", and "vr_teleop"
-
-    # Cartesian solver used when gamepad / phone is in cartesian mode.
-    # Options:
-    #   placo_servo  - SO-101 default, command-side Placo differential IK.
-    #   moveit_servo - MoveIt Servo comparison path. Simulation works; Humble
-    #                  real-hardware anti-drift handling is tracked separately.
-    cartesian:
-      solver: placo_servo
-      # tool_frame defaults to moveit.ee_link, so arm/gripper and arm_tcp/tcp
-      # remain a single SSOT. Set tool_frame only to override the angular
-      # velocity reference frame.
-      # Placo-only speed knobs, as fractions of the backend physical maximum.
-      placo_servo:
-        linear_speed: 0.17   # 0.0~1.0
-        angular_speed: 0.2   # 0.0~1.0
-
-    devices:
-      - name: "so101_leader"
-        type: "leader_arm"
-        port: "/dev/ttyACM1"
-        calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
-      - name: "phone_teleop"
-        type: "phone"
-        control_frequency: 50.0
-        phone_config:
-          backend: "webphone"
-          camera_offset: [0.0, -0.02, 0.04]
-          end_effector_bounds:
-            min: [-0.5, -0.5, -0.5]
-            max: [0.5, 0.5, 0.5]
-          max_ee_step_m: 0.05
-          gripper_speed_factor: 20.0
-          gripper_range: [0.0, 1.0]
-        ee_frame_name: "gripper"
-      - name: "xbox_controller"
-        type: "xbox_controller"
-        input_device: "/dev/input/js0"
-        default_mode: "joint"
-        mapping_config: "xbox_mapping"
-        servo_config: "so101_servo"
-        control_params:
-          deadzone: 0.1
-          joint_velocity_gain: 1.5
-          cartesian_linear_speed: 1.0
-          cartesian_angular_speed: 1.0
-          long_press_duration: 0.5
-      # VR teleop server. output_profile=so101 drives the placo cartesian
-      # servo; the VR node converts tool-frame angular → base via
-      # ToolAngularAdapter and the launch builder spawns so101_placo_servo_node
-      # alongside. Downstream placo topics/services use their defaults, so only
-      # tuning knobs are listed here. VR client connects to <host>:<port> (TCP).
-      - name: "vr_teleop"
-        type: "vr_teleop"
-        control_frequency: 50.0
-        vr_config:
-          output_profile: "so101"     # so101 | humanoid
-          controller_side: "right"    # left | right
-          # Security model: trusted LAN only. Listening on 0.0.0.0 is
-          # intentional so users can connect arbitrary VR headsets or other
-          # network devices without fixing their client IP in this config.
-          # This TCP control channel is unauthenticated: do NOT expose port
-          # 8889 through public port forwarding, untrusted Wi-Fi, or an
-          # untrusted VPN. The stale/disconnect watchdog remains mandatory.
-          host: "0.0.0.0"
-          port: 8889
-          # Input mode: "pose" = absolute EE pose passthrough (1:1 hand tracking,
-          # stop=stop, no drift); "velocity" = differential twist (placo
-          # integrates). Pose mode drives BOTH the VR node and the placo servo.
-          so101_input_mode: "pose"
-          # Hand→EE position gain (pose mode). SO-101 reach (~24cm) vs
-          # comfortable single-arm range (~60cm) suggests ~0.4, but 0.7 gives a
-          # less tiring feel (smaller hand travel reaches the target). Tune for
-          # finer/coarser feel.
-          position_scale: 0.7
-          # Rotation gate (pose mode). false = hand attitude drives the EE
-          # (default; VR +X/+Y wrist rotation maps to EE roll/pitch, validated on
-          # sim). true = hold the clutch-baseline attitude and teleop position
-          # only. NOTE: SO-101 is 5-DOF, so EE yaw about base +Z is NOT
-          # reproducible regardless of this setting (placo pins 3 position DOF +
-          # a soft 2-DOF orientation follow) — a kinematic limit, not a bug.
-          so101_position_only: false
-          # Stale-frame watchdog (s). If the VR client stays TCP-connected but
-          # stops sending frames, the last frame would otherwise be republished
-          # forever and the arm would keep tracking a dead target. When the
-          # newest frame is older than this, drop the clutch and call placo's
-          # stop service on the edge. ~0.2s = 10 missed frames at 50Hz.
-          so101_command_stale_s: 0.2
-          linear_speed_scale: 1.0
-          angular_speed_scale: 1.0
-          linear_deadzone: 0.005
-          angular_deadzone: 0.05
-          so101_gripper_open: 1.0
-          so101_gripper_closed: 0.0
+    active_device: "so101_leader"
+    # Operator input deployment config lives on the app side (robot_config),
+    # not inside the robot runtime package. Runtime model info (joints, limits,
+    # frames) comes from the public description via /runtime/get_status;
+    # hardware acquisition (serial, calibration) stays with the hardware node.
+    input_config: $(find robot_config)/config/teleop/so101_leader_inputs.yaml
+    target:
+      group: arm
+      gripper_group: gripper
+      interfaces:
+        joints: motion.arm.joints
+        pose: motion.arm.pose
+        linear: motion.arm.linear
+        angular: motion.arm.angular
+        start: motion.arm.start
+        stop: motion.arm.stop
+        home: motion.arm.home
+        lease: motion.arm.lease
+    control_params:
+      cartesian_linear_speed: 0.17
+      cartesian_angular_speed: 0.2
     safety:
-      joint_limits:
-        "1": {"min": -2.0693, "max": 2.0709}
-        "2": {"min": -1.92, "max": 1.92}
-        "3": {"min": -1.6813, "max": 1.6828}
-        "4": {"min": -1.65806, "max": 1.65806}
-        "5": {"min": -2.9115, "max": 2.9115}
-        "6": {"min": 0.0, "max": 1.0}
+      # Relative narrowing (rad), applied inward on the runtime public limits.
+      # Absolute limits here would be stale snapshots that conflict whenever
+      # the arm is recalibrated.
+      joint_limits_margin: 0.05
 
-  # ============================================
-  # Recording Configuration
-  # ============================================
   recording:
     bag_base_dir: "~/rosbag/episodes"
     storage: mcap

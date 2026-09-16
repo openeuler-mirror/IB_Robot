@@ -74,7 +74,7 @@ Launch Arguments:
     inference_pipeline: Pipeline ID targeted by inference launch overrides
     inference_execution_mode: Override the targeted pipeline mode (monolithic or distributed)
     with_moveit: Enable MoveIt motion planning. If empty, auto-detects from control mode name
-    moveit_display: Launch RViz for MoveIt visualization (default: true, only used if MoveIt is enabled)
+    moveit_display: Launch RViz for MoveIt visualization (default: false so headless runs stay clean)
     with_navigation: Enable navigation pipeline. If empty, uses robot.navigation.enabled from config
     navigation_mode: Override robot.navigation.default_mode when navigation is enabled
     record: Enable automatic rosbag recording (default: false, auto-discovers topics from config)
@@ -102,6 +102,7 @@ from robot_config.inference_config import (
     parse_inference_config,
     scheduler_enabled_from_raw_config,
 )
+from robot_config.interface_binding import required_interface_ids
 
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.benchmark import generate_benchmark_nodes
@@ -132,6 +133,11 @@ from robot_config.launch_builders.recording import (
     generate_rerun_viewer_node,
     resolve_recording_launch,
 )
+from robot_config.launch_builders.runtime import (
+    generate_bound_runtime_actions,
+    generate_runtime_provider_actions,
+    runtime_provider,
+)
 from robot_config.launch_builders.sim_backend import get_backend_caps, get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.launch_builders.tracing import (
@@ -149,7 +155,7 @@ from robot_config.utils import parse_bool
 logger = get_colored_logger("robot_config.launch")
 
 
-def load_robot_config(robot_config_name, config_path_override=None, nav_stage=""):
+def load_robot_config(robot_config_name, config_path_override=None, nav_stage="", *, defer_interface_binding=False):
     """Load robot configuration from YAML file.
 
     Args:
@@ -178,6 +184,7 @@ def load_robot_config(robot_config_name, config_path_override=None, nav_stage=""
         config_path,
         nav_stage=nav_stage,
         materialize_benchmark_transport=False,
+        defer_interface_binding=defer_interface_binding,
     )
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
@@ -387,7 +394,7 @@ def _create_controller_ready_waiter(robot_config: dict, controller_names, use_si
     )
 
 
-def launch_setup(context, *args, **kwargs):
+def launch_setup(context, *args, loaded_config=None, extra_consumers=None, **kwargs):
     """Launch setup function that generates all nodes.
 
     This is the "orchestrator" that:
@@ -397,13 +404,12 @@ def launch_setup(context, *args, **kwargs):
 
     Args:
         context: Launch context
+        loaded_config: Internal preloaded configuration; still normalized and live-bound here
+        extra_consumers: Internal callback constructing additional consumers after live logical binding
 
     Returns:
         List of launch actions
     """
-    actions = []
-    controller_dependent_actions = []
-
     # ========== 1. Get and normalize launch parameters ==========
     robot_config_name = context.launch_configurations.get("robot_config", "test_cam")
     config_path_override = context.launch_configurations.get("config_path", "")
@@ -434,11 +440,14 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 2. Load robot configuration ==========
     try:
-        robot_config = load_robot_config(
-            robot_config_name,
-            config_path_override if config_path_override else None,
-            nav_stage,
-        )
+        robot_config = loaded_config
+        if robot_config is None:
+            robot_config = load_robot_config(
+                robot_config_name,
+                config_path_override if config_path_override else None,
+                nav_stage,
+                defer_interface_binding=True,
+            )
     except Exception as e:
         logger.error(f"loading config: {e}")
         raise
@@ -469,12 +478,19 @@ def launch_setup(context, *args, **kwargs):
         print("[IBROBOT_BENCHMARK][SKIP] simulation_backend")
         print("[IBROBOT_BENCHMARK][SKIP] physical_perception")
 
-    sim_platform = str(robot_config.get("simulation", {}).get("platform", "gazebo")).lower()
+    runtime_provider_name = runtime_provider(robot_config)
+    sim_platform = str(
+        robot_config.get("simulation", {}).get("platform", "sdk" if runtime_provider_name else "gazebo")
+    ).lower()
     if sim_platform_override:
         logger.info(f"CLI override: simulation.platform={sim_platform_override} (was {sim_platform})")
         sim_platform = sim_platform_override
         robot_config.setdefault("simulation", {})["platform"] = sim_platform
-    if is_benchmark:
+    if runtime_provider_name and not is_benchmark:
+        if sim_platform != "sdk":
+            raise ValueError("runtime.provider requires sim_platform:=sdk; physics and legacy mock are unsupported")
+        backend_caps = {"provides_clock": False, "needs_ros2_control": False}
+    elif is_benchmark:
         backend_caps = {"provides_clock": False, "needs_ros2_control": False}
     else:
         backend_caps = (
@@ -487,8 +503,17 @@ def launch_setup(context, *args, **kwargs):
         )
     mock_backend_active = (use_sim and sim_platform == "mock") and not is_benchmark
     node_use_sim_time = use_sim and backend_caps["provides_clock"]
-    sim_backend_needs_ros2_control = ((not use_sim) or backend_caps["needs_ros2_control"]) and not is_benchmark
-    if use_sim and not backend_caps["needs_ros2_control"] and not is_benchmark:
+    # runtime.provider: the robot runtime (<provider>/launch/runtime.launch.py)
+    # brings up hardware, controllers, motion services and the runtime facade;
+    # robot_config delegates and gates upper layers on RuntimeStatus
+    # reconciliation. use_sim maps to the runtime's SDK simulated transport.
+    sim_backend_needs_ros2_control = (
+        ((not use_sim) or backend_caps["needs_ros2_control"]) and not is_benchmark and not runtime_provider_name
+    )
+    if runtime_provider_name:
+        auto_start_controllers = "false"
+        logger.info(f"runtime.provider={runtime_provider_name}: delegating bring-up to the robot runtime")
+    elif use_sim and not backend_caps["needs_ros2_control"] and not is_benchmark:
         auto_start_controllers = "false"
         logger.info(f"simulation.platform={sim_platform}: backend does not use ros2_control")
 
@@ -563,22 +588,83 @@ def launch_setup(context, *args, **kwargs):
             with_inference=with_inference,
         )
 
+    validate_runtime_resources(robot_config, use_sim=use_sim, control_mode=active_control_mode)
+    confirm_interactive_startup_p_pose(robot_config, use_sim=use_sim, control_mode=active_control_mode)
+    node_options = {
+        "runtime_target": runtime_target,
+        "sim_platform": sim_platform,
+        "node_use_sim_time": node_use_sim_time,
+        "auto_start_controllers": auto_start_controllers,
+        "sim_backend_needs_ros2_control": sim_backend_needs_ros2_control,
+        "with_inference": with_inference,
+        "scheduler_enabled": scheduler_enabled,
+    }
+    if required_interface_ids(robot_config) or (robot_config.get("runtime") or {}).get("require_model"):
+        if not runtime_provider_name or is_benchmark:
+            raise ValueError("Live logical interface binding requires runtime.provider and a non-benchmark target")
+        # Provider simulation is an SDK transport, not a Gazebo /clock owner.
+        node_options["node_use_sim_time"] = False
+        robot_config.setdefault("runtime", {})["target"] = runtime_target.value
+
+        def construct_consumers(effective):
+            actions = _construct_robot_nodes(context, effective, provider_started=True, **node_options)
+            if extra_consumers is not None:
+                actions.extend(extra_consumers(effective))
+            return actions
+
+        return generate_bound_runtime_actions(
+            robot_config,
+            construct_consumers,
+            use_sim=use_sim,
+            display=parse_bool(context.launch_configurations.get("moveit_display", "false"), default=False),
+            readiness_timeout_s=_resolve_controller_startup_timeout(robot_config, use_sim),
+        )
+    return _construct_robot_nodes(context, robot_config, **node_options)
+
+
+def _construct_robot_nodes(
+    context,
+    robot_config,
+    *,
+    runtime_target,
+    sim_platform,
+    node_use_sim_time,
+    auto_start_controllers,
+    sim_backend_needs_ros2_control,
+    with_inference,
+    scheduler_enabled,
+    provider_started=False,
+):
+    """Construct consumers from the effective config, never re-entering provider startup."""
+    actions = []
+    controller_dependent_actions = []
+    use_sim = runtime_target is not RuntimeTarget.HARDWARE
+    is_benchmark = runtime_target is RuntimeTarget.BENCHMARK
+    mock_backend_active = use_sim and sim_platform == "mock" and not is_benchmark
+    runtime_provider_name = runtime_provider(robot_config)
+    active_control_mode = robot_config.get("default_control_mode", "model_inference")
+
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
-    validate_runtime_resources(robot_config, use_sim=use_sim, control_mode=active_control_mode)
-    confirm_interactive_startup_p_pose(
-        robot_config,
-        use_sim=use_sim,
-        control_mode=active_control_mode,
-    )
     deferred_controller_spawners = []
     controller_names = []
     robot_description = {}
+    runtime_ready_waiter = None
     if is_benchmark:
         # ros2_control skipped by benchmark target; the
         # [IBROBOT_BENCHMARK][SKIP] ros2_control marker is already printed at
         # runtime target resolution.
         logger.info("benchmark target: skipping ros2_control / controller spawners")
+    elif runtime_provider_name and not provider_started:
+        moveit_display = parse_bool(context.launch_configurations.get("moveit_display", "false"), default=False)
+        provider_actions, runtime_ready_waiter = generate_runtime_provider_actions(
+            robot_config,
+            use_sim=use_sim,
+            display=moveit_display,
+            readiness_timeout_s=_resolve_controller_startup_timeout(robot_config, use_sim),
+        )
+        actions.extend(provider_actions)
+        logger.info(f"Added runtime provider include for {runtime_provider_name}")
     elif not sim_backend_needs_ros2_control:
         logger.info(f"simulation.platform={sim_platform}: skipping ros2_control / controller spawners")
     else:
@@ -616,7 +702,10 @@ def launch_setup(context, *args, **kwargs):
         logger.info(f"Added {len(hand_source_nodes)} shared hand source node(s)")
 
     controller_ready_waiter = None
-    if parse_bool(auto_start_controllers, default=True) and controller_names:
+    if runtime_provider_name:
+        # RuntimeStatus reconciliation replaces controller readiness gating.
+        controller_ready_waiter = runtime_ready_waiter
+    elif parse_bool(auto_start_controllers, default=True) and controller_names:
         controller_ready_waiter = _create_controller_ready_waiter(
             robot_config,
             controller_names,
@@ -629,7 +718,7 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 5. Generate Simulation Nodes (only in simulation mode) ==========
     gz_create_entity = None
-    if use_sim and not is_benchmark:
+    if use_sim and not is_benchmark and not runtime_provider_name:
         logger.info("========== Generating Simulation Nodes ==========")
         logger.info(f"Sim platform: {sim_platform}")
         try:
@@ -707,15 +796,28 @@ def launch_setup(context, *args, **kwargs):
     else:
         try:
             perception_nodes = []
-            # Camera nodes (Physical drivers)
-            camera_nodes = generate_camera_nodes(robot_config, use_sim)
-            perception_nodes.extend(camera_nodes)
-            logger.info(f"Added {len(camera_nodes)} camera nodes")
 
-            # LiDAR nodes (Physical drivers)
-            lidar_nodes = generate_lidar_nodes(robot_config, use_sim)
-            perception_nodes.extend(lidar_nodes)
-            print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
+            if runtime_provider_name:
+                # D12: physical sensor drivers and their static TF are owned by
+                # the robot runtime (peripherals_file passthrough); the generic
+                # layer only consumes the resulting topics. Virtual camera
+                # relays are topic-level utilities and stay here.
+                logger.info("runtime.provider active: physical perception owned by the robot runtime")
+            else:
+                # Camera nodes (Physical drivers)
+                camera_nodes = generate_camera_nodes(robot_config, use_sim)
+                perception_nodes.extend(camera_nodes)
+                logger.info(f"Added {len(camera_nodes)} camera nodes")
+
+                # LiDAR nodes (Physical drivers)
+                lidar_nodes = generate_lidar_nodes(robot_config, use_sim)
+                perception_nodes.extend(lidar_nodes)
+                print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
+
+                # Static TF publishers
+                tf_nodes = generate_tf_nodes(robot_config, use_sim)
+                perception_nodes.extend(tf_nodes)
+                logger.info(f"Added {len(tf_nodes)} TF nodes")
 
             # Virtual camera relay nodes (Topic tools)
             from robot_config.launch_builders.perception import (
@@ -726,11 +828,6 @@ def launch_setup(context, *args, **kwargs):
             perception_nodes.extend(virtual_nodes)
             if virtual_nodes:
                 logger.info(f"Added {len(virtual_nodes)} virtual camera relays")
-
-            # Static TF publishers
-            tf_nodes = generate_tf_nodes(robot_config, use_sim)
-            perception_nodes.extend(tf_nodes)
-            logger.info(f"Added {len(tf_nodes)} TF nodes")
 
             if controller_ready_barrier is not None:
                 controller_dependent_actions.extend(perception_nodes)
@@ -927,46 +1024,25 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating execution nodes: {e}")
         raise
 
-    # ========== 11. Generate MoveIt Nodes ==========
-    try:
-        # Determine with_moveit flag
-        with_moveit_str = context.launch_configurations.get("with_moveit", "")
-        moveit_display = parse_bool(context.launch_configurations.get("moveit_display", "true"), default=True)
+    # ========== 11. Motion planning ownership ==========
+    # Generic launch ships no planner: motion services (move_to_pose, IK/FK,
+    # servo) are owned by the robot runtime selected through runtime.provider.
+    with_moveit_str = context.launch_configurations.get("with_moveit", "")
+    if with_moveit_str != "":
+        with_moveit = parse_bool(with_moveit_str, default=False)
+    else:
+        with_moveit = "moveit" in active_control_mode.lower()
+    logger.info(f"with_moveit={with_moveit}")
 
-        if with_moveit_str != "":
-            with_moveit = parse_bool(with_moveit_str, default=False)
-        else:
-            with_moveit = "moveit" in active_control_mode.lower()
-
-        logger.info(f"with_moveit={with_moveit}")
-
-        if with_moveit:
-            from robot_config.launch_builders.moveit import generate_moveit_nodes
-
-            moveit_nodes = generate_moveit_nodes(
-                robot_config,
-                active_control_mode,
-                node_use_sim_time,
-                moveit_display,
-                # Force MoveIt launch when the user explicitly set
-                # with_moveit:=true. Without this,
-                # with_moveit:=true + control_mode=teleop would call
-                # generate_moveit_nodes(force=False) which tests
-                # 'moveit' in 'teleop' → False → returns [], starting nothing.
-                force=parse_bool(with_moveit_str, default=False),
-            )
-
-            if controller_ready_barrier is not None:
-                logger.info("Deferring MoveIt nodes until required controllers are active...")
-                controller_dependent_actions.extend(moveit_nodes)
-            else:
-                logger.info("No controller readiness probe active, launching MoveIt immediately")
-                actions.extend(moveit_nodes)
-        else:
-            logger.info("Skipping MoveIt nodes")
-    except Exception as e:
-        logger.error(f"generating MoveIt nodes: {e}")
-        logger.info("Continuing without MoveIt...")
+    if with_moveit and not runtime_provider_name:
+        raise RuntimeError(
+            "motion planning was requested (with_moveit / a moveit control mode) but robot.runtime.provider "
+            "is not set: motion services come from the robot runtime, generic launch ships no planner"
+        )
+    if with_moveit:
+        logger.info(f"Motion services provided by runtime.provider={runtime_provider_name}")
+    else:
+        logger.info("Motion planning not requested")
 
     # ========== 10.5 Generate Embodied Minimal-Closure Nodes ==========
     if robot_config.get("embodied", {}).get("enabled", False):

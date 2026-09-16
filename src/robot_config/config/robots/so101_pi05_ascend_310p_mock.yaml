@@ -35,7 +35,7 @@ robot:
         control_frequency: 20.0
 
   ros2_control:
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
+    urdf_path: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
 
   peripherals:
     - type: camera

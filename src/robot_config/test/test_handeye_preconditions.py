@@ -57,7 +57,7 @@ robot:
 
 
 def test_standard_so101_config_has_wrist_camera_for_eye_in_hand_precheck():
-    result = precheck.run_precheck(_robot_config("so101_single_arm.yaml"), camera_name="wrist")
+    result = precheck.run_precheck(_robot_config("so101_single_arm_legacy.yaml"), camera_name="wrist")
 
     assert result.passed
     assert [camera.name for camera in result.mounted_cameras] == ["wrist"]

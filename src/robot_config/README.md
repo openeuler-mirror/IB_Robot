@@ -21,6 +21,11 @@ override 注入序列号，避免把某一台实物设备绑定到所有同型�
 
 ## 特性
 
+未配置 runtime provider 的 pick / skill / task 链路默认连接中立运动服务
+`/motion/move_to_joint` 和 `/motion/move_to_pose`，不再使用已删除的
+`/moveit_gateway/*`。这些默认值不会自动启动运动服务；SO-101 部署必须独立启动
+`so101_motion` 的 `motion_server` 及其所需控制栈后才能执行运动。
+
 - **单一 YAML 配置**：在一个文件中定义 ros2_control、相机和 ML 契约
 - **使用现有 ROS2 相机驱动**：
   - `usb_cam` 用于 USB 相机（基于 OpenCV）

@@ -8,7 +8,6 @@ from pathlib import Path
 
 from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
 
-_DEFAULT_CONFIG_NAME = "so101_single_arm"
 _SOURCE_ROBOTS_DIRECTORY = Path(__file__).resolve().parents[1] / "config" / "robots"
 
 
@@ -59,7 +58,11 @@ def resolve_robot_config_path(config_name: str | None = None, config_path: str |
        treat it as an explicit path (must exist); otherwise treat it as a
        config name (same resolution as case 2).
     4. ``ROBOT_NAME`` environment variable: always treated as a config name.
-    5. Default ``so101_single_arm`` config name.
+
+    The library-level API has no implicit default robot: when neither an
+    explicit argument nor an environment variable provides a name/path,
+    a ``ValueError`` instructs the caller to provide one. Launch entry
+    points may supply one explicit, documented default value.
 
     This function never reads ROS runtime state; it is safe to call from
     catalog-only CLI paths that do not initialize rclpy.
@@ -75,4 +78,7 @@ def resolve_robot_config_path(config_name: str | None = None, config_path: str |
     environment_name = os.environ.get("ROBOT_NAME")
     if environment_name:
         return _resolve_config_name(environment_name)
-    return _resolve_config_name(_DEFAULT_CONFIG_NAME)
+    raise ValueError(
+        "Robot configuration name or path is required: pass config_name/config_path "
+        "or set the ROBOT_CONFIG/ROBOT_NAME environment variable"
+    )

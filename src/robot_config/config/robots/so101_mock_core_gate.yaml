@@ -1,0 +1,66 @@
+# Generic-core independence gate configuration (so101-runtime-migration 6.4).
+#
+# Consumed by scripts/verify_runtime_independence.sh core: the generic stack
+# must compose, reconcile and serve motion calls against the mock runtime
+# with NO robot package installed. Keep this configuration minimal — no
+# cameras, no inference, no embodied services.
+
+robot:
+  name: so101_mock_core_gate
+  type: so101
+  robot_type: so_101
+
+  simulation:
+    platform: sdk
+
+  runtime:
+    provider: mock_runtime
+    profile: mock
+
+  capabilities:
+    requires:
+      - joint.state
+      - joint.position_stream
+      - joint.trajectory
+      - motion.fk
+      - motion.ik
+      - motion.move_to_joint
+      - motion.move_to_pose
+      - runtime.stop
+
+  default_control_mode: "teleop"
+
+  control_modes:
+    teleop:
+      description: "Gate smoke mode"
+      runtime_mode: stream
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 10
+        control_frequency: 10.0
+
+  contract:
+    rate_hz: 10
+    max_duration_s: 30.0
+    observations:
+      - key: observation.state
+        interface: joint.state
+        selector: { names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"] }
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
+    actions:
+      - key: action
+        selector:
+          names: ["action.0", "action.1", "action.2", "action.3", "action.4"]
+        publish:
+          interface: joint.arm_stream
+        safety_behavior: hold
+
+  teleoperation:
+    enabled: false

@@ -545,7 +545,7 @@ def test_robot_state_freshness_defaults_independently_from_perception_scene_fres
 def test_load_single_arm_config():
     """Test loading SO-101 single arm configuration."""
     # This test assumes the example config exists
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -592,7 +592,7 @@ def test_load_single_arm_config():
 
 
 def test_load_single_arm_config_dict_preserves_launch_schema():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -610,7 +610,7 @@ def test_load_single_arm_config_dict_preserves_launch_schema():
 
 
 def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     config = load_robot_config_dict(config_path)
 
@@ -618,7 +618,7 @@ def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
 
 
 def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     config = load_robot_config_dict(config_path)
     policy_keys = {"observation.state", "observation.images.top", "observation.images.wrist"}
@@ -631,7 +631,7 @@ def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
 
 
 def test_dict_contract_builder_matches_typed_contract_shape():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
@@ -717,7 +717,7 @@ def test_align_rejects_negative_max_age():
 
 
 def test_so101_single_arm_contract_includes_motor_current_observation():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")

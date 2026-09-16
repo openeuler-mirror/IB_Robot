@@ -1,6 +1,0 @@
-<?xml version="1.0"?>
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="so101_dual">
-	<!-- SSOT wrapper: the model lives in so101_description; this copy only
-	     redirects legacy consumers so the two trees can never diverge. -->
-	<xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_dual.urdf.xacro" />
-</robot>

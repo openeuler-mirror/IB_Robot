@@ -61,6 +61,7 @@ class ObservationSpec:
     # {reliability, history, depth, durability}
     qos: dict[str, Any] | None = None
     transport: ObservationTransportSpec | None = None
+    _interface_source: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +76,7 @@ class ActionSpec:
     publish_qos: dict[str, Any] | None = None
     publish_strategy: dict[str, Any] | None = None
     safety_behavior: str = "zeros"  # "zeros" | "hold"
+    _interface_source: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,6 +145,7 @@ class SpecView:
     clamp: tuple[float, float] | None  # actions only
     safety_behavior: str | None  # actions only: "zeros" | "hold"
     transport: ObservationTransportSpec | None
+    qos: dict[str, Any] | None = None
 
 
 # Driver pixel_format names that are not ROS Image encodings but have a
@@ -263,6 +266,7 @@ def iter_specs(contract: Contract) -> Iterable[SpecView]:
             clamp=None,
             safety_behavior=None,
             transport=o.transport,
+            qos=o.qos,
         )
     for a in contract.actions:
         names = list((a.selector or {}).get("names", []))
@@ -286,6 +290,7 @@ def iter_specs(contract: Contract) -> Iterable[SpecView]:
             clamp=clamp,
             safety_behavior=(a.safety_behavior or "zeros").lower(),
             transport=None,
+            qos=a.publish_qos,
         )
 
 

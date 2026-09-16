@@ -1,11 +1,9 @@
-# SO-101 Single Arm with RTP distributed inference to remote Ascend 310B.
-# Based on so101_single_arm.yaml. Key changes:
-# - Camera observations use RTP H.264 transport instead of DDS tensors
-# - Inference runs in distributed mode on remote Ascend 310B
-# - Front RealSense camera removed (not connected on this host)
+# SO-101 Single Arm Robot Configuration
+# This configuration defines the complete hardware setup for a single SO-101 arm
+# with cameras for imitation learning.
 
 robot:
-  name: so101_rtp_distributed
+  name: so101_single_arm
   type: so101
   robot_type: so_101  # For LeRobot dataset metadata
   # Gazebo：须与 config/worlds 里 <world name="..."> 一致；create 不传 -world 时会随机取 worlds 列表第一个
@@ -37,6 +35,8 @@ robot:
   # MoveIt configuration
   # ============================================
   moveit:
+    # Motion services come from runtime.provider (so101_robot); this section
+    # only describes the frames/group generic consumers address.
     # End-effector selection for MoveIt and Cartesian teleop.
     # Default keeps the upstream gripper-origin path:
     #   arm_group_name: arm
@@ -90,8 +90,8 @@ robot:
         pipelines:
           policy:
             model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
-            deployment: ascend_310b1
-            execution_mode: distributed
+            deployment: cpu
+            execution_mode: monolithic
             request_timeout: 120.0
             default_task: "pick up the banana"
       # ============================================
@@ -139,20 +139,48 @@ robot:
     output_topic: /voice_command
     exit_on_init_failure: true
 
+  # TTS playback is routed through the same audio_common path used on openEuler.
+  audio_io:
+    enabled: true
+    playback_topic: /audio/play
+    playback_device: ""
+    playback_sample_rate: 24000
+    playback_channels: 1
+    playback_sample_format: S16LE
+
+  # Voice TTS is enabled with the validated ZipVoice bundle and the ubuntu_onnx deployment.
+  # exit_on_init_failure is false so a missing/unbuilt bundle degrades gracefully:
+  # the node stays alive, /voice_tts/synthesize stays registered, and requests return
+  # MODEL_NOT_READY instead of crashing the pipeline.
+  voice_tts:
+    enabled: true
+    bundle_path: "models/zipvoice"
+    deployment: "ubuntu_onnx"
+    service_name: /voice_tts/synthesize
+    playback_service_name: /voice_tts/play
+    playback_timeout_sec: 300.0
+    synthesis_timeout_sec: 90.0
+    prompt_profile: default
+    segment_max_chars: 200
+    segment_pause_ms: 150
+    max_request_chars: 4000
+    max_prompt_audio_bytes: 10485760
+    max_prompt_duration_sec: 30.0
+    max_segments: 32
+    max_response_audio_bytes: 67108864
+    tts_timeout_sec: 15.0
+    device_id: 0
+    exit_on_init_failure: false
+
   semantic_mapping:
     enabled: false
-    migration:
-      grounded_sam2_node: compatibility
-      grounded_sam2_snapshot: diagnostic_only
-      perception_service_node: general_scene
-      embedded_mapping_backend: disabled
 
   embodied:
     enabled: false
     entry_mode: hermes
     skill_catalog_source_mode: development
     skill_catalog_source_root: src/skill_catalog
-    skill_catalog_profile: so101_rtp_distributed
+    skill_catalog_profile: so101_single_arm
     debug_tracing: true
     task_input_topic: /voice_command
     task_command_topic: /embodied/task_command
@@ -213,7 +241,7 @@ robot:
     visual_games:
       sorting_hat:
         enabled: false  # 趣味游戏默认关；现场启用需同时置 perception.enabled: true
-        announce: false
+        announce: true
         handler: sorting_hat_v1
         summary: 根据主相机中的人物形象判断其霍格沃茨学院
     execution:
@@ -245,13 +273,13 @@ robot:
         position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
         orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
 
-  # ros2_control configuration
+  # ros2_control configuration (provider-less legacy bring-up)
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
     port: /dev/ttyACM0
     calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
     joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Reset positions (optional) - uses 'rest' pose from SRDF
+    # Semantic rest pose for upper layers; hardware activation holds the measured position.
     reset_positions:
       "1": 0.0       # shoulder_pan:  centered
       "2": -1.5854   # shoulder_lift: ~-90° (down)
@@ -304,7 +332,7 @@ robot:
       index: 2
       width: 640
       height: 480
-      fps: 30
+      fps: 60
       pixel_format: mjpeg2rgb
       frame_id: camera_wrist_frame
       optical_frame_id: camera_wrist_optical_frame
@@ -322,6 +350,32 @@ robot:
         yaw: 0.0
       fovy: 0
       # camera_info_url: file://$(env HOME)/.ros/camera_info/wrist_camera.yaml
+
+    - type: camera
+      name: front
+      driver: realsense
+      serial_number: ""  # Optional: specific serial number
+      width: 640
+      height: 480
+      fps: 30
+      pixel_format: bgr8
+      enable_pointcloud: false
+      align_depth: true
+      frame_id: camera_front_link
+      optical_frame_id: camera_front_optical_frame
+      # use_default_transform: 启用仿真相机预设位姿。
+      # 为 true 时，下方 transform 和 fovy 被忽略，
+      # 根据相机名和当前仿真平台自动填入位姿与视场角。
+      use_default_transform: true
+      transform:
+        parent_frame: base
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+      fovy: 0
 
 
   # ============================================
@@ -343,13 +397,12 @@ robot:
     max_duration_s: 90.0
 
     observations:
-      - key: observation.images.top
-        topic: /camera/top/image_raw
+      - key: observation.images.front
+        topic: /camera/front/image_raw
         type: sensor_msgs/msg/Image
-        peripheral: top
+        peripheral: front
         image:
           resize: [480, 640]
-          encoding: rgb8
         align:
           strategy: hold
           stamp: header
@@ -359,23 +412,29 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-        transport:
-          mode: rtp
-          stream_id: top
-          endpoint: {host: 192.168.136.127, port: 5004}
-          encoder_backend: software
-          decoder_backend: ascend
-          codec: h264
-          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
-          h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
+
+      - key: observation.images.top
+        topic: /camera/top/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: top  # References camera 'top' from peripherals above
+        image:
+          resize: [480, 640]  # height, width for LeRobot
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
 
       - key: observation.images.wrist
         topic: /camera/wrist/image_raw
         type: sensor_msgs/msg/Image
-        peripheral: wrist
+        peripheral: wrist  # References camera 'wrist' from peripherals above
         image:
           resize: [480, 640]
-          encoding: rgb8
         align:
           strategy: hold
           stamp: header
@@ -385,15 +444,6 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-        transport:
-          mode: rtp
-          stream_id: wrist
-          endpoint: {host: 192.168.136.127, port: 5006}
-          encoder_backend: software
-          decoder_backend: ascend
-          codec: h264
-          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
-          h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
 
       - key: observation.state
         topic: /joint_states
@@ -483,6 +533,9 @@ robot:
       # velocity reference frame.
       # Placo-only speed knobs, as fractions of the backend physical maximum.
       placo_servo:
+        # Robot-suite node serving the Placo contract (config-declared, never hardcoded).
+        package: so101_motion
+        executable: so101_placo_servo_node.py
         linear_speed: 0.17   # 0.0~1.0
         angular_speed: 0.2   # 0.0~1.0
 
@@ -493,13 +546,12 @@ robot:
         calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
       - name: "phone_teleop"
         type: "phone"
-        control_frequency: 30.0
+        control_frequency: 50.0
         phone_config:
-          phone_os: "android" # android/ios
+          backend: "webphone"
           camera_offset: [0.0, -0.02, 0.04]
-          linear_scale: 2.0
           end_effector_bounds:
-            min: [-0.5, -0.5, 0.0]
+            min: [-0.5, -0.5, -0.5]
             max: [0.5, 0.5, 0.5]
           max_ee_step_m: 0.05
           gripper_speed_factor: 20.0
@@ -571,7 +623,8 @@ robot:
         "3": {"min": -1.6813, "max": 1.6828}
         "4": {"min": -1.65806, "max": 1.65806}
         "5": {"min": -2.9115, "max": 2.9115}
-        "6": {"min": 0.0, "max": 1.0}
+        # No "6" entry: the gripper stroke comes from the follower calibration
+        # via the device (get_gripper_limits/stroke), never a [0,1] snapshot.
 
   # ============================================
   # Recording Configuration

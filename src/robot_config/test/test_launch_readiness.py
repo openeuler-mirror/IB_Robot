@@ -529,7 +529,7 @@ def test_gazebo_start_backend_uses_readiness_probe_instead_of_timer():
 
 
 def test_shared_loader_preserves_source_path_metadata():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
     robot_config = load_robot_config_dict(config_path)
 
     assert robot_config["name"] == "so101_single_arm"
@@ -538,10 +538,10 @@ def test_shared_loader_preserves_source_path_metadata():
 
 
 def test_launch_loader_uses_shared_dict_loader():
-    robot_config = robot_launch.load_robot_config("so101_single_arm")
+    robot_config = robot_launch.load_robot_config("so101_single_arm_legacy")
 
     assert robot_config["name"] == "so101_single_arm"
-    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm.yaml")
+    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm_legacy.yaml")
 
 
 def test_default_trace_session_auto_suffixes_on_collision(monkeypatch, tmp_path):
@@ -800,7 +800,9 @@ def test_launch_setup_enables_navigation_when_requested():
 
 def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
     src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
-    robot_config = load_robot_config_dict(src_config_path)
+    # The migrated provider config binds logical interfaces against the live
+    # runtime at launch time; offline structural loads defer that binding.
+    robot_config = load_robot_config_dict(src_config_path, defer_interface_binding=True)
     robot_config.pop("_config_path", None)
     robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": True}
     config_path = tmp_path / "scheduled_sim.yaml"
@@ -809,7 +811,9 @@ def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monk
     context.launch_configurations.update(
         config_path=str(config_path),
         use_sim="true",
-        sim_platform="mock",
+        # The migrated provider config supports the SDK simulated transport;
+        # the scheduler/simulation rejection below must fire before any nodes.
+        sim_platform="sdk",
         control_mode="model_inference",
         with_inference="true",
     )
@@ -827,7 +831,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
     monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
     monkeypatch.setattr(tracing_builder, "_resolve_trace_session", lambda name, _root: (name, tmp_path / name))
     monkeypatch.setattr(tracing_builder, "_run_trace_command", lambda _command, _reason: None)
-    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm_legacy.yaml"
     robot_config = load_robot_config_dict(src_config_path)
     robot_config.pop("_config_path", None)
     bundle = _create_inference_bundle(tmp_path / "model")
@@ -837,7 +841,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
     config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
 
     context = LaunchContext()
-    context.launch_configurations["robot_config"] = "so101_single_arm"
+    context.launch_configurations["robot_config"] = "so101_single_arm_legacy"
     context.launch_configurations["config_path"] = str(config_path)
     context.launch_configurations["use_sim"] = "true"
     context.launch_configurations["sim_platform"] = "mock"
@@ -1793,7 +1797,7 @@ def test_phone_placo_uses_explicit_arm_group_topic():
             "moveit": {
                 "base_link": "base",
                 "ee_link": "gripper",
-                "so101_placo_servo_config_path": "$(find robot_moveit)/config/so101_placo_servo.yaml",
+                "so101_placo_servo_config_path": "$(find so101_motion)/config/so101_placo_servo.yaml",
             },
             "ros2_control": {"reset_positions": {"1": 0.0, "2": 0.0}},
             "teleoperation": {

@@ -36,7 +36,7 @@ def test_resolve_robot_config_path_checks_share_before_checkout(tmp_path, monkey
     assert resolve_robot_config_path(config_name="so101_single_arm") == share_config.resolve()
 
 
-def test_resolve_robot_config_path_uses_robot_config_then_robot_name_then_default(monkeypatch):
+def test_resolve_robot_config_path_uses_robot_config_then_robot_name(monkeypatch):
     monkeypatch.setattr(config_path_module, "get_package_share_directory", lambda _package: "/missing/share")
     monkeypatch.setenv("ROBOT_CONFIG", "so101_single_arm")
     monkeypatch.setenv("ROBOT_NAME", "missing_robot")
@@ -46,8 +46,15 @@ def test_resolve_robot_config_path_uses_robot_config_then_robot_name_then_defaul
     monkeypatch.setenv("ROBOT_NAME", "so101_single_arm")
     assert resolve_robot_config_path() == (SOURCE_ROBOTS / "so101_single_arm.yaml").resolve()
 
-    monkeypatch.delenv("ROBOT_NAME")
-    assert resolve_robot_config_path() == (SOURCE_ROBOTS / "so101_single_arm.yaml").resolve()
+
+def test_resolve_robot_config_path_requires_explicit_selection(monkeypatch):
+    # robot-agnostic-core: library callers obtain no implicit default robot;
+    # only a launch entry point may document one.
+    monkeypatch.delenv("ROBOT_CONFIG", raising=False)
+    monkeypatch.delenv("ROBOT_NAME", raising=False)
+
+    with pytest.raises(ValueError, match="ROBOT_CONFIG"):
+        resolve_robot_config_path()
 
 
 def test_resolve_robot_config_path_reports_missing_explicit_path(tmp_path):

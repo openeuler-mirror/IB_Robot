@@ -15,9 +15,9 @@ import tempfile
 
 from launch_ros.actions import Node
 
-from robot_config.launch_builders.camera_isp_overrides import load_isp_override
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool, resolve_ros_path
+from robot_runtime.peripherals import load_isp_override
 
 logger = get_colored_logger("robot_config.perception")
 

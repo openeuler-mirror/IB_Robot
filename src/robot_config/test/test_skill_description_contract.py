@@ -9,7 +9,7 @@ import yaml
 
 from robot_config.loader import _validate_skill_description
 
-SO101 = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+SO101 = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
 SKILLS = SO101.parents[3] / "skill_catalog" / "config" / "skills"
 PROFILE = SO101.parents[3] / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
 

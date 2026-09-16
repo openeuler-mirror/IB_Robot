@@ -38,6 +38,7 @@ from robot_config.config import (
 )
 from robot_config.dispatch_strategies import reject_legacy_smoothing_config
 from robot_config.grasp_execution_config import validate_grasp_execution_config
+from robot_config.interface_binding import required_interface_ids, resolve_robot_interfaces
 from robot_config.observation_transport import (
     parse_observation_transport,
     validate_observation_transports,
@@ -47,6 +48,7 @@ from robot_config.perception_runtime_config import PerceptionRuntimeConfigError,
 from robot_config.placement_execution_config import validate_placement_execution_config
 from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from robot_runtime import contract as RUNTIME
 
 from .config_path import resolve_robot_config_path
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
@@ -283,6 +285,51 @@ def validate_speech_direction_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
+def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the optional ``runtime.provider`` selection (robot-runtime-packaging).
+
+    When ``runtime.provider`` names a robot runtime, that runtime's
+    ``runtime.launch.py`` brings up hardware, controllers, motion services and
+    the runtime facade; robot_config only delegates and reconciles
+    ``capabilities.requires`` against ``RuntimeStatus``. A provider is
+    mutually exclusive with a legacy simulation platform. Provider-less
+    configurations retain their existing launch path until separately migrated.
+    """
+    errors: list[str] = []
+    runtime = robot_config.get("runtime") or {}
+    if not isinstance(runtime, dict):
+        return ["runtime must be a mapping"]
+    provider = str(runtime.get("provider", "") or "").strip()
+    profile = str(runtime.get("profile", "") or "").strip()
+    if "provider" in runtime and not provider:
+        errors.append("runtime.provider must be a non-empty robot runtime package name (e.g. so101_robot)")
+        return errors
+    if provider:
+        if not profile:
+            errors.append(f"runtime.profile is required when runtime.provider={provider!r}")
+        sim_platform = str((robot_config.get("simulation") or {}).get("platform", "sdk")).lower()
+        if sim_platform != "sdk":
+            errors.append(
+                "runtime.provider supports simulation.platform=sdk only; "
+                "Gazebo, MuJoCo and legacy mock backends are not interchangeable with SDK simulated transport"
+            )
+        if runtime.get("require_model"):
+            if robot_config.get("ros2_control") or robot_config.get("peripherals"):
+                errors.append("public runtime consumers must place hardware and peripherals in runtime.profile")
+            for name, mode in (robot_config.get("control_modes") or {}).items():
+                if (mode or {}).get("controllers"):
+                    errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
+
+    required = (robot_config.get("capabilities") or {}).get("requires") or []
+    if required:
+        from robot_runtime.capabilities import validate_capability_set
+
+        invalid = validate_capability_set(required)
+        if invalid:
+            errors.append(f"capabilities.requires contains unknown names: {', '.join(invalid)}")
+    return errors
+
+
 def validate_navigation_endpoint_contract(robot_config: dict[str, Any]) -> list[str]:
     """Validate the stage-resolved navigation endpoint ownership contract."""
     errors: list[str] = []
@@ -408,9 +455,7 @@ def robot_execution_endpoints(robot_config: dict[str, Any]) -> dict[str, Any]:
         "arm_trajectory_action": execution.get(
             "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
         ),
-        "move_configuration_service": execution.get(
-            "move_configuration_service", "/moveit_gateway/move_to_configuration"
-        ),
+        "move_configuration_service": execution.get("move_configuration_service", RUNTIME.MOVE_TO_JOINT_SERVICE),
     }
     navigation_action = navigation_endpoint_projection(robot_config)
     if navigation_action is not None:
@@ -1228,7 +1273,11 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 def load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     """Load a validated robot section for consumers that need resolved YAML."""
-    return _load_robot_section(config_path)
+    resolved_path, robot_data = _load_robot_section(config_path)
+    if required_interface_ids(robot_data):
+        robot_data["_config_path"] = str(resolved_path)
+        robot_data = resolve_robot_interfaces(robot_data)
+    return resolved_path, robot_data
 
 
 _GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
@@ -1692,6 +1741,7 @@ def load_robot_config_dict(
     *,
     nav_stage: str = "",
     materialize_benchmark_transport: bool | None = None,
+    defer_interface_binding: bool = False,
 ) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
@@ -1700,6 +1750,8 @@ def load_robot_config_dict(
     downstream users that need provenance. Benchmark-specific observation
     transport materialization is opt-in; launch orchestration performs it only
     after all launch overrides and the effective runtime target are resolved.
+    ``defer_interface_binding`` is only for live launch's structural first phase;
+    all normal loaders require an embedded or file-backed description for logical IDs.
     """
     resolved_config_path, robot_data, config_sources = _load_robot_section_with_sources(
         resolve_robot_config_path(config_path=config_path)
@@ -1710,6 +1762,9 @@ def load_robot_config_dict(
         robot_config["peripherals"] = [
             item for item in peripherals if isinstance(item, dict) and not item.get("disabled", False)
         ]
+    robot_config["_config_path"] = str(resolved_config_path)
+    robot_config["_config_sources"] = [str(path) for path in config_sources]
+    robot_config = resolve_robot_interfaces(robot_config, defer=defer_interface_binding)
     for mode_name, mode_config in (robot_config.get("control_modes", {}) or {}).items():
         try:
             reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})
@@ -1724,7 +1779,16 @@ def load_robot_config_dict(
             robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
     _apply_approved_camera_calibration(robot_config)
     _warn_unbound_serial_cameras(robot_config)
+    validate_robot_config_dict(
+        robot_config, deferred_interfaces=defer_interface_binding and bool(required_interface_ids(robot_config))
+    )
+    return robot_config
+
+
+def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfaces: bool = False) -> None:
+    """Validate an effective config, including an in-memory launch binding before snapshotting."""
     validation_errors = validate_navigation_endpoint_contract(robot_config)
+    validation_errors.extend(validate_runtime_provider_config(robot_config))
     validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))
@@ -1743,15 +1807,13 @@ def load_robot_config_dict(
         validation_errors.append(str(exc))
     validation_errors.extend(validate_semantic_mapping_config(robot_config))
     validation_errors.extend(validate_speech_direction_config(robot_config))
-    try:
-        validation_errors.extend(validate_robot_config_observation_transports(robot_config))
-    except (TypeError, ValueError) as exc:
-        validation_errors.append(str(exc))
+    if not deferred_interfaces:
+        try:
+            validation_errors.extend(validate_robot_config_observation_transports(robot_config))
+        except (TypeError, ValueError) as exc:
+            validation_errors.append(str(exc))
     if validation_errors:
         raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
-    robot_config["_config_path"] = str(resolved_config_path)
-    robot_config["_config_sources"] = [str(path) for path in config_sources]
-    return robot_config
 
 
 def load_camera_config(data: dict[str, Any]) -> CameraConfig:
@@ -1810,7 +1872,7 @@ def load_ros2_control_config(data: dict[str, Any], config_dir: Path | None = Non
       port: /dev/ttyACM0
       calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
       reset_positions: {1: 0.0, 2: 0.0}
-      urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
+      urdf_path: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
     ```
     """
     params = {}
@@ -1828,7 +1890,9 @@ def load_ros2_control_config(data: dict[str, Any], config_dir: Path | None = Non
     )
 
 
-def load_contract_config(data: dict[str, Any]) -> ContractExtensionConfig:
+def load_contract_config(
+    data: dict[str, Any], *, robot_config: dict[str, Any] | None = None
+) -> ContractExtensionConfig:
     """Load contract extension configuration from dict.
 
     Example:
@@ -1846,6 +1910,7 @@ def load_contract_config(data: dict[str, Any]) -> ContractExtensionConfig:
             type: sensor_msgs/msg/JointState
     ```
     """
+    data = resolve_robot_interfaces({**(robot_config or {}), "contract": data})["contract"]
     observations = []
     for obs_data in data.get("observations", []):
         observations.append(
@@ -1859,6 +1924,7 @@ def load_contract_config(data: dict[str, Any]) -> ContractExtensionConfig:
                 align=obs_data.get("align"),
                 qos=obs_data.get("qos"),
                 transport=parse_observation_transport(obs_data.get("transport")),
+                _interface_source=obs_data.get("_interface_source"),
             )
         )
 
@@ -2122,7 +2188,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
 
     # Load contract config
     contract_data = robot_data.get("contract", {})
-    contract = load_contract_config(contract_data)
+    contract = load_contract_config(contract_data, robot_config=robot_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
     audio_io = load_audio_io_config(robot_data.get("audio_io", {}))
@@ -2147,6 +2213,8 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         name=name,
         type=type_,
         robot_type=robot_type,
+        runtime=dict(robot_data.get("runtime") or {}),
+        robot_model=dict(robot_data.get("robot_model") or {}),
         ros2_control=ros2_control,
         peripherals=peripherals,
         contract=contract,
@@ -2158,9 +2226,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         skill_gateway=skill_gateway,
         semantic_mapping=semantic_mapping,
         perception_services=perception_services,
-        placement_execution=robot_data.get("placement_execution", {})
-        if isinstance(robot_data.get("placement_execution", {}), dict)
-        else {},
+        placement_execution=robot_data.get("placement_execution"),
     )
 
 
@@ -2565,11 +2631,15 @@ def validate_config(config: RobotConfig) -> list[str]:
     )
 
     # Validate ros2_control config
-    if not config.ros2_control.hardware_plugin:
+    if not config.runtime.get("provider") and not config.ros2_control.hardware_plugin:
         errors.append("ros2_control.hardware_plugin is required")
 
     try:
-        calibration_paths = resolve_calibration_paths_from_config(_robot_config_to_validation_dict(config))
+        calibration_paths = (
+            []
+            if config.runtime.get("provider")
+            else resolve_calibration_paths_from_config(_robot_config_to_validation_dict(config))
+        )
     except (TypeError, ValueError) as exc:
         errors.append(f"Invalid ros2_control calibration configuration: {exc}")
     else:
@@ -2604,7 +2674,7 @@ def validate_config(config: RobotConfig) -> list[str]:
 
     # Validate contract-peripheral references
     for obs in config.contract.observations:
-        if obs.peripheral and obs.peripheral not in peripheral_names:
+        if obs.peripheral and obs._interface_source is None and obs.peripheral not in peripheral_names:
             errors.append(f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}")
 
     try:

@@ -3,6 +3,8 @@ robot:
   name: dev_rtp_single_camera
   type: so101
   robot_type: so_101
+  joints:
+    all: []  # No joint action consumer in this RTP contract.
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
   control_modes:

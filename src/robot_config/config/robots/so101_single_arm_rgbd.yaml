@@ -108,7 +108,7 @@ robot:
       "3": 0.0
       "4": 0.0
       "5": 0.0
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
+    urdf_path: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
 
     # Controllers configuration
     controllers_config: $(find so101_hardware)/config/so101_controllers.yaml

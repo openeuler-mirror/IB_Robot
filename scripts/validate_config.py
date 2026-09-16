@@ -18,9 +18,9 @@ Used in CI/CD to catch configuration drift before deployment.
 
 import argparse
 import sys
-import yaml
 from pathlib import Path
-from typing import Dict, Set, List, Tuple
+
+import yaml
 
 
 class ConfigValidator:
@@ -34,20 +34,15 @@ class ConfigValidator:
     def log(self, message: str, level: str = "INFO"):
         """Log a message if verbose mode is enabled."""
         if self.verbose or level in ["ERROR", "WARNING"]:
-            prefix = {
-                "INFO": "ℹ",
-                "WARNING": "⚠",
-                "ERROR": "✗",
-                "SUCCESS": "✓"
-            }.get(level, "•")
+            prefix = {"INFO": "ℹ", "WARNING": "⚠", "ERROR": "✗", "SUCCESS": "✓"}.get(level, "•")
             print(f"{prefix} {message}")
 
-    def load_yaml(self, path: Path) -> Dict:
+    def load_yaml(self, path: Path) -> dict:
         """Load a YAML file."""
         if not path.exists():
             raise FileNotFoundError(f"Configuration file not found: {path}")
 
-        with open(path, 'r') as f:
+        with open(path) as f:
             return yaml.safe_load(f)
 
     def resolve_ros_path(self, path_str: str, base_dir: Path) -> Path:
@@ -61,7 +56,7 @@ class ConfigValidator:
         import re
 
         # Handle $(find package)
-        find_pattern = r'\$\(find\s+(\w+)\)'
+        find_pattern = r"\$\(find\s+(\w+)\)"
         match = re.search(find_pattern, path_str)
         if match:
             package_name = match.group(1)
@@ -88,7 +83,7 @@ class ConfigValidator:
             raise FileNotFoundError(f"Could not find package '{package_name}'")
 
         # Handle $(env VAR)
-        env_pattern = r'\$\(env\s+(\w+)\)'
+        env_pattern = r"\$\(env\s+(\w+)\)"
         match = re.search(env_pattern, path_str)
         if match:
             env_var = match.group(1)
@@ -100,7 +95,7 @@ class ConfigValidator:
 
         return Path(path_str)
 
-    def validate_joints_config(self, robot_config_path: Path) -> Tuple[Dict, Set, Set, Set]:
+    def validate_joints_config(self, robot_config_path: Path) -> tuple[dict, set, set, set]:
         """Validate and extract joint configuration from robot_config."""
         self.log(f"Loading robot config: {robot_config_path}")
 
@@ -120,8 +115,7 @@ class ConfigValidator:
         expected_all = arm_joints | gripper_joints
         if all_joints != expected_all:
             self.warnings.append(
-                f"'all' joints list ({sorted(all_joints)}) does not match "
-                f"arm + gripper union ({sorted(expected_all)})"
+                f"'all' joints list ({sorted(all_joints)}) does not match arm + gripper union ({sorted(expected_all)})"
             )
 
         self.log(f"Arm joints: {sorted(arm_joints)}")
@@ -131,11 +125,7 @@ class ConfigValidator:
         return joints_cfg, arm_joints, gripper_joints, all_joints
 
     def validate_controller_config(
-        self,
-        controllers_config_path: Path,
-        expected_arm: Set[str],
-        expected_gripper: Set[str],
-        expected_all: Set[str]
+        self, controllers_config_path: Path, expected_arm: set[str], expected_gripper: set[str], expected_all: set[str]
     ) -> bool:
         """Validate controller configuration consistency."""
         self.log(f"\nValidating controller config: {controllers_config_path}")
@@ -175,10 +165,7 @@ class ConfigValidator:
         return all_valid
 
     def validate_moveit_config(
-        self,
-        moveit_config_path: Path,
-        expected_arm: Set[str],
-        expected_gripper: Set[str]
+        self, moveit_config_path: Path, expected_arm: set[str], expected_gripper: set[str]
     ) -> bool:
         """Validate MoveIt controller configuration consistency."""
         self.log(f"\nValidating MoveIt config: {moveit_config_path}")
@@ -217,10 +204,7 @@ class ConfigValidator:
         return all_valid
 
     def run_validation(
-        self,
-        robot_config_path: Path,
-        controllers_config_path: Path = None,
-        moveit_config_path: Path = None
+        self, robot_config_path: Path, controllers_config_path: Path = None, moveit_config_path: Path = None
     ) -> bool:
         """Run complete configuration validation."""
         self.log("=" * 60)
@@ -229,8 +213,7 @@ class ConfigValidator:
 
         # Step 1: Load and validate robot_config
         try:
-            joints_cfg, arm_joints, gripper_joints, all_joints = \
-                self.validate_joints_config(robot_config_path)
+            joints_cfg, arm_joints, gripper_joints, all_joints = self.validate_joints_config(robot_config_path)
         except Exception as e:
             self.errors.append(f"Failed to validate robot_config: {e}")
             return False
@@ -247,31 +230,19 @@ class ConfigValidator:
 
             if ctrl_path_str:
                 try:
-                    controllers_config_path = self.resolve_ros_path(
-                        ctrl_path_str,
-                        robot_config_path.parent
-                    )
+                    controllers_config_path = self.resolve_ros_path(ctrl_path_str, robot_config_path.parent)
                 except Exception as e:
                     self.warnings.append(f"Could not resolve controllers_config path: {e}")
 
         # Step 3: Validate controller config
         if controllers_config_path and controllers_config_path.exists():
-            self.validate_controller_config(
-                controllers_config_path,
-                arm_joints,
-                gripper_joints,
-                all_joints
-            )
+            self.validate_controller_config(controllers_config_path, arm_joints, gripper_joints, all_joints)
         else:
             self.warnings.append("Controllers config not found, skipping validation")
 
         # Step 4: Validate MoveIt config (if provided)
         if moveit_config_path and moveit_config_path.exists():
-            self.validate_moveit_config(
-                moveit_config_path,
-                arm_joints,
-                gripper_joints
-            )
+            self.validate_moveit_config(moveit_config_path, arm_joints, gripper_joints)
 
         # Step 5: Print summary
         self.log("\n" + "=" * 60)
@@ -295,53 +266,38 @@ class ConfigValidator:
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Validate IB Robot configuration consistency"
-    )
+    parser = argparse.ArgumentParser(description="Validate IB Robot configuration consistency")
     parser.add_argument(
         "--robot-config",
         type=Path,
         default=Path("src/robot_config/config/robots/so101_single_arm.yaml"),
-        help="Path to robot configuration YAML"
+        help="Path to robot configuration YAML",
     )
     parser.add_argument(
-        "--controllers-config",
-        type=Path,
-        help="Path to controllers configuration YAML (auto-resolved if not provided)"
+        "--controllers-config", type=Path, help="Path to controllers configuration YAML (auto-resolved if not provided)"
     )
-    parser.add_argument(
-        "--moveit-config",
-        type=Path,
-        help="Path to MoveIt controllers configuration YAML"
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose output"
-    )
+    parser.add_argument("--moveit-config", type=Path, help="Path to MoveIt controllers configuration YAML")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
 
     args = parser.parse_args()
 
     # Try to auto-detect MoveIt config if not provided
     moveit_config = args.moveit_config
     if not moveit_config:
-        candidate = Path("src/robot_moveit/config/lerobot/so101/moveit_controllers.yaml")
+        candidate = Path("src/robots/so101/so101_motion/config/so101/moveit_controllers.yaml")
         if candidate.exists():
             moveit_config = candidate
 
     validator = ConfigValidator(verbose=args.verbose)
 
     try:
-        success = validator.run_validation(
-            args.robot_config,
-            args.controllers_config,
-            moveit_config
-        )
+        success = validator.run_validation(args.robot_config, args.controllers_config, moveit_config)
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"✗ Validation failed with exception: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
+
             traceback.print_exc()
         sys.exit(2)
 

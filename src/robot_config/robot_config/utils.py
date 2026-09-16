@@ -10,15 +10,38 @@ This module contains common utility functions used across the robot_config packa
 import hashlib
 import json
 import logging
-import math
 import os
 import re
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+from robot_runtime.joint_conversion import (
+    NORM_MODE_DEGREES as NORM_MODE_DEGREES,
+)
+from robot_runtime.joint_conversion import (
+    NORM_MODE_NONE as NORM_MODE_NONE,
+)
+from robot_runtime.joint_conversion import (
+    NORM_MODE_RANGE as NORM_MODE_RANGE,
+)
+from robot_runtime.joint_conversion import (
+    JointConversionEntry as JointConversionEntry,
+)
+from robot_runtime.joint_conversion import (
+    build_joint_conversion_table_from_calibration as build_joint_conversion_table_from_calibration,
+)
+from robot_runtime.joint_conversion import (
+    build_joint_conversion_table_from_urdf as build_joint_conversion_table_from_urdf,
+)
+from robot_runtime.joint_conversion import (
+    normalize_lerobot_norm_mode as normalize_lerobot_norm_mode,
+)
+from robot_runtime.joint_conversion import (
+    resolve_calibration_key as _resolve_calibration_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -269,8 +292,6 @@ def prepare_lerobot_env():
 # Joint unit-conversion helpers  (LeRobot percentage  ↔  ros2_control radians)
 # ---------------------------------------------------------------------------
 
-# Each entry: (rad_min, rad_max, pct_span, pct_offset)
-JointConversionEntry = tuple[float, float, float, float]
 CalibrationSnapshot = dict[str, dict[str, Any]]
 
 
@@ -284,16 +305,6 @@ class CalibrationSourceSpec:
 
 CalibrationSource = str | os.PathLike[str] | CalibrationSourceSpec | dict[str, Any] | list[Any] | tuple[Any, ...]
 
-_TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
-
-
-# Supported LeRobot motor normalization modes.
-# Keep in sync with the YAML ``lerobot_norm_mode`` option.
-NORM_MODE_RANGE = "range_m100_100"  # arm [-100,+100], gripper [0,100]
-NORM_MODE_DEGREES = "degrees"  # arm centred degrees, gripper [0,100]
-NORM_MODE_NONE = "none"  # pass-through (no conversion)
-
-_MODEL_RESOLUTION = 4096  # Feetech STS3215 12-bit encoder
 _CALIBRATION_SNAPSHOT_FIELDS = (
     "id",
     "model",
@@ -304,19 +315,25 @@ _CALIBRATION_SNAPSHOT_FIELDS = (
 )
 
 
-def normalize_lerobot_norm_mode(norm_mode: str) -> str:
-    """Normalize and validate LeRobot motor normalization mode."""
-    mode = str(norm_mode or NORM_MODE_RANGE).strip().lower()
-    if mode not in (NORM_MODE_RANGE, NORM_MODE_DEGREES, NORM_MODE_NONE):
-        raise ValueError(
-            f"Unsupported LeRobot normalization mode '{norm_mode}'. "
-            f"Expected one of: {NORM_MODE_RANGE}, {NORM_MODE_DEGREES}, {NORM_MODE_NONE}"
-        )
-    return mode
+def uses_public_model(robot_config: dict[str, Any]) -> bool:
+    """Public consumers must not silently fall back to private files or raw radians."""
+    if "robot_model" in robot_config:
+        return True
+    runtime = robot_config.get("runtime") or {}
+    return bool(runtime.get("provider") or runtime.get("interface_description")) and not bool(
+        resolve_calibration_source_specs_from_config(robot_config)
+    )
 
 
 def resolve_joint_names_from_config(robot_config: dict[str, Any]) -> list[str]:
     """Resolve ordered joint names from raw robot_config YAML content."""
+    if uses_public_model(robot_config):
+        return [
+            str(name)
+            for observation in (robot_config.get("contract") or {}).get("observations", [])
+            if observation.get("key") == "observation.state"
+            for name in (observation.get("selector") or {}).get("names", [])
+        ]
     ros2_control = robot_config.get("ros2_control", {}) or {}
     joints_cfg = robot_config.get("joints", {}) or {}
     joint_names = ros2_control.get("joint_names") or joints_cfg.get("all") or []
@@ -337,6 +354,8 @@ def _dedupe_strings(values: list[Any]) -> list[str]:
 
 def resolve_gripper_joints_from_config(robot_config: dict[str, Any]) -> list[str]:
     """Resolve gripper joint names from raw robot_config YAML content."""
+    if uses_public_model(robot_config):
+        return list(((robot_config.get("robot_model") or {}).get("joint_groups") or {}).get("gripper", []))
     ros2_control = robot_config.get("ros2_control", {}) or {}
     joints_cfg = robot_config.get("joints", {}) or {}
     explicit = ros2_control.get("gripper_joints")
@@ -545,16 +564,6 @@ def load_calibration_data(calib_file: CalibrationSource) -> dict[str, Any]:
     return _load_calibration_data_from_specs(_normalize_calibration_source_specs(calib_file))
 
 
-def _resolve_calibration_key(calibration: dict[str, Any], joint_name: str) -> str:
-    if joint_name in calibration:
-        return joint_name
-    if joint_name.isdigit() and str(int(joint_name)) == joint_name:
-        arm_key = f"joint{int(joint_name)}_arm"
-        if arm_key in calibration:
-            return arm_key
-    raise KeyError(f"Joint '{joint_name}' missing from calibration data")
-
-
 def extract_calibration_snapshot(
     calibration: dict[str, Any],
     joint_names: list[str],
@@ -672,132 +681,21 @@ def build_lerobot_conversion_metadata(
     return metadata
 
 
-def build_joint_conversion_table_from_calibration(
-    calibration: dict[str, Any],
-    joint_names: list[str],
-    gripper_joints: list[str] | None = None,
-    norm_mode: str = NORM_MODE_RANGE,
-) -> list[JointConversionEntry]:
-    """Build a conversion table from calibration content already in memory."""
-    mode = normalize_lerobot_norm_mode(norm_mode)
-    if mode == NORM_MODE_NONE:
-        return []
+def build_public_lerobot_conversion_metadata(
+    robot_model: dict[str, Any],
+    interface_description: dict[str, Any],
+    feature_names: dict[str, list[str]],
+    norm_mode: str,
+) -> dict[str, Any]:
+    """Build a portable conversion snapshot from the bound public descriptor."""
+    from robot_runtime.model_metadata import build_public_conversion_metadata
 
-    ordered_joints = [str(name) for name in joint_names]
-    gripper_joint_set = {str(name) for name in (gripper_joints or [])}
-    table: list[JointConversionEntry] = []
-
-    for joint_name in ordered_joints:
-        calibration_key = _resolve_calibration_key(calibration, joint_name)
-        entry = calibration[calibration_key]
-        if not isinstance(entry, dict):
-            raise ValueError(f"Calibration entry for joint '{joint_name}' must be an object")
-
-        tick_min = int(entry["range_min"])
-        tick_max = int(entry["range_max"])
-
-        if mode == NORM_MODE_DEGREES and joint_name not in gripper_joint_set:
-            mid = (tick_min + tick_max) / 2.0
-            max_res = _MODEL_RESOLUTION - 1  # 4095
-            deg_at_tick_min = (tick_min - mid) * 360.0 / max_res
-            deg_at_tick_max = (tick_max - mid) * 360.0 / max_res
-
-            rad_min = (tick_min - 2048.0) / _TICKS_PER_RAD
-            rad_max = (tick_max - 2048.0) / _TICKS_PER_RAD
-            span = deg_at_tick_max - deg_at_tick_min
-            offset = deg_at_tick_min
-        else:
-            rad_min = (tick_min - 2048.0) / _TICKS_PER_RAD
-            rad_max = (tick_max - 2048.0) / _TICKS_PER_RAD
-
-            if joint_name in gripper_joint_set:
-                span = 100.0
-                offset = 0.0
-            else:
-                span = 200.0
-                offset = -100.0
-
-        table.append((rad_min, rad_max, span, offset))
-
-    return table
-
-
-def _joint_limits_from_urdf(root: ET.Element, joint_name: str) -> tuple[float, float]:
-    """Resolve lower/upper position limits (radians) for one joint from URDF XML.
-
-    Looks first at ``<joint><limit lower=... upper=.../></joint>`` and falls
-    back to the ``ros2_control`` command-interface ``min``/``max`` params when
-    the joint is not declared as a plain URDF joint (typical for grippers).
-    """
-    for joint in root.findall(".//joint"):
-        if joint.get("name") != joint_name:
-            continue
-
-        limit = joint.find("limit")
-        if limit is not None and limit.get("lower") is not None and limit.get("upper") is not None:
-            return float(limit.get("lower")), float(limit.get("upper"))
-
-    for joint in root.findall(".//ros2_control/joint"):
-        if joint.get("name") != joint_name:
-            continue
-
-        command = joint.find("./command_interface[@name='position']")
-        if command is None:
-            continue
-
-        params = {param.get("name"): param.text for param in command.findall("param")}
-        if params.get("min") is not None and params.get("max") is not None:
-            return float(params["min"]), float(params["max"])
-
-    raise KeyError(f"Joint '{joint_name}' missing lower/upper limits in URDF")
-
-
-def build_joint_conversion_table_from_urdf(
-    urdf_xml: str,
-    joint_names: list[str],
-    gripper_joints: list[str] | None = None,
-    norm_mode: str = NORM_MODE_RANGE,
-) -> list[JointConversionEntry]:
-    """Build a conversion table from URDF joint limits (sim mode).
-
-    Sister function of :func:`build_joint_conversion_table_from_calibration`.
-    Used in simulation where there is no physical calibration file: the URDF
-    joint ``limit`` (or the ``ros2_control`` command-interface min/max)
-    provides the runtime position range in radians.
-
-    The output contract is identical to
-    :func:`build_joint_conversion_table_from_calibration`, so callers can use
-    either table transparently. In ``degrees`` mode the radian range is scaled
-    by ``_MODEL_RESOLUTION / (_MODEL_RESOLUTION - 1)`` (= 4096/4095) so the
-    resulting ``span`` matches the tick-based formula used on real hardware.
-    This keeps sim-trained and real-deployed models numerically aligned.
-    """
-    mode = normalize_lerobot_norm_mode(norm_mode)
-    if mode == NORM_MODE_NONE:
-        return []
-
-    root = ET.fromstring(urdf_xml)
-    gripper_joint_set = {str(name) for name in (gripper_joints or [])}
-    table: list[JointConversionEntry] = []
-
-    for joint_name in [str(name) for name in joint_names]:
-        rad_min, rad_max = _joint_limits_from_urdf(root, joint_name)
-        if rad_max <= rad_min:
-            raise ValueError(f"Joint '{joint_name}' has invalid URDF limits: lower={rad_min}, upper={rad_max}")
-
-        if joint_name in gripper_joint_set:
-            span = 100.0
-            offset = 0.0
-        elif mode == NORM_MODE_DEGREES:
-            span = math.degrees(rad_max - rad_min) * _MODEL_RESOLUTION / (_MODEL_RESOLUTION - 1)
-            offset = -span / 2.0
-        else:
-            span = 200.0
-            offset = -100.0
-
-        table.append((rad_min, rad_max, span, offset))
-
-    return table
+    joint_names = list(feature_names.get("observation.state", []))
+    if not joint_names:
+        raise ValueError("public conversion metadata requires observation.state feature order")
+    return build_public_conversion_metadata(
+        robot_model, joint_names, norm_mode, description=interface_description, feature_names=feature_names
+    )
 
 
 def build_joint_conversion_table(

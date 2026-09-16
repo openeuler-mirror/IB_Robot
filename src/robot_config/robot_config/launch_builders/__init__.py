@@ -23,7 +23,6 @@ from robot_config.launch_builders.hardware_mock import (
     generate_hardware_mock_nodes,
     mock_mode_skips_subsystem,
 )
-from robot_config.launch_builders.moveit import generate_moveit_nodes
 from robot_config.launch_builders.navigation import (
     generate_navigation_nodes,
 )
@@ -34,6 +33,7 @@ from robot_config.launch_builders.perception import (
     generate_virtual_camera_relays,
 )
 from robot_config.launch_builders.perception_models import generate_perception_model_nodes
+from robot_config.launch_builders.runtime import generate_runtime_provider_actions, runtime_provider
 from robot_config.launch_builders.simulation import generate_gazebo_nodes
 
 
@@ -75,7 +75,8 @@ __all__ = [
     # Simulation
     "generate_gazebo_nodes",
     # MoveIt
-    "generate_moveit_nodes",
+    "generate_runtime_provider_actions",
+    "runtime_provider",
     # Voice ASR
     "generate_voice_asr_nodes",
     "generate_audio_io_actions",
