@@ -86,6 +86,59 @@ class _OneFrameDelayedDecoder(VideoDecoder):
         self._pending = None
 
 
+class _ResetCountingDecoder(VideoDecoder):
+    """Wrap a decoder and count reset() invocations."""
+
+    def __init__(self, inner: VideoDecoder) -> None:
+        self._inner = inner
+        self.reset_count = 0
+
+    @property
+    def state(self) -> CodecLifecycleState:
+        return self._inner.state
+
+    @property
+    def metrics(self) -> CodecMetrics:
+        return self._inner.metrics
+
+    def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
+        return self._inner.decode(packet)
+
+    def reset(self) -> None:
+        self.reset_count += 1
+        self._inner.reset()
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        self._inner.close(timeout_s)
+
+
+class _StarvedDecoder(VideoDecoder):
+    """Accept every access unit and never produce output."""
+
+    def __init__(self, reset_error: Exception | None = None) -> None:
+        self.reset_count = 0
+        self._reset_error = reset_error
+
+    @property
+    def state(self) -> CodecLifecycleState:
+        return CodecLifecycleState.RUNNING
+
+    @property
+    def metrics(self) -> CodecMetrics:
+        return CodecMetrics()
+
+    def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
+        return []
+
+    def reset(self) -> None:
+        self.reset_count += 1
+        if self._reset_error is not None:
+            raise self._reset_error
+
+    def close(self, timeout_s: float = 1.0) -> None:
+        pass
+
+
 def test_rtp_packet_round_trip_validates_fixed_header_and_identity():
     packet = RtpPacket(96, True, 65535, 0xFFFF_FFFE, _SSRC, b"payload")
 
@@ -402,6 +455,67 @@ def test_packet_loss_degrades_stream_then_next_repeated_header_idr_recovers():
     assert receiver.status.metrics.lost_packets == 1
     assert receiver.status.metrics.decoded_frames >= 3
     assert any(frame.keyframe and frame.capture_timestamp_ns >= 1_100_000_000 for frame in decoded)
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_keyframe_recovery_after_loss_does_not_reset_decoder():
+    datagrams, encoder, sender = _encoded_stream(frame_count=5, gop_frames=2, max_datagram_size=180)
+    decoder = _ResetCountingDecoder(SoftwareH264Decoder())
+    receiver, _ = _receiver(decoder=decoder)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+    packets = [RtpPacket.from_bytes(item) for item in datagrams]
+    damaged_timestamp = sorted({packet.timestamp for packet in packets})[1]
+    dropped = False
+    delivered = []
+    for datagram, packet in zip(datagrams, packets, strict=True):
+        if packet.timestamp == damaged_timestamp and not dropped:
+            dropped = True
+            continue
+        delivered.append(datagram)
+
+    _deliver(delivered, receiver, start_receive_ns=2_000_000_000)
+
+    assert decoder.reset_count == 0
+    assert receiver.status.state is StreamLifecycleState.READY
+    assert receiver.status.metrics.decoded_frames >= 3
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_starved_decoder_triggers_rate_limited_reset():
+    datagrams, encoder, sender = _encoded_stream(frame_count=40, gop_frames=1, max_datagram_size=180)
+    decoder = _StarvedDecoder()
+    receiver, _ = _receiver(decoder=decoder)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert decoder.reset_count == 1
+    assert receiver.status.state is StreamLifecycleState.WAITING_FOR_KEYFRAME
+    encoder.close()
+    sender.close()
+    receiver.close()
+
+
+def test_starved_decoder_reset_failure_degrades_stream():
+    datagrams, encoder, sender = _encoded_stream(frame_count=40, gop_frames=1, max_datagram_size=180)
+    from observation_transport.video_codec import VideoCodecError
+
+    decoder = _StarvedDecoder(reset_error=VideoCodecError("decode_failed", "decoder wedged", backend="software"))
+    receiver, _ = _receiver(decoder=decoder)
+    receiver.start()
+    receiver.timestamp_mapper.update(90_000, 1_000_000_000, 2_000_000_000, session_generation=1)
+
+    _deliver(datagrams, receiver, start_receive_ns=2_000_000_000)
+
+    assert decoder.reset_count == 1
+    assert receiver.status.state is StreamLifecycleState.DEGRADED
+    assert receiver.status.metrics.decode_errors == 1
     encoder.close()
     sender.close()
     receiver.close()

@@ -32,6 +32,9 @@ from observation_transport.video_codec import EncodedPacket, VideoCodecError, Vi
 from robot_config.contract_utils import StreamBuffer
 
 _RTP_HEADER_SIZE = 12
+_DECODER_STARVATION_AUS = 30
+_DECODER_FAILURE_RESET_THRESHOLD = 3
+_DECODER_RESET_MIN_INTERVAL_S = 3.0
 
 
 class H264RtpReceiver:
@@ -94,6 +97,9 @@ class H264RtpReceiver:
         self._have_sps = False
         self._have_pps = False
         self._keyframe_ready = False
+        self._decode_starvation_aus = 0
+        self._consecutive_decode_failures = 0
+        self._last_decoder_reset_monotonic_s = float("-inf")
         self._stopping = False
         self._receive_thread: threading.Thread | None = None
         self._process_thread: threading.Thread | None = None
@@ -163,6 +169,55 @@ class H264RtpReceiver:
             datagram, receive_time_ns = pending
             self._process_datagram_locked(datagram, receive_time_ns=receive_time_ns)
             return True
+
+    def _drop_queued_datagrams(self) -> int:
+        # Datagrams queued while the decoder is being reset belong to the
+        # pre-reset stream; keeping them only recreates sequence gaps against
+        # the fresh decoder and overflows the queue while the reset blocks.
+        with self._lock:
+            dropped = len(self._queue)
+            self._queue.clear()
+            if dropped:
+                self._metrics = replace(
+                    self._metrics,
+                    queued_packets=0,
+                    dropped_packets=self._metrics.dropped_packets + dropped,
+                    receiver_queue_overflow_drops=self._metrics.receiver_queue_overflow_drops + dropped,
+                )
+            return dropped
+
+    def _reset_starved_decoder(self) -> bool:
+        """Restart a decoder that stopped producing output despite keyframes.
+
+        Resetting on every keyframe recovery stalls the processing thread
+        while the queue overflows, which manufactures the very packet loss
+        that triggers the next recovery. A stateful hardware decoder that
+        silently wedges after a producer-side IDR restart is instead detected
+        by feeding a full starvation window with no output, and the restart
+        itself is rate-limited so it can never chain.
+        """
+        now_monotonic_s = time.monotonic()
+        if now_monotonic_s - self._last_decoder_reset_monotonic_s < _DECODER_RESET_MIN_INTERVAL_S:
+            return False
+        self._last_decoder_reset_monotonic_s = now_monotonic_s
+        self._drop_queued_datagrams()
+        try:
+            self.decoder.reset()
+        except VideoCodecError as exc:
+            self._keyframe_ready = False
+            self._have_sps = False
+            self._have_pps = False
+            self._degrade("decoder_reset_failed", str(exc), decode_errors=1)
+            return True
+        self._keyframe_ready = False
+        self._have_sps = False
+        self._have_pps = False
+        self._decode_starvation_aus = 0
+        self._consecutive_decode_failures = 0
+        with self._lock:
+            if self._state is not StreamLifecycleState.DEGRADED:
+                self._state = StreamLifecycleState.WAITING_FOR_KEYFRAME
+        return True
 
     def _pop_pending(self) -> tuple[bytes, int] | None:
         with self._lock:
@@ -242,20 +297,6 @@ class H264RtpReceiver:
                     if self._state is not StreamLifecycleState.DEGRADED:
                         self._state = StreamLifecycleState.WAITING_FOR_KEYFRAME
                 return []
-            # A producer-side IDR recovery resets the encoder context.  A
-            # stateful hardware decoder must be reset at the same boundary;
-            # otherwise it can accept the new SPS/PPS and keep returning empty
-            # output, which falsely drives another recovery request forever.
-            # Do not reset a fresh decoder before its first keyframe.
-            if self._metrics.decoded_frames > 0:
-                try:
-                    self.decoder.reset()
-                except VideoCodecError as exc:
-                    self._keyframe_ready = False
-                    self._have_sps = False
-                    self._have_pps = False
-                    self._degrade("decoder_reset_failed", str(exc), decode_errors=1)
-                    return []
             self._keyframe_ready = True
             with self._lock:
                 self._metrics = replace(
@@ -292,6 +333,11 @@ class H264RtpReceiver:
                 self._state = StreamLifecycleState.READY
                 self._last_error = ""
             return []
+        if (
+            self._decode_starvation_aus >= _DECODER_STARVATION_AUS
+            or self._consecutive_decode_failures >= _DECODER_FAILURE_RESET_THRESHOLD
+        ) and self._reset_starved_decoder():
+            return []
         try:
             decode_start_monotonic_ns = time.monotonic_ns()
             frames = self.decoder.decode(
@@ -307,8 +353,11 @@ class H264RtpReceiver:
             self._keyframe_ready = False
             self._have_sps = False
             self._have_pps = False
+            self._consecutive_decode_failures += 1
             self._degrade("decode_failed", str(exc), decode_errors=1)
             return []
+        self._consecutive_decode_failures = 0
+        self._decode_starvation_aus = 0 if frames else self._decode_starvation_aus + 1
         received_frames = []
         if frames:
             decoded_receive_time_ns = self._clock()

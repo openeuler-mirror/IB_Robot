@@ -6,6 +6,12 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import asdict
 
+from inference_service.distributed.types import PROTOCOL_VERSION, StreamReference
+from inference_service.distributed.video_streams import (
+    VideoStreamDescriptor,
+    VideoStreamDiagnosticSnapshot,
+    VideoStreamRuntimeStatus,
+)
 from observation_transport.frame_ingress import (
     DirectFrameStreamConfig,
     FrameAdmissionDisposition,
@@ -15,13 +21,6 @@ from observation_transport.frame_ingress import (
 )
 from observation_transport.rtp_sender import H264RtpSender
 from observation_transport.video_codec import VideoCodecRegistry, create_default_video_codec_registry
-
-from inference_service.distributed.types import StreamReference
-from inference_service.distributed.video_streams import (
-    VideoStreamDescriptor,
-    VideoStreamDiagnosticSnapshot,
-    VideoStreamRuntimeStatus,
-)
 from robot_config.contract_utils import SpecView
 from robot_config.observation_transport import effective_observation_transport
 from tensormsg.converter import ros_image_to_hwc_uint8
@@ -63,6 +62,7 @@ class DeviceVideoStreamManager:
             streams=configs,
             codec_registry=codec_registry or create_default_video_codec_registry(),
             sender_factory=sender_factory,
+            protocol_version=PROTOCOL_VERSION,
         )
         self._diagnostic_started_monotonic_ns = time.monotonic_ns()
         self._diagnostic_baseline: dict[str, tuple[int, int, int, int, int]] = {}

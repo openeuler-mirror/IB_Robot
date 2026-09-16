@@ -85,6 +85,7 @@ class ComputeVideoStreamManager:
         self._decode = decode
         self._recorders: dict[str, H264StreamRecorder] = {}
         self._lock = threading.RLock()
+        self._selection_diagnostics: tuple[tuple[str, int, float, float], ...] = ()
         self._receiver_start_lock = threading.Lock()
         self._specs: dict[str, tuple[SpecView, ObservationTransportSpec]] = {}
         for spec in observation_specs:
@@ -241,6 +242,10 @@ class ComputeVideoStreamManager:
             streams = tuple(sorted(self._streams.values(), key=lambda item: item.spec.key))
         return tuple((stream.spec.key, stream.receiver.decoder.metrics) for stream in streams)
 
+    def selection_diagnostics(self) -> tuple[tuple[str, int, float, float], ...]:
+        with self._lock:
+            return self._selection_diagnostics
+
     def reset_session(self, session_id: str, session_generation: int) -> None:
         self.negotiator.reset(session_id, session_generation)
         with self._lock:
@@ -307,6 +312,16 @@ class ComputeVideoStreamManager:
             for observation_key, item in selected.items():
                 stream = self._streams[observation_key]
                 history[observation_key].append(self._canonical_frame(item.value, stream.spec))
+            with self._lock:
+                self._selection_diagnostics = tuple(
+                    (
+                        observation_key,
+                        item.capture_timestamp_ns,
+                        (timestamp_ns - item.capture_timestamp_ns) / 1e6,
+                        (current_time_ns - item.receive_timestamp_ns) / 1e6,
+                    )
+                    for observation_key, item in selected.items()
+                )
         return {
             key: values[0] if self.n_obs_steps == 1 else np.ascontiguousarray(np.stack(values)[None, ...])
             for key, values in history.items()

@@ -248,6 +248,13 @@ class PureInferenceNode(Node):
                 f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}",
                 throttle_duration_sec=2.0,
             )
+        for observation_key, capture_ns, capture_age_ms, live_age_ms in self._stream_manager.selection_diagnostics():
+            self.get_logger().info(
+                f"Video selection: observation={observation_key}, "
+                f"capture_age_ms={capture_age_ms:.1f}, live_age_ms={live_age_ms:.1f}, "
+                f"selected_capture_ns={capture_ns}",
+                throttle_duration_sec=2.0,
+            )
 
     def _request_callback(self, message: DistributedInferenceRequest) -> None:
         request = None

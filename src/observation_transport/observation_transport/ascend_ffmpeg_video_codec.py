@@ -1051,12 +1051,15 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
 
     def reset(self) -> None:
         self._require_not_closed()
-        self._stop_process(self._io_timeout_s)
+        # An IDR-boundary reset runs on the receiver processing thread, so it
+        # must not spend multiple io timeouts waiting for a graceful exit.
+        reset_timeout_s = min(self._io_timeout_s, 0.25)
+        self._stop_process(reset_timeout_s)
         if self._output_pipe is not None:
             self._output_pipe.close()
             self._output_pipe = None
         if self._reader is not None:
-            self._reader.join(self._io_timeout_s)
+            self._reader.join(reset_timeout_s)
         if self._socket is not None:
             self._socket.close()
             self._socket = None
