@@ -1,0 +1,106 @@
+# AgiBot X2 (AimDK) application configuration.
+#
+# Runtime ownership: every vendor fact — MC modes, arbitration, command topics,
+# sensor endpoints, interaction services — lives in the aimdk_robot runtime
+# profile (aimdk_robot/profiles/x2_ultra.yaml). This file selects that runtime
+# and states what the application requires of it.
+#
+# Deployment note: the AimDK overlay must be on the ROS 2 path before launch
+# (see src/robots/aimdk/aimdk_robot/README.md). Consumers of the raw camera
+# streams must run on the development compute unit (PC2): the vendor documents
+# that those streams must not be subscribed across compute units.
+
+robot:
+  name: aimdk_x2
+  type: aimdk
+  robot_type: agibot_x2  # For LeRobot dataset metadata
+
+  simulation:
+    # The vendor mock stands in for the robot; there is no physics simulation.
+    platform: sdk
+
+  runtime:
+    provider: aimdk_robot
+    profile: x2_ultra
+    # No public model is published for the X2 in this stage (design D5), so
+    # consumers must not require one. Policy inference and dataset recording
+    # that need normalization metadata are not enabled here.
+    require_model: false
+
+  capabilities:
+    requires:
+      - joint.state
+      - joint.position_stream
+      - gripper.1d
+      - base.cmd_vel
+      - base.navigation_gate
+      - motion.named
+      - motion.posture
+      - perception.camera
+      # perception.lidar is not required: the vendor point cloud endpoint the
+      # SDK documents is absent on the verified firmware, so the X2 profiles do
+      # not declare it (see the profile comments).
+      - perception.imu
+      - power.state
+      - diagnostics.codes
+      - interaction.tts
+      - interaction.expression
+      - interaction.led
+      - runtime.stop
+
+  # Control mode management. The runtime owns what each mode means on the
+  # platform; the application only selects it.
+  default_control_mode: "teleop"
+  controller_startup_timeout:
+    sim: 120.0
+    hardware: 60.0
+
+  control_modes:
+    teleop:
+      description: "Operator-streamed upper body control"
+      description_cn: "遥操作上半身流式控制"
+      runtime_mode: stream
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+    base_navigation:
+      description: "Velocity control of the legged base"
+      description_cn: "足式底盘速度控制"
+      runtime_mode: locomotion
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: base_navigation
+        queue_size: 50
+        control_frequency: 50.0
+
+  # X2 publishes its own audio on the project's audio contract topics, so the
+  # shared ALSA capture/playback nodes are not launched here. Enabling the
+  # voice stack against the runtime-published audio needs the audio_io capture
+  # gate to accept a runtime-provided source; that is a separate change.
+  audio_io:
+    enabled: false
+
+  voice_asr:
+    enabled: false
+
+  voice_tts:
+    # The platform's own speech output is exposed as interaction.tts on
+    # /speech/speak; the ZipVoice synthesis service is not launched.
+    enabled: false
+
+  semantic_mapping:
+    enabled: false
+
+  # The embodied skill stack is not enabled for the X2 yet: its primitive
+  # vocabulary has no entry for the platform's named motions, postures or
+  # interaction surfaces. Those primitives are a separate change against the
+  # shared embodied stack (see the aimdk-runtime-migration OpenSpec, task 6).
+  embodied:
+    enabled: false
