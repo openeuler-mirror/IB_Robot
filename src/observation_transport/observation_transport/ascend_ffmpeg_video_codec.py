@@ -531,15 +531,16 @@ class _AscendProcessCodec:
         with suppress(AttributeError, OSError, ValueError):
             process.stdin.close()
         try:
-            process.wait(timeout=max(0.0, deadline - time.monotonic()))
+            process.wait(timeout=max(0.05, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             process.terminate()
             try:
-                process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                process.wait(timeout=max(0.05, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 process.kill()
-                with suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=max(0.0, deadline - time.monotonic()))
+                # Always reap: a zero timeout after the kill leaves a zombie
+                # that pins the DVPP channel the replacement process needs.
+                process.wait(timeout=1.0)
         if self._stderr is not None:
             self._stderr.join(max(0.0, deadline - time.monotonic()))
         self._process = None
