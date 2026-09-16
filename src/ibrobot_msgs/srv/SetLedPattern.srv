@@ -1,0 +1,31 @@
+# Set the robot's status light pattern.
+#
+# A runtime whose platform software also drives the lights reports preemption
+# through the response rather than pretending the request stuck.
+
+uint8 PATTERN_SOLID=0
+uint8 PATTERN_BREATHE=1
+uint8 PATTERN_BLINK=2
+uint8 PATTERN_FLOW=3
+
+uint8 pattern
+uint8 r
+uint8 g
+uint8 b
+
+# 0..100 neutral priority. A request below the currently effective priority is
+# rejected with INSUFFICIENT_PRIORITY unless preempt is set.
+uint8 priority
+bool preempt
+string trace_id
+---
+bool success
+
+# "" on success, otherwise one of:
+# INSUFFICIENT_PRIORITY, UNSUPPORTED_PATTERN, INVALID_REQUEST,
+# RUNTIME_UNAVAILABLE, STOP_LATCHED, INTERNAL_ERROR
+string error_code
+string message
+
+# Priority effective after this call, so a caller can tell it was preempted.
+uint8 active_priority

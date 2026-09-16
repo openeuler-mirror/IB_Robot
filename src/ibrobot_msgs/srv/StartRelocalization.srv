@@ -1,0 +1,25 @@
+# Localize the robot inside a stored map.
+#
+# Runtimes whose localization is map-frame (localization.pose) require this
+# before goal navigation is accepted. The map name comes from the
+# localization.map capability parameters.
+
+string map_name
+
+# Optional pose hint. An empty frame_id lets the runtime choose its own
+# strategy; a set frame_id is used as the initial guess.
+geometry_msgs/PoseWithCovarianceStamped initial_pose
+
+bool wait_for_completion
+float32 timeout_sec
+---
+bool success
+
+# "" on success, otherwise one of:
+# UNKNOWN_MAP, INVALID_REQUEST, TIMEOUT, LOCALIZATION_FAILED,
+# RUNTIME_UNAVAILABLE, STOP_LATCHED, INTERNAL_ERROR
+string error_code
+string message
+
+# Localized pose when wait_for_completion was set and localization succeeded.
+geometry_msgs/PoseWithCovarianceStamped pose

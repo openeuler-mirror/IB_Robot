@@ -1,0 +1,21 @@
+# Play a named expression on the robot's display or face.
+#
+# Expression names are semantic ("happy", "thinking"), not vendor enum values.
+# The runtime advertises the names it accepts through the interaction.expression
+# capability parameters; unknown names are rejected, never silently substituted.
+
+uint8 MODE_ONCE=0
+uint8 MODE_LOOP=1
+
+string expression
+uint8 mode
+uint8 priority          # 0..100 neutral priority
+string trace_id
+---
+bool success
+
+# "" on success, otherwise one of:
+# UNKNOWN_EXPRESSION, REJECTED, BUSY, INVALID_REQUEST, RUNTIME_UNAVAILABLE,
+# STOP_LATCHED, INTERNAL_ERROR
+string error_code
+string message

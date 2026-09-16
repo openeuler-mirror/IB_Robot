@@ -69,6 +69,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MHandProFrame.msg"
   "msg/HumanHandState.msg"
   "msg/StampedFloat32MultiArray.msg"
+  "msg/PowerState.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
@@ -87,6 +88,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ArmReturnHome.action"
   "action/ExecuteAgentPlan.action"
   "action/ExecuteNavigation.action"
+  "action/ExecuteNamedMotion.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
   "srv/MoveToConfiguration.srv"
@@ -131,6 +133,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PreparePolicyEpisode.srv"
   "srv/GetBenchmarkPlan.srv"
   "srv/FinalizeBenchmarkScope.srv"
+  "srv/SpeakText.srv"
+  "srv/PlayExpression.srv"
+  "srv/SetLedPattern.srv"
+  "srv/StartRelocalization.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

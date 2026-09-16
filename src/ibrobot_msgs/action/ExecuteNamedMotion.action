@@ -1,0 +1,38 @@
+# Execute one named motion the runtime already owns: a preset gesture
+# (motion.named) or a whole-body posture change (motion.posture).
+#
+# Names are semantic and advertised through the corresponding capability
+# parameters. The runtime never substitutes a different motion for an unknown
+# name, and never runs a posture change the platform reports as unsafe.
+
+# "" when the motion has no side; otherwise "left", "right" or "both".
+string TARGET_LEFT=left
+string TARGET_RIGHT=right
+string TARGET_BOTH=both
+
+string name
+string target
+
+# true: interrupt a motion already playing. false: reject while one is playing.
+bool interrupt
+---
+uint16 NONE=0
+uint16 UNKNOWN_MOTION=1
+uint16 INVALID_TARGET=2
+uint16 BUSY=3
+uint16 REJECTED_BY_PLATFORM=4
+uint16 UNSAFE_POSTURE=5
+uint16 STOP_LATCHED=6
+uint16 MODE_NOT_ALLOWED=7
+uint16 TIMEOUT=8
+uint16 CANCELLED=9
+uint16 RUNTIME_UNAVAILABLE=10
+uint16 INTERNAL_ERROR=255
+
+bool success
+uint16 error_code
+string message
+---
+# "accepted", "running", "completing"
+string state
+float32 progress

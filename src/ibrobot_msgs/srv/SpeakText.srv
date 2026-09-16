@@ -1,0 +1,31 @@
+# Speak text through the robot's own speech output.
+#
+# Distinct from SynthesizeSpeech: that returns audio for the caller to handle,
+# while this asks the robot to say something. A runtime with on-device TTS maps
+# this onto it; a runtime without one may synthesize and play locally.
+
+string text
+
+# BCP-47 tag, or empty for the runtime's configured default.
+string language
+
+# 0..100 neutral priority. The runtime maps it onto its own scale and reports
+# the mapping through the interaction.tts capability parameters.
+uint8 priority
+
+# true: interrupt speech of the same or lower priority. false: queue.
+bool interrupt
+
+# Caller-supplied correlation id, propagated to the runtime where supported.
+string trace_id
+---
+bool success
+
+# "" on success, otherwise one of:
+# REJECTED, BUSY, UNSUPPORTED_LANGUAGE, INVALID_REQUEST, RUNTIME_UNAVAILABLE,
+# STOP_LATCHED, INTERNAL_ERROR
+string error_code
+string message
+
+# Runtime-assigned identifier for the queued or playing utterance.
+string utterance_id
