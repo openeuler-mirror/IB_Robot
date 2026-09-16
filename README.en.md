@@ -83,12 +83,12 @@ IB_Robot/                           # Main Workspace
 │   ├── ibrobot_msgs/               # Unified system interfaces (Message/Action/Service)
 │   ├── dataset_tools/              # Dataset collection & conversion (Episode Recorder)
 │   ├── robot_teleop/               # Teleoperation (Leader Arm/Xbox controller)
-│   ├── robot_description/          # Unified URDF/SRDF/MJCF model descriptions
+│   ├── robot_runtime/              # Robot runtime contract (RuntimeStatus / capabilities / interface description)
 │   ├── lekiwi_description/         # Lekiwi chassis URDF/Mesh model descriptions
-│   ├── robot_moveit/               # MoveIt 2 motion planning integration
 │   ├── robot_navigation/           # Navigation package
 │   ├── inference_service/          # Multi-model inference & deployment service
-│   ├── so101_hardware/             # SO-101 motor driver interface
+│   ├── robots/so101/               # SO-101 runtime suite (sdk/hardware/description/motion/robot)
+│   ├── robots/feetech/             # Feetech servo SDK
 │   ├── lekiwi_hardware/            # Lekiwi chassis hardware driver interface
 │   ├── hardware_mock/              # Hardware mock interface
 │   ├── omni_wheel_controller/      # Omni-wheel controller plugin
@@ -197,7 +197,7 @@ For detailed sub-module documentation, see:
 | Document | Description |
 | :--- | :--- |
 | [`src/inference_service/README.md`](src/inference_service/README.md) | Inference service architecture, single-host/distributed deployment, and NPU/GPU cloud node launch |
-| [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt planning control, `/cmd_pose` usage, and headless launch |
+| [`src/robots/so101/so101_motion/README.md`](src/robots/so101/so101_motion/README.md) | SO-101 motion services (motion_server / Placo servo / IK workers) and headless launch |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | Episodic recording, `record_cli` usage, and `bag_to_lerobot` dataset conversion |
 
 ### I. Ubuntu Simulation

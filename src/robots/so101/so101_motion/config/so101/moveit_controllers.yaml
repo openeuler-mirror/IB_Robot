@@ -1,0 +1,37 @@
+# connect moveit with ros2_contol
+moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControllerManager
+
+# The SO101 controller can report the trajectory goal as reached before the
+# action result crosses the non-realtime ROS executor. Keep MoveIt's watchdog
+# comfortably outside that bounded transport delay; the trajectory controller's
+# own endpoint tolerances and the gateway post-motion feedback barrier still
+# fail closed on real hardware errors.
+trajectory_execution:
+  allowed_execution_duration_scaling: 1.5
+  allowed_goal_duration_margin: 2.0
+  allowed_start_tolerance: 0.12
+
+# define the controller used in ros2_control 
+moveit_simple_controller_manager:
+  controller_names:
+    - arm_trajectory_controller
+    - gripper_trajectory_controller
+
+  arm_trajectory_controller:
+    action_ns: follow_joint_trajectory
+    type: FollowJointTrajectory
+    default: true
+    joints:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+
+
+  gripper_trajectory_controller:
+    action_ns: follow_joint_trajectory
+    type: FollowJointTrajectory
+    default: true
+    joints:
+      - "6"

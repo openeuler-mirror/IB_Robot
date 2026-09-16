@@ -9,3 +9,10 @@ float64 velocity_scaling          # 0.0 = use default, otherwise 0.0-1.0
 bool success
 string message
 float64 execution_time_s
+# Outcome class: SUCCEEDED | REJECTED | PLANNING_FAILED | EXECUTION_FAILED | CANCELLED
+# (REJECTED: runtime stopped or mode disallows trajectory execution;
+#  CANCELLED: a StopRuntime request pre-empted this move.)
+string outcome
+# Achieved end-effector error relative to target_pose after execution.
+float64 position_error_m
+float64 orientation_error_rad

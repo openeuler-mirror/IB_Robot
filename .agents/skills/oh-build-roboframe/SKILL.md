@@ -70,7 +70,7 @@ OH_ROOT="<oh_build_root>" \
 **Do NOT pass `--packages` to manually reduce the package list.** The default
 `PACKAGES` array in `build_roboframe_oh.sh` is the authoritative complete list —
 it includes all transitive dependencies (`embodied_common`, `voice_asr_service`)
-and runtime-required data packages (`robot_description`, `robot_moveit`).
+and the SO-101 runtime suite (`so101_description`, `so101_motion`, `so101_robot`, ...).
 Excluding packages causes runtime `ModuleNotFoundError` / `package not found`
 errors on the board. If a package fails to build, fix the root cause (e.g.
 stale build cache) rather than excluding it from the list.

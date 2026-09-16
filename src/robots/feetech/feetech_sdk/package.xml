@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>feetech_sdk</name>
+  <version>0.1.0</version>
+  <description>
+    ROS-free Feetech STS/SMS motor-family SDK: bus lifecycle, protocol I/O with
+    explicit errors, single-source unit conversion, configuration with
+    rollback, and a simulated transport for tests.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+  <license>MIT</license>
+
+  <!-- Runtime: intentionally EMPTY. This is a plain C++ library: no ROS
+       interface dependencies are allowed (CI-enforced by
+       test/check_package_hygiene.cmake). -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

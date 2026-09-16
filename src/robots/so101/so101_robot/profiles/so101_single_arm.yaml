@@ -1,0 +1,208 @@
+# SO-101 single-arm runtime profile (robot-runtime-packaging spec).
+#
+# The single source of runtime parameters for so101_robot/launch/runtime.launch.py,
+# the runtime facade, and the conformance suite. Robot-instance values (port,
+# calibration) live here, not in code or launch files. `$(find pkg)` and
+# `$(env VAR)` are resolved by robot_runtime.launch_support.
+
+runtime:
+  name: so101_robot
+  version: 0.1.0
+  type: so101
+
+# true: so101_hardware runs on the SDK simulated transport (no serial port, no
+# physics) — the production controller stack, headless. Overridable by the
+# `simulated` launch argument.
+simulated: false
+
+controller_manager: controller_manager
+joint_state_topic: /joint_states
+joints: ["1", "2", "3", "4", "5", "6"]
+arm_joints: ["1", "2", "3", "4", "5"]
+gripper_joints: ["6"]
+
+# Semantic HOME is not an actuator startup command.
+home_positions:
+  "1": 0.0
+  "2": -1.5854
+  "3": 1.5708
+  "4": 0.7854
+  "5": 0.0
+
+description:
+  xacro: $(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro
+  # Forwarded as xacro args; use_sim=false selects the so101_hardware plugin.
+  xacro_args:
+    use_sim: "false"
+
+hardware:
+  port: /dev/ttyACM0
+  calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+
+ros2_control:
+  controllers_config: $(find so101_hardware)/config/so101_controllers.yaml
+  # Always active regardless of mode.
+  broadcasters: [joint_state_broadcaster]
+  # ros2_control hardware component name (<ros2_control name=...> in the xacro);
+  # deactivated on StopRuntime TORQUE_OFF.
+  hardware_components: [RobotSystem]
+
+# Mode = named controller activation set (robot_runtime.modes).
+modes:
+  initial: idle
+  idle:
+    controllers: []
+    transitions: [stream, policy_stream, trajectory]
+  stream:
+    controllers: [arm_position_controller, gripper_position_controller]
+    allows_stream: true
+    transitions: [idle, trajectory]
+  policy_stream:
+    controllers: [arm_position_controller, gripper_position_controller]
+    allows_stream: true
+    transitions: [idle, trajectory]
+  trajectory:
+    controllers: [arm_trajectory_controller, gripper_trajectory_controller]
+    allows_trajectory: true
+    transitions: [idle, stream, policy_stream]
+
+# Streaming command topics observed for rejected-command counting.
+command_channels:
+  - channel: arm_stream
+    topic: /arm_position_controller/commands
+    joints: ["1", "2", "3", "4", "5"]
+    modes: [stream, policy_stream]
+  - channel: gripper_stream
+    topic: /gripper_position_controller/commands
+    joints: ["6"]
+    modes: [stream, policy_stream]
+
+# Trajectory action endpoints cancelled on StopRuntime.
+trajectory_actions:
+  - /arm_trajectory_controller/follow_joint_trajectory
+  - /gripper_trajectory_controller/follow_joint_trajectory
+
+motion:
+  arm_group_name: arm
+  base_link: base
+  ee_link: gripper
+  shoulder_link: shoulder
+  ik_worker_count: 0
+  motion_feedback_timeout_s: 0.3
+  motion_feedback_tolerance_rad: 0.12
+  motion_require_tf_sync: true
+  motion_hardware_feedback_topic: /so101_follower/joint_currents
+
+capabilities:
+  joint.state: {joint_count: 6, rate_hz: 100.0}
+  joint.position_stream: {joint_count: 6, rate_hz: 100.0}
+  joint.trajectory: {joint_count: 6}
+  gripper.1d: {count: 1}
+  motion.fk: {ee_link: gripper, endpoints: [/motion/compute_fk]}
+  motion.ik: {endpoints: [/motion/compute_ik]}
+  motion.move_to_joint: {}
+  motion.move_to_pose: {}
+  # Latency bounds for StopRuntime guarantees; initial values, to be replaced
+  # by measurements from conformance runs (design.md open question).
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
+
+teleoperation:
+  enabled: true
+  target_group: arm
+  endpoint_prefix: /motion/arm
+  command_stale_s: 0.2
+  servo_config: $(find so101_motion)/config/so101_placo_servo.yaml
+  # Leader hardware acquisition: the runtime launches the read-only source
+  # node, never the application. Serial and calibration are deployment data,
+  # same ownership as the follower hardware above.
+  leader_source:
+    port: /dev/ttyACM1
+    baudrate: 1000000
+    calibration_file: $(env HOME)/.calibrate/so101_leader_calibrate.json
+    calibration_version: 1
+    publish_rate: 50.0
+
+interfaces:
+  joint.current:
+    capability: joint.state
+    kind: topic
+    direction: publish
+    endpoint: /so101_follower/joint_currents
+    message_type: ibrobot_msgs/msg/JointCurrent
+    joint_names: ["1", "2", "3", "4", "5", "6"]
+    units: {current: A}
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  motion.ee_pose:
+    capability: motion.fk
+    kind: topic
+    direction: publish
+    endpoint: /robot_status/ee_pose
+    message_type: geometry_msgs/msg/PoseStamped
+    frame_id: base
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+
+# D12: the robot's default sensor surface. Deployment robot YAMLs override
+# entries by (type, name) via the runtime `peripherals` launch argument.
+peripherals:
+- type: camera
+  name: top
+  driver: opencv
+  index: 0
+  width: 640
+  height: 480
+  fps: 30
+  pixel_format: mjpeg2rgb
+  frame_id: camera_top_frame
+  optical_frame_id: camera_top_optical_frame
+  use_default_transform: true
+  transform:
+    parent_frame: base
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  fovy: 0
+- type: camera
+  name: wrist
+  driver: opencv
+  index: 2
+  width: 640
+  height: 480
+  fps: 60
+  pixel_format: mjpeg2rgb
+  frame_id: camera_wrist_frame
+  optical_frame_id: camera_wrist_optical_frame
+  use_default_transform: true
+  transform:
+    parent_frame: gripper
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  fovy: 0
+- type: camera
+  name: front
+  driver: realsense
+  serial_number: ''
+  width: 640
+  height: 480
+  fps: 30
+  pixel_format: bgr8
+  enable_pointcloud: false
+  align_depth: true
+  frame_id: camera_front_link
+  optical_frame_id: camera_front_optical_frame
+  use_default_transform: true
+  transform:
+    parent_frame: base
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
+  fovy: 0

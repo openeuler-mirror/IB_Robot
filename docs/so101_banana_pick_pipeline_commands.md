@@ -178,7 +178,7 @@ ros2 pkg prefix perception_service
 ros2 pkg prefix manipulation_service
 ros2 pkg prefix manipulation_execution
 ros2 pkg prefix embodied_bringup
-ros2 pkg prefix robot_moveit
+ros2 pkg prefix so101_motion
 ros2 pkg prefix so101_hardware
 ros2 pkg prefix lekiwi_hardware
 ros2 pkg prefix lekiwi_description

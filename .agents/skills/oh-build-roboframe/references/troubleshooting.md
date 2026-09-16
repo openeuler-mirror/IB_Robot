@@ -7,7 +7,7 @@ Read this file when one of the following scenarios occurs during the OpenHarmony
 - `libs/lerobot` submodule metadata becomes broken in `/tmp` or the working copy, surfacing `fatal: not a git repository ... .git/modules/libs/lerobot`.
 - The staged runtime tree still imports training-only dependencies (`datasets`, `pyarrow`, `av`).
 - A stale build cache causes `COLCON_CURRENT_PREFIX` mismatches or references to a previously installed prefix.
-- A package is reported as missing at runtime after deploy (`embodied_common`, `robot_description`, `robot_moveit`).
+- A package is reported as missing at runtime after deploy (`embodied_common`, `so101_description`, `so101_motion`).
 
 ## Case 1: `libs/lerobot` submodule metadata is broken in `/tmp`
 
@@ -72,14 +72,14 @@ Symptom:
 
 ```text
 ModuleNotFoundError: No module named 'embodied_common'
-package 'robot_description' not found, searching: [...]
+package 'so101_description' not found, searching: [...]
 ```
 
 Likely cause:
 
 - The build used a manually reduced `--packages` list that omitted a transitive
-  dependency (`embodied_common`, `voice_asr_service`) or a runtime data package
-  (`robot_description`, `robot_moveit`).
+  dependency (`embodied_common`, `voice_asr_service`) or an SO-101 suite package
+  (`so101_description`, `so101_motion`, `so101_robot`).
 
 Correct action:
 

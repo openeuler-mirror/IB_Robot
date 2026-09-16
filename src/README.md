@@ -89,17 +89,16 @@ flowchart TD
 - **实时序列化**: 实现 ROS 2 消息与 NumPy/Torch 张量之间的高性能转换。
 - **时戳对齐**: 采用 `asof` 采样策略，确保多传感器观测数据在时间轴上精确对齐。
 
-### 5. 📂 `robot_moveit` — 运动规划集成
-- **避障与规划**: 提供 SO-101 机械臂的 MoveIt 2 配置，支持 OMPL 和 Pilz 规划器。
-- **交互控制**: 预配置了 RViz 交互式标记点，支持手动拖拽规划。
+### 5. 📂 `robot_runtime` — 机器人运行时契约
+- **公共接口**: 定义 RuntimeStatus、能力声明、接口描述 schema，是通用层与机器人套件之间唯一的依赖边界。
+- **Mock 运行时**: 提供 `mock_runtime` provider，让通用包在没有任何机器人包的情况下完成契约链验证。
 
-### 6. 📂 `robot_description` — 模型资产库
-- **统一描述**: 维护全系统的 URDF、SRDF 和 STL 网格文件。
-- **仿真适配**: 预置了 Gazebo 传感器插件和 ros2_control 硬件仿真接口。
-
-### 7. 📂 `so101_hardware` — 物理硬件驱动
-- **底层驱动**: 深度集成飞特 (Feetech) 舵机 SDK，支持高频状态反馈与位置控制。
-- **资源隔离**: 作为纯粹的 C++ 驱动包，与上游 ML 依赖完全隔离。
+### 6. 📂 `robots/so101` — SO-101 运行时套件
+- **`so101_sdk` / `feetech_sdk`**: 纯 C++ 舵机与机械臂 SDK（含 Python 绑定），不依赖任何 ROS 接口。
+- **`so101_hardware`**: ros2_control 硬件插件，与上游 ML 依赖完全隔离。
+- **`so101_description`**: URDF/xacro、STL 网格、MuJoCo 模板与 Gazebo 插件配置的唯一来源。
+- **`so101_motion`**: 运动服务（`motion_server`、Placo servo、隔离 IK/FK worker 池）与 MoveIt 配置。
+- **`so101_robot`**: 独立可部署的运行时入口（`runtime.launch.py` + profile），通过 `runtime.provider` 接入通用层。
 
 ### 8. 📂 `voice_asr_service` — 语音识别接入层
 - **统一入口**: `voice_asr_node` 提供麦克风实时识别和音频文件识别两种入口。

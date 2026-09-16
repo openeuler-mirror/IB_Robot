@@ -22,8 +22,8 @@ include(FetchContent)
 FetchContent_Declare(
   ftservo_sdk_external
   GIT_REPOSITORY https://gitcode.com/ib_robot/FTServo_Linux.git
-  GIT_TAG        main
-  GIT_SHALLOW    TRUE
+  # Keep in sync with feetech_sdk: both libraries export the vendor symbols.
+  GIT_TAG        06fd3356dbd7bccd886b5a70d7ae0fccc6c76d38
 )
 FetchContent_MakeAvailable(ftservo_sdk_external)
 

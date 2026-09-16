@@ -1,0 +1,4 @@
+# GetRuntimeStatus.srv - query the current RuntimeStatus snapshot.
+---
+# Same content as the most recently published RuntimeStatus.
+RuntimeStatus status

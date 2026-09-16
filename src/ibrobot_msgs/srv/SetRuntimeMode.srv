@@ -1,0 +1,14 @@
+# SetRuntimeMode.srv - switch the runtime's active mode.
+#
+# A mode is a named controller activation set declared in the runtime profile.
+# Exactly one mode is active at a time; the runtime guarantees at most one
+# command source per joint group. While the stop latch is engaged only "idle"
+# is accepted (and clears the latch).
+
+# Target mode name from the runtime profile.
+string mode
+---
+bool success
+string message
+# Valid transitions from the (unchanged) current mode; populated on failure.
+string[] valid_transitions

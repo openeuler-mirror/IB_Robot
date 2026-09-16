@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="so101">
+
+    <xacro:arg name="use_sim" default="true"/>
+    <xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_base.xacro" />
+    <xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_gazebo.xacro" />
+    <xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_ros2_control.xacro" />
+    <!-- cameras are generated dynamically from YAML peripherals by control.py -->
+
+</robot>

@@ -1,36 +1,5 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-
-    <!-- Absolute path set at launch (gz_ros2_control); fallback keeps install-time find. -->
-    <xacro:arg name="gz_ros2_control_parameters_file" default="$(find so101_hardware)/config/so101_controllers.yaml"/>
-
-    <!-- ROS 2 Control -->
-    <gazebo>
-        <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
-            <parameters>$(arg gz_ros2_control_parameters_file)</parameters>
-        </plugin>
-    </gazebo>
-
-    <!-- ============================================= -->
-    <!-- Gazebo material: uniform dark (sts3215 black) -->
-    <!-- ============================================= -->
-    <!-- Gazebo cannot color individual visuals within a link separately.
-         Uniform black matches the real robot's dominant visual appearance. -->
-    <xacro:macro name="gz_black" params="link_name">
-        <gazebo reference="${link_name}">
-            <visual><material>
-                <ambient>0.12 0.12 0.12 1</ambient>
-                <diffuse>0.12 0.12 0.12 1</diffuse>
-                <specular>0.15 0.15 0.15 1</specular>
-            </material></visual>
-        </gazebo>
-    </xacro:macro>
-    <xacro:gz_black link_name="base"/>
-    <xacro:gz_black link_name="shoulder"/>
-    <xacro:gz_black link_name="upper_arm"/>
-    <xacro:gz_black link_name="lower_arm"/>
-    <xacro:gz_black link_name="wrist"/>
-    <xacro:gz_black link_name="gripper"/>
-    <xacro:gz_black link_name="jaw"/>
-
+	<!-- SSOT wrapper: included content lives in so101_description. -->
+	<xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101_gazebo.xacro" />
 </robot>

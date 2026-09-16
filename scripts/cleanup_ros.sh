@@ -59,7 +59,7 @@ safe_kill_matching KILL "realsense2_camera"
 # IB-Robot application nodes
 safe_kill_matching KILL "lerobot_policy_node"
 safe_kill_matching KILL "action_dispatcher_node"
-safe_kill_matching KILL "moveit_gateway"
+safe_kill_matching KILL "motion_server"
 safe_kill_matching KILL "safety_guard_node"
 safe_kill_matching KILL "skill_executor_node"
 safe_kill_matching KILL "agent_plan_node"

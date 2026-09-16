@@ -1,0 +1,25 @@
+arm:
+  # LMA (Levenberg-Marquardt) is more robust than Newton-Raphson for
+  # under-constrained Jacobians (5-DOF arm targeting 6-DOF pose). Both are
+  # bundled in moveit_kinematics — no extra apt packages needed.
+  kinematics_solver: lma_kinematics_plugin/LMAKinematicsPlugin
+  kinematics_solver_timeout: 1.0
+  kinematics_solver_attempts: 3
+
+  # orientation_vs_position_weight (confirmed present in plugin binary):
+  # Default = 1.0 (equal weight). Setting < 1.0 lets solver de-prioritise
+  # orientation and find approximate solutions for 5-DOF arms.
+  # 0.1 = orientation error counts 10x less than position error.
+  orientation_vs_position_weight: 0.5
+
+  position_only_ik: true   # False: j4/j5 can still be optimised toward tp.R
+
+# arm_tcp: identical solver config to 'arm', but for the group whose tip is the
+# virtual TCP link. Selected when moveit.ee_link == "tcp". The 'arm' block above
+# is left untouched so selecting "gripper" stays byte-for-byte identical.
+arm_tcp:
+  kinematics_solver: lma_kinematics_plugin/LMAKinematicsPlugin
+  kinematics_solver_timeout: 1.0
+  kinematics_solver_attempts: 3
+  orientation_vs_position_weight: 0.5
+  position_only_ik: true

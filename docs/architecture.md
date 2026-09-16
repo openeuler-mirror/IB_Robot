@@ -99,8 +99,8 @@ flowchart TB
         Skill["skill_library"]
         Safety["safety_guard"]
         Pick["manipulation_execution"]
-        Motion["task_dispatch / MoveIt gateway"]
-        MoveIt["MoveIt 2 main + IK/FK workers"]
+        Motion["task_dispatch"]
+        MoveIt["so101_motion: motion_server + IK/FK workers"]
         Dispatch["action_dispatch"]
     end
 
@@ -113,14 +113,14 @@ flowchart TB
 
     subgraph control["控制与执行层 Control and Execution"]
         Controller["ros2_control"]
-        Hardware["so101_hardware"]
+        Hardware["so101_robot runtime (so101_hardware)"]
         Simulation["Gazebo / Ignition"]
     end
 
     subgraph global["全局契约 Global Contracts"]
         Config["robot_config<br/>SSOT"]
         Interfaces["ibrobot_msgs"]
-        Description["robot_description"]
+        Runtime["robot_runtime<br/>运行时契约"]
     end
 
     Hermes --> AgentSkill
@@ -167,8 +167,8 @@ flowchart TB
     Interfaces -.-> Skill
     Interfaces -.-> Pick
     Interfaces -.-> GraspPerception
-    Description -.-> MoveIt
-    Description -.-> Controller
+    Runtime -.-> MoveIt
+    Runtime -.-> Hardware
 
     style Config fill:#fff3e0,stroke:#ff9800,stroke-width:3px
     style Interfaces fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
@@ -259,8 +259,9 @@ IB-Robot 深度集成 ROS 2 Control，并在此基础上实现了：
 | 组件 | 状态 | 功能描述 |
 |------|------|----------|
 | **robot_config** | 已实现 | **配置中心**。管理全系统的规格文件（YAML），作为唯一真相来源。 |
-| **robot_description** | 已实现 | 统一管理机器人 URDF/SRDF 及相关 Mesh 资产。 |
-| **so101_hardware** | 已实现 | SO-101 舵机臂的实机驱动实现。 |
+| **robot_runtime** | 已实现 | 机器人运行时契约：RuntimeStatus、能力声明、接口描述与 mock 运行时。 |
+| **robots/so101** | 已实现 | SO-101 运行时套件：`so101_sdk` / `so101_hardware` / `so101_description`（URDF/Mesh）/ `so101_motion`（运动服务）/ `so101_robot`（运行时入口）。 |
+
 
 ---
 

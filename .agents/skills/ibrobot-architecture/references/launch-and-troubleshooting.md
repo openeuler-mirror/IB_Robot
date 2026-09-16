@@ -125,7 +125,7 @@ ros2 launch robot_config robot.launch.py control_mode:=moveit_planning
 ros2 launch robot_config robot.launch.py control_mode:=model_inference
 ```
 
-参考映射：position controllers（topic executor）用于 teleop / model_inference；trajectory controllers（action executor，经 `moveit_gateway` / `task_dispatch`）用于 moveit_planning；`base_controller` / `base_velocity_controller` 用于 base_navigation。
+参考映射：position controllers（topic executor）用于 teleop / model_inference；trajectory controllers（action executor，经运行时 `motion_server` / `task_dispatch`）用于 moveit_planning；`base_controller` / `base_velocity_controller` 用于 base_navigation。
 
 ### Issue: Inference pipeline fails to start
 

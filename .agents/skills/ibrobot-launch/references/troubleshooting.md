@@ -26,6 +26,29 @@ Confirm the board env was loaded, the artifact is aarch64/musl compatible, the d
 python3 -c "from rknnlite.api import RKNNLite; print('RKNNLite OK')"
 ```
 
+## `/joint_states` Publishes Joints in an Unexpected Order
+
+This is expected Humble behavior, not a misconfiguration. The `joints` list in
+`so101_controllers.yaml` only selects which state interfaces the broadcaster
+claims; the Humble `joint_state_broadcaster` builds the message by iterating an
+`std::unordered_map`, so the published order (e.g. `2,4,1,3,5,6`) is a
+hash-bucket order and differs from any declared order. The order is stable per
+process but unspecified, and no parameter can pin it (fixed only in newer
+ros2_controllers releases, not backported to Humble).
+
+Implications and rules:
+
+- Never read a JointState positionally; always resolve by `msg.name`
+  (the shipped consumers — tensormsg, conversions, servo, MoveIt — all do).
+- The ordered joint list for datasets, commands and limits is the public
+  description's `joint.state` `joint_names` (via `/runtime/get_status`).
+- To eyeball values in a fixed order, sort by name:
+
+```sh
+ros2 topic echo /joint_states --once | sed -n '/^header:/,$p' | python3 -c \
+  "import sys, yaml; m = next(y for y in yaml.safe_load_all(sys.stdin) if y); [print(f'{n:>3} {p:+.4f}') for n, p in sorted(zip(m['name'], m['position']), key=lambda t: int(t[0]))]"
+```
+
 ## Controller or Hardware Device Missing
 
 Check the selected control mode, YAML paths, calibration, permissions, `/dev/ttyACM*`, camera

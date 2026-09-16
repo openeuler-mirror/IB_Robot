@@ -1,0 +1,22 @@
+# ComputeIk.srv - inverse kinematics through the runtime motion services.
+#
+# Capability: motion.ik. Success means a within-limits solution satisfying the
+# orientation tolerance was found. It does NOT imply a collision-free path.
+# Reduced-DOF runtimes apply their own orientation strategy and report the
+# residual orientation error.
+
+geometry_msgs/PoseStamped target
+sensor_msgs/JointState seed
+# Allowed orientation error (rad); 0 means the runtime default.
+float64 orientation_tolerance
+# Solver timeout (s); 0 means the runtime default.
+float64 timeout
+---
+bool success
+string message
+# Failure class on !success (mirrors MoveIt error names where applicable, e.g.
+# NO_IK_SOLUTION, TIMED_OUT, INVALID_LINK_NAME, JOINT_LIMIT_VIOLATION).
+string code
+sensor_msgs/JointState solution
+# Achieved orientation error (rad) of the returned solution.
+float64 orientation_error

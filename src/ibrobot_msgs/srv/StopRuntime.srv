@@ -1,0 +1,23 @@
+# StopRuntime.srv - stop the robot with ordered guarantees.
+#
+# HOLD:       (1) cancel every in-flight trajectory and reject streaming
+#                 commands; (2) enter "idle" with joints holding position;
+#                 (3) lifecycle STOPPED. The stop latch stays engaged until a
+#                 SetRuntimeMode("idle") request clears it.
+# TORQUE_OFF: HOLD guarantees, then release joint torque through the hardware
+#             lifecycle.
+#
+# Each guarantee is reached within the latency bound the runtime declares in
+# RuntimeStatus.capabilities_json under "runtime.stop".
+
+string HOLD=HOLD
+string TORQUE_OFF=TORQUE_OFF
+
+string policy
+---
+bool success
+string message
+# Measured latencies for this request (seconds); -1 when not applicable.
+float64 cancel_latency_s
+float64 idle_latency_s
+float64 torque_off_latency_s

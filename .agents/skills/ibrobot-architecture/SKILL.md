@@ -69,7 +69,7 @@ Four control modes converge on the same `ros2_control` hardware interface; per-m
 |------|--------------------|----------|----------|
 | `teleop` | `*_position_controller` | topic | Human teleoperation |
 | `model_inference` | `*_position_controller` | topic | AI policy control |
-| `moveit_planning` | `*_trajectory_controller` | action (via `moveit_gateway` / `task_dispatch`) | Motion planning, skills |
+| `moveit_planning` | `*_trajectory_controller` | action (via runtime `motion_server` / `task_dispatch`) | Motion planning, skills |
 | `base_navigation` | `base_controller` / `base_velocity_controller` | topic (cmd_vel) | Mobile base (lekiwi), skill_catalog schema v2+ |
 
 `action_dispatch` decouples "when to request/submit" from "where output goes":
@@ -107,7 +107,7 @@ Agent/LLM → robot-skill CLI (robot_skill_cli)
   → Capability Gateway skill_executor_node (skill_library, /embodied/execute_skill)
     → preflight safety_guard_node (/embodied/validate_skill, read-only snapshot)
     → skill_catalog compiled manifests (exact snapshot: registry_epoch + generation + digest)
-    → primitives → task_dispatch / moveit_gateway / manipulation_execution / navigation
+    → primitives → task_dispatch / runtime motion services / manipulation_execution / navigation
 ```
 
 - `skill_library` owns gateway admission/idempotency and delegates to protected executors.
@@ -142,15 +142,15 @@ src/
 ├── semantic_mapping/        # Persistent RGB-D 3D semantic mapping
 ├── object_tracker/          # Single-target RGB-D tracking + Nav2 following
 ├── robot_navigation/        # Nav2 client, navigation_command_server, chassis bridge
-├── robot_moveit/            # MoveIt config + moveit_gateway + IK workers
+├── robot_runtime/           # Runtime contract: RuntimeStatus, capabilities, interface description, mock runtime
 ├── robot_teleop/            # Teleop bridges (50 Hz), glove/VR/mhandpro sources
 ├── voice_asr_service/       # sherpa-onnx ASR + speech direction nodes
 ├── voice_tts_service/       # Manifest-backed ZipVoice TTS typed service
-├── so101_hardware/          # ros2_control hardware plugin (SO-101, Feetech)
+├── robots/so101/            # SO-101 runtime suite: so101_sdk, so101_hardware, so101_description, so101_motion, so101_suite, so101_robot
+├── robots/feetech/          # feetech_sdk (pinned Feetech servo SDK)
 ├── lekiwi_hardware/         # ros2_control hardware plugin (LeKiwi base + arm)
 ├── aero_hand_hardware/      # Aero Hand command/state bridge
 ├── hardware_mock/           # Contract-driven mock backend (no real hardware)
-├── robot_description/       # SO-101 URDF/xacro/meshes
 ├── lekiwi_description/      # LeKiwi URDF/meshes
 ├── sim_models/              # Scene assets + scene compiler (Gazebo/MuJoCo)
 ├── robot_calibration/       # Sensor calibration capture/validate/activate workflows

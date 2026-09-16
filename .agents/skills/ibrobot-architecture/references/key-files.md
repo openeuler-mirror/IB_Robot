@@ -56,13 +56,15 @@
 
 | Package | Primary Responsibility |
 |---------|----------------------|
-| `so101_hardware` | ros2_control hardware plugin: SO-101 arm via Feetech |
+| `robots/so101/so101_hardware` | ros2_control hardware plugin: SO-101 arm via `so101_sdk` / `feetech_sdk` |
 | `lekiwi_hardware` | ros2_control hardware plugin: LeKiwi arm + base via Feetech STS |
 | `aero_hand_hardware` | Aero Hand command/state bridge (intentionally not ros2_control) |
 | `hardware_mock` | Contract-driven mock backend for end-to-end inference pipelines |
-| `robot_description` / `lekiwi_description` | URDF/xacro/meshes for SO-101 / LeKiwi |
+| `robots/so101/so101_description` / `lekiwi_description` | URDF/xacro/meshes for SO-101 / LeKiwi |
 | `sim_models` | Scene assets + scene compiler (Gazebo/MuJoCo) |
-| `robot_moveit` | MoveIt 2 config, `moveit_gateway` (`MoveToPose`), PLACO servo, IK workers |
+| `robots/so101/so101_motion` | SO-101 motion services: `motion_server` (`MoveToPose`), PLACO servo, IK workers, MoveIt config |
+| `robots/so101/so101_robot` | SO-101 runtime unit (`runtime.launch.py` + profiles), selected via `runtime.provider` |
+| `robot_runtime` | Runtime contract layer: RuntimeStatus, capabilities, interface description, mock runtime |
 | `robot_teleop` | Teleop bridges (50 Hz serial-to-controller), glove/VR/mhandpro sources |
 | `robot_navigation` | Nav2 client, `navigation_command_server` (`ExecuteNavigation`), cmd_vel bridge |
 | `robot_calibration` | Sensor calibration capture/artifact/validation/activation workflows |

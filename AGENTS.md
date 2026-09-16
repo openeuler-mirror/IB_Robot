@@ -12,9 +12,9 @@ IB_Robot/
 │   ├── action_dispatch/    # 动作分发与执行
 │   ├── task_dispatch/      # 任务调度
 │   ├── robot_teleop/       # 遥操作控制
-│   ├── robot_moveit/       # MoveIt 运动规划
+│   ├── robot_runtime/      # 机器人运行时契约（状态/能力/接口描述）
 │   ├── robot_navigation/   # 导航
-│   ├── so101_hardware/     # SO-101 硬件接口
+│   ├── robots/so101/       # SO-101 运行时套件（sdk/hardware/description/motion/robot）
 │   ├── lekiwi_hardware/    # LeKiwi 硬件接口
 │   ├── ibrobot_msgs/       # 自定义消息/服务定义
 │   ├── ibrobot_agent/      # 自然语言 Agent 孵化运行时（entry_mode=agent）

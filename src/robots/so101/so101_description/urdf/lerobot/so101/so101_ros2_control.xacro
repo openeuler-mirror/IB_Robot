@@ -1,0 +1,111 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+    <xacro:arg name="use_sim" default="true"/>
+    <xacro:arg name="port" default="/dev/ttyACM0"/>
+    <xacro:arg name="calib_file" default=""/>
+    <!-- Legacy explicit startup motion only. Semantic HOME belongs to the
+         runtime model and must never be passed as reset_positions. -->
+    <xacro:arg name="reset_positions" default=""/>
+    <!-- simulated: run the SO101 hardware plugin on the SDK simulated transport
+         (no serial port, no physics) so the production controller stack runs
+         headless for runtime conformance. Independent of use_sim (Gazebo/MuJoCo). -->
+    <xacro:arg name="simulated" default="false"/>
+    <!-- sim_plugin: hardware plugin for simulation. Default = Gazebo.
+         MuJoCo: description.py passes "mujoco_ros2_control/MujocoSystemInterface" when platform=mujoco. -->
+    <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
+    <xacro:arg name="mujoco_model" default=""/>
+    <xacro:arg name="camera_publish_rate" default=""/>
+
+    <ros2_control name="RobotSystem" type="system">
+        <xacro:if value="$(arg use_sim)">
+            <hardware>
+                <plugin>$(arg sim_plugin)</plugin>
+                <xacro:if value="${'$(arg mujoco_model)' != ''}">
+                    <param name="mujoco_model">$(arg mujoco_model)</param>
+                </xacro:if>
+                <xacro:if value="${'$(arg camera_publish_rate)' != ''}">
+                    <param name="camera_publish_rate">$(arg camera_publish_rate)</param>
+                </xacro:if>
+            </hardware>
+        </xacro:if>
+
+        <xacro:unless value="$(arg use_sim)">
+            <hardware>
+                <plugin>so101_hardware/SO101SystemHardware</plugin>
+                <param name="port">$(arg port)</param>
+                <param name="calib_file">$(arg calib_file)</param>
+                <param name="reset_positions">$(arg reset_positions)</param>
+                <param name="simulated">$(arg simulated)</param>
+            </hardware>
+        </xacro:unless>
+
+        <joint name="1">
+            <command_interface name="position">
+                <param name="min">-3.1416</param>
+                <param name="max">3.1416</param>
+                <param name="initial_value">0.0</param>
+            </command_interface>
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+            <param name="id">1</param>
+        </joint>
+
+        <joint name="2">
+            <command_interface name="position">
+                <param name="min">-3.1416</param>
+                <param name="max">3.1416</param>
+                <param name="initial_value">0.0</param>
+            </command_interface>
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+            <param name="id">2</param>
+        </joint>
+
+        <joint name="3">
+            <command_interface name="position">
+                <param name="min">-3.1416</param>
+                <param name="max">3.1416</param>
+                <param name="initial_value">0.0</param>
+            </command_interface>
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+            <param name="id">3</param>
+        </joint>
+
+        <joint name="4">
+            <command_interface name="position">
+                <param name="min">-3.1416</param>
+                <param name="max">3.1416</param>
+                <param name="initial_value">0.0</param>
+            </command_interface>
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+            <param name="id">4</param>
+        </joint>
+        <joint name="5">
+            <command_interface name="position">
+                <param name="min">-3.1416</param>
+                <param name="max">3.1416</param>
+                <param name="initial_value">0.0</param>
+            </command_interface>
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+            <param name="id">5</param>
+        </joint>
+
+        <joint name="6">
+            <command_interface name="position">
+                <!-- Mechanical envelope in centered coordinates; the 0..1 URDF
+                     joint limit element stays the simulation's model convention. -->
+                <param name="min">-3.1416</param>
+                <param name="max">3.1416</param>
+                <param name="initial_value">0.0</param>
+            </command_interface>
+            <state_interface name="position" />
+            <state_interface name="velocity" />
+            <param name="id">6</param>
+        </joint>
+    </ros2_control>
+
+</robot>

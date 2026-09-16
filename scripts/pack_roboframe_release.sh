@@ -155,7 +155,7 @@ if [[ -d "${PYMOVEIT2_SRC}" ]]; then
     log_info "Copying pymoveit2 from source..."
     cp -a "${PYMOVEIT2_SRC}" "${PKG_ROOT}/pysite/pymoveit2"
 else
-    log_warn "pymoveit2 source not found at ${PYMOVEIT2_SRC}, moveit_gateway will fail"
+    log_warn "pymoveit2 source not found at ${PYMOVEIT2_SRC}, motion_server will fail"
 fi
 
 # [3] Extract optional syslib from legacy skh-run.tar.gz
@@ -234,11 +234,16 @@ RF_LIB=/data/roboframe/syslib:\
 /data/roboframe/install/inference_service/lib:\
 /data/roboframe/install/hardware_mock/lib:\
 /data/roboframe/install/action_dispatch/lib:\
+/data/roboframe/install/feetech_sdk/lib:\
+/data/roboframe/install/so101_sdk/lib:\
 /data/roboframe/install/so101_hardware/lib:\
+/data/roboframe/install/so101_description/lib:\
+/data/roboframe/install/so101_motion/lib:\
+/data/roboframe/install/so101_suite/lib:\
+/data/roboframe/install/so101_robot/lib:\
+/data/roboframe/install/robot_runtime/lib:\
 /data/roboframe/install/task_dispatch/lib:\
-/data/roboframe/install/dataset_tools/lib:\
-/data/roboframe/install/robot_moveit/lib:\
-/data/roboframe/install/robot_description/lib
+/data/roboframe/install/dataset_tools/lib
 export LD_LIBRARY_PATH="${RF_LIB}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 PY_PATH=/data/roboframe/pysite:\
@@ -252,11 +257,16 @@ PY_PATH=/data/roboframe/pysite:\
 /data/roboframe/install/inference_service/lib/python3.12/site-packages:\
 /data/roboframe/install/hardware_mock/lib/python3.12/site-packages:\
 /data/roboframe/install/action_dispatch/lib/python3.12/site-packages:\
+/data/roboframe/install/feetech_sdk/lib/python3.12/site-packages:\
+/data/roboframe/install/so101_sdk/lib/python3.12/site-packages:\
 /data/roboframe/install/so101_hardware/lib/python3.12/site-packages:\
+/data/roboframe/install/so101_description/lib/python3.12/site-packages:\
+/data/roboframe/install/so101_motion/lib/python3.12/site-packages:\
+/data/roboframe/install/so101_suite/lib/python3.12/site-packages:\
+/data/roboframe/install/so101_robot/lib/python3.12/site-packages:\
+/data/roboframe/install/robot_runtime/lib/python3.12/site-packages:\
 /data/roboframe/install/task_dispatch/lib/python3.12/site-packages:\
 /data/roboframe/install/dataset_tools/lib/python3.12/site-packages:\
-/data/roboframe/install/robot_moveit/lib/python3.12/site-packages:\
-/data/roboframe/install/robot_description/lib/python3.12/site-packages:\
 /sys_prod/robot/out/lib/python3.12/site-packages:\
 /sys_prod/robot/install/lib/python3.12/site-packages
 export PYTHONPATH="${PY_PATH}${PYTHONPATH:+:$PYTHONPATH}"

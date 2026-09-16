@@ -14,7 +14,7 @@ gripper is driven via ``/gripper/target`` (the proxy input), which is the
 JointGroupPositionController path active in **teleop / model_inference modes**.
 
 To verify the guard during a grasp, this script therefore:
-  * Moves the arm via ``/moveit_gateway/move_to_pose`` (same service MoveIt
+  * Moves the arm via ``/motion/move_to_pose`` (same service MoveIt
     pipeline uses).
   * Commands the gripper by publishing to ``/gripper/target`` so the guard
     proxy is exercised.
@@ -60,6 +60,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 
 from ibrobot_msgs.srv import MoveToPose
+from robot_runtime import contract as RUNTIME
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,7 +73,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--gripper-target-topic", default="/gripper/target")
     p.add_argument("--gripper-cmd-topic", default="/gripper_position_controller/commands")
     p.add_argument("--joint-states-topic", default="/joint_states")
-    p.add_argument("--move-service", default="/moveit_gateway/move_to_pose")
+    p.add_argument("--move-service", default=RUNTIME.MOVE_TO_POSE_SERVICE)
     p.add_argument("--gripper-joint", default="6", help="Gripper joint name in /joint_states")
 
     # --- Guard thresholds (read from /gripper_guard by default) ---
@@ -100,9 +101,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reopen-monitor-s", type=float, default=1.5, help="Duration to monitor guard release after reopen")
 
     # --- Arm motion (optional, to integrate with a real grasp) ---
-    p.add_argument(
-        "--with-arm-motion", action="store_true", help="Move arm to grasp poses via /moveit_gateway/move_to_pose"
-    )
+    p.add_argument("--with-arm-motion", action="store_true", help="Move arm to grasp poses via /motion/move_to_pose")
     p.add_argument("--approach-x", type=float, default=0.20)
     p.add_argument("--approach-y", type=float, default=0.0)
     p.add_argument("--approach-z", type=float, default=0.28)
@@ -241,7 +240,7 @@ class GripperGuardPickTest(Node):
             self.spin_wait(rate_period)
 
     def move_arm(self, label: str, x: float, y: float, z: float) -> None:
-        """Move arm to a Cartesian pose via /moveit_gateway/move_to_pose."""
+        """Move arm to a Cartesian pose via /motion/move_to_pose."""
         if not self._move_client.service_is_ready():
             self.get_logger().info(f"Waiting for {self.args.move_service} ...")
             if not self._move_client.wait_for_service(timeout_sec=5.0):

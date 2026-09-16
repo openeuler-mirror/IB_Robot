@@ -1,0 +1,33 @@
+# Simulation-only example. Hardware settings belong to the runtime profile.
+robot:
+  name: so101_interface_consumer
+  type: so101
+  runtime:
+    provider: so101_robot
+    profile: so101_single_arm
+    instance_id: so101-interface-demo
+    target: simulation
+  default_control_mode: teleop
+  capabilities:
+    requires: [joint.state, perception.camera]
+  contract:
+    name: interface_binding_demo
+    version: 1
+    rate_hz: 20
+    observations:
+      - key: observation.images.front
+        interface: camera.front.color
+        requires:
+          width: 640
+          height: 480
+          encoding: rgb8
+          min_fps: 15
+        image:
+          resize: [224, 224]
+          encoding: rgb8
+        align: {strategy: hold, stamp: header, tol_ms: 1500}
+      - key: observation.state
+        interface: joint.state
+        selector:
+          names: [position.1, position.2, position.3, position.4, position.5, position.6]
+    actions: []

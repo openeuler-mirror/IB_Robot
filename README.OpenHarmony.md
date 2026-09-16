@@ -205,15 +205,16 @@ export DEPS_ARCHIVE="$OH_ROOT/downloads/deps/roboframe-deps-1.0.5-robopi-2026080
   --oh-root "$OH_ROOT"
 ```
 
-默认编译以下 13 个包（覆盖推理 + 控制 + 仿真全链路）：
+默认编译以下 19 个包（覆盖推理 + 控制 + 仿真全链路）：
 
 | 类别 | 包 |
 | --- | --- |
 | 消息 | `ibrobot_msgs` `tensormsg` |
-| 配置 | `robot_config` `robot_description` |
+| 配置/契约 | `robot_config` `robot_runtime` `inference_manifest` |
 | 推理 | `inference_service` `dataset_tools` |
-| 控制 | `action_dispatch` `task_dispatch` `robot_moveit` |
-| 硬件 | `so101_hardware` `hardware_mock` |
+| 控制 | `action_dispatch` `task_dispatch` |
+| SO-101 套件 | `feetech_sdk` `so101_sdk` `so101_hardware` `so101_description` `so101_motion` `so101_suite` `so101_robot` |
+| 硬件 | `hardware_mock` |
 | 其他 | `embodied_common` `voice_asr_service` |
 
 > 脚本自动处理：SDK 解压、sysdeps overlay（tinyxml2/openssl/libz 等 1200+ 库整体提取到 sysroot）、lerobot patch 应用、wrapper 脚本生成。如需增减包，用 `--packages pkg1,pkg2,...` 覆盖。

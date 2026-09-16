@@ -248,7 +248,7 @@ robot.launch.py
 
 | 项目 | 原因 |
 | --- | --- |
-| TF 树 | 真实 TF 由 `robot_description` 在非 mock 模式下负责，避免在 mock 里复制一份漂移 |
+| TF 树 | 真实 TF 由 `robot_state_publisher`（机器人 description 包的 URDF）在非 mock 模式下负责，避免在 mock 里复制一份漂移 |
 | 物理动力学 | 用 Gazebo (`use_sim:=true`) |
 | 真实图像 / rosbag 回放 | 这是 `dataset_tools` 的职责 |
 | `CompressedImage` / `Twist` / `JointTrajectory` 等 | 当前推理流水线契约不使用，需要时再加 |

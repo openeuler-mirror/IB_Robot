@@ -1,0 +1,12 @@
+# ComputeFk.srv - forward kinematics through the runtime motion services.
+#
+# Capability: motion.fk. Joint states missing declared arm joints and unknown
+# link names are rejected by name.
+
+sensor_msgs/JointState joint_state
+string[] link_names
+---
+bool success
+string message
+# One stamped pose per requested link, in the runtime's base frame, same order.
+geometry_msgs/PoseStamped[] poses

@@ -172,8 +172,8 @@ robot-skill --config-name lekiwi_nav_grasp validate imitate_human_motion \
 primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 CLI catalog。
 
 `list-games` 只公开已启用游戏的 `name`、`summary`、`result_field` 和视觉游戏 `config_digest`；
-四个视觉游戏命令使用独立的轻量配置上下文，不编译运动 Skill catalog，也不要求 MoveIt 或
-`robot_description` 才能完成发现、启动和查询。
+四个视觉游戏命令使用独立的轻量配置上下文，不编译运动 Skill catalog，也不要求运动服务或
+机器人 description 包才能完成发现、启动和查询。
 `describe-game` 进一步公开 required inputs、结果 schema、timeout、retention 与 ledger capacity。视觉游戏不属于运动 capability，因此不进入
 `list-skills`、`ValidateSkill` 或 `SkillCommand`。
 

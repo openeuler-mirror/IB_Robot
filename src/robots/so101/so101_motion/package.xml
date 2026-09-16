@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>so101_motion</name>
+  <version>0.1.0</version>
+  <description>
+    SO-101 motion package: MoveIt assets (SRDF, kinematics, joint limits,
+    planning pipeline, controllers mapping) and the motion server that
+    implements the runtime motion services (motion.fk / motion.ik /
+    motion.move_to_joint / motion.move_to_pose) with the SO-101 5-DOF
+    orientation strategies. Member of the so101_robot runtime.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>so101_description</exec_depend>
+  <exec_depend>moveit</exec_depend>
+  <exec_depend>moveit_configs_utils</exec_depend>
+  <exec_depend>moveit_planners_ompl</exec_depend>
+  <exec_depend>moveit_planners_chomp</exec_depend>
+  <exec_depend>moveit_servo</exec_depend>
+  <exec_depend>pymoveit2</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

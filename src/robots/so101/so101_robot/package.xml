@@ -1,0 +1,49 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>so101_robot</name>
+  <version>0.1.0</version>
+  <description>
+    SO-101 robot runtime: the independently deployable unit through which the
+    SO-101 joins IB-Robot. Its dependency closure is the complete set of
+    packages needed to launch the robot (description, SDK, ros2_control
+    adapter, controllers, motion assets and motion server, runtime facade);
+    launch/runtime.launch.py brings the robot to ACTIVE from a runtime profile
+    with no IB-Robot generic package present.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- runtime contract layer (the only IB-Robot packages a runtime may depend on) -->
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+
+  <!-- robot members -->
+  <exec_depend>so101_description</exec_depend>
+  <exec_depend>so101_sdk</exec_depend>
+  <exec_depend>so101_hardware</exec_depend>
+  <exec_depend>so101_motion</exec_depend>
+  <!-- D12: sensor peripherals owned by the runtime -->
+  <exec_depend>usb_cam</exec_depend>
+  <exec_depend>camera_ros</exec_depend>
+  <exec_depend>realsense2_camera</exec_depend>
+
+  <!-- execution stack -->
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>xacro</exec_depend>
+  <exec_depend>robot_state_publisher</exec_depend>
+  <exec_depend>controller_manager</exec_depend>
+  <exec_depend>joint_state_broadcaster</exec_depend>
+  <exec_depend>joint_trajectory_controller</exec_depend>
+  <exec_depend>position_controllers</exec_depend>
+  <exec_depend>forward_command_controller</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

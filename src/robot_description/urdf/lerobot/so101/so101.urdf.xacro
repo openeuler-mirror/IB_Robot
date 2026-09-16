@@ -1,10 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="so101">
-
-    <xacro:arg name="use_sim" default="true"/>
-    <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_base.xacro" />
-    <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_gazebo.xacro" />
-    <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_ros2_control.xacro" />
-    <!-- cameras are generated dynamically from YAML peripherals by control.py -->
-
+	<!-- SSOT wrapper: the model lives in so101_description; this copy only
+	     redirects legacy consumers so the two trees can never diverge. -->
+	<xacro:include filename="$(find so101_description)/urdf/lerobot/so101/so101.urdf.xacro" />
 </robot>

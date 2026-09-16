@@ -47,6 +47,8 @@ OH_CUSTOM_HUMBLE_TAR_GLOB="${OH_CUSTOM_HUMBLE_TAR_GLOB:-}"
 USE_SUDO=0
 DRY_RUN=0
 PULL_IMAGE=1
+# Entries are paths relative to src/; the basename is the colcon package name
+# (robot suites live under src/robots/<robot>/<pkg>).
 declare -a PACKAGES=(
     "ibrobot_msgs"
     "tensormsg"
@@ -55,15 +57,27 @@ declare -a PACKAGES=(
     "inference_manifest"
     "ibrobot_tracing"
     "robot_config"
-    "robot_description"
+    "robot_runtime"
     "inference_service"
     "hardware_mock"
     "action_dispatch"
-    "so101_hardware"
+    "robots/feetech/feetech_sdk"
+    "robots/so101/so101_sdk"
+    "robots/so101/so101_hardware"
+    "robots/so101/so101_description"
+    "robots/so101/so101_motion"
+    "robots/so101/so101_suite"
+    "robots/so101/so101_robot"
     "task_dispatch"
-    "robot_moveit"
     "dataset_tools"
 )
+
+package_names() {
+    local entry
+    for entry in "${PACKAGES[@]}"; do
+        basename "${entry}"
+    done
+}
 declare -a COLCON_ARGS=()
 declare -a CMAKE_ARGS=()
 
@@ -90,7 +104,7 @@ Options:
   --cpu <arch>             Target OHOS CPU (default: aarch64)
   --image <image>          Builder image (default: voxelsky/ohos-ros-humble-builder:v0.1.5)
   --container-name <name>  Container name (default: ibrobot-oh-build)
-  --packages <csv>         Comma-separated package list
+  --packages <csv>         Comma-separated package list (paths relative to src/, e.g. robots/so101/so101_hardware)
   --colcon-args <...>      Extra arguments passed through to build-ros-humble
   --cmk-args <...>         Extra CMake arguments passed through to build-ros-humble
   --sudo                   Run docker via sudo
@@ -189,7 +203,7 @@ ensure_workspace_links() {
 
     for pkg in "${PACKAGES[@]}"; do
         local src_pkg="${IB_ROBOT_ROOT}/src/${pkg}"
-        local dst_pkg="${OH_CUSTOM_SRC}/${pkg}"
+        local dst_pkg="${OH_CUSTOM_SRC}/$(basename "${pkg}")"
         if [[ ! -e "${src_pkg}" ]]; then
             log_error "Source package not found: ${src_pkg}"
             exit 1
@@ -580,7 +594,7 @@ build_command_string() {
     local colcon_str=""
     local cmake_str=""
 
-    package_args="$(IFS=,; echo "${PACKAGES[*]}")"
+    package_args="$(package_names | paste -sd,)"
 
     if [[ "${#COLCON_ARGS[@]}" -gt 0 ]]; then
         # shellcheck disable=SC2206
