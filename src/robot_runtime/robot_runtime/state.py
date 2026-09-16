@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from copy import deepcopy
 from typing import Any
 
@@ -91,6 +91,27 @@ class RuntimeState:
             if not self._faults:
                 return
             self._faults.clear()
+        self._changed()
+
+    def set_status(self, lifecycle: str | None, faults: Sequence[str]) -> None:
+        """Replace the lifecycle and the fault list as one observation.
+
+        A reader must never catch this mid-update. Replacing the faults with
+        `clear_faults()` followed by `add_fault()` leaves a window in which the
+        snapshot says a runtime is degraded and names no reason, which is the
+        one thing a status consumer cannot act on. Pass ``lifecycle=None`` to
+        replace only the faults.
+        """
+        if lifecycle is not None and lifecycle not in LIFECYCLES:
+            raise ValueError(f"unknown lifecycle {lifecycle!r}")
+        replacement = list(dict.fromkeys(str(fault) for fault in faults))
+        with self._lock:
+            unchanged = replacement == self._faults and (lifecycle is None or lifecycle == self._lifecycle)
+            if unchanged:
+                return
+            self._faults[:] = replacement
+            if lifecycle is not None:
+                self._lifecycle = lifecycle
         self._changed()
 
     @property

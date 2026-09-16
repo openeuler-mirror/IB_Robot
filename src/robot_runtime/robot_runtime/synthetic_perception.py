@@ -91,8 +91,15 @@ class SyntheticStreams:
             )
 
             def publish(pub=publisher, msg=message, frame_id=frame):
-                msg.header.stamp = node.get_clock().now().to_msg()
-                msg.header.frame_id = frame_id
+                # Not every sensor message is stamped. A plain array is a
+                # legitimate declared interface, and assuming a header here
+                # raised AttributeError inside the timer — which took this
+                # publisher down and with it every other synthetic topic it
+                # serves, so an unrelated camera test was what failed.
+                header = getattr(msg, "header", None)
+                if header is not None:
+                    header.stamp = node.get_clock().now().to_msg()
+                    header.frame_id = frame_id
                 pub.publish(msg)
 
             self._timers.append(node.create_timer(1.0 / float(rate), publish))

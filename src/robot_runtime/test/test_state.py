@@ -4,7 +4,13 @@ import json
 
 from builtin_interfaces.msg import Time
 
-from robot_runtime.contract import LIFECYCLE_ACTIVE, LIFECYCLE_CONNECTING, LIFECYCLE_STOPPED, STOP_TORQUE_OFF
+from robot_runtime.contract import (
+    LIFECYCLE_ACTIVE,
+    LIFECYCLE_CONNECTING,
+    LIFECYCLE_DEGRADED,
+    LIFECYCLE_STOPPED,
+    STOP_TORQUE_OFF,
+)
 from robot_runtime.modes import ModeModel, ModeModelConfig
 from robot_runtime.state import RuntimeState
 
@@ -92,3 +98,46 @@ def test_rejections_serialized_as_parallel_arrays():
     msg = state.to_msg(Time())
     assert msg.rejected_channels == ["arm_stream", "gripper_stream"]
     assert list(msg.rejected_counts) == [2, 1]
+
+
+def test_set_status_replaces_lifecycle_and_faults_as_one_observation():
+    """A snapshot that is not ACTIVE must always carry the reason why.
+
+    Replacing faults with clear + add leaves a window in which a reader sees a
+    degraded runtime and no reason, which is the one status a consumer cannot
+    act on.
+    """
+    events: list[str] = []
+    state = _state(events)
+    state.set_status(LIFECYCLE_DEGRADED, ["arbitration lost"])
+    assert state.lifecycle == LIFECYCLE_DEGRADED
+    assert state.faults == ["arbitration lost"]
+    assert len(events) == 1
+
+    # Replacing the whole set is one change, not one per fault.
+    state.set_status(LIFECYCLE_DEGRADED, ["arbitration lost", "feedback stale"])
+    assert state.faults == ["arbitration lost", "feedback stale"]
+    assert len(events) == 2
+
+    # Duplicates collapse, and an unchanged status notifies nobody.
+    state.set_status(LIFECYCLE_DEGRADED, ["arbitration lost", "feedback stale", "arbitration lost"])
+    assert state.faults == ["arbitration lost", "feedback stale"]
+    assert len(events) == 2
+
+    # Faults alone can be replaced while the lifecycle is owned elsewhere.
+    state.set_status(None, [])
+    assert state.faults == []
+    assert state.lifecycle == LIFECYCLE_DEGRADED
+
+    state.set_status(LIFECYCLE_ACTIVE, [])
+    assert state.lifecycle == LIFECYCLE_ACTIVE
+
+
+def test_set_status_rejects_an_unknown_lifecycle():
+    state = _state()
+    try:
+        state.set_status("NEARLY_FINE", [])
+    except ValueError as exc:
+        assert "NEARLY_FINE" in str(exc)
+    else:
+        raise AssertionError("an unknown lifecycle must be rejected")

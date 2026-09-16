@@ -68,3 +68,61 @@ def test_parameter_schema_for_stop_bounds():
     schema = parameter_schema("runtime.stop")
     assert set(schema) == {"cancel_bound_s", "idle_bound_s", "torque_off_bound_s"}
     assert parameter_schema("motion.fk") == {}
+
+
+def test_registry_v3_vendor_surfaces_registered():
+    """v3 adds the surfaces a vendor-owned runtime republishes (aimdk-runtime-migration)."""
+    caps = all_capabilities()
+    for name in (
+        "perception.imu",
+        "perception.touch",
+        "perception.gnss",
+        "localization.pose",
+        "localization.map",
+        "power.state",
+        "diagnostics.codes",
+        "interaction.tts",
+        "interaction.audio_capture",
+        "interaction.audio_playback",
+        "interaction.expression",
+        "interaction.led",
+        "motion.posture",
+    ):
+        assert name in caps, f"{name} missing from the vocabulary"
+
+
+def test_v2_vocabulary_is_preserved():
+    """Extension-only: every v2 name survives the v3 extension."""
+    caps = all_capabilities()
+    for name in (
+        "joint.state",
+        "joint.position_stream",
+        "joint.trajectory",
+        "gripper.1d",
+        "hand.multi_joint",
+        "hand.gesture",
+        "base.cmd_vel",
+        "base.odom",
+        "base.navigation_gate",
+        "nav.goal",
+        "motion.fk",
+        "motion.ik",
+        "motion.move_to_joint",
+        "motion.move_to_pose",
+        "motion.named",
+        "perception.camera",
+        "perception.lidar",
+        "runtime.stop",
+        "runtime.status",
+        "body.whole_stream",
+        "joint.priority_stream",
+    ):
+        assert name in caps, f"v2 name {name} was removed"
+
+
+def test_localization_pose_is_not_base_odom():
+    """A map-frame pose is a distinct capability: it jumps on relocalization."""
+    from robot_runtime.capabilities import parameter_schema
+
+    assert set(parameter_schema("localization.pose")) == {"topics", "reference_frame"}
+    assert set(parameter_schema("base.odom")) == set()

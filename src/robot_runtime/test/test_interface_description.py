@@ -322,3 +322,49 @@ def test_monitor_subscription_mirrors_declared_qos(profile):
     camera_qos = node.subscribed["/camera/front/image_raw"][1]
     assert camera_qos.reliability == ReliabilityPolicy.BEST_EFFORT
     assert camera_qos.durability == DurabilityPolicy.VOLATILE
+
+
+def test_synthetic_perception_publishes_an_unstamped_message(profile):
+    """A declared sensor interface need not be a stamped message.
+
+    Assuming a header raised AttributeError inside the publish timer, which
+    tore down the synthetic publisher and silenced every other topic it served
+    — so the visible failure was an unrelated camera interface.
+    """
+    from std_msgs.msg import Float64MultiArray
+
+    from robot_runtime.synthetic_perception import SyntheticStreams
+
+    published: list[object] = []
+
+    class _Pub:
+        def publish(self, message):
+            published.append(message)
+
+    class _Node:
+        def create_publisher(self, *_args, **_kwargs):
+            return _Pub()
+
+        def create_timer(self, _period, callback):
+            callback()
+            return object()
+
+        def get_clock(self):
+            raise AssertionError("an unstamped message must not reach the clock")
+
+    descriptor = build_description(profile, simulated=True)
+    # Only the headerless interface, so any use of the clock is this one's.
+    descriptor["interfaces"] = {
+        "touch.hands": {
+            "capability": "perception.touch",
+            "kind": "topic",
+            "direction": "publish",
+            "endpoint": "/aimdk/hand_touch",
+            "message_type": "std_msgs/msg/Float64MultiArray",
+            "rate_hz": 10.0,
+            "qos": {"reliability": "best_effort", "durability": "volatile", "history": "keep_last", "depth": 10},
+        }
+    }
+    descriptor["digest"] = description_digest(descriptor)
+    SyntheticStreams(_Node(), descriptor)
+    assert published and isinstance(published[0], Float64MultiArray)

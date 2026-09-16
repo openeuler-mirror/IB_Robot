@@ -276,12 +276,34 @@ def requires(harness: Harness, *capabilities: str):
         pytest.skip(f"runtime does not declare {missing}")
 
 
+def _mode_named(harness: Harness, flag: str, default: str) -> str:
+    """A declared mode carrying ``flag``, or the conventional name.
+
+    Runtimes name their modes; only the semantics are contractual. A runtime
+    that declares no mode with the requested semantics still returns the
+    conventional name, so the caller's own ``requires`` gate decides whether
+    the test runs at all.
+    """
+    for name, spec in (harness.profile.get("modes") or {}).items():
+        if name != "initial" and isinstance(spec, dict) and spec.get(flag):
+            return str(name)
+    return default
+
+
 def _trajectory_mode(harness: Harness) -> str:
-    return "trajectory"
+    return _mode_named(harness, "allows_trajectory", "trajectory")
 
 
 def _stream_mode(harness: Harness) -> str:
-    return "stream"
+    return _mode_named(harness, "allows_stream", "stream")
+
+
+def _any_other_mode(harness: Harness) -> str:
+    """Any declared mode other than idle, for tests about switching itself."""
+    for name in harness.status().declared_modes:
+        if name != C.IDLE_MODE:
+            return str(name)
+    raise AssertionError("runtime declares no mode other than idle")
 
 
 # ---------------------------------------------------------------------------
@@ -442,14 +464,17 @@ def test_trajectory_cancel_holds_position(harness: Harness):
 
 def test_status_published_on_mode_change_and_query_parity(harness: Harness):
     harness.statuses.clear()
-    assert harness.set_mode(_trajectory_mode(harness)).success
+    # Any declared mode exercises publication-on-change; this is not a
+    # trajectory test, so a runtime without a trajectory mode still runs it.
+    target = _any_other_mode(harness)
+    assert harness.set_mode(target).success
     harness.spin_until(
-        lambda: any(s.active_mode == _trajectory_mode(harness) for s in harness.statuses),
+        lambda: any(s.active_mode == target for s in harness.statuses),
         1.5,
         "[Runtime status / on change] status carrying the new mode within one period",
     )
     queried = harness.status()
-    assert queried.active_mode == _trajectory_mode(harness), "[Runtime status / query parity] queried mode differs"
+    assert queried.active_mode == target, "[Runtime status / query parity] queried mode differs"
     assert queried.lifecycle == C.LIFECYCLE_ACTIVE
     assert queried.runtime_name and queried.runtime_version, "[Runtime status] identity fields empty"
     assert set(queried.declared_modes) >= {C.IDLE_MODE}, "[Runtime status] declared modes missing idle"
@@ -503,7 +528,7 @@ def test_stop_guarantees_within_declared_bounds(harness: Harness, policy: str):
 def test_stop_latches_until_cleared(harness: Harness):
     requires(harness, "runtime.stop")
     assert harness.stop(C.STOP_HOLD).success
-    rejected = harness.set_mode(_trajectory_mode(harness))
+    rejected = harness.set_mode(_any_other_mode(harness))
     assert not rejected.success and "latch" in rejected.message.lower(), (
         f"[Stop service / latch] mode request accepted while stopped: {rejected.message}"
     )
@@ -732,7 +757,7 @@ def test_move_to_pose_reaches_within_reported_error(harness: Harness):
 
 
 def _base_mode(harness: Harness) -> str:
-    return "base_navigation"
+    return _mode_named(harness, "allows_base", "base_navigation")
 
 
 def test_base_velocity_honored_and_odometry_integrates(harness: Harness):
