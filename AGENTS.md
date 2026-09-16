@@ -15,6 +15,8 @@ IB_Robot/
 │   ├── robot_runtime/      # 机器人运行时契约（状态/能力/接口描述）
 │   ├── robot_navigation/   # 导航
 │   ├── robots/so101/       # SO-101 运行时套件（sdk/hardware/description/motion/robot）
+│   ├── robots/feetech/     # Feetech 舵机 SDK
+│   ├── robots/aimdk/       # 灵犀 X2（AimDK）：桥接厂商 MC 层的运行时
 │   ├── lekiwi_hardware/    # LeKiwi 硬件接口
 │   ├── ibrobot_msgs/       # 自定义消息/服务定义
 │   ├── ibrobot_agent/      # 自然语言 Agent 孵化运行时（entry_mode=agent）
