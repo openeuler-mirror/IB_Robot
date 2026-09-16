@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from rclpy.action import ActionClient
+from rclpy.clock import Clock, ClockType
 from rclpy.task import Future
 from std_msgs.msg import Empty
 from std_srvs.srv import Trigger
@@ -72,9 +73,12 @@ class PlacoServoBackend(CartesianBackend):
         command_lease_topic: str = _DEFAULT_COMMAND_LEASE_TOPIC,
         input_mode: str = "velocity",
         stale_threshold_s: float = 0.2,
+        managed_teleop: bool = False,
+        runtime_status_topic: str = "/runtime/status",
         **_unused,  # tolerate extra kwargs for signature parity with siblings
     ) -> None:
         self._node = node
+        self._managed = managed_teleop
         self._base = base_link
         self._input_mode = str(input_mode).lower()
         if self._input_mode not in ("velocity", "pose"):
@@ -103,6 +107,8 @@ class PlacoServoBackend(CartesianBackend):
         self._active_enabled = False
         self._start_request_inflight = False
         self._start_retry_timer = None
+        self._enable_result = None
+        self._enable_timeout_timer = None
         self._stop_pending = False
         self._stop_request_inflight = False
         self._stop_retry_timer = None
@@ -111,10 +117,64 @@ class PlacoServoBackend(CartesianBackend):
         self._home_goal_handle = None
         self._home_goal_generation: int | None = None
         self._lifecycle_generation = 0
+        self._runtime_stop_latched = False
+        if self._managed:
+            from ibrobot_msgs.msg import RuntimeStatus
+
+            node.create_subscription(RuntimeStatus, runtime_status_topic, self._on_runtime_status, 1)
+
+    def _on_runtime_status(self, status):
+        invalid = status.stop_latched or status.active_mode != "stream" or status.lifecycle != "ACTIVE"
+        stop_edge = status.stop_latched and not self._runtime_stop_latched
+        self._runtime_stop_latched = status.stop_latched
+        if stop_edge:
+            if self._requested_enabled or self._active_enabled or self._home_pending:
+                self.disable()
+            else:
+                self._lifecycle_generation += 1
+            return
+        if invalid and (self._active_enabled or self._home_pending):
+            self._lifecycle_generation += 1
+            self._requested_enabled = False
+            self._active_enabled = False
+            self._home_pending = False
+            self._home_result = False
+            self._cancel_start_retry()
+            self._finish_enable(False, "runtime admission lost")
+            if self._home_goal_handle is not None:
+                self._home_goal_handle.cancel_goal_async()
+                self._home_goal_handle = None
 
     # ------------------------------------------------------------------ enable
+    def enable_with_result(self, timeout_s: float) -> Future:
+        """Return final admission, retaining enable()'s queued-bool device API."""
+        result = Future()
+        if self._requested_enabled or self._start_request_inflight or self._stop_pending or self._home_pending:
+            result.set_result(Trigger.Response(success=False, message="admission busy or stop pending"))
+            return result
+        self._enable_result = result
+        self._enable_timeout_timer = self._node.create_timer(
+            timeout_s, self._enable_timed_out, clock=Clock(clock_type=ClockType.STEADY_TIME)
+        )
+        if not self.enable():
+            self._finish_enable(False, "start service unavailable or admission refused")
+        return result
+
+    def _finish_enable(self, success: bool, message: str) -> None:
+        result = self._enable_result
+        if self._enable_timeout_timer is not None:
+            self._node.destroy_timer(self._enable_timeout_timer)
+            self._enable_timeout_timer = None
+        self._enable_result = None
+        if result is not None and not result.done():
+            result.set_result(Trigger.Response(success=success, message=message))
+
+    def _enable_timed_out(self) -> None:
+        self._finish_enable(False, "runtime admission timed out; stop requested")
+        self.disable()
+
     def enable(self) -> bool:
-        if self._stop_pending:
+        if self._stop_pending or getattr(self, "_runtime_stop_latched", False):
             return False
         # A start requested before the previous release must not be reused as a
         # new grip. Wait for its response; a late success will issue another
@@ -134,6 +194,9 @@ class PlacoServoBackend(CartesianBackend):
         return self._requested_enabled
 
     def _schedule_start_retry(self) -> None:
+        if self._managed:
+            self._requested_enabled = False
+            return
         if self._start_retry_timer is not None:
             return
         self._start_retry_timer = self._node.create_timer(0.5, self._retry_start)
@@ -154,6 +217,7 @@ class PlacoServoBackend(CartesianBackend):
             future = self._start_cli.call_async(Trigger.Request())
         except Exception as exc:  # noqa: BLE001
             self._node.get_logger().error(f"so101_placo_servo_node start request failed: {exc}")
+            self._finish_enable(False, f"start request failed: {exc}")
             if self._requested_enabled:
                 self._schedule_start_retry()
             return
@@ -163,16 +227,22 @@ class PlacoServoBackend(CartesianBackend):
 
     def _on_start_response(self, future: Future, generation: int | None = None) -> None:
         self._start_request_inflight = False
-        if generation is not None and generation != self._lifecycle_generation:
-            self._node.get_logger().info("Ignoring stale Placo start response after lifecycle transition")
-            return
         try:
             response = future.result()
         except Exception as exc:  # noqa: BLE001
+            if generation is not None and generation != self._lifecycle_generation:
+                return
             self._active_enabled = False
+            self._finish_enable(False, f"start request failed: {exc}")
             self._node.get_logger().error(f"so101_placo_servo_node start request failed: {exc}")
             if self._requested_enabled:
                 self._schedule_start_retry()
+            return
+
+        if generation is not None and generation != self._lifecycle_generation:
+            if response.success:
+                self.disable()
+            self._node.get_logger().info("Ignoring stale Placo start response after lifecycle transition")
             return
 
         if response.success:
@@ -184,9 +254,11 @@ class PlacoServoBackend(CartesianBackend):
             self._active_enabled = True
             self._cancel_start_retry()
             self._node.get_logger().info(response.message or "so101_placo_servo_node enabled")
+            self._finish_enable(True, response.message or "runtime admitted")
             return
 
         self._active_enabled = False
+        self._finish_enable(False, response.message or "runtime rejected admission")
         self._node.get_logger().error(response.message or "so101_placo_servo_node rejected start request")
         if self._requested_enabled:
             self._schedule_start_retry()
@@ -200,6 +272,7 @@ class PlacoServoBackend(CartesianBackend):
 
     def disable(self) -> bool:
         self._lifecycle_generation += 1
+        self._finish_enable(False, "admission canceled by stop")
         self._requested_enabled = False
         self._cancel_start_retry()
         self._active_enabled = False
@@ -226,9 +299,10 @@ class PlacoServoBackend(CartesianBackend):
             self._schedule_stop_retry()
             return
         self._stop_request_inflight = True
-        future.add_done_callback(self._on_stop_response)
+        generation = self._lifecycle_generation
+        future.add_done_callback(lambda completed: self._on_stop_response(completed, generation))
 
-    def _on_stop_response(self, future: Future) -> None:
+    def _on_stop_response(self, future: Future, generation: int | None = None) -> None:
         self._stop_request_inflight = False
         try:
             response = future.result()
@@ -237,6 +311,10 @@ class PlacoServoBackend(CartesianBackend):
             self._schedule_stop_retry()
             return
         if response.success:
+            # An older HOLD cannot acknowledge a stop requested after a late start.
+            if generation is not None and generation != self._lifecycle_generation:
+                self._try_stop()
+                return
             self._stop_pending = False
             self._cancel_stop_retry()
             self._node.get_logger().info(response.message or "so101_placo_servo_node stopped")
@@ -306,6 +384,8 @@ class PlacoServoBackend(CartesianBackend):
         self._pose_pub.publish(msg)
 
     def home(self) -> bool:
+        if self._managed and not self._active_enabled:
+            return False
         if self._stop_pending or self._home_pending or not self._home_client.server_is_ready():
             return False
         self._lifecycle_generation += 1

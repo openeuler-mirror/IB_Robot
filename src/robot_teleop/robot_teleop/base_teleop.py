@@ -105,11 +105,11 @@ class BaseTeleopDevice(ABC):
         Return radian safety limits for gripper joints, derived from the follower
         calibration so they stay in sync with the follower's physical stroke.
 
-        Devices that emit radian gripper commands (e.g. the SO-101 leader arm,
-        which maps the leader's 0~1 percentage onto the follower's radian stroke)
-        override this to report the actual ``[rad_min, rad_max]``. The TeleopNode
-        uses these to override the static YAML limits for the gripper joints, so
-        changing or re-calibrating the follower needs no YAML edit.
+        Devices that know the follower's calibrated stroke (e.g. the SO-101
+        leader arm, which reads the follower calibration) override this to
+        report the actual ``[rad_min, rad_max]``. The TeleopNode uses these to
+        override the static YAML limits for the gripper joints, so changing or
+        re-calibrating the follower needs no YAML edit.
 
         Returns:
             dict[str, dict[str, float]]: Mapping from gripper joint name to
@@ -117,6 +117,17 @@ class BaseTeleopDevice(ABC):
                 (no override), letting the YAML limits stand as-is.
         """
         return {}
+
+    def get_gripper_stroke(self) -> tuple[float, float] | None:
+        """
+        Return the follower gripper stroke ``(closed_rad, open_rad)`` or None.
+
+        Ratio-emitting devices that know the follower's calibrated stroke
+        override this. TeleopNode uses it as the ratio -> radian endpoint
+        source only when neither the device config nor the runtime public
+        description provides endpoints (provider-less legacy deployments).
+        """
+        return None
 
     @abstractmethod
     def disconnect(self):

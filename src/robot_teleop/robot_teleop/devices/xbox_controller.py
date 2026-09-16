@@ -5,6 +5,7 @@ Refined Logic: Full-State Reporting with Direction-Snap.
 Ensures zero jumps and instant response even at limits.
 """
 
+import math
 import os
 import sys
 import threading
@@ -59,6 +60,10 @@ class XboxTeleopDevice(BaseTeleopDevice):
         self._last_commanded_positions = {}  # The Source of Truth for commands
         self._current_joint_states = {}  # The Source of Truth for physical robot
         self._latest_joy: Joy | None = None
+        self._latest_joy_at = 0.0
+        self._latest_state_at = 0.0
+        self._managed = bool(config.get("managed_teleop", False))
+        self._input_stale_s = float(config.get("input_stale_s", 0.2))
         self._previous_buttons = []
         self._trigger_initialized = False
         self._first_state_received = False
@@ -67,8 +72,8 @@ class XboxTeleopDevice(BaseTeleopDevice):
         self._last_debug_time = 0
 
         # Gripper
-        self.GRIPPER_OPEN_POS = 1.0
-        self.GRIPPER_CLOSED_POS = 0.0
+        self.GRIPPER_OPEN_POS = float(config.get("gripper_open", 1.0))
+        self.GRIPPER_CLOSED_POS = float(config.get("gripper_closed", 0.0))
         self._current_gripper_pos = self.GRIPPER_OPEN_POS
 
         self.servo_client = None
@@ -158,9 +163,11 @@ CONTROLS:
         if self._node is None:
             return False
         try:
-            self._joy_sub = self._node.create_subscription(Joy, "/joy", self._process_joy_event, 10)
+            self._joy_sub = self._node.create_subscription(
+                Joy, self._config.get("source_topic", "/joy"), self._process_joy_event, 1
+            )
             self._joint_state_sub = self._node.create_subscription(
-                JointState, "/joint_states", self._joint_state_callback, 10
+                JointState, self._config.get("joint_state_topic", "/joint_states"), self._joint_state_callback, 1
             )
 
             # TF buffer for tool_frame angular-velocity conversion.
@@ -175,6 +182,8 @@ CONTROLS:
                 tool_frame=self.tool_frame,
                 linear_speed=self.cartesian_linear_speed,
                 angular_speed=self.cartesian_angular_speed,
+                managed_teleop=self._managed,
+                **self._config.get("cartesian_backend_config", {}),
             )
             self.logger.info(
                 f"XboxTeleopDevice: cartesian solver={self.cartesian_solver}, tool_frame={self.tool_frame}"
@@ -189,7 +198,16 @@ CONTROLS:
     def get_joint_targets(self) -> dict[str, float]:
         """Main interface called by TeleopNode."""
         with self._state_lock:
+            if self._managed and (
+                time.monotonic() - self._latest_joy_at > self._input_stale_s
+                or time.monotonic() - self._latest_state_at > self._input_stale_s
+            ):
+                self.emergency_stop()
+                return {}
             if not self._is_control_enabled or self._latest_joy is None:
+                return {}
+            if self._managed and self.servo_client._home_pending:
+                self.servo_client.keepalive()
                 return {}
 
             # Update gripper
@@ -309,16 +327,25 @@ CONTROLS:
 
     def _process_joy_event(self, msg: Joy):
         with self._state_lock:
+            if self._managed:
+                now = self._node.get_clock().now().nanoseconds * 1e-9
+                stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                if not 0 <= now - stamp <= self._input_stale_s or not all(math.isfinite(v) for v in msg.axes):
+                    return
             self._latest_joy = msg
+            self._latest_joy_at = time.monotonic()
             if not self._previous_buttons:
                 self._previous_buttons = list(msg.buttons)
                 return
+            self._previous_buttons += [0] * max(0, len(msg.buttons) - len(self._previous_buttons))
             a_idx, b_idx = self.button_mapping.get("arm_enable", 0), self.button_mapping.get("arm_disable", 1)
 
             if a_idx < len(msg.buttons) and msg.buttons[a_idx] and not self._previous_buttons[a_idx]:
-                self._is_control_enabled = True
+                self._is_control_enabled = not self._managed or (
+                    self._first_state_received and time.monotonic() - self._latest_state_at <= self._input_stale_s
+                )
                 self._sync_targets_to_actual("Enabled")
-                if self._mode == "cartesian" and self.servo_client:
+                if self._is_control_enabled and (self._managed or self._mode == "cartesian") and self.servo_client:
                     self.servo_client.enable()
                 self._print_usage(level="full")
 
@@ -344,6 +371,11 @@ CONTROLS:
         sys.stdout.flush()
 
     def _go_to_fixed_position(self, target_key: str):
+        if self._managed:
+            if target_key == "home" and self._is_control_enabled and self.servo_client.is_enabled:
+                self.servo_client.home()
+                self._last_commanded_positions.clear()
+            return
         if self._mode == "cartesian":
             self._toggle_mode()
         target_values = {
@@ -357,6 +389,18 @@ CONTROLS:
 
     def _joint_state_callback(self, msg: JointState):
         with self._state_lock:
+            if self._managed and not all(name in msg.name for name in self.arm_joint_names + self.gripper_joint_names):
+                return
+            if self._managed:
+                now = self._node.get_clock().now().nanoseconds * 1e-9
+                stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                if (
+                    len(msg.name) != len(msg.position)
+                    or not all(math.isfinite(v) for v in msg.position)
+                    or not 0 <= now - stamp <= self._input_stale_s
+                ):
+                    return
+            self._latest_state_at = time.monotonic()
             for name, pos in zip(msg.name, msg.position, strict=False):
                 self._current_joint_states[name] = pos
             if not self._first_state_received:
@@ -378,6 +422,9 @@ CONTROLS:
     def _toggle_mode(self):
         old_mode = self._mode
         self._mode = "cartesian" if old_mode == "joint" else "joint"
+        if self._managed:
+            self.emergency_stop()
+            return
         if self._mode == "joint":
             if self.servo_client and self.servo_client.is_enabled:
                 self.servo_client.disable()
@@ -391,3 +438,9 @@ CONTROLS:
         if self.servo_client and self.servo_client.is_enabled:
             self.servo_client.disable()
         self._is_connected = False
+
+    def emergency_stop(self):
+        self._is_control_enabled = False
+        self._last_commanded_positions.clear()
+        if self.servo_client and (self.servo_client.is_enabled or self.servo_client._requested_enabled):
+            self.servo_client.disable()

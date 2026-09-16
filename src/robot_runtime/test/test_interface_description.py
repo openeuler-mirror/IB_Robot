@@ -12,6 +12,8 @@ from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 from sensor_msgs.msg import Image
 
 from robot_runtime.interface_description import (
+    InterfaceDescriptionError,
+    _teleoperation_interfaces,
     build_description,
     description_digest,
     load_description,
@@ -22,6 +24,26 @@ from robot_runtime.interface_description import (
 from robot_runtime.interface_monitor import InterfaceMonitor
 from robot_runtime.synthetic_perception import SyntheticStreams
 from robot_runtime.wait_for_runtime import validate_endpoint_graph, validate_runtime_snapshot
+
+
+@pytest.mark.parametrize("stale", [0.0, -0.1, 1.001, float("nan"), float("inf"), True])
+def test_teleoperation_deadline_rejects_out_of_contract_profile_values(stale):
+    profile = {
+        "teleoperation": {"enabled": True, "target_group": "arm", "endpoint_prefix": "/arm", "command_stale_s": stale}
+    }
+    model = {"joint_groups": {"arm": ["1"], "all": ["1", "6"]}, "frames": {"base_link": "base", "ee_link": "tool"}}
+    with pytest.raises(InterfaceDescriptionError, match="command_stale_s"):
+        _teleoperation_interfaces(profile, model)
+
+
+@pytest.mark.parametrize("stale", [0.2, 0.5, 1.0])
+def test_teleoperation_deadline_projects_hardware_profile_budget(stale):
+    profile = {
+        "teleoperation": {"enabled": True, "target_group": "arm", "endpoint_prefix": "/arm", "command_stale_s": stale}
+    }
+    model = {"joint_groups": {"arm": ["1"], "all": ["1", "6"]}, "frames": {"base_link": "base", "ee_link": "tool"}}
+    interfaces = _teleoperation_interfaces(profile, model)
+    assert all(interface["command_stale_s"] == stale for interface in interfaces.values())
 
 
 @pytest.fixture

@@ -1,0 +1,49 @@
+# Operator input deployment (app side, not robot runtime package).
+# Never loaded by a policy-only runtime.
+# When the leader runs on another host, set the runtime profile's
+# teleoperation.leader_source to a stub or remove it and launch the
+# source node on the operator machine separately.
+# Content responsibility:
+#   - device selection, topics, mappings, stale timeouts → app/operator config (this file)
+#   - joint groups, limits, frames, conversions → runtime public description (/runtime/get_status)
+#   - serial port, baudrate, calibration → runtime profile (leader_source)
+devices:
+  # NOTE: no acquisition block here — the runtime launches the leader
+  # source from its own profile (teleoperation.leader_source). The app
+  # only consumes the published topic.
+  - name: so101_leader
+    type: leader_topic
+    source_topic: /inputs/so101_leader/state
+    input_gripper_joint: "6"
+    # Inherit the runtime's command_stale_s; deployments can set a tighter bound.
+    joint_mapping: {"1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6"}
+  - name: xbox_controller
+    type: xbox_controller
+    input_device: /dev/input/js0
+    source_topic: /joy
+    input_stale_s: 0.2
+    default_mode: joint
+    mapping_config: xbox_mapping
+    control_params: {deadzone: 0.1, joint_velocity_gain: 1.5, long_press_duration: 0.5}
+  - name: phone_teleop
+    type: phone
+    control_frequency: 50.0
+    input_stale_s: 0.2
+    phone_config:
+      backend: webphone
+      max_ee_step_m: 0.05
+      gripper_speed_factor: 20.0
+      gripper_range: [0.0, 1.0]
+      end_effector_bounds: {min: [-0.5, -0.5, -0.5], max: [0.5, 0.5, 0.5]}
+  - name: vr_teleop
+    type: vr_teleop
+    control_frequency: 50.0
+    input_stale_s: 0.2
+    vr_config:
+      output_profile: so101
+      controller_side: right
+      host: 0.0.0.0
+      port: 8889
+      so101_input_mode: pose
+      position_scale: 0.7
+      so101_command_stale_s: 0.2

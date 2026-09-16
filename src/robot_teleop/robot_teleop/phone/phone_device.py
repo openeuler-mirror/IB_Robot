@@ -124,7 +124,7 @@ class PhoneDevice(BaseTeleopDevice):
         self.arm_joint_names = config.get("arm_joint_names", ["1", "2", "3", "4", "5"])
         self.gripper_joint_names = config.get("gripper_joint_names", ["6"])
         self._cartesian_solver = str(config.get("cartesian_solver", "placo_servo"))
-        if self._cartesian_solver != "placo_servo":
+        if self._cartesian_solver not in ("placo_servo", "runtime"):
             raise ValueError("PhoneDevice requires cartesian_solver=placo_servo")
         raw_control_frequency = config.get("control_frequency", 50.0)
         if isinstance(raw_control_frequency, bool):
@@ -173,6 +173,7 @@ class PhoneDevice(BaseTeleopDevice):
                 linear_speed=linear_speed,
                 angular_speed=angular_speed,
                 input_mode=self.phone_config.cartesian_input_mode,
+                managed_teleop=self._config.get("managed_teleop", False),
                 **backend_config,
             )
             self.logger.info(
@@ -184,7 +185,7 @@ class PhoneDevice(BaseTeleopDevice):
             from sensor_msgs.msg import JointState
 
             self._joint_state_sub = self._node.create_subscription(
-                JointState, "/joint_states", self._joint_state_callback, 10
+                JointState, self._config.get("joint_state_topic", "/joint_states"), self._joint_state_callback, 10
             )
 
             self._is_connected = True
@@ -222,7 +223,18 @@ class PhoneDevice(BaseTeleopDevice):
             servo_enabled = self._servo_enabled
 
         if going_home:
-            if self.servo_client is not None and not getattr(self.servo_client, "stop_pending", False):
+            if self._config.get("managed_teleop", False):
+                cmd = self._get_cmd_internal()
+                if cmd is None or not cmd.enabled or self._validate_cartesian_command(cmd) is not None:
+                    self._disable_motion(force=True)
+                    self._require_deadman_release("HOME input lost", request_transport_stop=False)
+                else:
+                    self.servo_client.keepalive()
+            if (
+                not self._config.get("managed_teleop", False)
+                and self.servo_client is not None
+                and not getattr(self.servo_client, "stop_pending", False)
+            ):
                 self.servo_client.keepalive()
             return self._update_home_state()
 
@@ -253,7 +265,8 @@ class PhoneDevice(BaseTeleopDevice):
                 self._going_home = True
                 self._servo_enabled = False
                 self._clear_pose_state_locked()
-            self._require_deadman_release("go-home requested", request_transport_stop=False)
+            if not self._config.get("managed_teleop", False):
+                self._require_deadman_release("go-home requested", request_transport_stop=False)
             return {self.gripper_joint_names[0]: cmd.gripper_pos}
 
         if not cmd.enabled:
@@ -273,6 +286,9 @@ class PhoneDevice(BaseTeleopDevice):
             return {self.gripper_joint_names[0]: cmd.gripper_pos}
 
         if self.servo_client and not self.servo_client.is_enabled:
+            if self._config.get("managed_teleop", False) and not self.servo_client._requested_enabled:
+                self._servo_enabled = False
+                self._require_deadman_release("runtime admission lost", request_transport_stop=False)
             return {self.gripper_joint_names[0]: cmd.gripper_pos}
 
         if self._pose_clutch_pos is None or self._pose_clutch_rot is None:
@@ -327,6 +343,8 @@ class PhoneDevice(BaseTeleopDevice):
                 self._going_home = False
                 self._servo_enabled = False
                 self._clear_pose_state_locked()
+            if self._config.get("managed_teleop", False):
+                self._require_deadman_release("HOME completed", request_transport_stop=False)
             # The release latch was set when Home was requested and commands are
             # not consumed while Home owns the backend. A real release observed
             # after this point clears it; do not re-latch or stop Placo again.

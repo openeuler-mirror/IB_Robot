@@ -39,6 +39,6 @@ def make_cartesian_backend(solver: str, **kwargs) -> CartesianBackend:
     """
     if solver == "moveit_servo":
         return MoveItServoBackend(**kwargs)
-    if solver == "placo_servo":
+    if solver in ("placo_servo", "runtime"):
         return PlacoServoBackend(**kwargs)
     raise ValueError(f"unknown cartesian solver: {solver!r}")

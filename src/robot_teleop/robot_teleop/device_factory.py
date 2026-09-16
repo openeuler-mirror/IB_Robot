@@ -8,6 +8,7 @@ configuration, enabling easy extension without modifying core code.
 from .base_teleop import BaseTeleopDevice
 from .devices.hand_retarget import HandRetargetDevice
 from .devices.leader_arm import LeaderArmDevice
+from .devices.leader_topic import LeaderTopicDevice
 from .devices.xbox_controller import XboxTeleopDevice
 from .phone.phone_device import PhoneDevice
 
@@ -15,6 +16,7 @@ from .phone.phone_device import PhoneDevice
 DEVICE_MAP: dict[str, type[BaseTeleopDevice]] = {
     "hand_retarget": HandRetargetDevice,
     "leader_arm": LeaderArmDevice,  # SO-101 leader arm
+    "leader_topic": LeaderTopicDevice,
     "phone": PhoneDevice,
     "xbox_controller": XboxTeleopDevice,
 }

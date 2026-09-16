@@ -52,6 +52,7 @@ Typical speed magnitudes: linear ~0.02 m/s, angular ~1.0 rad/s.
 import contextlib
 import json
 import logging
+import math
 import socket
 import threading
 import time
@@ -60,6 +61,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation
@@ -403,6 +405,13 @@ class VRTeleopNode(Node):
 
         self.declare_parameter("host", "0.0.0.0")
         self.declare_parameter("port", 8889)
+        self.declare_parameter("managed_teleop", False)
+        self.declare_parameter("command_lease_topic", "")
+        self.declare_parameter("gripper_joint_name", "")
+        self.declare_parameter("joint_limits", "{}", ParameterDescriptor(read_only=True))
+        self.declare_parameter("runtime_status_topic", "/runtime/status")
+        self._managed = bool(self.get_parameter("managed_teleop").value)
+        self._managed_release_required = True
         self.declare_parameter("control_frequency", 50.0)
         self.declare_parameter("linear_speed_scale", 1.0)
         self.declare_parameter("angular_speed_scale", 1.0)
@@ -478,6 +487,32 @@ class VRTeleopNode(Node):
             raise ValueError("controller_side must be 'left' or 'right'")
         if self._so101_input_mode not in ("velocity", "pose"):
             raise ValueError("so101_input_mode must be 'velocity' or 'pose'")
+
+        self._joint_limits = json.loads(self.get_parameter("joint_limits").value)
+        if not isinstance(self._joint_limits, dict):
+            raise ValueError("joint_limits must be a JSON object")
+        for name, limit in self._joint_limits.items():
+            try:
+                valid = (
+                    bool(name.strip())
+                    and isinstance(limit, dict)
+                    and all(
+                        isinstance(limit.get(key), int | float)
+                        and not isinstance(limit[key], bool)
+                        and math.isfinite(limit[key])
+                        for key in ("min", "max")
+                    )
+                    and limit["min"] < limit["max"]
+                )
+            except (OverflowError, ValueError):
+                valid = False
+            if not valid:
+                raise ValueError(f"joint_limits[{name!r}] requires finite numeric min < max")
+        if self._managed:
+            if self._output_profile != "so101":
+                raise ValueError("managed_teleop requires output_profile=so101")
+            if self.get_parameter("gripper_joint_name").value not in self._joint_limits:
+                raise ValueError("joint_limits must include the managed gripper joint")
 
         self._tcp_server = VRDualArmTcpServer(host, port)
         self._tcp_server.start()
@@ -586,9 +621,23 @@ class VRTeleopNode(Node):
             self._so101_angular_pub = self.create_publisher(
                 Vector3Stamped, self.get_parameter("so101_angular_topic").value, 10
             )
-        self._so101_gripper_pub = self.create_publisher(
-            Float64MultiArray, self.get_parameter("so101_gripper_topic").value, 10
-        )
+        if self._managed:
+            from sensor_msgs.msg import JointState
+            from std_msgs.msg import Empty
+
+            self._so101_gripper_pub = self.create_publisher(
+                JointState, self.get_parameter("so101_gripper_topic").value, 1
+            )
+            self._managed_lease_pub = self.create_publisher(Empty, self.get_parameter("command_lease_topic").value, 1)
+            from ibrobot_msgs.msg import RuntimeStatus
+
+            self.create_subscription(
+                RuntimeStatus, self.get_parameter("runtime_status_topic").value, self._managed_runtime_status, 1
+            )
+        else:
+            self._so101_gripper_pub = self.create_publisher(
+                Float64MultiArray, self.get_parameter("so101_gripper_topic").value, 10
+            )
         self._so101_start_cli = self.create_client(Trigger, self.get_parameter("so101_start_service").value)
         self._so101_stop_cli = self.create_client(Trigger, self.get_parameter("so101_stop_service").value)
         self._so101_home_cli = ActionClient(self, ArmReturnHome, self.get_parameter("so101_home_action").value)
@@ -621,6 +670,10 @@ class VRTeleopNode(Node):
         super().destroy_node()
 
     def _ensure_so101_started(self) -> None:
+        if getattr(self, "_managed", False):
+            if self._so101_stop_pending:
+                self._stop_so101_servo("retry managed stop")
+            return
         if self._output_profile != "so101" or self._estop_active:
             return
         # If a stop is pending but never confirmed (e.g. it was rejected while the
@@ -988,6 +1041,9 @@ class VRTeleopNode(Node):
 
     def _control_so101(self, data: _DualArmVRData) -> None:
         ctrl = getattr(data, self._controller_side)
+        if getattr(self, "_managed", False):
+            self._control_managed(ctrl)
+            return
         if self._estop_active:
             return
         if self._handle_so101_home_input(ctrl):
@@ -1026,6 +1082,55 @@ class VRTeleopNode(Node):
         state = self._arm_state[self._controller_side]
         linear, angular = self._compute_velocities(ctrl, state)
         self._publish_so101(linear, angular, ctrl.grip_value)
+
+    def _control_managed(self, ctrl):
+        """Fresh trigger edges own the runtime session in both VR modes."""
+        from std_msgs.msg import Empty
+
+        if self._estop_active:
+            return
+        if ctrl is None or not ctrl.enabled:
+            if self._so101_started or self._so101_recalib_inflight or self._so101_home_inflight:
+                self._stop_so101_servo("VR deadman released")
+            self._managed_release_required = ctrl is None
+            self._pose_calib_pos = None
+            self._pose_calib_rot = None
+            self._arm_state[self._controller_side] = _ArmState()
+            if ctrl is not None:
+                self._so101_stalled = False
+            return
+        if self._so101_home_inflight:
+            self._managed_lease_pub.publish(Empty())
+            return
+        if not self._so101_started:
+            if self._managed_release_required or self._so101_stop_pending or self._so101_recalib_inflight:
+                return
+            self._managed_release_required = True
+            self._pose_calib_pos = ctrl.position.copy()
+            self._pose_calib_rot = ctrl.rotation
+            self._recalibrate_so101_baseline()
+            return
+        self._managed_lease_pub.publish(Empty())
+        secondary = bool(ctrl.secondary_button)
+        if secondary and not self._secondary_prev:
+            self._secondary_prev = True
+            self._go_home_so101()
+            return
+        self._secondary_prev = secondary
+        if self._so101_input_mode == "pose":
+            self._control_so101_pose(ctrl)
+        else:
+            linear, angular = self._compute_velocities(ctrl, self._arm_state[self._controller_side])
+            self._publish_so101(linear, angular, ctrl.grip_value)
+
+    def _managed_runtime_status(self, status):
+        invalid = status.stop_latched or status.active_mode != "stream" or status.lifecycle != "ACTIVE"
+        if invalid and self._so101_started:
+            self._so101_started = False
+            self._managed_release_required = True
+            self._pose_calib_pos = None
+            self._pose_calib_rot = None
+            self._so101_stalled = True
 
     def _on_estop(self, msg: Bool) -> None:
         if bool(msg.data):
@@ -1175,6 +1280,8 @@ class VRTeleopNode(Node):
         grip_value: float | None,
     ) -> None:
         """Publish a PoseStamped EE command + gripper for pose mode."""
+        if getattr(self, "_managed", False) and not self._so101_started:
+            return
         if self._so101_pose_pub is None:
             return
         base_frame = str(self.get_parameter("base_link_name").value)
@@ -1198,6 +1305,18 @@ class VRTeleopNode(Node):
         open_pos = float(self.get_parameter("so101_gripper_open").value)
         closed_pos = float(self.get_parameter("so101_gripper_closed").value)
         gripper_pos = open_pos + (closed_pos - open_pos) * float(np.clip(grip_value, 0.0, 1.0))
+        if getattr(self, "_managed", False):
+            from sensor_msgs.msg import JointState
+
+            if not self._so101_started or not np.isfinite(gripper_pos):
+                return
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.name = [self.get_parameter("gripper_joint_name").value]
+            limit = self._joint_limits[msg.name[0]]
+            msg.position = [min(limit["max"], max(limit["min"], gripper_pos))]
+            self._so101_gripper_pub.publish(msg)
+            return
         msg = Float64MultiArray()
         msg.data = [gripper_pos]
         self._so101_gripper_pub.publish(msg)
@@ -1307,6 +1426,8 @@ class VRTeleopNode(Node):
         angular: np.ndarray,
         grip_value: float | None,
     ) -> None:
+        if getattr(self, "_managed", False) and not self._so101_started:
+            return
         if self._so101_linear_pub is None or self._so101_angular_pub is None:
             return
 
@@ -1339,14 +1460,7 @@ class VRTeleopNode(Node):
         ang_msg.vector.z = float(angular_base[2])
         self._so101_angular_pub.publish(ang_msg)
 
-        if grip_value is None or self._so101_gripper_pub is None:
-            return
-        open_pos = float(self.get_parameter("so101_gripper_open").value)
-        closed_pos = float(self.get_parameter("so101_gripper_closed").value)
-        gripper_pos = open_pos + (closed_pos - open_pos) * float(np.clip(grip_value, 0.0, 1.0))
-        msg = Float64MultiArray()
-        msg.data = [gripper_pos]
-        self._so101_gripper_pub.publish(msg)
+        self._publish_so101_gripper(grip_value)
 
     def _publish_zero(self, side: str) -> None:
         self._publish_arm(side, np.zeros(3), np.zeros(3))

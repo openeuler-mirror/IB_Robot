@@ -415,8 +415,10 @@ def _teleoperation_interfaces(profile: dict, model: dict) -> dict[str, dict]:
         raise InterfaceDescriptionError("teleoperation.target_group must name the single public arm group")
     prefix = str(teleop.get("endpoint_prefix", "")).rstrip("/")
     stale = teleop.get("command_stale_s")
-    if not prefix.startswith("/") or type(stale) not in (int, float) or not math.isfinite(stale) or stale <= 0:
-        raise InterfaceDescriptionError("teleoperation requires absolute endpoint_prefix and finite command_stale_s")
+    if not prefix.startswith("/") or type(stale) not in (int, float) or not math.isfinite(stale) or not 0 < stale <= 1:
+        raise InterfaceDescriptionError(
+            "teleoperation requires absolute endpoint_prefix and finite command_stale_s in (0, 1]"
+        )
     try:
         base_frame, tool_frame = frames["base_link"], frames["ee_link"]
     except KeyError as exc:

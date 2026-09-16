@@ -100,10 +100,12 @@ def test_arm_joint_still_uses_radians_path():
     assert device.get_joint_targets()["1"] == device.rad_per_step
 
 
-# --- follower gripper stroke mapping ---------------------------------------
-# The leader normalizes the gripper to 0~1 while the follower runs a radian
-# position controller, so publishing the raw percentage makes the follower stop
-# near tick 2048 and only close halfway.
+# --- follower gripper stroke -----------------------------------------------
+# The leader normalizes the gripper to 0~1 and the follower runs a radian
+# position controller. The device always emits the RAW ratio; the single
+# ratio -> radian conversion lives in TeleopNode, whose endpoints come from
+# the runtime public description or (provider-less deployments) from
+# get_gripper_stroke below — never a device-side second mapping.
 
 # Representative follower calibration; the real values are read at runtime.
 _FOLLOWER_RANGE_MIN = 1622
@@ -144,26 +146,40 @@ def _gripper_device(tmp_path, raw, *, follower_calib_file=None, follower_named=F
     return device
 
 
-def test_gripper_target_maps_percentage_onto_follower_radian_stroke(tmp_path):
-    # raw 75 over a 0~100 leader range is 0.75 of the way open.
+def test_gripper_target_stays_the_raw_ratio_with_follower_calibration(tmp_path):
+    # raw 75 over a 0~100 leader range is 0.75 open. The device must NOT map
+    # it to radians itself: TeleopNode owns the single ratio -> radian mapping
+    # (a device-side second mapping double-converts and breaks the gripper).
     device = _gripper_device(tmp_path, 75, follower_calib_file=_follower_calib(tmp_path))
 
-    target = device.get_joint_targets()["6"]
-
-    expected = _EXPECTED_RAD_MIN + 0.75 * (_EXPECTED_RAD_MAX - _EXPECTED_RAD_MIN)
-    assert target == pytest.approx(expected)
+    assert device.get_joint_targets()["6"] == pytest.approx(0.75)
 
 
-def test_fully_closed_leader_reaches_the_follower_closed_limit(tmp_path):
-    """The reported symptom: fully closing the leader must fully close the follower."""
+def test_fully_closed_leader_emits_ratio_zero_not_fake_radians(tmp_path):
+    """Fully closing the leader emits 0.0 (the ratio), not a stale 0 rad command.
+
+    The historical bug published the unmapped percentage as radians; the fix
+    routes every ratio through the shared mapping, so the device output must
+    stay in [0, 1] regardless of the follower calibration state.
+    """
     device = _gripper_device(tmp_path, 0, follower_calib_file=_follower_calib(tmp_path))
 
-    target = device.get_joint_targets()["6"]
+    assert device.get_joint_targets()["6"] == pytest.approx(0.0)
 
-    assert target == pytest.approx(_EXPECTED_RAD_MIN)
-    # The old behaviour published 0.0, which the follower executed as 0 rad
-    # (tick 2048) and stopped 426 ticks short of its 1622 mechanical limit.
-    assert target < 0.0
+
+def test_get_gripper_stroke_reports_the_follower_calibration(tmp_path):
+    """Provider-less fallback: the stroke is the endpoint source without a runtime."""
+    device = _gripper_device(tmp_path, 0, follower_calib_file=_follower_calib(tmp_path))
+
+    stroke = device.get_gripper_stroke()
+
+    assert stroke == (_EXPECTED_RAD_MIN, _EXPECTED_RAD_MAX)
+
+
+def test_get_gripper_stroke_none_without_follower_calibration(tmp_path):
+    device = _gripper_device(tmp_path, 0)
+
+    assert device.get_gripper_stroke() is None
 
 
 def test_gripper_limits_track_the_follower_calibration(tmp_path):
@@ -196,8 +212,9 @@ def test_follower_named_gripper_still_finds_the_calibration(tmp_path):
     """
     device = _gripper_device(tmp_path, 0, follower_calib_file=_follower_calib(tmp_path), follower_named=True)
 
-    assert device.get_joint_targets()["joint6_left"] == pytest.approx(_EXPECTED_RAD_MIN)
+    assert device.get_joint_targets()["joint6_left"] == pytest.approx(0.0)
     assert device.get_gripper_limits()["joint6_left"]["min"] == pytest.approx(_EXPECTED_RAD_MIN)
+    assert device.get_gripper_stroke() == (_EXPECTED_RAD_MIN, _EXPECTED_RAD_MAX)
 
 
 def test_malformed_follower_calibration_keeps_the_legacy_percentage(tmp_path):

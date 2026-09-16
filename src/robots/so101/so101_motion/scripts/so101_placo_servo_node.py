@@ -77,6 +77,8 @@ if _THIS_DIR not in sys.path:
 
 from so101_placo_kinematics import SO101PlacoDiffIK  # noqa: E402
 
+_IDLE_RELEASE_TIMEOUT_S = 5.0
+
 
 def _require_placo(logger) -> None:
     try:
@@ -153,6 +155,17 @@ class _HomePreemption:
     outcome: str
     error_code: str
     message: str
+
+
+@dataclass
+class _StartRequest:
+    response: object
+    done: threading.Event
+    mode_future: object | None = None
+    hold_future: object | None = None
+    started_at: float = 0.0
+    feedback_wait_started_at: float | None = None
+    canceled: bool = False
 
 
 class SO101PlacoServoNode(Node):
@@ -233,6 +246,12 @@ class SO101PlacoServoNode(Node):
         # Timing.
         self.declare_parameter("control_period", 0.02)  # 50 Hz solve/publish
         self.declare_parameter("incoming_command_timeout", 0.5)
+        # RuntimeStatus is a 1 Hz liveness heartbeat from the facade, not a
+        # streaming command: the budget must tolerate whole heartbeat gaps
+        # (~2.5x the 1 s publish period). It is deliberately independent of
+        # the <= 1 s command-stream freshness contract; revisit if the
+        # facade's heartbeat period changes.
+        self.declare_parameter("runtime_status_stale_s", 2.5)
         self.declare_parameter("target_reset_timeout_s", 2.0)
         self.declare_parameter("tf_stale_threshold_s", 0.2)
         # Zero preserves the existing VR/Xbox behavior. Phone launch enables the
@@ -332,6 +351,7 @@ class SO101PlacoServoNode(Node):
         self.cmd_out_topic = self.get_parameter("command_out_topic").value
         self.control_period = float(self.get_parameter("control_period").value)
         self.input_timeout = float(self.get_parameter("incoming_command_timeout").value)
+        self.runtime_status_stale_s = float(self.get_parameter("runtime_status_stale_s").value)
         self.target_reset_timeout = float(self.get_parameter("target_reset_timeout_s").value)
         self.tf_stale_threshold_s = float(self.get_parameter("tf_stale_threshold_s").value)
         self.command_lease_timeout_s = float(self.get_parameter("command_lease_timeout_s").value)
@@ -376,6 +396,8 @@ class SO101PlacoServoNode(Node):
                     raise RuntimeError("managed joint limits must be finite ordered vectors")
             if not np.isfinite(self.input_timeout) or self.input_timeout <= 0:
                 raise RuntimeError("incoming_command_timeout must be positive")
+            if not np.isfinite(self.runtime_status_stale_s) or self.runtime_status_stale_s <= 0:
+                raise RuntimeError("runtime_status_stale_s must be positive")
             if not np.isfinite(self.future_tolerance_s) or self.future_tolerance_s < 0:
                 raise RuntimeError("future_tolerance_s must be nonnegative")
             if self.command_lease_timeout_s == 0:
@@ -455,7 +477,11 @@ class SO101PlacoServoNode(Node):
         self._stop_confirmed = False
         self._stop_future = None
         self._stop_attempt_at = 0.0
+        self._idle_release_started_at = 0.0
+        self._idle_release_abandoned = False
         self._status_received_at = 0.0
+        self._start_request_lock = threading.Lock()
+        self._start_request: _StartRequest | None = None
 
         # ---- diagnostics counters ----
         self._recovery_count: int = 0
@@ -502,7 +528,7 @@ class SO101PlacoServoNode(Node):
                 callback_group=self.cb_group,
             )
         self.cmd_pub = self.create_publisher(Float64MultiArray, self.cmd_out_topic, 10)
-        self.create_service(Trigger, self.start_srv_name, self._on_start_srv, callback_group=self.cb_group)
+        self.create_service(Trigger, self.start_srv_name, self._on_start_srv, callback_group=self.action_group)
         self.create_service(Trigger, self.stop_srv_name, self._on_stop_srv, callback_group=self.cb_group)
         self._runtime_mode_client = (
             self.create_client(SetRuntimeMode, self.runtime_mode_service, callback_group=self.action_group)
@@ -529,7 +555,7 @@ class SO101PlacoServoNode(Node):
 
         # ---- timer (fixed-rate solve+publish for smoothness) ----
         self.create_timer(self.control_period, self._on_control_tick, callback_group=self.cb_group)
-        if self.managed_teleop:
+        if self.managed_teleop or self._runtime_mode_client is not None:
             self.create_timer(0.05, self._retry_runtime_stop, callback_group=self.cb_group)
 
         self.get_logger().info(
@@ -635,6 +661,11 @@ class SO101PlacoServoNode(Node):
         self._runtime_status = msg
         self._status_received_at = self._now()
         self._stop_latched = msg.stop_latched
+        if self._start_request is not None and (msg.stop_latched or msg.lifecycle != "ACTIVE"):
+            if self._start_request.mode_future is None:
+                self._cancel_start_request("runtime is not ready for stream admission")
+            else:
+                self._managed_stop("runtime stopped during stream admission")
         if (
             self._stop_pending
             and msg.stop_latched
@@ -664,6 +695,16 @@ class SO101PlacoServoNode(Node):
         )
 
     def _managed_stop(self, reason: str) -> None:
+        if not self._stop_pending:
+            now = self._now()
+            self.get_logger().warning(
+                f"runtime HOLD requested: {reason}; "
+                f"input_age={now - self._last_managed_input:.3f}s/{self.input_timeout:.3f}s, "
+                f"lease_age={now - self._last_lease_time:.3f}s/{self.command_lease_timeout_s:.3f}s, "
+                f"feedback_age={now - self._latest_js_received_at:.3f}s/{self.home_joint_state_stale_s:.3f}s, "
+                f"status_age={now - self._status_received_at:.3f}s/{self.runtime_status_stale_s:.3f}s"
+            )
+        self._cancel_start_request(reason)
         self._managed_owner = False
         self._preempt_home("STOP_REQUESTED", reason)
         self._home_active = False
@@ -681,6 +722,21 @@ class SO101PlacoServoNode(Node):
         if not self._stop_pending:
             return
         now = self._now()
+        if not self.managed_teleop:
+            # Release only after a canceled claim settles, so a late stream
+            # response cannot undo idle. Bound the fence if the service never replies.
+            start = self._start_request
+            if start is not None and start.mode_future is not None and not start.mode_future.done():
+                if now - self._idle_release_started_at > _IDLE_RELEASE_TIMEOUT_S:
+                    self.get_logger().error("runtime idle release abandoned after claim timeout; runtime state unknown")
+                    self._stop_pending = False
+                    self._stop_future = None
+                    self._stop_confirmed = False
+                    self._idle_release_abandoned = True
+                    with self._start_request_lock:
+                        if self._start_request is start:
+                            self._start_request = None
+                return
         if self._stop_future is not None:
             if self._stop_future.done():
                 try:
@@ -695,14 +751,23 @@ class SO101PlacoServoNode(Node):
                 self._stop_future = None
             else:
                 # Cancelling a client future does not cancel the remote request.
-                # Never queue another HOLD behind a slow stop and a later rearm.
+                # Never queue another stop behind a slow stop and a later rearm.
                 return
-        if self._runtime_stop_client is not None and self._runtime_stop_client.service_is_ready():
-            request = StopRuntime.Request()
-            request.policy = "HOLD"
+        client = self._runtime_stop_client if self.managed_teleop else self._runtime_mode_client
+        if not self.managed_teleop and now - self._idle_release_started_at > _IDLE_RELEASE_TIMEOUT_S:
+            return
+        if not self.managed_teleop and now - self._stop_attempt_at < 0.05:
+            return
+        if client is not None and client.service_is_ready():
+            if self.managed_teleop:
+                request = StopRuntime.Request()
+                request.policy = "HOLD"
+            else:
+                request = SetRuntimeMode.Request()
+                request.mode = self.runtime_idle_mode
             self._stop_attempt_at = now
             try:
-                self._stop_future = self._runtime_stop_client.call_async(request)
+                self._stop_future = client.call_async(request)
             except Exception:
                 self._stop_future = None
 
@@ -730,6 +795,7 @@ class SO101PlacoServoNode(Node):
         active = bool(msg.data)
         if active:
             self._estop_active = True
+            self._cancel_start_request("emergency stop")
             if self.managed_teleop:
                 self._managed_stop("emergency stop")
             self._preempt_home("EMERGENCY_STOP", "ArmReturnHome aborted by emergency stop")
@@ -741,6 +807,8 @@ class SO101PlacoServoNode(Node):
         self._estop_active = False
 
     def _home_goal_callback(self, goal_request: ArmReturnHome.Goal) -> GoalResponse:
+        if self._start_request is not None:
+            return GoalResponse.REJECT
         if self.managed_teleop and (
             not self._managed_owner
             or not self._enabled
@@ -928,6 +996,127 @@ class SO101PlacoServoNode(Node):
 
     # ------------------------------------------------------------------ srvs
     def _on_start_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
+        # The motion group owns all admission state. Waiting here must leave
+        # its feedback, stop and control callbacks free to run during a switch.
+        request = _StartRequest(resp, threading.Event())
+        with self._start_request_lock:
+            if self._start_request is not None:
+                resp.success = False
+                resp.message = "enable refused: another mode transition is still pending"
+                return resp
+            self._start_request = request
+        while rclpy.ok() and not request.done.wait(0.05):
+            pass
+        if not request.done.is_set():
+            resp.success = False
+            resp.message = "enable refused: ROS shutdown"
+        return resp
+
+    def _cancel_start_request(self, reason: str) -> None:
+        with self._start_request_lock:
+            request = self._start_request
+            if request is None:
+                return
+            request.canceled = True
+            request.response.success = False
+            request.response.message = f"enable refused: {reason}"
+            request.done.set()
+            # Keep an outstanding claim as a fence against another start, even
+            # after timeout: cancelling a client future cannot cancel the server.
+            if request.mode_future is None:
+                self._start_request = None
+
+    def _process_start_request(self) -> None:
+        with self._start_request_lock:
+            request = self._start_request
+        if request is None:
+            return
+        if request.mode_future is None:
+            response = self._begin_start(request.response)
+            if response is not None:
+                with self._start_request_lock:
+                    if self._start_request is request:
+                        self._start_request = None
+                request.done.set()
+            return
+        if not request.mode_future.done():
+            if not request.canceled and self._now() - request.started_at > 5.0:
+                self._cancel_start_request("runtime stream claim timed out")
+                if self.managed_teleop:
+                    self._managed_stop("runtime stream claim timed out")
+                else:
+                    self._on_stop_srv(None, Trigger.Response())
+            return
+        if request.canceled:
+            # Confirm a HOLD dispatched AFTER the canceled claim completed.
+            # An earlier stop acknowledgement cannot prove the runtime is idle
+            # after a late switch; retain the admission fence until this reply.
+            if self.managed_teleop:
+                if request.hold_future is None:
+                    if self._stop_future is not None:
+                        self._retry_runtime_stop()
+                        if self._stop_future is not None:
+                            return
+                    self._stop_confirmed = False
+                    self._managed_stop("mode transition completed after start was canceled")
+                    request.hold_future = self._stop_future
+                    return
+                if not request.hold_future.done():
+                    return
+                try:
+                    result = request.hold_future.result()
+                    if result is None or not result.success:
+                        request.hold_future = None
+                        return
+                except Exception:
+                    request.hold_future = None
+                    return
+                self._retry_runtime_stop()
+            else:
+                if not self._stop_pending and not self._stop_confirmed:
+                    self._stop_pending = True
+                    self._idle_release_started_at = self._now()
+                self._retry_runtime_stop()
+                if not self._stop_confirmed:
+                    return
+            with self._start_request_lock:
+                if self._start_request is request:
+                    self._start_request = None
+            return
+        try:
+            result = request.mode_future.result()
+            if result is None or not result.success:
+                raise RuntimeError(result.message if result else "no response")
+        except Exception as exc:
+            self._cancel_start_request(f"runtime rejected stream claim: {exc}")
+            if self.managed_teleop:
+                self._managed_stop("runtime stream claim failed")
+            return
+        now = self._now()
+        if (
+            request.feedback_wait_started_at is not None
+            and now - request.feedback_wait_started_at > self.home_joint_state_stale_s
+        ):
+            self._managed_stop("fresh joint feedback unavailable after stream admission")
+            return
+        if self.managed_teleop and now - self._latest_js_received_at > self.home_joint_state_stale_s:
+            # A switch response can arrive before the next feedback callback.
+            # Wait without publishing or blocking that callback, but never seed
+            # from the expired sample or extend this deadline on every tick.
+            if request.feedback_wait_started_at is None:
+                request.feedback_wait_started_at = now
+            return
+        self._enable_motion(request.response)
+        with self._start_request_lock:
+            if self._start_request is request and not request.canceled:
+                self._start_request = None
+        request.done.set()
+
+    def _begin_start(self, resp: Trigger.Response) -> Trigger.Response | None:
+        if self._stop_pending:
+            resp.success = False
+            resp.message = "enable refused: runtime stop is still pending"
+            return resp
         if self.managed_teleop:
             status = self._runtime_status
             if (
@@ -938,7 +1127,7 @@ class SO101PlacoServoNode(Node):
                 or status.lifecycle != "ACTIVE"
                 or status.active_mode != self.runtime_idle_mode
                 or status.stop_latched
-                or self._now() - self._status_received_at > 2.0
+                or self._now() - self._status_received_at > self.runtime_status_stale_s
             ):
                 resp.success = False
                 resp.message = "enable refused: runtime must be ACTIVE/idle, unlatched and unowned"
@@ -965,28 +1154,47 @@ class SO101PlacoServoNode(Node):
             resp.success = False
             resp.message = "enable refused: ArmReturnHome has priority"
             return resp
-        # Latch command-side state to the current measured pose on enable so the
-        # first hold tick targets where the arm actually is (no jump). After
-        # that, the hot path seeds from _last_cmd to avoid feeding hardware
-        # sag/lag into the position-only QP nullspace.
-        q = self._measured_arm_joints()
-        if q is None:
+        if self._measured_arm_joints() is None:
             resp.success = False
             resp.message = "enable refused: no /joint_states seed available yet"
             self.get_logger().error(resp.message)
             return resp
-        ok, reason = self._request_runtime_mode(self.runtime_stream_mode)
-        if not ok:
-            if self.managed_teleop:
-                self._managed_stop("stream claim failed or timed out")
-            resp.success = False
-            resp.message = f"enable refused: {reason}"
-            self.get_logger().error(resp.message)
-            return resp
+        client = self._runtime_mode_client
+        if client is not None and self.runtime_stream_mode:
+            if not client.service_is_ready():
+                resp.success = False
+                resp.message = f"enable refused: runtime mode service {self.runtime_mode_service} unavailable"
+                return resp
+            request = SetRuntimeMode.Request()
+            request.mode = self.runtime_stream_mode
+            self._start_request.started_at = self._now()
+            try:
+                self._start_request.mode_future = client.call_async(request)
+            except Exception as exc:
+                resp.success = False
+                resp.message = f"enable refused: runtime mode request failed: {exc}"
+                if self.managed_teleop:
+                    self._managed_stop("runtime stream claim failed")
+                return resp
+            self._stop_confirmed = False
+            self._idle_release_abandoned = False
+            return None
+        return self._enable_motion(resp)
+
+    def _enable_motion(self, resp: Trigger.Response) -> Trigger.Response:
         if self.managed_teleop and self._now() - self._latest_js_received_at > self.home_joint_state_stale_s:
             self._managed_stop("joint feedback expired during stream admission")
             resp.success = False
             resp.message = "enable refused: fresh reference expired during mode transition"
+            return resp
+        # Re-read after the asynchronous switch. The arm may have moved during
+        # admission; seed the new session from the latest accepted feedback.
+        q = self._measured_arm_joints()
+        if q is None or not np.all(np.isfinite(q)):
+            if self.managed_teleop:
+                self._managed_stop("joint feedback unavailable after stream admission")
+            resp.success = False
+            resp.message = "enable refused: fresh finite joint reference required"
             return resp
         self._p_ref = self.diffik.ee_position(q)
         self._r_ref = self.diffik.ee_rotation(q)
@@ -1012,9 +1220,10 @@ class SO101PlacoServoNode(Node):
             self._joint_intent = None
             self._managed_start_stamp = self.get_clock().now().nanoseconds * 1e-9
             self._last_managed_input = now
-            self._stop_confirmed = False
         self._latest_pose_stamp = now
         self._enabled = True
+        self._stop_confirmed = False
+        self._idle_release_abandoned = False
         self._last_input_time = now
         # Topic and service callbacks have no cross-entity delivery ordering.
         # Refresh here so a freshly accepted Phone start cannot lose its lease
@@ -1035,41 +1244,37 @@ class SO101PlacoServoNode(Node):
         return resp
 
     def _on_stop_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
+        self._cancel_start_request("teleop stop requested")
         if self.managed_teleop:
             if not self._stop_confirmed:
                 self._managed_stop("teleop stop requested")
                 self._retry_runtime_stop()
-            resp.success = self._stop_confirmed
+            resp.success = self._stop_confirmed and self._start_request is None
             resp.message = "runtime HOLD confirmed" if resp.success else "runtime HOLD pending; retry stop"
             return resp
         self._preempt_home("STOP_REQUESTED", "ArmReturnHome aborted by stop request")
         self._disable_motion_state()
-        ok, reason = self._request_runtime_mode(self.runtime_idle_mode)
-        if not ok:
-            self.get_logger().warning(f"runtime mode release failed: {reason}")
+        if self._runtime_mode_client is None or not self.runtime_idle_mode:
+            resp.success = True
+            resp.message = "so101_placo_servo_node disabled; no runtime idle release configured"
+            return resp
+        if not self._stop_confirmed and not self._idle_release_abandoned:
+            if not self._stop_pending or (
+                self._stop_future is None
+                and self._start_request is None
+                and self._now() - self._idle_release_started_at > _IDLE_RELEASE_TIMEOUT_S
+            ):
+                self._idle_release_started_at = self._now()
+                self._stop_pending = True
+            self._retry_runtime_stop()
         resp.success = True
-        resp.message = "so101_placo_servo_node disabled"
-        self.get_logger().info(resp.message)
+        if self._stop_confirmed and self._start_request is None:
+            resp.message = "so101_placo_servo_node disabled; runtime idle release confirmed"
+        elif self._idle_release_abandoned or self._now() - self._idle_release_started_at > _IDLE_RELEASE_TIMEOUT_S:
+            resp.message = "motion disabled; runtime idle release unconfirmed after timeout; runtime state unknown"
+        else:
+            resp.message = "motion disabled; runtime idle release in progress"
         return resp
-
-    def _request_runtime_mode(self, mode: str) -> tuple[bool, str]:
-        """Ask the runtime facade for ``mode``; a no-op without a runtime provider."""
-        client = getattr(self, "_runtime_mode_client", None)
-        if client is None or not mode:
-            return True, ""
-        if not client.wait_for_service(timeout_sec=2.0):
-            return False, f"runtime mode service {self.runtime_mode_service} unavailable"
-        request = SetRuntimeMode.Request()
-        request.mode = mode
-        done = threading.Event()
-        future = client.call_async(request)
-        future.add_done_callback(lambda _f: done.set())
-        if not done.wait(5.0):
-            return False, f"runtime mode request {mode!r} timed out"
-        response = future.result()
-        if response is None or not response.success:
-            return False, f"runtime rejected mode {mode!r}: {response.message if response else 'no response'}"
-        return True, ""
 
     # ------------------------------------------------------------------ tick
     def _on_control_tick(self) -> None:
@@ -1086,6 +1291,7 @@ class SO101PlacoServoNode(Node):
             5. finite-check, defense-in-depth limit clamp, optional low-pass
             6. publish
         """
+        self._process_start_request()
         now = self._now()
         if self.managed_teleop and self._managed_owner:
             home_pending = self._home_active or self._home_goal_reserved
@@ -1102,7 +1308,7 @@ class SO101PlacoServoNode(Node):
                         for stamp in (self._latest_linear_stamp, self._latest_angular_stamp)
                     )
             expired = expired or now - self._latest_js_received_at > self.home_joint_state_stale_s
-            if expired or now - self._status_received_at > 2.0:
+            if expired or now - self._status_received_at > self.runtime_status_stale_s:
                 self._managed_stop("teleop command or runtime status expired")
                 return
         if self._estop_active:
@@ -1395,7 +1601,8 @@ class SO101PlacoServoNode(Node):
         return super().destroy_node()
 
     def prepare_shutdown(self) -> None:
-        """Release a blocking Action execute callback before executor shutdown."""
+        """Release service/action waiters before executor shutdown."""
+        self._cancel_start_request("ROS shutdown")
         self._preempt_home("ROS_SHUTDOWN", "ArmReturnHome interrupted by ROS shutdown")
         if self.managed_teleop:
             self._managed_stop("ROS shutdown")
@@ -1404,10 +1611,8 @@ class SO101PlacoServoNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SO101PlacoServoNode()
-    # All callbacks are short (<5 ms) and the solve tick must never overlap
-    # itself.
-    # One worker waits for the long-running ArmReturnHome action while the motion
-    # callback group remains serialized on the other worker.
+    # Start/Home service waiters run outside the serialized motion group, leaving
+    # workers available for feedback, stop and asynchronous mode responses.
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:

@@ -16,6 +16,7 @@
 
   <!-- Runtime dependencies -->
   <depend>rclpy</depend>
+  <depend>robot_runtime</depend>
   <depend>ibrobot_msgs</depend>
   <depend>ament_index_python</depend>
   <depend>tf2_ros</depend>

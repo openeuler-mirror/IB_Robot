@@ -110,7 +110,9 @@ teleoperation:
   enabled: true
   target_group: arm
   endpoint_prefix: /motion/arm
-  command_stale_s: 0.2
+  # Board scheduling budget for input, lease and managed joint feedback.
+  # Deployment profiles may tighten it; the public contract caps it at 1 s.
+  command_stale_s: 0.5
   servo_config: $(find so101_motion)/config/so101_placo_servo.yaml
   # Leader hardware acquisition: the runtime launches the read-only source
   # node, never the application. Serial and calibration are deployment data,

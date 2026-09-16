@@ -53,6 +53,7 @@ def generate_teleoperation_nodes(profile, descriptor, robot_description_dict):
             "ik_link_name": model["frames"]["ee_link"],
             "incoming_command_timeout": config["command_stale_s"],
             "command_lease_timeout_s": config["command_stale_s"],
+            "home_joint_state_stale_s": config["command_stale_s"],
             "runtime_mode_service": interfaces["runtime.set_mode"]["endpoint"],
             "runtime_stop_service": interfaces["runtime.stop"]["endpoint"],
             "runtime_status_topic": interfaces["runtime.status"]["endpoint"],

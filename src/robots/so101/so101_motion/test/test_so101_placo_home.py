@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import types
+from concurrent.futures import Future
 
 import numpy as np
 import pytest
@@ -73,7 +74,7 @@ def _install_stubs():
     # stub ibrobot_msgs remains importable for that path too.
     srv = _mod("ibrobot_msgs.srv")
     ibrobot.srv = srv
-    srv.SetRuntimeMode = types.SimpleNamespace
+    srv.SetRuntimeMode = types.SimpleNamespace(Request=types.SimpleNamespace)
     srv.StopRuntime = types.SimpleNamespace(Request=types.SimpleNamespace)
     _mod("ibrobot_msgs.msg").RuntimeStatus = types.SimpleNamespace
 
@@ -128,6 +129,8 @@ class _FakeLogger:
     def warn(self, *_args, **_kwargs):
         pass
 
+    warning = warn
+
     def error(self, *_args, **_kwargs):
         pass
 
@@ -171,6 +174,14 @@ def _make_node():
     node.runtime_stream_mode = "stream"
     node.runtime_idle_mode = "idle"
     node._runtime_mode_client = None
+    node._stop_pending = False
+    node._stop_confirmed = False
+    node._stop_future = None
+    node._stop_attempt_at = 0.0
+    node._idle_release_started_at = 0.0
+    node._idle_release_abandoned = False
+    node._start_request_lock = threading.Lock()
+    node._start_request = None
     node.target_reset_timeout = 2.0
     node.input_mode = "pose"
     node._enabled = True
@@ -233,6 +244,7 @@ def _managed_node():
     node._managed_mode = None
     node.input_mode = "auto"
     node.input_timeout = 0.2
+    node.runtime_status_stale_s = 0.2
     node.max_joint_speed = 1.0
     node.command_lease_timeout_s = 0.2
     node.planning_frame = "base"
@@ -282,6 +294,14 @@ def _pose_message(stamp=123.0, frame="base", quaternion_w=1.0):
             orientation=types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=quaternion_w),
         ),
     )
+
+
+def _start(node):
+    request = mod._StartRequest(Trigger.Response(), threading.Event())
+    node._start_request = request
+    node._process_start_request()
+    assert request.done.is_set()
+    return request.response
 
 
 def test_managed_joint_intent_routes_gripper_and_bounded_arm():
@@ -379,7 +399,7 @@ def test_managed_losing_stream_preempts_home_and_requires_clear():
     assert request.done.is_set()
     assert not node._managed_owner
     assert node.requests[0].policy == "HOLD"
-    assert not node._on_start_srv(None, Trigger.Response()).success
+    assert not _start(node).success
 
 
 @pytest.mark.parametrize("mode,latched", [("policy_stream", False), ("trajectory", False), ("idle", True)])
@@ -387,7 +407,7 @@ def test_managed_start_refuses_policy_and_latch(mode, latched):
     node = _managed_node()
     node._managed_owner = False
     node._runtime_status = types.SimpleNamespace(active_mode=mode, lifecycle="ACTIVE", stop_latched=latched)
-    assert not node._on_start_srv(None, Trigger.Response()).success
+    assert not _start(node).success
     assert node.published == []
 
 
@@ -395,12 +415,11 @@ def test_managed_explicit_start_latches_fresh_reference_after_clear():
     node = _managed_node()
     node._managed_owner = False
     node._runtime_status = types.SimpleNamespace(active_mode="idle", lifecycle="ACTIVE", stop_latched=False)
-    node._request_runtime_mode = lambda mode: (mode == "stream", "")
     node.diffik = types.SimpleNamespace(ee_position=lambda q: np.zeros(3), ee_rotation=lambda q: np.eye(3))
-    assert node._on_start_srv(None, Trigger.Response()).success
+    assert _start(node).success
     assert node._managed_owner and node._enabled
     assert node._latest_pose is None and node._joint_intent is None
-    assert not node._on_start_srv(None, Trigger.Response()).success  # second managed producer rejected
+    assert not _start(node).success  # second managed producer rejected
     assert node.published == []  # activation is not HOME
 
 
@@ -463,7 +482,7 @@ def test_start_is_rejected_while_home_is_reserved():
     node = _make_node()
     node._home_goal_reserved = True
 
-    response = node._on_start_srv(Trigger.Request(), Trigger.Response())
+    response = _start(node)
 
     assert response.success is False
     assert "ArmReturnHome" in response.message
@@ -479,7 +498,7 @@ def test_estop_aborts_home_and_blocks_new_home_and_start():
     assert node._enabled is False
     goal = types.SimpleNamespace(target_name="home")
     assert node._home_goal_callback(goal) == mod.GoalResponse.REJECT
-    response = node._on_start_srv(Trigger.Request(), Trigger.Response())
+    response = _start(node)
     assert response.success is False
 
     node._on_estop(types.SimpleNamespace(data=False))
@@ -604,7 +623,412 @@ def test_start_refreshes_command_lease():
         ee_rotation=lambda _q: np.eye(3),
     )
 
-    response = node._on_start_srv(Trigger.Request(), Trigger.Response())
+    response = _start(node)
 
     assert response.success is True
     assert node._last_lease_time == 123.0
+
+
+def _pending_start():
+    node = _managed_node()
+    node._enabled = False
+    node._managed_owner = False
+    node._runtime_status.active_mode = "idle"
+    node.diffik = types.SimpleNamespace(ee_position=lambda q: q[:3], ee_rotation=lambda q: np.eye(3))
+    future = Future()
+    node._runtime_mode_client = types.SimpleNamespace(service_is_ready=lambda: True, call_async=lambda _: future)
+    node.hold_futures = []
+
+    def hold(request):
+        node.requests.append(request)
+        hold_future = Future()
+        node.hold_futures.append(hold_future)
+        return hold_future
+
+    node._runtime_stop_client.call_async = hold
+    request = mod._StartRequest(Trigger.Response(), threading.Event())
+    node._start_request = request
+    node._on_control_tick()
+    assert not request.done.is_set()
+    assert not node._enabled
+    return node, request, future
+
+
+def test_slow_start_reseeds_from_feedback_received_during_mode_transition():
+    node, request, future = _pending_start()
+    node._now = lambda: 123.3
+    node._status_received_at = 123.3
+    node._on_joint_state(_joint_message())
+    node._measured_q = np.full(5, 0.3)
+    future.set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert request.done.is_set() and request.response.success
+    assert node._enabled and node._managed_owner
+    np.testing.assert_allclose(node._last_cmd, [0.3] * 5)
+    assert node.published == []
+
+
+def test_slow_start_still_refuses_when_feedback_really_stops():
+    node, request, future = _pending_start()
+    node._now = lambda: 123.3
+    future.set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert not request.done.is_set()
+    assert not node._enabled and not node._managed_owner
+    assert node.published == []
+    node._now = lambda: 123.51
+    node._on_control_tick()
+    assert request.done.is_set() and not request.response.success
+    assert not node._enabled and not node._managed_owner
+    assert node.requests[0].policy == "HOLD"
+    assert node.published == []
+
+
+def test_start_waits_for_feedback_callback_after_mode_response():
+    node, request, future = _pending_start()
+    node._now = lambda: 123.3
+    future.set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert not request.done.is_set()
+    assert node.requests == []
+    assert node.published == []
+    node._now = lambda: 123.4
+    node._status_received_at = 123.4
+    node._on_joint_state(_joint_message())
+    node._measured_q = np.full(5, 0.4)
+    node._on_control_tick()
+    assert request.done.is_set() and request.response.success
+    np.testing.assert_allclose(node._last_cmd, [0.4] * 5)
+    assert node.published == []
+
+
+def test_stop_preempts_post_switch_feedback_wait():
+    node, request, future = _pending_start()
+    node._now = lambda: 123.3
+    future.set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert not request.done.is_set()
+    node._on_stop_srv(None, Trigger.Response())
+    node._on_joint_state(_joint_message())
+    node._on_control_tick()
+    assert request.done.is_set() and not request.response.success
+    assert not node._enabled and not node._managed_owner
+    assert node.published == []
+
+
+def test_feedback_arriving_after_admission_deadline_cannot_revive_start():
+    node, request, future = _pending_start()
+    node._now = lambda: 123.3
+    future.set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    node._now = lambda: 123.51
+    node._on_joint_state(_joint_message())
+    node._on_control_tick()
+    assert request.done.is_set() and not request.response.success
+    assert not node._enabled and not node._managed_owner
+    assert node.requests[0].policy == "HOLD"
+
+
+@pytest.mark.parametrize("expired", ["input", "lease", "feedback", "status"])
+def test_board_budget_tolerates_short_spike_but_still_stops_at_deadline(expired):
+    node = _managed_node()
+    node.input_timeout = node.command_lease_timeout_s = node.home_joint_state_stale_s = 0.5
+    node.runtime_status_stale_s = 0.5
+    node._now = lambda: 123.3
+    node._on_control_tick()
+    assert node._enabled and not node.requests
+    node._now = lambda: 123.51
+    node._last_managed_input = 123.0 if expired == "input" else 123.51
+    node._last_lease_time = 123.0 if expired == "lease" else 123.51
+    node._latest_js_received_at = 123.0 if expired == "feedback" else 123.51
+    node._status_received_at = 123.0 if expired == "status" else 123.51
+    node._on_control_tick()
+    assert not node._enabled
+    assert node.requests[0].policy == "HOLD"
+
+
+@pytest.mark.parametrize("cause", ["stop", "estop", "runtime_stop", "timeout", "shutdown"])
+def test_start_cancellation_fences_late_mode_response(cause):
+    node, request, future = _pending_start()
+    if cause == "stop":
+        node._on_stop_srv(None, Trigger.Response())
+    elif cause == "estop":
+        node._on_estop(types.SimpleNamespace(data=True))
+    elif cause == "runtime_stop":
+        node._on_runtime_status(
+            types.SimpleNamespace(active_mode="idle", lifecycle="ACTIVE", stop_latched=True, stop_policy="HOLD")
+        )
+    elif cause == "shutdown":
+        node.prepare_shutdown()
+    else:
+        node._now = lambda: 129.0
+        node._on_control_tick()
+    assert request.done.is_set() and not request.response.success
+    assert node._start_request is request  # outstanding remote request still fenced
+    assert not node._on_start_srv(None, Trigger.Response()).success
+    node.hold_futures[0].set_result(types.SimpleNamespace(success=True))
+    future.set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert len(node.hold_futures) == 2
+    assert node._start_request is request  # wait for HOLD after the late mode response
+    node.hold_futures[1].set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert node._start_request is None
+    assert not node._enabled and not node._managed_owner
+    assert node.requests[0].policy == "HOLD"
+    assert node.published == []
+
+
+@pytest.mark.parametrize("consume_old_ack", [False, True])
+def test_repeated_stop_cannot_reuse_hold_ack_from_before_late_claim(consume_old_ack):
+    node, request, future = _pending_start()
+    node._on_stop_srv(None, Trigger.Response())
+    node.hold_futures[0].set_result(types.SimpleNamespace(success=True))
+    if consume_old_ack:
+        node._retry_runtime_stop()
+        assert node._stop_confirmed
+    future.set_result(types.SimpleNamespace(success=True))
+    response = node._on_stop_srv(None, Trigger.Response())
+    assert not response.success
+    assert node._start_request is request
+    node._on_control_tick()
+    assert len(node.hold_futures) == 2
+    assert node._start_request is request
+    node.hold_futures[1].set_result(types.SimpleNamespace(success=True))
+    node._on_control_tick()
+    assert node._start_request is None
+    assert node._on_stop_srv(None, Trigger.Response()).success
+    assert not node._enabled
+
+
+def test_unready_runtime_refuses_start_without_global_hold_before_preflight():
+    node = _managed_node()
+    node._managed_owner = False
+    node._enabled = False
+    request = mod._StartRequest(Trigger.Response(), threading.Event())
+    node._start_request = request
+    node._on_runtime_status(types.SimpleNamespace(active_mode="idle", lifecycle="CONNECTING", stop_latched=False))
+    assert request.done.is_set() and not request.response.success
+    assert node._start_request is None
+    assert node.requests == []
+
+
+@pytest.mark.parametrize("ready", [False, True])
+def test_nonmanaged_stop_succeeds_locally_while_idle_release_is_pending(ready):
+    node = _make_node()
+    future = Future()
+    requests = []
+    node._runtime_mode_client = types.SimpleNamespace(
+        service_is_ready=lambda: ready,
+        call_async=lambda req: requests.append(req) or future,
+    )
+    response = node._on_stop_srv(None, Trigger.Response())
+    assert response.success and "release in progress" in response.message
+    assert not node._enabled
+    assert not node._begin_start(Trigger.Response()).success
+    node._now = lambda: 129.0
+    node._retry_runtime_stop()
+    assert len(requests) == int(ready)
+    response = node._on_stop_srv(None, Trigger.Response())
+    assert response.success
+    assert ("unconfirmed after timeout; runtime state unknown" if ready else "release in progress") in response.message
+    assert len(requests) == int(ready)
+    if ready:
+        assert requests[0].mode == "idle"
+        future.set_result(types.SimpleNamespace(success=True))
+        response = node._on_stop_srv(None, Trigger.Response())
+        assert response.success and "runtime idle release confirmed" in response.message
+
+
+def test_nonmanaged_stop_waits_for_canceled_claim_before_idle_release():
+    node = _make_node()
+    claim, release = Future(), Future()
+    node._start_request = mod._StartRequest(Trigger.Response(), threading.Event(), mode_future=claim)
+    requests = []
+    node._runtime_mode_client = types.SimpleNamespace(
+        service_is_ready=lambda: True,
+        call_async=lambda req: requests.append(req) or release,
+    )
+    assert node._on_stop_srv(None, Trigger.Response()).success
+    assert not requests
+    node._now = lambda: 124.0
+    claim.set_result(types.SimpleNamespace(success=True))
+    node._process_start_request()
+    assert [req.mode for req in requests] == ["idle"]
+    assert node._idle_release_started_at == 123.0
+    assert node._start_request is not None
+    assert not node._on_start_srv(None, Trigger.Response()).success
+    assert not node._begin_start(Trigger.Response()).success
+    release.set_result(types.SimpleNamespace(success=True))
+    node._process_start_request()
+    assert node._start_request is None
+    response = node._on_stop_srv(None, Trigger.Response())
+    assert response.success and "runtime idle release confirmed" in response.message
+
+
+@pytest.mark.parametrize("elapsed", [0.1, 4.9, 5.0])
+def test_nonmanaged_pending_claim_does_not_refresh_release_deadline(elapsed):
+    node = _make_node()
+    claim = Future()
+    request = mod._StartRequest(Trigger.Response(), threading.Event(), mode_future=claim)
+    node._start_request = request
+    requests = []
+    node._runtime_mode_client = types.SimpleNamespace(
+        service_is_ready=lambda: True, call_async=lambda req: requests.append(req) or Future()
+    )
+    assert node._on_stop_srv(None, Trigger.Response()).success
+    node._now = lambda: 123.0 + elapsed
+    node._retry_runtime_stop()
+    response = node._on_stop_srv(None, Trigger.Response())
+    assert response.success and "release in progress" in response.message
+    assert node._idle_release_started_at == 123.0
+    assert node._stop_pending and not node._stop_confirmed
+    assert node._start_request is request
+    assert requests == []
+
+
+@pytest.mark.parametrize("expire_via_stop", [False, True])
+def test_nonmanaged_unresolved_claim_release_timeout_drops_fence_and_allows_new_start(expire_via_stop):
+    node = _make_node()
+    claim = Future()
+    old_request = mod._StartRequest(Trigger.Response(), threading.Event(), mode_future=claim)
+    node._start_request = old_request
+    requests = []
+    errors = []
+    logger = _FakeLogger()
+    logger.error = errors.append
+    node.get_logger = lambda: logger
+    node._runtime_mode_client = types.SimpleNamespace(
+        service_is_ready=lambda: True, call_async=lambda req: requests.append(req) or Future()
+    )
+    assert node._on_stop_srv(None, Trigger.Response()).success
+    assert old_request.canceled and old_request.done.is_set()
+    node._now = lambda: 128.01
+    if not expire_via_stop:
+        node._retry_runtime_stop()
+    response = node._on_stop_srv(None, Trigger.Response())
+    assert response.success
+    assert "release unconfirmed after timeout; runtime state unknown" in response.message
+    assert len(errors) == 1 and "abandoned" in errors[0] and "runtime state unknown" in errors[0]
+    assert requests == []
+    assert node._start_request is None
+    assert not node._stop_pending and not node._stop_confirmed
+    assert node._stop_future is None
+    assert not node._enabled
+    assert node._idle_release_started_at == 123.0
+
+    new_request = mod._StartRequest(Trigger.Response(), threading.Event())
+    node._start_request = new_request
+    node._process_start_request()
+    assert [req.mode for req in requests] == ["stream"]
+    assert not new_request.done.is_set()
+    assert not node._idle_release_abandoned
+    # A second dead claim also enters a bounded release window without a caller retry.
+    node._now = lambda: 134.0
+    node._process_start_request()
+    assert new_request.canceled and new_request.done.is_set()
+    assert node._stop_pending and node._idle_release_started_at == 134.0
+    node._now = lambda: 139.01
+    node._retry_runtime_stop()
+    assert node._start_request is None and not node._stop_pending
+    assert [req.mode for req in requests] == ["stream"]
+
+
+def test_nonmanaged_idle_rejection_retries_are_bounded_and_can_recover():
+    node = _make_node()
+    requests = []
+
+    def reject(req):
+        requests.append(req)
+        future = Future()
+        future.set_result(types.SimpleNamespace(success=False))
+        return future
+
+    node._runtime_mode_client = types.SimpleNamespace(service_is_ready=lambda: True, call_async=reject)
+    assert node._on_stop_srv(None, Trigger.Response()).success
+    node._now = lambda: 123.1
+    node._retry_runtime_stop()
+    assert len(requests) == 2
+    node._now = lambda: 129.0
+    node._retry_runtime_stop()
+    assert len(requests) == 2 and node._stop_pending
+    assert not node._stop_confirmed
+    # An explicit retry opens another bounded window after service recovery.
+    future = Future()
+    future.set_result(types.SimpleNamespace(success=True))
+    node._runtime_mode_client.call_async = lambda req: future
+    assert node._on_stop_srv(None, Trigger.Response()).success
+    node._retry_runtime_stop()
+    assert node._on_stop_srv(None, Trigger.Response()).success
+
+
+def test_managed_start_rejects_status_older_than_configured_budget():
+    node = _managed_node()
+    node._managed_owner = False
+    node._runtime_status.active_mode = "idle"
+    node._status_received_at = 122.7
+    assert not node._begin_start(Trigger.Response()).success
+
+
+def test_runtime_status_heartbeat_gap_does_not_stop_managed_session():
+    # Production heartbeat is 1 Hz: the 2.5 s default must tolerate the gap
+    # between beats, and only a missed beat plus margin may stop the session.
+    node = _managed_node()
+    node.runtime_status_stale_s = 2.5
+    node._status_received_at = node._now() - 1.4
+    node._on_control_tick()
+    assert node._enabled and node.requests == []
+    node._status_received_at = node._now() - 2.6
+    node._on_control_tick()
+    assert not node._enabled
+    assert node.requests[0].policy == "HOLD"
+
+
+@pytest.mark.parametrize("budget", [None, 0.1, 1.0, 1.01, 2.5, 4.0, 0.0, -0.1, float("nan"), float("inf")])
+def test_managed_status_budget_default_and_validation(monkeypatch, budget):
+    params = {
+        "joint_limits_lower": [-2.0] * 5,
+        "joint_limits_upper": [2.0] * 5,
+        "gripper_limits_lower": [-1.0],
+        "gripper_limits_upper": [1.0],
+        "managed_teleop": True,
+        "runtime_mode_service": "/mode",
+        "runtime_stop_service": "/stop",
+        "runtime_status_topic": "/status",
+        "joint_intent_topic": "/intent",
+        "gripper_command_out_topic": "/gripper",
+        "robot_description": "<robot/>",
+        "incoming_command_timeout": 0.3,
+    }
+    if budget is not None:
+        params["runtime_status_stale_s"] = budget
+    monkeypatch.setattr(mod.Node, "__init__", lambda self, *args: None)
+    monkeypatch.setattr(
+        mod.Node,
+        "declare_parameter",
+        lambda self, name, value=None, **kw: params.setdefault(name, value),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod.Node, "get_parameter", lambda self, name: types.SimpleNamespace(value=params[name]), raising=False
+    )
+    monkeypatch.setattr(mod.Node, "get_logger", lambda self: _FakeLogger(), raising=False)
+
+    class Validated(Exception):
+        pass
+
+    def stop_after_validation(_logger):
+        raise Validated
+
+    monkeypatch.setattr(mod, "_require_placo", stop_after_validation)
+    node = mod.SO101PlacoServoNode.__new__(mod.SO101PlacoServoNode)
+    effective = 2.5 if budget is None else budget
+    if np.isfinite(effective) and effective > 0:
+        with pytest.raises(Validated):
+            node.__init__()
+        assert node.runtime_status_stale_s == effective
+        if budget is None:
+            assert params["runtime_status_stale_s"] == 2.5
+    else:
+        with pytest.raises(RuntimeError, match="runtime_status_stale_s"):
+            node.__init__()

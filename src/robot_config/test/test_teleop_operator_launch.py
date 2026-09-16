@@ -136,3 +136,48 @@ def test_launch_setup_accepts_any_profile_not_just_lekiwi(tmp_path, monkeypatch)
     actions = teleop_operator_launch.launch_setup(_context(config_path, robot_config="so101_rtp_distributed"))
 
     assert [action for action in actions if isinstance(action, Node)]
+
+
+def test_managed_leader_inherits_runtime_budget_and_passes_diagnostic_tuning(monkeypatch):
+    from robot_config.launch_builders import teleop
+    from robot_teleop import public_target
+
+    names = [str(i) for i in range(1, 7)]
+    target = {
+        "arm": names[:5],
+        "gripper": names[5:],
+        "limits": {name: {"min": -1.0, "max": 1.0} for name in names},
+        "closed": -1.0,
+        "open": 1.0,
+        "frames": {"base_link": "base", "ee_link": "tool"},
+        "interfaces": {
+            key: {"endpoint": f"/arm/{key}", "command_stale_s": 0.5}
+            for key in ("linear", "angular", "pose", "start", "stop", "home", "lease", "joints")
+        },
+    }
+    monkeypatch.setattr(public_target, "resolve_public_target", lambda config: target)
+    monkeypatch.setattr(teleop, "Node", lambda **kwargs: kwargs)
+    config = {
+        "runtime": {
+            "provider": "test",
+            "interface_description": {
+                "interfaces": {
+                    "joint.state": {"endpoint": "/joint_states"},
+                    "runtime.status": {"endpoint": "/runtime_status"},
+                }
+            },
+        },
+        "teleoperation": {
+            "enabled": True,
+            "active_device": "so101_leader",
+            "input_config": str(_PROFILE_DIR.parent / "teleop/so101_leader_inputs.yaml"),
+            "latency_warn_s": 0.015,
+            "diagnostics_period_s": 2.0,
+            "rearm_timeout_s": 4.0,
+        },
+    }
+    params = teleop.generate_teleop_nodes(config)[0]["parameters"][0]
+    assert json.loads(params["device_config"])["input_stale_s"] == 0.5
+    assert params["latency_warn_s"] == 0.015
+    assert params["diagnostics_period_s"] == 2.0
+    assert params["rearm_timeout_s"] == 4.0

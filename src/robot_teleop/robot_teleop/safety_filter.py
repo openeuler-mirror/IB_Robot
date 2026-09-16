@@ -5,8 +5,7 @@ Ensures all teleoperation commands stay within safe joint limits
 before being published to controllers.
 """
 
-from typing import Dict
-import numpy as np
+import math
 
 
 class SafetyFilter:
@@ -20,7 +19,7 @@ class SafetyFilter:
         joint_limits (Dict): Dictionary of joint limits {joint_name: {"min": float, "max": float}}
     """
 
-    def __init__(self, joint_limits: Dict[str, Dict[str, float]]):
+    def __init__(self, joint_limits: dict[str, dict[str, float]]):
         """
         Initialize safety filter with joint limits.
 
@@ -33,8 +32,12 @@ class SafetyFilter:
         """
         self.joint_limits = joint_limits
         self._clip_count = {}  # Track clipping frequency per joint
+        for name, limits in joint_limits.items():
+            lower, upper = limits.get("min", -math.inf), limits.get("max", math.inf)
+            if math.isnan(lower) or math.isnan(upper) or lower > upper or lower == math.inf or upper == -math.inf:
+                raise ValueError(f"Invalid joint limits for {name!r}")
 
-    def apply_limits(self, joint_targets: Dict[str, float]) -> Dict[str, float]:
+    def apply_limits(self, joint_targets: dict[str, float]) -> dict[str, float]:
         """
         Apply joint limits to target positions.
 
@@ -55,19 +58,23 @@ class SafetyFilter:
         safe_targets = {}
 
         for joint_name, target_angle in joint_targets.items():
+            # Reject the entire command, including unlimited joints, on corrupt input.
+            if not math.isfinite(target_angle):
+                return {}
             # Get limits for this joint (default to no limit if not specified)
             if joint_name in self.joint_limits:
                 limits = self.joint_limits[joint_name]
-                min_limit = limits.get("min", -np.inf)
-                max_limit = limits.get("max", np.inf)
+                min_limit = limits.get("min", -math.inf)
+                max_limit = limits.get("max", math.inf)
 
                 # Clip to limits
                 original_angle = target_angle
-                safe_angle = float(np.clip(target_angle, min_limit, max_limit))
+                safe_angle = float(min(max(target_angle, min_limit), max_limit))
                 safe_targets[joint_name] = safe_angle
 
                 # Log if clipping occurred
-                if not np.isclose(original_angle, safe_angle, atol=1e-6):
+                # Match numpy.isclose's asymmetric default rtol without scalar array work.
+                if abs(original_angle - safe_angle) > 1e-6 + 1e-5 * abs(safe_angle):
                     self._log_clip(joint_name, original_angle, safe_angle, min_limit, max_limit)
             else:
                 # No limits defined - pass through
@@ -75,8 +82,7 @@ class SafetyFilter:
 
         return safe_targets
 
-    def _log_clip(self, joint_name: str, original: float, clipped: float,
-                  min_limit: float, max_limit: float):
+    def _log_clip(self, joint_name: str, original: float, clipped: float, min_limit: float, max_limit: float):
         """
         Log joint clipping event.
 
@@ -95,6 +101,7 @@ class SafetyFilter:
         # Log warning (rate-limited to avoid spam)
         if self._clip_count[joint_name] <= 3 or self._clip_count[joint_name] % 100 == 0:
             import logging
+
             logger = logging.getLogger(__name__)
             logger.warning(
                 f"Joint '{joint_name}' clipped: {original:.3f} → {clipped:.3f} "
@@ -102,7 +109,7 @@ class SafetyFilter:
                 f"[clip count: {self._clip_count[joint_name]}]"
             )
 
-    def get_clip_statistics(self) -> Dict[str, int]:
+    def get_clip_statistics(self) -> dict[str, int]:
         """
         Get statistics on joint clipping frequency.
 

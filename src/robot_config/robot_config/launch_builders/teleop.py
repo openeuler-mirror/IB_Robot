@@ -14,6 +14,7 @@ from launch.actions import EmitEvent
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.control import _calibration_tool_command
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
     prepare_lerobot_env,
@@ -64,6 +65,12 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     This function creates ROS 2 nodes for teleoperation based on the
     robot configuration YAML. It integrates with the robot_config launch system.
 
+    Robot-specific Cartesian servo nodes are launched only from
+    configuration-declared package/executable/config paths (never a hardcoded
+    robot package). With a runtime provider, the Placo servo claims the
+    runtime's stream mode through SetRuntimeMode on start (design D11); the
+    client keepalive lease stays as the client-liveness signal.
+
     Args:
         robot_config: Robot configuration dictionary loaded from YAML
         robot_description_dict: Dictionary containing robot_description (URDF)
@@ -100,6 +107,9 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     if not teleop_config.get("enabled", False):
         logger.info("Teleoperation not enabled, skipping")
         return nodes
+
+    if (robot_config.get("runtime") or {}).get("provider"):
+        return _generate_public_teleop_nodes(robot_config)
 
     validation_errors = validate_teleop_config(
         teleop_config,
@@ -205,12 +215,10 @@ def _resolve_follower_calib_file(robot_config: dict, device_config: dict, device
         logger.error("")
         logger.error("  Please run calibration first:")
         follower_port = (robot_config.get("ros2_control", {}) or {}).get("port", "/dev/ttyACM0")
-        logger.error(f"    ros2 run so101_hardware calibrate_arm --arm follower --port {follower_port}")
+        follower_command = _calibration_tool_command(robot_config, "follower", follower_port)
+        logger.error(f"    {follower_command}")
         logger.error("=" * 60)
-        raise RuntimeError(
-            f"Follower calibration file not found: {resolved}. "
-            f"Run: ros2 run so101_hardware calibrate_arm --arm follower --port {follower_port}"
-        )
+        raise RuntimeError(f"Follower calibration file not found: {resolved}. Run: {follower_command}")
 
     return resolved
 
@@ -219,6 +227,8 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     nodes = []
     teleop_config = robot_config.get("teleoperation", {})
     device_type = device_config.get("type", "")
+    if device_type == "joy_teleop":
+        return _create_joy_teleop_nodes(device_config)
 
     # Get joint limits from safety config
     safety_config = teleop_config.get("safety", robot_config.get("safety", {}))
@@ -267,7 +277,7 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
                 )
             else:
                 calib_port = device_config.get("port", "/dev/ttyACM0")
-                calibration_command = "ros2 run so101_hardware calibrate_arm --arm leader --port " + calib_port
+                calibration_command = _calibration_tool_command(robot_config, "leader", calib_port)
             logger.error("    " + calibration_command)
             logger.error("=" * 60)
             raise RuntimeError(f"Calibration file not found: {calib_file_expanded}. Run: {calibration_command}")
@@ -444,6 +454,9 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         ),
         "estop_topic": safety_config.get("estop_topic", "/emergency_stop"),
     }
+    for key in ("latency_warn_s", "diagnostics_period_s", "rearm_timeout_s"):
+        if key in device_config or key in teleop_config:
+            teleop_parameters[key] = float(device_config.get(key, teleop_config.get(key)))
     # Empty arrays are not valid untyped ROS 2 parameters. Hand retargeting
     # uses explicit publish_groups, so omit unused legacy arrays.
     if arm_joint_names:
@@ -667,46 +680,42 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
 
     from robot_config.utils import resolve_ros_path
 
-    # 1. Load servo parameters
-    servo_config_name = device_config.get("servo_config", "so101_servo")
-    servo_params_path = resolve_ros_path(f"$(find robot_moveit)/config/{servo_config_name}.yaml")
-
+    # 1. Load servo parameters from the configuration-declared path (no
+    #    hardcoded robot package: robot-agnostic-core).
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    servo_config_ref = device_config.get("servo_config_path") or moveit_cfg.get("servo_config_path")
+    if not servo_config_ref:
+        raise ConfigError(
+            "solver=moveit_servo requires moveit.servo_config_path (e.g. $(find so101_motion)/config/so101_servo.yaml)"
+        )
+    servo_params_path = resolve_ros_path(servo_config_ref)
     with open(servo_params_path) as f:
         servo_params = yaml.safe_load(f)
 
-    # 2. Build MoveIt configuration manually for robustness
-    # MoveItConfigsBuilder can be finicky with relative paths in different environments
-    robot_type = robot_config.get("type", "so101")
-
+    # 2. MoveIt model parameters from configuration-declared paths.
     moveit_params = {}
-    try:
-        # Load SRDF (Semantic Robot Description Format)
-        srdf_path = resolve_ros_path(f"$(find robot_moveit)/config/lerobot/{robot_type}/{robot_type}.srdf")
-        if os.path.exists(srdf_path):
-            with open(srdf_path) as f:
+    for key, loader_name in (
+        ("srdf_path", "srdf"),
+        ("kinematics_path", "kinematics"),
+        ("joint_limits_path", "joint_limits"),
+    ):
+        ref = moveit_cfg.get(key)
+        if not ref:
+            raise ConfigError(f"solver=moveit_servo requires moveit.{key} (declared by the robot configuration)")
+        path = resolve_ros_path(ref)
+        if not os.path.exists(path):
+            raise ConfigError(f"moveit.{key} does not exist: {path}")
+        with open(path) as f:
+            if loader_name == "srdf":
                 moveit_params["robot_description_semantic"] = f.read()
-            logger.info(f"Loaded SRDF from {srdf_path}")
-        else:
-            logger.warning(f"SRDF not found at {srdf_path}")
-
-        # Load Kinematics
-        kinematics_path = resolve_ros_path(f"$(find robot_moveit)/config/lerobot/{robot_type}/kinematics.yaml")
-        if os.path.exists(kinematics_path):
-            with open(kinematics_path) as f:
+            elif loader_name == "kinematics":
                 moveit_params["robot_description_kinematics"] = yaml.safe_load(f)
-            logger.info(f"Loaded kinematics from {kinematics_path}")
-
-        # Load Joint Limits
-        joint_limits_path = resolve_ros_path(f"$(find robot_moveit)/config/lerobot/{robot_type}/joint_limits.yaml")
-        if os.path.exists(joint_limits_path):
-            with open(joint_limits_path) as f:
+            else:
                 joint_limits_data = yaml.safe_load(f)
                 moveit_params.update(joint_limits_data)
                 # MoveIt 2 nodes also look for joint_limits under robot_description_planning
                 moveit_params["robot_description_planning"] = joint_limits_data
-            logger.info(f"Loaded joint limits from {joint_limits_path}")
-    except Exception as e:
-        logger.warning(f"Failed to manually load MoveIt configs: {e}")
+        logger.info(f"Loaded {loader_name} from {path}")
 
     # Merge robot_description_dict to ensure robot_description
     # and use_sim_time are always present (from description layer)
@@ -733,6 +742,123 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
 # ---------------------------------------------------------------------------
 # Cartesian helpers: tool_frame validation + placo_servo launcher
 # ---------------------------------------------------------------------------
+
+
+def _generate_public_teleop_nodes(config):
+    """Input deployment is separate; no robot-specific model or solver is loaded here."""
+    import copy
+
+    import yaml
+
+    from robot_teleop.public_target import resolve_public_target
+
+    teleop = config["teleoperation"]
+    if teleop.get("active_devices"):
+        raise ConfigError("managed single-arm teleoperation accepts exactly one active_device")
+    target = resolve_public_target(config)
+    with open(resolve_ros_path(teleop["input_config"]), encoding="utf-8") as handle:
+        inputs = yaml.safe_load(handle)
+    matches = [item for item in inputs["devices"] if item["name"] == teleop["active_device"]]
+    if len(matches) != 1:
+        raise ConfigError("active input must resolve to exactly one device")
+    device = copy.deepcopy(matches[0])
+    kind = device["type"]
+    if kind not in ("leader_topic", "xbox_controller", "phone", "vr_teleop"):
+        raise ConfigError(f"unsupported managed input {kind!r}")
+    endpoints = {key: item["endpoint"] for key, item in target["interfaces"].items()}
+    bound = min(item["command_stale_s"] for item in target["interfaces"].values())
+    device["input_stale_s"] = min(float(device.get("input_stale_s", bound)), bound)
+    device.update(
+        {
+            "managed_teleop": True,
+            "arm_joint_names": target["arm"],
+            "gripper_joint_names": target["gripper"],
+            "joint_limits": target["limits"],
+            "base_link_name": target["frames"]["base_link"],
+            "tool_frame": target["frames"]["ee_link"],
+            "joint_state_topic": config["runtime"]["interface_description"]["interfaces"]["joint.state"]["endpoint"],
+            "cartesian_solver": "runtime",
+            "gripper_closed": target["closed"],
+            "gripper_open": target["open"],
+            "control_params": {**device.get("control_params", {}), **teleop.get("control_params", {})},
+        }
+    )
+    device["cartesian_backend_config"] = {
+        "linear_topic": endpoints["linear"],
+        "angular_topic": endpoints["angular"],
+        "pose_topic": endpoints["pose"],
+        "start_srv": endpoints["start"],
+        "stop_srv": endpoints["stop"],
+        "home_action": endpoints["home"],
+        "command_lease_topic": endpoints["lease"],
+        "runtime_status_topic": config["runtime"]["interface_description"]["interfaces"]["runtime.status"]["endpoint"],
+    }
+    nodes = []
+    # Leader acquisition is launched by the runtime from its own profile
+    # (teleoperation.leader_source), not from the application side.
+    if kind == "leader_topic" and set(device["joint_mapping"].values()) != set(target["arm"] + target["gripper"]):
+        raise ConfigError("leader mapping must cover every public target joint exactly once")
+    if kind == "vr_teleop":
+        params = dict(device.get("vr_config", {}))
+        params.update(
+            {
+                "managed_teleop": True,
+                "control_frequency": device.get("control_frequency", 50.0),
+                "base_link_name": device["base_link_name"],
+                "tool_frame": device["tool_frame"],
+                "so101_linear_topic": endpoints["linear"],
+                "so101_angular_topic": endpoints["angular"],
+                "so101_pose_topic": endpoints["pose"],
+                "so101_start_service": endpoints["start"],
+                "so101_stop_service": endpoints["stop"],
+                "so101_home_action": endpoints["home"],
+                "so101_gripper_topic": endpoints["joints"],
+                "gripper_joint_name": target["gripper"][0],
+                "joint_limits": json.dumps(target["limits"]),
+                "so101_gripper_closed": target["closed"],
+                "so101_gripper_open": target["open"],
+                "command_lease_topic": endpoints["lease"],
+                "runtime_status_topic": config["runtime"]["interface_description"]["interfaces"]["runtime.status"][
+                    "endpoint"
+                ],
+            }
+        )
+        nodes.append(
+            Node(package="robot_teleop", executable="vr_teleop", name="vr_teleop", output="screen", parameters=[params])
+        )
+    else:
+        params = {
+            "device_config": json.dumps(device),
+            "joint_limits": json.dumps(target["limits"]),
+            "control_frequency": device.get("control_frequency", 50.0),
+            "arm_joint_names": target["arm"],
+            "gripper_joint_names": target["gripper"],
+            "managed_joint_topic": endpoints["joints"],
+        }
+        for key in ("latency_warn_s", "diagnostics_period_s", "rearm_timeout_s"):
+            if key in device or key in teleop:
+                params[key] = float(device.get(key, teleop.get(key)))
+        nodes.append(
+            Node(
+                package="robot_teleop",
+                executable="teleop_node",
+                name="robot_teleop_node",
+                output="screen",
+                parameters=[params],
+            )
+        )
+    if kind == "xbox_controller":
+        nodes.append(
+            Node(
+                package="joy",
+                executable="joy_node",
+                name="joy_node",
+                output="screen",
+                parameters=[{"dev": device["input_device"], "autorepeat_rate": 20.0}],
+                remappings=[("joy", device["source_topic"])],
+            )
+        )
+    return nodes
 
 
 class ConfigError(ValueError):
@@ -799,7 +925,7 @@ def _resolve_so101_placo_servo_params(
     if not yaml_ref:
         raise ConfigError(
             "solver=placo_servo requires moveit.so101_placo_servo_config_path "
-            "(e.g. $(find robot_moveit)/config/so101_placo_servo.yaml)"
+            "(e.g. $(find so101_motion)/config/so101_placo_servo.yaml)"
         )
     yaml_path = resolve_ros_path(yaml_ref)
     with open(yaml_path) as f:
@@ -848,6 +974,12 @@ def _resolve_so101_placo_servo_params(
         params["home_action"] = home_action
     if command_lease_topic is not None:
         params["command_lease_topic"] = command_lease_topic
+    # Runtime provider (design D11): the servo claims the runtime's stream
+    # mode on start and releases it on stop through SetRuntimeMode; the
+    # runtime enforces single command ownership per joint group. The client
+    # keepalive lease stays as the client-liveness signal.
+    if str((robot_config.get("runtime") or {}).get("provider", "") or "").strip():
+        params["runtime_mode_service"] = "/runtime/set_mode"
     if position_only is not None:
         params["position_only"] = position_only
     teleop_safety = (robot_config.get("teleoperation", {}) or {}).get("safety", robot_config.get("safety", {}) or {})
@@ -927,9 +1059,18 @@ def _create_so101_placo_servo_node(
     if robot_description_dict:
         extra.update(robot_description_dict)
 
+    node_cfg = ((robot_config.get("teleoperation", {}) or {}).get("cartesian", {}) or {}).get("placo_servo", {}) or {}
+    legacy = not (robot_config.get("runtime") or {}).get("provider")
+    package = str(node_cfg.get("package", "so101_motion" if legacy else "") or "").strip()
+    executable = str(node_cfg.get("executable", "so101_placo_servo_node.py" if legacy else "") or "").strip()
+    if not package or not executable:
+        raise ConfigError(
+            "solver=placo_servo requires teleoperation.cartesian.placo_servo.package and .executable "
+            "(the robot-suite node that serves the Placo contract, e.g. so101_motion / so101_placo_servo_node.py)"
+        )
     return Node(
-        package="robot_moveit",
-        executable="so101_placo_servo_node.py",
+        package=package,
+        executable=executable,
         name="so101_placo_servo_node",
         output="screen",
         parameters=[params, extra],
@@ -1016,16 +1157,31 @@ def validate_teleop_config(
             else:
                 command_groups = []
         else:
+            explicit_target = "publish_groups" in target or "actuator" in target or "arm_joint_names" in target
+            if joints is not None and not joints and commands_so101 and not explicit_target:
+                errors.append(
+                    f"Device '{name}': robot.joints is required for teleoperation "
+                    "(declare arm/gripper/all explicitly in the robot configuration)"
+                )
+                # Fall through: topic-sharing and other validations still run
+                # so configuration errors surface together, not one at a time.
             try:
                 groups = resolve_target_publish_groups(
                     target,
-                    joints or {"arm": ["1", "2", "3", "4", "5"], "gripper": ["6"]},
+                    joints,
                     auxiliary_actuators or {},
                 )
             except ValueError as exc:
                 errors.append(f"Device '{name}': {exc}")
                 groups = []
             command_groups = [(group.name, group.topic) for group in groups]
+            if not command_groups and commands_so101 and not explicit_target:
+                # Standalone validation can still reject shared output channels
+                # before the robot model is available. This does not invent joints.
+                command_groups = [
+                    ("arm", target.get("arm_command_topic", "/arm_position_controller/commands")),
+                    ("gripper", target.get("gripper_command_topic", "/gripper_position_controller/commands")),
+                ]
             if device_type == "hand_retarget" and "publish_groups" not in target and "actuator" not in target:
                 errors.append(
                     f"Device '{name}': hand retarget requires explicit target.publish_groups or target.actuator"

@@ -81,6 +81,35 @@ description (`RuntimeStatus.interface_description_json`, schema v1,
   cannot be active together), input loss or stop latches require explicit
   re-arm, and every input path triggers the bounded robot-side hold/stop.
 
+The profile's `teleoperation.command_stale_s` is the managed input, lease and
+joint-feedback deadline (including HOME feedback). It defaults to 0.5 s for the
+SO-101 board and must remain in `(0, 1]`. The leader input inherits this deadline;
+operator configurations may request a tighter input bound. Expiry still triggers
+HOLD on the first control tick, with no additional consecutive-failure delay.
+Phone and VR retain their stricter device-local deadman deadlines.
+`runtime_status_stale_s` (default 2.5 s) is a separate liveness budget: the
+facade publishes RuntimeStatus as a 1 Hz heartbeat, so its freshness threshold
+is derived from that period (~2.5x) and is intentionally not capped by the
+1 s command-stream contract.
+
+Teleop admission waits for the controller switch without blocking joint feedback
+or stop callbacks. After the switch, it seeds the new session from the latest
+accepted joint state. If that state has expired, it waits up to one feedback
+window for a new sample without publishing any commands. Actual feedback loss
+still refuses admission and requests HOLD. Stops, emergency stops and shutdown
+preempt a pending start. An outstanding
+mode request remains fenced until its response arrives, so a late response cannot
+resume motion or overlap a new start.
+
+For a HOLD during episodic recording, inspect the first `runtime HOLD requested`
+or `Disabling managed teleop` warning. The former reports input, lease, feedback
+and runtime-status ages; leader-input warnings also identify rejected samples.
+`runtime HOLD confirmed` only acknowledges the stop. Before each managed leader
+episode, `record_cli` explicitly clears to idle, rearms and checks fresh stream
+status. It does not rearm in the background during recording. An episode with
+missing or interrupted arm/gripper commands is aborted and discarded, even if
+images and joint feedback were saved.
+
 ## Application configuration
 
 `robot_config/config/robots/so101_single_arm.yaml` selects this runtime

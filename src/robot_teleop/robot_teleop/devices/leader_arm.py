@@ -132,14 +132,10 @@ class LeaderArmDevice(BaseTeleopDevice):
                             "skipping publish to avoid bad radians target"
                         )
                         continue
-                    # Map the leader 0~1 percentage onto the follower gripper's
-                    # physical radian stroke so the command matches the follower's
-                    # radian position controller. Falls back to the legacy 0~1
-                    # value when the follower stroke is unknown (backward compat).
-                    if self.gripper_rad_min is not None and self.gripper_rad_max is not None:
-                        gripper_target = self.gripper_rad_min + gripper_target * (
-                            self.gripper_rad_max - self.gripper_rad_min
-                        )
+                    # Emit the raw 0~1 opening ratio: the single ratio -> radian
+                    # conversion lives in TeleopNode (shared mapping), with
+                    # endpoints from the runtime public description or, when no
+                    # runtime exists, from get_gripper_stroke below.
                     joint_targets[follower_joint] = gripper_target
                 else:
                     # EXACTLY matching so101_hardware.cpp logic:
@@ -245,6 +241,18 @@ class LeaderArmDevice(BaseTeleopDevice):
             return {}
         gripper_joint = next(iter(self.gripper_joints), "6") if self.gripper_joints else "6"
         return {gripper_joint: {"min": self.gripper_rad_min, "max": self.gripper_rad_max}}
+
+    def get_gripper_stroke(self) -> tuple[float, float] | None:
+        """Follower gripper stroke ``(closed_rad, open_rad)`` or None.
+
+        Serves as the ratio -> radian endpoint source when no runtime public
+        description is available (provider-less legacy deployments): the device
+        already reads the follower calibration, so the stroke follows
+        recalibration without any YAML edit.
+        """
+        if self.gripper_rad_min is None or self.gripper_rad_max is None:
+            return None
+        return (self.gripper_rad_min, self.gripper_rad_max)
 
     def disconnect(self):
         if self.motors_bus is not None:
