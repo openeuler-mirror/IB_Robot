@@ -52,6 +52,23 @@ Or build specific package:
 source .shrc_local && ./scripts/build.sh -- --packages-select robot_config
 ```
 
+Or build by package group (additive flags, resolved through the colcon
+dependency closure so each robot/agent flag automatically brings its base
+dependencies):
+```bash
+source .shrc_local && ./scripts/build.sh --so101              # SO-101 + base
+source .shrc_local && ./scripts/build.sh --lekiwi             # LeKiwi + base
+source .shrc_local && ./scripts/build.sh --agent              # Agent stack + base
+source .shrc_local && ./scripts/build.sh --rosclaw            # rosclaw + base
+source .shrc_local && ./scripts/build.sh --base --agent --lekiwi  # LeKiwi complete content
+source .shrc_local && ./scripts/build.sh --list-groups --so101    # Inspect resolved packages
+```
+
+Group flags cannot be combined with `--this` or explicit `--packages-*`
+selections after `--`. Group membership maps to `src/` path prefixes
+defined in `scripts/build.sh` (`GROUP_PATHS`); adjust there when packages
+move between groups.
+
 **Never invoke `colcon build` directly.** All builds go through `./scripts/build.sh`; it applies the correct layout, symlink, and CMake settings (default dev mixin).
 
 **Why single call?** Each Bash tool call creates a new shell process. Environment variables set by `source` in one call are lost in the next call. Using `&&` keeps everything in the **same shell process**.

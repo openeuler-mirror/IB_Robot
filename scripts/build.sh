@@ -38,10 +38,25 @@ Usage: ./scripts/build.sh [OPTIONS] [-- COLCON_ARGS]
 Options:
   --mixin NAME [NAME...]   Use specified mixin(s) (can combine multiple)
   --list-mixins            List available mixins and exit
+  --base                   Build the shared base packages only
+  --agent                  Build the agent stack plus its base dependencies
+  --so101                  Build the SO-101 robot plus its base dependencies
+  --lekiwi                 Build the LeKiwi robot plus its base dependencies
+  --rosclaw                Build rosclaw plus its base dependencies
+  --list-groups            Resolve and list group members, then exit
   --clean                  Clean build (cmake-clean-cache)
   --this                   Build only packages in current directory
   -v, --verbose            Show detailed build output
   -h, --help               Show this help
+
+Group flags are additive and resolved through the colcon dependency
+closure, so each robot/agent flag automatically brings in the base
+packages it depends on:
+  ./scripts/build.sh --so101                  # SO-101 + base
+  ./scripts/build.sh --base --agent --lekiwi  # LeKiwi complete content
+  ./scripts/build.sh --agent                  # Agent stack + base
+Group flags cannot be combined with --this or explicit --packages-*
+selections passed after "--".
 
 Common mixins:
   dev               Development (debug, no tests, symlink-install) [DEFAULT]
@@ -85,6 +100,8 @@ MIXINS=()
 CLEAN_BUILD=false
 BUILD_THIS=false
 VERBOSE=false
+LIST_GROUPS=false
+GROUP_FLAGS=()
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -99,6 +116,14 @@ while [[ $# -gt 0 ]]; do
         --list-mixins)
             list_mixins
             exit 0
+            ;;
+        --base|--agent|--so101|--lekiwi|--rosclaw)
+            GROUP_FLAGS+=("${1#--}")
+            shift
+            ;;
+        --list-groups)
+            LIST_GROUPS=true
+            shift
             ;;
         --clean)
             CLEAN_BUILD=true
@@ -234,6 +259,71 @@ require_setup_environment() {
 
 require_setup_environment
 
+# ============================================================================
+# Package Group Selection (--base / --agent / --so101 / --lekiwi / --rosclaw)
+# Groups map to src/ path prefixes; membership is resolved from the colcon
+# package index so the lists follow the tree instead of rotting. The build
+# uses --packages-up-to, which adds each selected package's workspace
+# dependencies — that is how a robot flag "brings its base" automatically.
+# ============================================================================
+declare -A GROUP_PATHS=(
+    [base]="ibrobot_msgs robot_config robot_runtime robot_teleop tensormsg robot_calibration model_utils hardware_mock observation_transport perception_service manipulation_service action_dispatch task_dispatch inference_service inference_manifest torch_models ibrobot_tracing voice_asr_service voice_tts_service manipulation_execution semantic_mapping object_tracker sim_models dataset_tools benchmark aero_hand_hardware attention_viz pymoveit2"
+    [agent]="embodied_agent embodied_bringup embodied_common skill_library skill_catalog robot_skill_cli safety_guard workflows ibrobot_agent"
+    [so101]="robots/so101 robots/feetech"
+    [lekiwi]="lekiwi_hardware lekiwi_description omni_wheel_controller robot_navigation fast_calib fast_lio livox_ros_driver2"
+    [rosclaw]="rosclaw"
+)
+
+resolve_group_names() {
+    local flag="$1"
+    local matched=0
+    while IFS=$'\t' read -r pkg_name pkg_path _pkg_type; do
+        for prefix in ${GROUP_PATHS[$flag]}; do
+            if [[ "${pkg_path}" == "src/${prefix}" || "${pkg_path}" == "src/${prefix}/"* ]]; then
+                GROUP_PKGS["${pkg_name}"]=1
+                matched=$((matched + 1))
+                break
+            fi
+        done
+    done < <(python3 -m colcon list --base-paths src 2>/dev/null)
+    if [[ ${matched} -eq 0 ]]; then
+        log_error "Group '${flag}' matched no packages under src/ (prefixes: ${GROUP_PATHS[$flag]})."
+        exit 1
+    fi
+}
+
+if [[ "${LIST_GROUPS}" == "true" || ${#GROUP_FLAGS[@]} -gt 0 ]]; then
+    declare -A GROUP_PKGS=()
+    for flag in ${GROUP_FLAGS[@]+"${GROUP_FLAGS[@]}"}; do
+        resolve_group_names "${flag}"
+        log_info "Group '${flag}' resolved."
+    done
+    if [[ "${LIST_GROUPS}" == "true" ]]; then
+        if [[ ${#GROUP_FLAGS[@]} -eq 0 ]]; then
+            log_warning "--list-groups without group flags; pass one or more of --base --agent --so101 --lekiwi --rosclaw."
+        fi
+        echo "Selected packages (${#GROUP_PKGS[@]}):"
+        for pkg_name in ${!GROUP_PKGS[@]}; do echo "  ${pkg_name}"; done | sort
+        exit 0
+    fi
+    if [[ ${#GROUP_FLAGS[@]} -gt 0 ]]; then
+        if [[ "${BUILD_THIS}" == "true" ]]; then
+            log_error "Group flags cannot be combined with --this."
+            exit 1
+        fi
+        for arg in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+            if [[ "${arg}" == --packages-* || "${arg}" == --paths ]]; then
+                log_error "Group flags cannot be combined with explicit package selection ('${arg}' after --)."
+                exit 1
+            fi
+        done
+        GROUP_SELECTION=()
+        for pkg_name in ${!GROUP_PKGS[@]}; do GROUP_SELECTION+=("${pkg_name}"); done
+        log_info "Group selection: ${#GROUP_SELECTION[@]} packages (dependency closure via --packages-up-to)."
+    fi
+fi
+
+
 
 # ============================================================================
 # ROS 2 Environment
@@ -331,6 +421,7 @@ PYTHONNOUSERSITE=1 python3 -m colcon build \
     "${CLEAN_ARGS[@]}" \
     "${THIS_ARGS[@]}" \
     "${PLATFORM_ARGS[@]}" \
+    ${GROUP_SELECTION[@]+--packages-up-to "${GROUP_SELECTION[@]}"} \
     "${EXTRA_ARGS[@]}"
 
 echo ""
