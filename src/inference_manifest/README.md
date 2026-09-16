@@ -3,6 +3,12 @@
 `inference_manifest` 定义 IB-Robot 推理 bundle 的硬件无关 schema v3 契约。加载器只接受
 schema version 3，不翻译旧身份或旧 runtime 别名。
 
+模型结构使用 `execution`、`bindings`、`device_links` 和 `execution_contract` 表达。
+manifest 不声明异步提交、dataset 隔离或发布正确性等运行时保证；这些能力由加载后的 runtime 验证。
+PI0.5 policy adapter 在运行时检查可复用 prefix 的输入依赖和状态契约，backend 检查异步隔离及 priority streams，
+executor 负责触发、快照时效和代际隔离。机器人配置的 `scheduling.stages` 仍按执行角色设置优先级。
+旧实验 bundle 必须通过转换器重新发布 manifest，清除旧字段并刷新身份指纹；模型产物 ABI 未变时无需重新编译。
+
 ## Schema v3
 
 调度身份永远是 `interface`、`model_type`、`operation` 三元组。Policy 使用

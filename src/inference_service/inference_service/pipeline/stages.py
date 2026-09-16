@@ -221,7 +221,11 @@ class ModelStage:
         role_inputs = frame.execution_frame.begin_role(self.role)
         values = {**role_inputs, **frame.values}
         plan = frame.execution_plan
-        linked_inputs = {link.semantic for link in plan.device_links_for_consumer(self.role)}
+        linked_inputs = (
+            set()
+            if frame.values.get("_independent_stage")
+            else {link.semantic for link in plan.device_links_for_consumer(self.role)}
+        )
         role_input_bindings = plan.role(self.role).bindings.inputs
         host_semantics = {binding.semantic for binding in role_input_bindings if binding.semantic not in linked_inputs}
         binding_by_semantic = {binding.semantic: binding for binding in role_input_bindings}
@@ -230,6 +234,17 @@ class ModelStage:
             for semantic in host_semantics
             if semantic in values
         }
+        options = {}
+        if frame.values.get("_independent_stage"):
+            priority_offsets = frame.values.get("_stage_priority_offsets", {})
+            priority = frame.values.get("_stage_base_priority", request.metadata.get("priority", 0))
+            if isinstance(priority_offsets, Mapping):
+                priority += int(priority_offsets.get(self.role, 0))
+            request = ModelRequest(
+                selected_values,
+                {**request.metadata, "priority": priority},
+            )
+            options = {"isolated": True, "operation_factory": frame.values.get("_operation_factory")}
         execute_role = getattr(self.session, "execute_role", None)
         if not callable(execute_role):
             raise TypeError(f"session {type(self.session).__name__} does not support role execution")
@@ -238,6 +253,7 @@ class ModelStage:
             selected_values,
             ModelRequest(selected_values, request.metadata),
             execution_context,
+            **options,
         )
         frame.execution_frame.finish_role(self.role, outputs)
         frame.values.update(

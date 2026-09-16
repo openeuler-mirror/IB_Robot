@@ -1,0 +1,54 @@
+# Scheduled-only policy/VLA-private Global -> Pipeline dispatch protocol.
+# Perception and voice retain their own typed inputs/results; action_chunk is
+# a policy action output, not a generic model result container.
+# session_id/request_id are UUID4; request_id is scoped to the logical session
+# generation. Global sends the positive logical_generation returned by Open.
+# The binding guard treats logical_generation=0 as the current bound generation;
+# Global does not use that alias for Dispatch. No new generation is created.
+# binding_id, positive binding_incarnation, and expected_boot_id must match Open.
+# operation_id is a UUID4 identifying this downstream operation, echoed back.
+# Ledger key: (session_id, logical_generation, request_id). Duplicates preserve
+# the entire payload (including deadline and operation_id) to wait/replay;
+# changed payload conflicts. Only NOT_STARTED permits a fresh execution retry.
+# Cancellation is cooperative and backend-dependent; it may be rejected.
+# Accepted cancellation or caller timeout does not prove device completion.
+# UNKNOWN forbids retry/fallback until ownership is resolved by drain/boot fence.
+# Observation sample time in the Pipeline ROS clock domain; zero selects now.
+builtin_interfaces/Time obs_timestamp
+string<=4096 prompt
+string<=36 request_id
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 expected_boot_id
+# Positive generation returned by private Open. Zero cannot pass admission.
+uint64 expected_pipeline_generation
+# Required positive absolute UTC Unix deadline; zero is invalid. Global resolves
+# public defaults before forwarding. Local waits use a monotonic clock budget.
+builtin_interfaces/Time deadline
+# Public priority 0..7, bounded by max_supported_public_priority and hardware levels.
+int32 priority
+---
+ibrobot_msgs/VariantsList action_chunk
+int32 chunk_size
+int32 execution_horizon                  # Optional executable prefix; zero means full chunk
+bool success
+float64 inference_latency_ms
+float64 backend_latency_ms
+string<=36 request_id
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 boot_id
+string<=63 pipeline_id
+uint64 pipeline_generation
+string<=64 deployment_fingerprint
+string<=64 runtime_policy_fingerprint
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+string<=128 status

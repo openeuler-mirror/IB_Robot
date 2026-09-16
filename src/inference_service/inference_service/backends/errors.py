@@ -13,8 +13,10 @@ class BackendError(RuntimeError):
 
 
 class BackendLifecycleError(BackendError):
-    def __init__(self, message: str, *, code: str = "invalid_lifecycle") -> None:
+    def __init__(self, message: str, *, code: str = "invalid_lifecycle", close_pending: bool = False) -> None:
         super().__init__(message, code=code)
+        # Only retained ownership permits another close attempt.
+        self.close_pending = close_pending
 
 
 class BackendNotReadyError(BackendLifecycleError):

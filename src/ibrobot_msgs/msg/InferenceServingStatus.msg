@@ -22,5 +22,17 @@ string<=64 pipeline_compatibility_fingerprint
 string<=128 configured_hardware_resource_id
 string<=128 runtime_hardware_resource_id
 uint32 hardware_priority_levels
+# Policy/VLA-private execution capabilities; not a perception/voice protocol.
+# schema_version=1 is the only accepted version. Publishers and consumers must
+# rebuild together when this experimental interface changes.
+uint32 scheduling_capability_schema_version
+# Policy executor scheduling mode: SEQUENTIAL or INDEPENDENT.
+string<=16 stage_policy
+# Whether the loaded executor supports Global's priority-0 FIFO profile/EDF
+# admission scheme. This is neither a hardware capability nor a finish guarantee;
+# profile availability, resource contention and request deadlines are checked separately.
+bool supports_priority_zero_deadline_admission
+# Accepted public priorities are the continuous interval [0, this value].
+int32 max_supported_public_priority
 ibrobot_msgs/InferenceWorkCapacity[<=2] capacities
 ibrobot_msgs/ScheduledInferenceError error

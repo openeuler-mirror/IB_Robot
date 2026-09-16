@@ -635,6 +635,30 @@ def test_launch_setup_enables_navigation_when_requested():
     assert len(nav_nodes) == 1
 
 
+def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monkeypatch):
+    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    robot_config = load_robot_config_dict(src_config_path)
+    robot_config.pop("_config_path", None)
+    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": True}
+    config_path = tmp_path / "scheduled_sim.yaml"
+    config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
+    context = LaunchContext()
+    context.launch_configurations.update(
+        config_path=str(config_path),
+        use_sim="true",
+        sim_platform="mock",
+        control_mode="model_inference",
+        with_inference="true",
+    )
+
+    def unexpected_control_generation(*args, **kwargs):
+        pytest.fail("control generation must not run for unsupported scheduled simulation")
+
+    monkeypatch.setattr(robot_launch, "generate_ros2_control_nodes", unexpected_control_generation)
+    with pytest.raises(ValueError, match="simulation does not support"):
+        robot_launch.launch_setup(context)
+
+
 def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
     robot_config = load_robot_config_dict(src_config_path)

@@ -19,7 +19,11 @@ import pytest
 from inference_manifest import BundleFile, canonical_bundle_digest
 from inference_service.scheduler.profiles import ProfileRegistry
 from robot_config import InferenceConfigError, parse_inference_config
-from robot_config.inference_config import scheduler_enabled_from_raw_config
+from robot_config.inference_config import (
+    StageSchedulingConfig,
+    _validate_stage_priority_range,
+    scheduler_enabled_from_raw_config,
+)
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
@@ -174,6 +178,83 @@ def _profile_file(tmp_path: Path) -> Path:
     path = tmp_path / "profile.yaml"
     path.write_text("closure_profiles: []\n", encoding="utf-8")
     return path
+
+
+def _create_independent_bundle(root: Path) -> Path:
+    """Two-role request-scoped Ascend bundle."""
+
+    root.mkdir(parents=True)
+    _write_json(
+        root / "config.json",
+        {
+            "type": "pi05",
+            "input_features": {"observation.state": {"type": "STATE", "shape": [6]}},
+            "output_features": {"action": {"type": "ACTION", "shape": [6]}},
+        },
+    )
+    _write_json(root / "policy_preprocessor.json", {"name": "policy_preprocessor", "steps": []})
+    _write_json(root / "policy_postprocessor.json", {"name": "policy_postprocessor", "steps": []})
+    roles = ("vlm", "action_expert")
+    (root / "vlm.om").write_bytes(b"compiled-vlm")
+    (root / "action_expert.om").write_bytes(b"compiled-action_expert")
+    bundle_paths = ("config.json", "policy_postprocessor.json", "policy_preprocessor.json")
+    entries = [BundleFile(path=path) for path in bundle_paths]
+    deployment_value = {
+        "uuid": _DEPLOYMENT_UUID,
+        "revision": 1,
+        "execution_contract": {
+            "state_scope": "request",
+            "execution_structure": "direct",
+            "cancellation_granularity": "request_boundary",
+        },
+        "runtime_profile": {
+            "backend": "ascend",
+            "target": {"soc": "ascend310", "runtime": "acl"},
+            "profile": {"device_id": 0},
+        },
+        "artifacts": {
+            role: {
+                "path": f"{role}.om",
+                "format": "om",
+                "sha256": hashlib.sha256(f"compiled-{role}".encode()).hexdigest(),
+            }
+            for role in roles
+        },
+        "execution": list(roles),
+        "bindings": {
+            role: {
+                "inputs": [{"semantic": "observation.state", "index": 0, "dtype": "float32", "shape": [6]}],
+                "outputs": [{"semantic": "action", "index": 0, "dtype": "float32", "shape": [6]}],
+            }
+            for role in roles
+        },
+    }
+    _write_json(
+        root / "inference_manifest.json",
+        {
+            "schema_version": 3,
+            "bundle": {
+                "uuid": _BUNDLE_UUID,
+                "revision": 1,
+                "name": root.name,
+                "files": [entry.model_dump(mode="json") for entry in entries],
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
+                },
+            },
+            "model": {
+                "interface": "policy",
+                "model_type": "pi05",
+                "operation": "predict",
+                "inputs": [{"semantic": "observation.state", "dtype": "float32", "shape": [6]}],
+                "outputs": [{"semantic": "action", "dtype": "float32", "shape": [6]}],
+            },
+            "deployments": {"npu": deployment_value},
+        },
+    )
+    return root
 
 
 def _pipeline(bundle: Path, *, profile: Path, compatibility_group: str = "so101_action") -> dict[str, Any]:
@@ -906,6 +987,160 @@ def test_dispatch_safety_margin_must_be_below_idle_timeout(tmp_path: Path) -> No
         )
 
 
+def test_edf_is_parsed_without_profile_deadline_admission(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    block = _scheduler_block()
+    block["global_policy"] = "edf"
+
+    cfg = parse_inference_config(
+        _robot_config({"policy": _pipeline(bundle, profile=profile)}, scheduler=block),
+        "model_inference",
+    )
+
+    assert cfg.scheduler is not None
+    assert cfg.scheduler.global_policy == "edf"
+    assert not cfg.scheduler.priority_zero_deadline_admission.enable
+
+
+@pytest.mark.parametrize(
+    "enabled,policy,admission",
+    [(True, "fifo", False), (True, "fifo", True), (True, "edf", False), (False, "fifo", False)],
+)
+def test_default_fallback_requires_supported_policy_only_when_enabled(tmp_path, enabled, policy, admission):
+    bundle = _create_bundle(tmp_path / "bundle")
+    block = _scheduler_block()
+    block.update(enable=enabled, global_policy=policy, priority_zero_deadline_admission={"enable": admission})
+    pipeline = _pipeline(bundle, profile=_profile_file(tmp_path))
+    backup = {
+        **pipeline,
+        "transport": {key: value.replace("policy", "backup") for key, value in pipeline["transport"].items()},
+    }
+    rc = _robot_config({"policy": pipeline, "backup": backup}, scheduler=block)
+    rc["control_modes"]["model_inference"]["executor"]["inference_fallback_chain"] = ["backup"]
+    if enabled and policy == "fifo" and not admission:
+        with pytest.raises(InferenceConfigError, match="inference_fallback_chain requires"):
+            parse_inference_config(rc, "model_inference")
+    else:
+        parse_inference_config(rc, "model_inference")
+
+
+def test_edf_rejects_profile_deadline_admission(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    block = _scheduler_block()
+    block["global_policy"] = "edf"
+    block["priority_zero_deadline_admission"] = {"enable": True}
+
+    with pytest.raises(InferenceConfigError, match="edf requires priority-zero deadline admission to be disabled"):
+        parse_inference_config(
+            _robot_config({"policy": _pipeline(bundle, profile=profile)}, scheduler=block),
+            "model_inference",
+        )
+
+
+def _independent_pipeline(bundle: Path, profile: Path, *, pipeline_id: str = "policy") -> dict[str, Any]:
+    pipeline = _pipeline(bundle, profile=profile)
+    pipeline["deployment"] = "npu"
+    pipeline["scheduling"] = {"stage_policy": "independent", "stages": {}}
+    pipeline["transport"] = {key: value.replace("policy", pipeline_id) for key, value in pipeline["transport"].items()}
+    return pipeline
+
+
+@pytest.mark.parametrize(
+    "policy,admission",
+    [("edf", False), ("fifo", True)],
+)
+def test_deadline_driven_priority_zero_rejects_independent_target_or_fallback(tmp_path, policy, admission):
+    independent_bundle = _create_independent_bundle(tmp_path / "independent")
+    sequential = _pipeline(_create_bundle(tmp_path / "sequential"), profile=_profile_file(tmp_path))
+    block = _scheduler_block()
+    block["global_policy"] = policy
+    block["priority_zero_deadline_admission"] = {"enable": admission}
+
+    # Target selecting an independent pipeline is rejected.
+    with pytest.raises(InferenceConfigError, match="cannot select independent-stage pipelines: \\['policy'\\]"):
+        parse_inference_config(
+            _robot_config(
+                {"policy": _independent_pipeline(independent_bundle, _profile_file(tmp_path))}, scheduler=block
+            ),
+            "model_inference",
+        )
+
+    # Independent entry in the fallback chain is equally rejected.
+    rc = _robot_config(
+        {
+            "policy": sequential,
+            "backup": _independent_pipeline(independent_bundle, _profile_file(tmp_path), pipeline_id="backup"),
+        },
+        scheduler=block,
+    )
+    rc["control_modes"]["model_inference"]["executor"]["inference_fallback_chain"] = ["backup"]
+    with pytest.raises(InferenceConfigError, match="cannot select independent-stage pipelines: \\['backup'\\]"):
+        parse_inference_config(rc, "model_inference")
+
+
+@pytest.mark.parametrize("max_age_ms", [0, -1, True, 1.5, "50"])
+def test_snapshot_age_requires_positive_integer(tmp_path, max_age_ms):
+    independent = _independent_pipeline(_create_independent_bundle(tmp_path / "independent"), _profile_file(tmp_path))
+    independent["scheduling"]["stages"] = {"vlm": {"max_snapshot_age_ms": max_age_ms}}
+    with pytest.raises(InferenceConfigError, match="max_snapshot_age_ms"):
+        parse_inference_config(_robot_config({"policy": independent}, scheduler=_scheduler_block()), "model_inference")
+
+
+@pytest.mark.parametrize("stage_policy,role", [("sequential", "vlm"), ("independent", "action_expert")])
+def test_snapshot_age_rejects_stages_without_snapshot_production(tmp_path, stage_policy, role):
+    independent = _independent_pipeline(_create_independent_bundle(tmp_path / "independent"), _profile_file(tmp_path))
+    independent["scheduling"] = {"stage_policy": stage_policy, "stages": {role: {"max_snapshot_age_ms": 50}}}
+    with pytest.raises(InferenceConfigError, match="requires an independent producer stage"):
+        parse_inference_config(_robot_config({"policy": independent}, scheduler=_scheduler_block()), "model_inference")
+
+
+def test_snapshot_age_flows_into_runtime_policy_and_fingerprint(tmp_path):
+    independent = _independent_pipeline(_create_independent_bundle(tmp_path / "independent"), _profile_file(tmp_path))
+    block = _scheduler_block()
+    block["priority_zero_deadline_admission"] = {"enable": False}
+    rc = _robot_config({"policy": independent}, scheduler=block)
+    original = parse_inference_config(rc, "model_inference").pipelines["policy"]
+    assert original.scheduling.stages["vlm"].max_snapshot_age_ms == 5000
+    independent["scheduling"]["stages"] = {"vlm": {"max_snapshot_age_ms": 50}}
+    updated = parse_inference_config(rc, "model_inference").pipelines["policy"]
+    assert updated.scheduling.stages["vlm"].max_snapshot_age_ms == 50
+    assert json.loads(updated.runtime_policy_json)["scheduling"]["stages"]["vlm"]["max_snapshot_age_ms"] == 50
+    assert updated.runtime_policy_fingerprint != original.runtime_policy_fingerprint
+
+
+def test_independent_pipeline_accepts_priority_zero_under_plain_fifo(tmp_path):
+    """Plain FIFO dispatches priority-0 without ordering, so independent stays legal."""
+
+    independent = _independent_pipeline(_create_independent_bundle(tmp_path / "independent"), _profile_file(tmp_path))
+    block = _scheduler_block()
+    block["global_policy"] = "fifo"
+    block["priority_zero_deadline_admission"] = {"enable": False}
+
+    cfg = parse_inference_config(
+        _robot_config({"policy": independent}, scheduler=block),
+        "model_inference",
+    )
+    assert cfg.pipelines["policy"].scheduling is not None
+    assert cfg.pipelines["policy"].scheduling.stage_policy == "independent"
+
+
+@pytest.mark.parametrize("policy,admission", [("edf", False), ("fifo", True)])
+def test_independent_pipeline_accepts_positive_priority_under_deadline_driven_policy(tmp_path, policy, admission):
+    """Deadline-driven ordering applies to priority-0 only."""
+
+    independent = _independent_pipeline(_create_independent_bundle(tmp_path / "independent"), _profile_file(tmp_path))
+    block = _scheduler_block()
+    block["global_policy"] = policy
+    block["priority_zero_deadline_admission"] = {"enable": admission}
+    rc = _robot_config({"policy": independent}, scheduler=block)
+    rc["control_modes"]["model_inference"]["executor"]["inference_priority"] = 1
+
+    cfg = parse_inference_config(rc, "model_inference")
+    assert cfg.inference_priority == 1
+
+
 def test_lower_priority_dispatch_contexts_must_leave_priority_zero_reserve(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     profile = _profile_file(tmp_path)
@@ -967,3 +1202,53 @@ def test_only_one_scheduling_switch_exists() -> None:
         assert not re.search(pattern, source), f"forbidden switch pattern {pattern!r} present"
     # `enable` parsed exactly under the scheduler block.
     assert "_parse_scheduler" in source
+
+
+def test_stage_instance_count_cannot_claim_unloaded_replicas(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    pipeline = _pipeline(bundle, profile=profile)
+    pipeline["scheduling"] = {
+        "stage_policy": "sequential",
+        "stages": {"policy": {"instance_count": 2}},
+    }
+
+    with pytest.raises(InferenceConfigError, match="one stage artifact owns one serial runtime instance"):
+        parse_inference_config(
+            _robot_config({"policy": pipeline}, scheduler=_scheduler_block()),
+            "model_inference",
+        )
+
+
+@pytest.mark.parametrize(
+    "obsolete",
+    [
+        {"triggers": {"action_generation": {"queue_watermark": 20}}},
+        {"stages": {"policy": {"trigger": "dispatch"}}},
+    ],
+)
+def test_scheduler_rejects_obsolete_pipeline_trigger_configuration(tmp_path: Path, obsolete: dict[str, Any]) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    pipeline = _pipeline(bundle, profile=profile)
+    pipeline["scheduling"] = {"stage_policy": "sequential", **obsolete}
+
+    with pytest.raises(InferenceConfigError, match="unsupported fields"):
+        parse_inference_config(
+            _robot_config({"policy": pipeline}, scheduler=_scheduler_block()),
+            "model_inference",
+        )
+
+
+def test_frame_base_priority_and_stage_offset_must_fit_ascend_range() -> None:
+    stages = {"encoder": StageSchedulingConfig("encoder", 4, 1)}
+
+    with pytest.raises(InferenceConfigError, match="priorities must fit"):
+        _validate_stage_priority_range(stages, 4, "pipeline.scheduling")
+
+
+def test_sequential_rejects_ineffective_stage_priority_offset(tmp_path):
+    pipeline = _pipeline(_create_bundle(tmp_path / "bundle"), profile=_profile_file(tmp_path))
+    pipeline["scheduling"] = {"stage_policy": "sequential", "stages": {"policy": {"priority_offset": 1}}}
+    with pytest.raises(InferenceConfigError, match="requires independent"):
+        parse_inference_config(_robot_config({"policy": pipeline}, scheduler=_scheduler_block()), "model_inference")

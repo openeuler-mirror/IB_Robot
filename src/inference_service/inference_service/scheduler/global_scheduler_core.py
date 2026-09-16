@@ -9,6 +9,7 @@ continue to use the logical generation returned by the public Open action.
 from __future__ import annotations
 
 import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -20,14 +21,15 @@ class GlobalSessionState(str, Enum):
     ACTIVE = "active"
     CLOSING = "closing"
     CLOSED = "closed"
-    FAILED = "failed"
+    QUARANTINED = "quarantined"
 
 
 class BindingState(str, Enum):
     OPENING = "opening"
     ACTIVE = "active"
     CLOSING = "closing"
-    FAILED = "failed"
+    CLOSED = "closed"
+    QUARANTINED = "quarantined"
 
 
 @dataclass(frozen=True)
@@ -54,9 +56,14 @@ class PipelineCandidate:
 class PipelineBinding:
     pipeline_id: str
     hardware_resource_id: str
+    binding_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    binding_incarnation: int = 1
     state: BindingState = BindingState.OPENING
     pipeline_generation: int = 0
     quarantine: bool = False
+    observed_boot_id: str | None = None
+    expected_boot_id: str | None = None
+    close_operation_id: str | None = None
 
 
 @dataclass
@@ -71,7 +78,7 @@ class SessionRecord:
     quarantine: bool = False
     unresolved_cleanup: bool = False
     close_requested: bool = False
-    state_before_close: GlobalSessionState | None = None
+    close_retry_pending: bool = False
     in_flight_requests: int = 0
     product_request_count: int = 0
 
@@ -94,6 +101,9 @@ class BindingDecision:
     reason: str = ""
     pipeline_generation: int = 0
     needs_open: bool = False
+    binding_id: str = ""
+    binding_incarnation: int = 0
+    expected_boot_id: str = ""
 
 
 class SchedulerError(Exception):
@@ -128,6 +138,7 @@ class GlobalSchedulerCore:
         self._sessions: dict[str, SessionRecord] = {}
         self._quarantined_pipelines: set[str] = set()
         self._session_terminal_ns: dict[str, int] = {}
+        self._public_dispatches: set[tuple[str, int, str]] = set()
 
     # ------------------------------------------------------------------
     # Open lifecycle.
@@ -167,6 +178,9 @@ class GlobalSchedulerCore:
         pipeline_id: str,
         pipeline_generation: int,
         hardware_resource_id: str,
+        binding_id: str | None = None,
+        binding_incarnation: int | None = None,
+        boot_id: str | None = None,
     ) -> bool:
         """CAS an OPENING binding to ACTIVE.
 
@@ -182,7 +196,19 @@ class GlobalSchedulerCore:
             binding = record.bindings.get(pipeline_id)
             if binding is None or binding.state != BindingState.OPENING:
                 return record.close_requested
+            if binding_id is not None and binding.binding_id != binding_id:
+                return True
+            if binding_incarnation is not None and binding.binding_incarnation != binding_incarnation:
+                return True
+            if boot_id is not None and binding.expected_boot_id != boot_id:
+                binding.state = BindingState.QUARANTINED
+                binding.quarantine = True
+                record.state = GlobalSessionState.QUARANTINED
+                record.quarantine = True
+                record.unresolved_cleanup = True
+                return True
             binding.pipeline_generation = pipeline_generation
+            binding.observed_boot_id = boot_id or binding.expected_boot_id
             binding.hardware_resource_id = hardware_resource_id
             binding.state = BindingState.ACTIVE
             if record.close_requested:
@@ -216,11 +242,11 @@ class GlobalSchedulerCore:
                 self._condition.notify_all()
                 return
             if binding is not None:
-                binding.state = BindingState.FAILED
+                binding.state = BindingState.QUARANTINED
                 binding.pipeline_generation = max(binding.pipeline_generation, pipeline_generation)
                 binding.quarantine = True
                 self._quarantined_pipelines.add(binding.pipeline_id)
-            record.state = GlobalSessionState.FAILED
+            record.state = GlobalSessionState.QUARANTINED
             record.quarantine = True
             record.unresolved_cleanup = True
             record.last_activity_mono_ns = self._now_ns()
@@ -238,6 +264,7 @@ class GlobalSchedulerCore:
         target_pipeline_id: str,
         fallback_chain: list[str],
         priority: int,
+        request_id: str | None = None,
     ) -> DispatchPlan:
         with self._condition:
             record = self._active_session_locked(session_id, session_generation)
@@ -251,6 +278,14 @@ class GlobalSchedulerCore:
             record.lease_expires_at_ns = record.last_activity_mono_ns + self._session_idle_timeout_ns
             record.in_flight_requests += 1
             record.product_request_count += 1
+            if request_id is not None:
+                validate_uuid4(request_id, field="request_id")
+                key = (session_id, session_generation, request_id)
+                if key in self._public_dispatches:
+                    record.in_flight_requests -= 1
+                    record.product_request_count -= 1
+                    raise SchedulerError("duplicate_public_dispatch")
+                self._public_dispatches.add(key)
             return DispatchPlan(ordered)
 
     def prepare_dispatch_candidate(
@@ -259,6 +294,7 @@ class GlobalSchedulerCore:
         session_id: str,
         session_generation: int,
         pipeline_id: str,
+        expected_boot_id: str | None = None,
     ) -> BindingDecision:
         with self._condition:
             record = self._active_session_locked(session_id, session_generation)
@@ -267,15 +303,41 @@ class GlobalSchedulerCore:
             binding = record.bindings.get(pipeline_id)
             if binding is not None:
                 if binding.state == BindingState.ACTIVE:
-                    return BindingDecision(pipeline_id, pipeline_generation=binding.pipeline_generation)
+                    if expected_boot_id is not None and binding.expected_boot_id != expected_boot_id:
+                        return BindingDecision(None, "boot_mismatch")
+                    return BindingDecision(
+                        pipeline_id,
+                        pipeline_generation=binding.pipeline_generation,
+                        binding_id=binding.binding_id,
+                        binding_incarnation=binding.binding_incarnation,
+                        expected_boot_id=binding.expected_boot_id or "",
+                    )
                 if binding.state == BindingState.OPENING:
-                    return BindingDecision(None, "binding_open_in_progress")
+                    return BindingDecision(
+                        pipeline_id,
+                        "binding_open_in_progress",
+                        binding_id=binding.binding_id,
+                        binding_incarnation=binding.binding_incarnation,
+                        expected_boot_id=binding.expected_boot_id or "",
+                    )
                 return BindingDecision(None, "pipeline_quarantined")
             if self._pipeline_owned_by_other_session_locked(pipeline_id, record):
                 return BindingDecision(None, "pipeline_busy")
             candidate = self._candidates[pipeline_id]
-            record.bindings[pipeline_id] = PipelineBinding(pipeline_id, candidate.hardware_resource_id)
-            return BindingDecision(pipeline_id, needs_open=True)
+            binding = PipelineBinding(
+                pipeline_id,
+                candidate.hardware_resource_id,
+                expected_boot_id=expected_boot_id,
+                observed_boot_id=expected_boot_id,
+            )
+            record.bindings[pipeline_id] = binding
+            return BindingDecision(
+                pipeline_id,
+                needs_open=True,
+                binding_id=binding.binding_id,
+                binding_incarnation=binding.binding_incarnation,
+                expected_boot_id=expected_boot_id or "",
+            )
 
     def release_dispatch_candidate(self, *, session_id: str, pipeline_id: str, not_started: bool) -> None:
         if not_started:
@@ -283,11 +345,46 @@ class GlobalSchedulerCore:
         else:
             self.mark_session_failed(session_id, pipeline_id=pipeline_id)
 
-    def record_request_terminal(self, session_id: str) -> None:
+    def wait_for_binding_open(
+        self,
+        *,
+        session_id: str,
+        pipeline_id: str,
+        deadline_monotonic_ns: int,
+    ) -> bool:
+        """Wait until another request's lazy Open stops being in flight.
+
+        A caller that observes an OPENING binding must not send Dispatch with
+        generation zero. Returning after the binding is removed also lets the
+        caller retry admission and become the new opener when the first Open
+        was proven not to have started.
+        """
+        with self._condition:
+            while True:
+                record = self._sessions.get(session_id)
+                binding = record.bindings.get(pipeline_id) if record is not None else None
+                if binding is None or binding.state != BindingState.OPENING:
+                    return True
+                remaining_ns = deadline_monotonic_ns - self._now_ns()
+                if remaining_ns <= 0:
+                    return False
+                self._condition.wait(remaining_ns / 1_000_000_000)
+
+    def record_request_terminal(
+        self,
+        session_id: str,
+        *,
+        request_id: str | None = None,
+        session_generation: int | None = None,
+    ) -> None:
         with self._condition:
             record = self._sessions.get(session_id)
             if record is not None and record.in_flight_requests > 0:
                 record.in_flight_requests -= 1
+                if request_id is not None:
+                    generation = session_generation if session_generation is not None else record.session_generation
+                    self._public_dispatches.discard((session_id, generation, request_id))
+                self._retain_drained_failure_locked(session_id, record)
                 self._condition.notify_all()
 
     # ------------------------------------------------------------------
@@ -303,11 +400,19 @@ class GlobalSchedulerCore:
                 raise SchedulerError("generation_mismatch")
             if record.state == GlobalSessionState.CLOSED:
                 return
-            if record.state == GlobalSessionState.CLOSING and record.close_requested:
+            if record.state == GlobalSessionState.CLOSING and record.close_requested and not record.close_retry_pending:
                 raise SchedulerError("close_in_progress")
-            record.state_before_close = record.state
             record.close_requested = True
+            record.close_retry_pending = False
             record.state = GlobalSessionState.CLOSING
+            for binding in record.bindings.values():
+                if binding.close_operation_id is None:
+                    binding.close_operation_id = str(uuid.uuid4())
+                elif binding.state is not BindingState.CLOSED:
+                    # Retries re-send Close with a fresh operation id: the
+                    # previous attempt's UNKNOWN outcome must not be replayed
+                    # from the idempotency cache (P0-2 no-replay contract).
+                    binding.close_operation_id = str(uuid.uuid4())
             self._condition.notify_all()
 
     def wait_for_bindings_to_settle(self, session_id: str, deadline_monotonic_ns: int) -> bool:
@@ -316,7 +421,12 @@ class GlobalSchedulerCore:
                 record = self._sessions.get(session_id)
                 if record is None:
                     return True
-                if not any(binding.state == BindingState.OPENING for binding in record.bindings.values()):
+                # Close is a drain barrier for both lazy Opens and product
+                # Dispatches. Do not return while a request still owns the
+                # logical session.
+                if record.in_flight_requests == 0 and not any(
+                    binding.state == BindingState.OPENING for binding in record.bindings.values()
+                ):
                     return True
                 remaining_ns = deadline_monotonic_ns - self._now_ns()
                 if remaining_ns <= 0:
@@ -330,15 +440,22 @@ class GlobalSchedulerCore:
                 return []
             result: list[PipelineBinding] = []
             for binding in record.bindings.values():
-                if binding.state in (BindingState.ACTIVE, BindingState.FAILED, BindingState.CLOSING):
+                if binding.state in (BindingState.ACTIVE, BindingState.QUARANTINED, BindingState.CLOSING):
                     binding.state = BindingState.CLOSING
+                    if binding.close_operation_id is None:
+                        binding.close_operation_id = str(uuid.uuid4())
                     result.append(
                         PipelineBinding(
                             pipeline_id=binding.pipeline_id,
                             hardware_resource_id=binding.hardware_resource_id,
+                            binding_id=binding.binding_id,
+                            binding_incarnation=binding.binding_incarnation,
                             state=binding.state,
                             pipeline_generation=binding.pipeline_generation,
                             quarantine=binding.quarantine,
+                            observed_boot_id=binding.observed_boot_id,
+                            expected_boot_id=binding.expected_boot_id,
+                            close_operation_id=binding.close_operation_id,
                         )
                     )
             return sorted(result, key=lambda item: item.pipeline_id)
@@ -349,8 +466,21 @@ class GlobalSchedulerCore:
             if record is None:
                 return
             record.bindings.pop(pipeline_id, None)
+            self._retain_drained_failure_locked(session_id, record)
             if not any(other.unresolved_cleanup and pipeline_id in other.bindings for other in self._sessions.values()):
                 self._quarantined_pipelines.discard(pipeline_id)
+            self._condition.notify_all()
+
+    def record_close_not_started(self, session_id: str) -> None:
+        """Allow another Close attempt without reopening product admission."""
+        with self._condition:
+            record = self._sessions.get(session_id)
+            if record is None:
+                return
+            record.state = GlobalSessionState.CLOSING
+            record.close_retry_pending = True
+            record.unresolved_cleanup = bool(record.bindings)
+            record.last_activity_mono_ns = self._now_ns()
             self._condition.notify_all()
 
     def record_close_complete(self, session_id: str, *, success: bool, unresolved: bool = False) -> int:
@@ -359,35 +489,21 @@ class GlobalSchedulerCore:
             if record is None:
                 return 0
             now = self._now_ns()
-            if success and not record.bindings:
+            if success and not record.bindings and record.in_flight_requests == 0:
                 record.session_generation = max(1, record.session_generation + 1)
                 record.state = GlobalSessionState.CLOSED
                 record.quarantine = False
                 record.unresolved_cleanup = False
-                record.close_requested = False
-                record.state_before_close = None
                 self._session_terminal_ns[session_id] = now
             else:
-                record.state = GlobalSessionState.FAILED
+                record.state = GlobalSessionState.QUARANTINED
                 record.quarantine = True
                 record.unresolved_cleanup = unresolved or bool(record.bindings)
                 if not record.unresolved_cleanup:
-                    self._session_terminal_ns[session_id] = now
+                    self._retain_drained_failure_locked(session_id, record)
             record.last_activity_mono_ns = now
             self._condition.notify_all()
             return record.session_generation
-
-    def record_close_not_started(self, session_id: str) -> None:
-        with self._condition:
-            record = self._sessions.get(session_id)
-            if record is not None and record.state == GlobalSessionState.CLOSING:
-                for binding in record.bindings.values():
-                    if binding.state == BindingState.CLOSING:
-                        binding.state = BindingState.FAILED if binding.quarantine else BindingState.ACTIVE
-                record.close_requested = False
-                record.state = record.state_before_close or GlobalSessionState.ACTIVE
-                record.state_before_close = None
-                self._condition.notify_all()
 
     # ------------------------------------------------------------------
     # Quarantine, lease, retention, and introspection.
@@ -398,7 +514,7 @@ class GlobalSchedulerCore:
             record = self._sessions.get(session_id)
             if record is None:
                 return
-            record.state = GlobalSessionState.FAILED
+            record.state = GlobalSessionState.QUARANTINED
             record.quarantine = True
             record.unresolved_cleanup = True
             record.last_activity_mono_ns = self._now_ns()
@@ -406,25 +522,44 @@ class GlobalSchedulerCore:
             for target in targets:
                 binding = record.bindings.get(target)
                 if binding is not None:
-                    binding.state = BindingState.FAILED
+                    binding.state = BindingState.QUARANTINED
                     binding.quarantine = True
-                self._quarantined_pipelines.add(target)
+                    self._quarantined_pipelines.add(target)
             self._condition.notify_all()
 
-    def reconcile_pipeline_boot(self, pipeline_id: str) -> None:
+    def reconcile_pipeline_boot(self, pipeline_id: str, *, boot_id: str | None = None) -> None:
+        """Fence bindings from a previous pipeline process boot."""
         with self._condition:
             self._quarantined_pipelines.discard(pipeline_id)
             for session_id, record in self._sessions.items():
                 binding = record.bindings.get(pipeline_id)
-                if binding is None or not binding.quarantine:
+                if binding is None:
                     continue
+                if boot_id is None or binding.expected_boot_id is None:
+                    binding.state = BindingState.QUARANTINED
+                    binding.quarantine = True
+                    record.state = GlobalSessionState.QUARANTINED
+                    record.quarantine = True
+                    record.unresolved_cleanup = True
+                    self._quarantined_pipelines.add(pipeline_id)
+                    continue
+                if binding.expected_boot_id == boot_id:
+                    continue
+                # A new boot fences the old process. Sending Close with the
+                # old boot identity would be rejected by the new process.
                 record.bindings.pop(pipeline_id, None)
-                if record.unresolved_cleanup and not record.bindings:
-                    record.unresolved_cleanup = False
-                    record.quarantine = False
-                    record.state = GlobalSessionState.CLOSED
-                    self._session_terminal_ns[session_id] = self._now_ns()
+                if record.state != GlobalSessionState.ACTIVE or record.close_requested or record.in_flight_requests > 0:
+                    record.state = GlobalSessionState.QUARANTINED
+                    record.quarantine = True
+                    record.unresolved_cleanup = bool(record.bindings)
+                    self._retain_drained_failure_locked(session_id, record)
             self._condition.notify_all()
+
+    def _retain_drained_failure_locked(self, session_id: str, record: SessionRecord) -> None:
+        """Retain the failure result only after every resource owner is fenced."""
+        if record.state == GlobalSessionState.QUARANTINED and not record.bindings and record.in_flight_requests == 0:
+            record.unresolved_cleanup = False
+            self._session_terminal_ns.setdefault(session_id, self._now_ns())
 
     def expired_sessions(self) -> list[str]:
         with self._condition:
@@ -435,6 +570,23 @@ class GlobalSchedulerCore:
                 if record.state == GlobalSessionState.ACTIVE
                 and record.in_flight_requests == 0
                 and now >= record.lease_expires_at_ns
+            ]
+
+    def aged_quarantined_sessions(self, age_ns: int) -> list[str]:
+        """Sessions stuck QUARANTINED/CLOSING beyond the recovery window.
+
+        The idle sweep retries Close once. Failed retries retain ownership
+        until a successful Close or a trusted boot fence.
+        """
+
+        with self._condition:
+            now = self._now_ns()
+            return [
+                session_id
+                for session_id, record in self._sessions.items()
+                if record.state in (GlobalSessionState.QUARANTINED, GlobalSessionState.CLOSING)
+                and record.in_flight_requests == 0
+                and now - record.last_activity_mono_ns >= age_ns
             ]
 
     def session_record(self, session_id: str) -> SessionRecord | None:
@@ -483,7 +635,7 @@ class GlobalSchedulerCore:
                 BindingState.OPENING,
                 BindingState.ACTIVE,
                 BindingState.CLOSING,
-                BindingState.FAILED,
+                BindingState.QUARANTINED,
             }:
                 return True
         return False
@@ -495,6 +647,8 @@ class GlobalSchedulerCore:
             for session_id, terminal_ns in self._session_terminal_ns.items()
             if now - terminal_ns > self._terminal_session_retention_ns
             and not self._sessions[session_id].unresolved_cleanup
+            and not self._sessions[session_id].bindings
+            and self._sessions[session_id].in_flight_requests == 0
         ]
         for session_id in expired:
             self._session_terminal_ns.pop(session_id, None)

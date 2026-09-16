@@ -23,9 +23,11 @@ from inference_service.backends.types import (
     BackendAdmissionEvidence,
     BackendCapabilities,
     BackendPriorityMapping,
+    BackendState,
     RuntimeContext,
 )
 from inference_service.model_sessions.base import ModelSession
+from inference_service.scheduler.operations import Certainty
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
 
@@ -89,6 +91,36 @@ class AscendOmModelSession(ModelSession):
     def runtime_version(self) -> str:
         return self._runtime_version(None if self._lease is None else self._lease.acl)
 
+    def close(self) -> None:
+        if not self._priority_scheduling:
+            return super().close()
+        with self._condition:
+            if self._state in (BackendState.CLOSED, BackendState.CLOSING):
+                return
+            self._state = BackendState.CLOSING
+        try:
+            self._close()
+        except Exception as exc:
+            # Failed device drain retains ownership and permits a later close retry.
+            with self._condition:
+                self._failure_count += 1
+                self._reason_code = getattr(exc, "code", "close_failed")
+                self._message = str(exc)
+                self._state = BackendState.FAILED
+            raise
+        with self._condition:
+            self._context = None
+            self._state = BackendState.CLOSED
+
+    def drain_uncertain_operations(self) -> None:
+        """排空所有阶段模型的隔离资源，不卸载模型。
+
+        供上层（staged executor reset）在不关闭会话的前提下恢复设备侧
+        确定性；任一阶段排空失败则抛出，保留剩余隔离资源以便重试。
+        """
+        for model in self._models.values():
+            model.drain_quarantined()
+
     def _load(self, context: RuntimeContext, rollback: LoadRollback) -> None:
         if context.priority_scheduling != self._priority_scheduling:
             raise BackendLoadError(
@@ -143,7 +175,8 @@ class AscendOmModelSession(ModelSession):
             path = context.resolved_artifacts.get(role)
             if path is None or not path.is_file():
                 raise BackendLoadError(f"Ascend artifact {role!r} is unavailable: {path}", code="invalid_artifact")
-            model = self._model_factory(lease, role, path, deployment.bindings[role])
+            model_options = {"async_execution": True} if self._priority_scheduling else {}
+            model = self._model_factory(lease, role, path, deployment.bindings[role], **model_options)
             models[role] = model
             model.load_descriptor()
         linked_inputs = {(link.consumer, link.semantic) for link in deployment.device_links}
@@ -154,6 +187,7 @@ class AscendOmModelSession(ModelSession):
         self._linked_inputs = frozenset(linked_inputs)
         self._update_loaded_capabilities(
             supports_attention=False,
+            supports_isolated_stage_execution=priority_streams is not None,
             priority_mapping=(
                 BackendPriorityMapping(tuple(range(priority_streams.level_count)))
                 if priority_streams is not None
@@ -216,6 +250,8 @@ class AscendOmModelSession(ModelSession):
         *,
         request: ModelRequest | None = None,
         context: ExecutionContext | None = None,
+        isolated: bool = False,
+        operation_factory=None,
     ) -> dict[str, np.ndarray]:
         """Execute one manifest role and write its outputs back into ``values``.
 
@@ -226,18 +262,28 @@ class AscendOmModelSession(ModelSession):
         loop that happens to call it.
         """
         execute_options: dict[str, object] = {
-            "read_outputs": self._role_read_indices(role_index, role),
+            "read_outputs": (
+                {
+                    int(binding.index)
+                    for binding in self._loaded_deployment().bindings[role].outputs
+                    if binding.index is not None
+                }
+                if isolated
+                else self._role_read_indices(role_index, role)
+            ),
         }
         if request is not None:
             stream = self._request_stream(request, context)
             if stream is not None:
                 execute_options["stream"] = stream
-        role_inputs = self._role_inputs(role, values)
+        role_inputs = self._role_inputs(role, values, isolated=isolated)
         self._capture_role_inputs(role, role_inputs)
-        runtime_outputs = self._models[role].execute(
-            role_inputs,
-            **execute_options,
-        )
+        if isolated:
+            runtime_outputs = self._submit_isolated_role(
+                role, role_inputs, context, operation_factory=operation_factory, **execute_options
+            )
+        else:
+            runtime_outputs = self._models[role].execute(role_inputs, **execute_options)
         outputs: dict[str, np.ndarray] = {}
         for binding in self._loaded_deployment().bindings[role].outputs:
             if binding.index is not None and int(binding.index) not in runtime_outputs:
@@ -246,7 +292,7 @@ class AscendOmModelSession(ModelSession):
             values[binding.semantic] = output
             outputs[binding.semantic] = output
         self._capture_role_outputs(role, outputs)
-        if self._diagnostic_capture is not None:
+        if self._diagnostic_capture is not None and not isolated:
             linked_outputs = {
                 link.semantic
                 for link in self._loaded_deployment().device_links
@@ -285,7 +331,7 @@ class AscendOmModelSession(ModelSession):
         for semantic, value in outputs.items():
             self._diagnostic_capture(names.get(semantic, f"{role}_out_{semantic}"), value)
 
-    def _role_inputs(self, role: str, values: Mapping[str, object]) -> dict[int, np.ndarray]:
+    def _role_inputs(self, role: str, values: Mapping[str, object], *, isolated: bool = False) -> dict[int, np.ndarray]:
         """Gather one role's runtime inputs, skipping the slots a device link already fills."""
         indexed_inputs: dict[int, np.ndarray] = {}
         for binding in self._loaded_deployment().bindings[role].inputs:
@@ -293,7 +339,7 @@ class AscendOmModelSession(ModelSession):
                 raise BackendInferenceError(
                     f"Ascend input {binding.semantic!r} has no runtime index", code="invalid_input_bindings"
                 )
-            if (role, binding.semantic) in self._linked_inputs:
+            if not isolated and (role, binding.semantic) in self._linked_inputs:
                 continue
             try:
                 indexed_inputs[int(binding.index)] = np.asarray(values[binding.semantic])
@@ -353,11 +399,78 @@ class AscendOmModelSession(ModelSession):
             ) from exc
         return self._run_role(role_index, role, dict(inputs), request=request, context=context)
 
+    def _execute_role_isolated(
+        self,
+        role: str,
+        inputs: Mapping[str, object],
+        request: ModelRequest,
+        context: ExecutionContext,
+        *,
+        operation_factory=None,
+    ) -> Mapping[str, object]:
+        """Execute one role with request-owned datasets for staged overlap."""
+
+        deployment = self._loaded_deployment()
+        if role not in deployment.execution:
+            raise BackendInferenceError(f"unknown Ascend stage {role!r}", code="unknown_execution_role")
+        return self._run_role(
+            deployment.execution.index(role),
+            role,
+            dict(inputs),
+            request=request,
+            context=context,
+            isolated=True,
+            operation_factory=operation_factory,
+        )
+
+    def _submit_isolated_role(self, role, role_inputs, context, *, read_outputs, stream=None, operation_factory=None):
+        model = self._models[role]
+        operation = registry = None
+        if stream is not None and callable(operation_factory):
+            operation, registry = operation_factory(role)
+            if not operation.claim_send():
+                registry.detach_waiter(operation.operation_id, context.request_id)
+                raise BackendInferenceError(
+                    f"stage operation {operation.operation_id} is already owned",
+                    code="stage_operation_not_retryable",
+                    operation_started=True,
+                    outcome_known=False,
+                )
+        try:
+            if stream is None:
+                runtime_outputs = model.execute(role_inputs, read_outputs=read_outputs)
+            else:
+                submitted = model.submit_async_isolated(
+                    role_inputs,
+                    stream=stream,
+                    read_outputs=read_outputs,
+                )
+                if operation is not None and registry is not None:
+                    registry.bind_future(operation.operation_id, submitted.completion)
+                runtime_outputs = submitted.completion.result()
+                # Future.result() may wake before its registry callback runs.
+                # Publish completion before an iteration reuses the key.
+                if operation is not None and registry is not None:
+                    registry.finish(operation.operation_id, certainty=Certainty.COMPLETED, result=runtime_outputs)
+        except Exception as exc:
+            if operation is not None and registry is not None:
+                certainty = Certainty.UNKNOWN
+                if bool(getattr(exc, "outcome_known", True)):
+                    certainty = (
+                        Certainty.COMPLETED if bool(getattr(exc, "operation_started", False)) else Certainty.NOT_STARTED
+                    )
+                registry.finish(operation.operation_id, certainty=certainty, error=str(exc))
+            raise
+        finally:
+            if operation is not None and registry is not None:
+                registry.detach_waiter(operation.operation_id, context.request_id)
+        return runtime_outputs
+
     def _request_stream(self, request: ModelRequest, context: ExecutionContext | None = None) -> object | None:
         del context
+        priority = request.metadata.get("priority", 0)
         streams = self._priority_streams
         if streams is None:
-            priority = request.metadata.get("priority", 0)
             if priority != 0:
                 raise BackendAdmissionError(
                     "non-zero Ascend priority requires scheduler-enabled priority streams",
@@ -389,19 +502,25 @@ class AscendOmModelSession(ModelSession):
         models = self._models
         lease = self._lease
         priority_streams = self._priority_streams
-        self._models = {}
-        self._lease = None
-        self._priority_streams = None
-        self._linked_inputs = frozenset()
+        if not self._priority_scheduling:
+            self._models = {}
+            self._lease = None
+            self._priority_streams = None
+            self._linked_inputs = frozenset()
         errors: list[Exception] = []
-        if priority_streams is not None:
-            try:
-                priority_streams.close()
-            except Exception as exc:
-                errors.append(exc)
         for model in reversed(tuple(models.values())):
             try:
                 model.close()
+            except Exception as exc:
+                if self._priority_scheduling:
+                    raise BackendLifecycleError(
+                        f"Ascend model drain failed: {exc}", code="close_failed", close_pending=True
+                    ) from exc
+                errors.append(exc)
+        self._models = {}
+        if priority_streams is not None:
+            try:
+                priority_streams.close()
             except Exception as exc:
                 errors.append(exc)
         if lease is not None:
@@ -409,6 +528,9 @@ class AscendOmModelSession(ModelSession):
                 lease.close()
             except Exception as exc:
                 errors.append(exc)
+        self._lease = None
+        self._priority_streams = None
+        self._linked_inputs = frozenset()
         if errors:
             raise BackendLifecycleError(
                 f"Ascend model session close failed: {'; '.join(str(error) for error in errors)}",

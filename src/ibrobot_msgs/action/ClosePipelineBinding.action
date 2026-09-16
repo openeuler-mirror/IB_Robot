@@ -1,0 +1,48 @@
+# Scheduled-only policy/VLA-private Global -> Pipeline close protocol.
+# session_id (UUID4) and logical_generation identify the Global logical session.
+# binding_id (UUID4), positive binding_incarnation, and expected_boot_id (UUID4)
+# must match the accepted Open, including for cleanup with zero generations.
+# operation_id is the downstream operation UUID4 and is echoed in the result.
+# Ledger key: (session_id, operation_id). Duplicate identity/payload must
+# be unchanged (including operation_id); duplicates wait/replay retained results.
+# A different deadline does not extend an existing Close. NOT_STARTED allows
+# retry; UNKNOWN is not proof of drain and must retain cleanup ownership.
+# A new operation_id starts a cleanup attempt only when the binding controller
+# allows Close; an active Close is rejected and all attempts use the drain barrier.
+# Close cancellation is rejected. Caller timeout does not stop the drain.
+# success=true guarantees this binding's work is fenced and drained through the
+# whole-graph reset barrier, or that no cleanup was needed. A terminal action or
+# COMPLETED outcome alone does not guarantee successful drain; check success.
+string<=36 session_id
+# Positive logical generation, or zero to select the current bound generation
+# during cleanup of a late/failed Open whose result was not obtained.
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 expected_boot_id
+# Positive Open result generation, or zero for cleanup when it is unknown.
+uint64 expected_pipeline_generation
+# Required positive absolute UTC Unix deadline, never ROS/simulation time.
+# Zero is invalid; Global resolves defaults before sending this private action.
+builtin_interfaces/Time deadline
+---
+bool success
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 boot_id
+string<=63 pipeline_id
+# Closed product generation and reset/drain fence generation, respectively.
+# Zero is possible for cleanup with no active product or no cleanup needed.
+# On failure these fields are diagnostic, not evidence that drain succeeded.
+# Normal success requires drained_generation > closed_pipeline_generation > 0.
+# The only zero/zero success is cleanup_not_needed for a generation-zero request.
+uint64 closed_pipeline_generation
+uint64 drained_generation
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+string<=128 status

@@ -1,0 +1,40 @@
+# Scheduled-only policy/VLA-private Global -> Pipeline binding protocol.
+# Global supplies a UUID4 session_id and its positive logical_generation.
+# binding_id (UUID4) and positive binding_incarnation identify this binding;
+# expected_boot_id (UUID4) fences the Pipeline process. None may be omitted.
+# operation_id is the UUID4 of this downstream operation and is echoed back.
+# Idempotency key: session_id, within this Pipeline's retained ledger.
+# Duplicates preserve all identity fields, including operation_id; changing
+# them conflicts. Duplicates wait for or replay the original result.
+# NOT_STARTED permits retry; UNKNOWN requires fenced cleanup, never blind retry.
+# Open cancellation is rejected. Caller timeout does not stop reset/device work;
+# a late accepted Open still requires identity-fenced Close cleanup.
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 expected_boot_id
+# Required positive absolute UTC Unix time, never ROS/simulation/monotonic time.
+# Global resolves the public default; zero is invalid on this private action.
+# Duplicate Open cannot extend the original operation's deadline.
+builtin_interfaces/Time deadline
+---
+bool success
+string<=36 session_id
+uint64 logical_generation
+string<=36 binding_id
+uint64 binding_incarnation
+string<=36 operation_id
+string<=36 boot_id
+string<=63 pipeline_id
+# Positive on successful Open; zero may appear on failure before admission.
+uint64 pipeline_generation
+string<=64 deployment_fingerprint
+string<=64 runtime_policy_fingerprint
+# Pipeline ROS-clock expiry projected from its monotonic lease; zero on failure.
+builtin_interfaces/Time lease_expires_at
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+string<=128 status

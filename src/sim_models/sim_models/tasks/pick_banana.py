@@ -164,8 +164,6 @@ class PickBananaTask(SceneTask):
         self._disp_start = node.create_client(Trigger, "/action_dispatcher/start_evaluate", callback_group=self._cbg)
         self._disp_stop = node.create_client(Trigger, "/action_dispatcher/stop_evaluate", callback_group=self._cbg)
         self._disp_reset = node.create_client(Empty, "/action_dispatcher/reset", callback_group=self._cbg)
-        restart_service = str(node.declare_parameter("restart_session_service", "").value)
-        self._scheduled_dispatch = bool(restart_service)
 
         # Arm command publishers + rest pose. Re-commanding the rest pose right
         # before a world reset aligns the controller setpoint with the keyframe,
@@ -268,25 +266,15 @@ class PickBananaTask(SceneTask):
     def _clean_world_reset(self, randomize: bool, resume: bool, settle_s: float = 0.8) -> tuple[bool, str]:
         """Pause inference → reset the world → (optionally) resume inference.
 
-        Inference reset behavior:
-
-        - Scheduled path (restart_session configured): stop and confirm Close →
-          reset world → start and Open a new session. On world-reset failure
-          stay stopped (do not unconditionally resume control). Never call the
-          legacy /action_dispatcher/reset.
-        - Legacy/disabled path: stop → rest pose → reset world → reset the
-          policy episode → resume. Keeps the historical unconditional resume.
-
-        Steps 2-3 (rest pose, world reset) are shared by both branches.
+        Stop, publish the rest pose, reset the world and policy episode, then
+        resume when requested. This task uses the legacy dispatcher only.
         """
-        stop_ok = self._call_service_sync(
+        self._call_service_sync(
             self._disp_stop,
             Trigger.Request(),
             "dispatcher/stop",
             check_success=True,
         )
-        if self._scheduled_path() and not stop_ok:
-            return False, "scheduled dispatcher stop/safe-stop/Close failed; world reset aborted"
         self._publish_rest_pose()
 
         ok, msg = self.randomize() if randomize else self.reset()
@@ -295,29 +283,10 @@ class PickBananaTask(SceneTask):
             time.sleep(settle_s)
 
         if resume:
-            if self._scheduled_path():
-                # Scheduled: never call legacy reset; resume only if the world
-                # reset itself succeeded — otherwise stay stopped.
-                if ok:
-                    start_ok = self._call_service_sync(
-                        self._disp_start,
-                        Trigger.Request(),
-                        "dispatcher/start",
-                        check_success=True,
-                    )
-                    if not start_ok:
-                        return False, "world reset succeeded but scheduled session Open failed"
-                else:
-                    self._node.get_logger().warning(
-                        "scheduled path: world reset failed; staying stopped (not resuming control)"
-                    )
-            else:
-                # Legacy/disabled branch.
-                if ok:
-                    self._call_service_sync(self._disp_reset, Empty.Request(), "dispatcher/reset")
-                # Always resume so a stop never leaves the robot stuck, even if
-                # the world reset itself failed (legacy behavior preserved).
-                self._call_service_sync(self._disp_start, Trigger.Request(), "dispatcher/start")
+            if ok:
+                self._call_service_sync(self._disp_reset, Empty.Request(), "dispatcher/reset")
+            # Preserve the legacy resume behavior even when the world reset fails.
+            self._call_service_sync(self._disp_start, Trigger.Request(), "dispatcher/start")
         return ok, msg
 
     def _publish_rest_pose(self, count: int = 6, period: float = 0.05) -> None:
@@ -507,10 +476,6 @@ class PickBananaTask(SceneTask):
             self._node.get_logger().warning(f"{label}: service returned failure")
             return False
         return True
-
-    def _scheduled_path(self) -> bool:
-        """The launch graph passes this endpoint only on the scheduled branch."""
-        return self._scheduled_dispatch
 
 
 # ─── Node entrypoint ──────────────────────────────────────────────────────────

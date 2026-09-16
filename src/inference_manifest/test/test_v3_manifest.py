@@ -36,6 +36,32 @@ BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
 
 
+def test_manifest_rejects_runtime_capability_claims(tmp_path):
+    deployment = _request_deployment()
+    deployment.update(
+        {
+            "execution": ["encoder", "decoder"],
+            "artifacts": {role: {"path": f"{role}.om", "format": "om"} for role in ("encoder", "decoder")},
+            "bindings": {
+                role: {
+                    "inputs": [{"semantic": "audio", "index": 0, "dtype": "float32", "shape": [1, 4]}],
+                    "outputs": [{"semantic": "prob", "index": 0, "dtype": "float32", "shape": [1, 1]}],
+                }
+                for role in ("encoder", "decoder")
+            },
+        }
+    )
+    value = _bundle(tmp_path, deployment)
+    validate_manifest_schema(value, tmp_path / "inference_manifest.json")
+    parsed = Deployment.model_validate(deployment)
+    assert parsed.execution == ("encoder", "decoder")
+    deployment["functional_execution"] = {"schema_version": 1, "supports_async_stage_submission": True}
+    with pytest.raises(ManifestValidationError):
+        validate_manifest_schema(value, tmp_path / "inference_manifest.json")
+    with pytest.raises(ValueError, match="functional_execution"):
+        Deployment.model_validate(deployment)
+
+
 def _bundle(root: Path, deployment: dict, *, model: dict | None = None) -> dict:
     (root / "payload.json").write_text("{}", encoding="utf-8")
     entry = BundleFile(path="payload.json")

@@ -284,12 +284,12 @@ class DeploymentArtifact(StrictFrozenModel):
 _IMAGE_SEMANTIC_PREFIXES = ("observation.image.", "observation.images.")
 
 
-def _is_image_semantic(semantic: str) -> bool:
+def is_image_semantic(semantic: str) -> bool:
     return semantic == "observation.image" or semantic.startswith(_IMAGE_SEMANTIC_PREFIXES)
 
 
 def _validate_layout(shape: tuple[int, ...], layout: str | None, semantic: str) -> None:
-    needs_layout = len(shape) == 4 and _is_image_semantic(semantic)
+    needs_layout = len(shape) == 4 and is_image_semantic(semantic)
     if needs_layout and layout is None:
         raise ValueError(f"rank-4 image tensor {semantic!r} requires NCHW or NHWC layout")
     if len(shape) != 4 and layout is not None:

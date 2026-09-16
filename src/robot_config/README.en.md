@@ -388,13 +388,28 @@ robot:
 ```
 
 Scheduled inference is opt-in through `control_modes.<mode>.inference.scheduler.enable`, which defaults to `false`.
+Independent stages support `scheduling.stages.<producer>.max_snapshot_age_ms` (positive integer, default `5000`).
+The producer is the first manifest execution role; terminal and sequential stages reject this option. The age limit
+includes producer queueing and execution from observation capture, participates in the runtime policy fingerprint,
+and is forwarded by launch. Reprocessing an expired observation does not renew its validity.
+Simulation inference (`runtime_target=simulation`, including Gazebo, MuJoCo and mock) requires
+`scheduler.enable=false`. Launch rejects the enabled combination before generating control or simulation nodes.
+Simulation scenes do not manage scheduler sessions or pipeline bindings.
 With an explicit `scheduler` block and `enable: false`, the complete scheduled configuration may remain dormant while
 the generated launch graph and node parameters stay identical to the legacy path. This makes `enable` a one-line
 rollback switch. If the entire `scheduler` block is absent, scheduled fields are still rejected as unknown fields.
+With the default FIFO policy and profile admission disabled, priority-0 dispatches the target directly without a resource
+queue. Nonempty default fallback chains are rejected during configuration loading when the scheduler is enabled.
+Fallback requires EDF or FIFO with profile admission enabled; deadline-driven priority-0 (EDF or FIFO admission)
+supports sequential pipelines only — selecting an independent-stage pipeline as the priority-0 target or in its fallback
+chain fails configuration loading, and Global skips independent candidates by serving-status capability at runtime.
 On the scheduled path, `profile_path` is optional and is consulted only when a priority-0 request actually considers
-that pipeline for deadline admission. Readiness requires at least one generic backend priority level. For a configured
-default priority greater than zero, it additionally verifies that `executor.inference_pipeline` is online and supports
-that priority; other pipelines do not need multi-priority support.
+that pipeline under FIFO with profile deadline admission enabled. `global_policy: edf` instead orders not-yet-started
+priority-0 requests on each hardware resource by absolute deadline, preserves FIFO for ties, and does not preempt active
+work. EDF expires queued work without using profiles to promise finish feasibility, so profile deadline admission must
+remain disabled with EDF. Readiness requires at least one generic backend priority level. For a configured default
+priority greater than zero, it additionally verifies that `executor.inference_pipeline` is online and supports that
+priority; other pipelines do not need multi-priority support.
 
 **Launched controllers:**
 - `arm_position_controller` (JointGroupPositionController)

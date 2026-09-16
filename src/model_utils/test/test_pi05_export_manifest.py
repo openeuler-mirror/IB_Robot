@@ -205,6 +205,10 @@ def test_write_pi05_ascend_deployment_uses_compiled_abis_and_strict_loader(tmp_p
 
     assert manifest_path == bundle / "inference_manifest.json"
     assert validated.deployment.execution == ("vlm", "action_expert")
+    assert "functional_execution" not in validated.deployment.model_dump()
+    from inference_service.codecs.policies import PI05PolicyCodec
+
+    PI05PolicyCodec.validate_staged_deployment(validated.deployment)
     assert {link.semantic for link in validated.deployment.device_links} == {
         "internal.past_kv",
         "internal.prefix_pad_masks",
@@ -492,6 +496,102 @@ def _write_pi05_abis(vlm_path: Path, action_path: Path) -> None:
             "outputs": [{"name": "velocity", "index": 0, "dtype": "float32", "shape": [1, 2, 8]}],
         },
     )
+
+
+def test_published_pi05_runs_staged_factory_iteration_postprocess_and_reset(tmp_path, monkeypatch):
+    import numpy as np
+
+    from inference_service.backends import BackendCapabilities, InferenceRequest
+    from inference_service.pipeline.factory import create_inference_pipeline
+    from inference_service.pipeline.staged_executor import StagedModelExecutor
+    from inference_service.pipeline.stages import IterativeStage
+    from inference_service.runtime_composition import build_policy_runtime_dependencies
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    _create_pi05_bundle(bundle)
+    vlm_abi, action_abi = tmp_path / "vlm.json", tmp_path / "action.json"
+    _write_pi05_abis(vlm_abi, action_abi)
+    vlm_om, action_om = tmp_path / "vlm.om", tmp_path / "action.om"
+    vlm_om.write_bytes(b"test-vlm")
+    action_om.write_bytes(b"test-action")
+    write_pi05_ascend_deployment(bundle, "ascend", "Ascend310P3", vlm_abi, vlm_om, action_abi, action_om)
+    manifest = load_inference_manifest(bundle, "ascend")
+    calls, postprocessed = [], []
+
+    class Session:
+        from inference_service.backends.types import BackendPriorityMapping
+
+        capabilities = BackendCapabilities(
+            supports_isolated_stage_execution=True, priority_mapping=BackendPriorityMapping(tuple(range(8)))
+        )
+
+        def execute_role(self, role, inputs, request, context, *, isolated, operation_factory):
+            assert isolated
+            operation, registry = operation_factory(role)
+            assert operation is not None and registry is not None
+            calls.append((role, context.request_id))
+            # Isolated operations must reach a known outcome before the stub
+            # returns, otherwise the registry keeps them and staged reset
+            # refuses to run (same contract as the real Ascend session).
+            from inference_service.scheduler.operations import Certainty
+
+            registry.finish(operation.operation_id, certainty=Certainty.COMPLETED)
+            registry.detach_waiter(operation.operation_id, context.request_id)
+            if role == "vlm":
+                return {
+                    "internal.past_kv": np.ones((1, 2), dtype=np.float16),
+                    "internal.prefix_pad_masks": np.ones((1, 4), dtype=bool),
+                }
+            return {"action": np.ones_like(inputs["noise"])}
+
+    def postprocess(action):
+        postprocessed.append(action.copy())
+        return action + 10
+
+    # Keep manifest validation, factory, codec, stages and lifecycle real;
+    # substitute only external processors and the vendor model session.
+    monkeypatch.setattr(
+        "inference_service.pipeline.factory.create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, postprocess),
+    )
+    dependencies = build_policy_runtime_dependencies()
+    policy = None
+    try:
+        policy = create_inference_pipeline(
+            "policy",
+            manifest,
+            stage_policy="independent",
+            priority_scheduling=True,
+            request_timeout=2,
+            registry_set=dependencies.registry_set,
+            providers=dependencies.providers,
+            model_session_factory=lambda *_: Session(),
+        )
+        assert isinstance(policy._session_executor, StagedModelExecutor)
+        assert any(isinstance(stage, IterativeStage) for stage in policy._session_executor.stages)
+        policy.load()
+        inputs = {
+            "observation.images.top": np.zeros((1, 3, 16, 24), dtype=np.float32),
+            "lang_tokens": np.zeros((1, 4), dtype=np.int64),
+            "lang_masks": np.ones((1, 4), dtype=bool),
+            "noise": np.zeros((1, 2, 8), dtype=np.float32),
+        }
+        assert policy.submit_frame(InferenceRequest("camera", inputs=inputs)).result(timeout=2) == 1
+        result = policy.infer(InferenceRequest("dispatch", inputs=inputs), capture_raw_action=True)
+        assert [role for role, _ in calls] == ["vlm", "action_expert", "action_expert"]
+        assert result.actual_chunk_size == 2
+        assert result.deployment_fingerprint == manifest.fingerprint
+        np.testing.assert_allclose(postprocessed[0], -np.ones((1, 2, 6)))
+        np.testing.assert_allclose(result.action, np.full((1, 2, 6), 9))
+        policy.reset()
+        policy.infer(InferenceRequest("after-reset", inputs=inputs))
+        assert [role for role, _ in calls[3:]] == ["vlm", "action_expert", "action_expert"]
+        assert calls[3][1].startswith("after-reset:refresh:")
+    finally:
+        if policy is not None:
+            policy.close()
+        dependencies.providers.close()
 
 
 def _resolved(tmp_path: Path, steps: str) -> SimpleNamespace:

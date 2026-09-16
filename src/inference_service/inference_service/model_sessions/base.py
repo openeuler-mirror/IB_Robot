@@ -149,6 +149,9 @@ class ModelSession(ABC):
         inputs: Mapping[str, object],
         request: ModelRequest,
         context: ExecutionContext,
+        *,
+        isolated: bool = False,
+        operation_factory=None,
     ) -> Mapping[str, object]:
         """Execute one manifest role inside an already admitted handle request."""
 
@@ -156,10 +159,18 @@ class ModelSession(ABC):
             raise TypeError("role execution requires native ModelRequest and ExecutionContext")
         self._require_ready()
         context.check(f"model.{role}")
-        outputs = self._execute_role(role, inputs, request, context)
-        self._validate_role_values(role, inputs, outputs)
+        if isolated:
+            outputs = self._execute_role_isolated(role, inputs, request, context, operation_factory=operation_factory)
+        else:
+            outputs = self._execute_role(role, inputs, request, context)
+        self._validate_role_values(role, inputs, outputs, isolated=isolated)
         context.check(f"model.{role}")
         return outputs
+
+    def _execute_role_isolated(self, role, inputs, request, context, *, operation_factory=None):
+        raise BackendCapabilityError(
+            "model runtime does not support isolated role execution", capability="isolated_role"
+        )
 
     def reset(self, context: ExecutionContext | None = None) -> None:
         if not self.capabilities.resettable:
@@ -256,6 +267,8 @@ class ModelSession(ABC):
         role: str,
         inputs: Mapping[str, object],
         outputs: Mapping[str, object],
+        *,
+        isolated: bool = False,
     ) -> None:
         deployment = self._require_context().deployment
         if not isinstance(deployment, CompiledDeployment):
@@ -267,13 +280,13 @@ class ModelSession(ABC):
         linked_inputs = {
             link.semantic
             for link in deployment.device_links
-            if link.consumer == role and link.transport == "device_pointer"
+            if not isolated and link.consumer == role and link.transport == "device_pointer"
         }
         host_inputs = tuple(binding for binding in bindings.inputs if binding.semantic not in linked_inputs)
         linked_outputs = {
             link.semantic
             for link in deployment.device_links
-            if link.producer == role and link.transport == "device_pointer"
+            if not isolated and link.producer == role and link.transport == "device_pointer"
         }
         host_outputs = tuple(binding for binding in bindings.outputs if binding.semantic not in linked_outputs)
         self._validate_values(inputs, host_inputs, f"role_{role}_input")

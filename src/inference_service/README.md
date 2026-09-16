@@ -9,6 +9,9 @@ pipeline ID，并支持单体和边云分布式执行。
 
 非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。公共本地执行通过
 `ModelRuntimeHandle.execute(ModelRequest, ExecutionContext)` 进入，成功结果统一为 `ModelResult`；
+独立 producer 帧通过 `ModelRuntimeHandle.submit_frame(ModelRequest, ExecutionContext)` 返回 future，
+与 Dispatch 共用请求登记、取消、失败处理和生命周期排空。帧有独立的有界准入额度，允许 producer 与
+Dispatch 重叠执行，统一 diagnostics 的活动计数包含两者。
 `ModelRuntimeFactory` 是注册式构造入口，不是请求边界。`ModelRuntimeHandle` 接受 `RuntimeAssembly` 的
 所有权转移，负责公开生命周期、准入、deadline、取消、健康状态和关闭等待。`ModelSession` 是 assembly
 中的资源，只负责加载、执行和释放 vendor 模型对象、设备 lease、buffer 或 worker。
@@ -151,9 +154,16 @@ Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
 `InferencePipeline` 是策略模型 facade，把既有 policy 请求/结果契约适配到
 `ModelRuntimeHandle`。Handle 统一生命周期、准入、deadline、cancellation、health 和 diagnostics，并按
 `RuntimeAssembly` 的 owned component 顺序加载、反向释放资源。编译模型由
-`SequentialModelExecutor` 按 `InferenceStage` 序列执行；循环 family 通过 `IterativeStage` 驱动多个 role。
+顺序或 staged executor 按 `InferenceStage` 编排，共用 `ComponentModelExecutor` 的组件辅助逻辑；
+循环 family 通过 `IterativeStage` 驱动多个 role。
 同一个 `ExecutionContext` 把 request ID、deadline 和 cancellation token 传到各 stage 与
 `ModelSession` resource；session 持有跨 role 复用的 vendor 设备资源。
+两种策略都通过 `ModelSession.execute_role()` 校验角色张量，Ascend 在内部选择隔离 dataset，
+继续复用语义绑定和诊断采集。independent 模式通过 PI0.5 policy adapter 验证 request-scoped 的
+`vlm` / `action_expert` 双段 ABI：prefix 仅依赖图像和语言，不允许状态、noise/time 或反向链接依赖。
+manifest 描述模型 ABI；异步执行与资源隔离能力由加载后的 runtime 验证。
+加载后的 Ascend backend 必须提供隔离异步 role 执行及 priority streams；executor 保证不可变发布、
+prompt 匹配、快照时效和代际隔离。模型类型或两个角色本身都不足以证明可跨请求复用中间结果。
 
 默认 endpoint：
 
@@ -194,17 +204,61 @@ logical generation，不选择模型、不检查 fallback，也不访问 pipelin
 pipeline、fallback chain、priority 和 deadline；候选首次被该 session 选中时，Global 才向对应 pipeline
 下发私有 Open/reset 并记录其 pipeline generation。同一个逻辑 session 可按需建立多个 pipeline binding。
 Close 停止新 admission，并逐一 drain/reset 实际使用过的全部 binding；从未 Dispatch 的 session 可直接关闭。
+下游 Close 明确 `NOT_STARTED` 时，公共 Close 保留该 outcome 与 recoverable 标志，session 留在 `CLOSING`，
+不因未开始而隔离 pipeline。可恢复的失败可重试 Close，但不能恢复 Dispatch；重试只处理尚未排空的 binding，
+使用新的 operation ID。混合结果中的 `UNKNOWN` 优先隔离，已执行的失败仍返回失败的 `COMPLETED`。
+身份校验通过且成功排空的 Close 会回收该 binding 的 reservation 与 operation；仍有 waiter 的
+operation 在 waiter 退出后回收，迟到结果不会重新占用已释放的容量。
 
-priority-0 请求按 `[target, *fallback_chain]` 顺序逐个检查。`profile_path` 可选，但实际参与本次准入的候选
-必须有匹配身份、覆盖当前输入契约和 prompt 大小、未过期的离线测量：
-已绑定候选使用 `full_infer` closure；尚未绑定的候选还必须包含 `session_open` closure，确保 Open/reset 与推理
-其 p99 admission SLA 估计加 safety margin 不超过该请求的绝对 deadline。同一个 `hardware_resource_id` 上已准入的 priority-0 工作按同优先级
-FIFO 串行下发：reservation 未成为资源队首前不会 Open/Dispatch；真正取得下发权时会按当前剩余时间再次检查
-deadline。已知未开始或已知完成时释放，执行结果不确定时保持隔离直到对应 pipeline 重启。
-这不是 pipeline 数量上限，也不限制 priority 大于 0 的请求。缺失或无效 profile 的候选按不可准入处理并继续
-fallback；没有候选可完成时返回
-`no_feasible_deadline/NOT_STARTED`，不会下发；
-`NOT_STARTED` 才继续下一个 fallback，`UNKNOWN` 立即 quarantine，绝不 fallback。Global ingress 仍保持有界：
+独立阶段的 producer 可配置 `scheduling.stages.<producer>.max_snapshot_age_ms`，默认 `5000`，必须是正整数；
+仅允许配置在 manifest 执行顺序中的第一个角色，terminal 和 sequential 模式拒绝此字段。snapshot 必须匹配
+generation 与 prompt，且观测年龄不超过该阈值。Pipeline Node 将 ROS 采样时间相对当前 ROS 时钟的年龄
+换算到单调时钟，producer 排队和执行时间均计入年龄；Dispatch 刷新也保留同一采样时间。没有观测时间元数据的
+直接 runtime 调用从首次准入计时。刷新后仍过期的观测会失败，不会通过重复计算延长有效期。
+
+### Legacy 生命周期兼容
+
+下列生命周期行为仅在启用 scheduler 时生效：
+
+- `PipelineManager.close()` 可再次尝试释放仍处于 `close_pending` 的 owned pipeline。
+- reset 跳过明确无状态且不支持 reset 的非 executor 组件，避免无效 reset 报错。
+- 有状态 policy 的后端已完成但结果迟到，或已开始后发生失败时，后续 `infer()` 会持续报告未就绪；成功 reset 后才能恢复。
+- LeRobot Torch session 加载后发现的 reset 能力会同步到 handle，`pipeline.reset()` 会真正调用 `policy.reset()`，不再因加载前能力缺失而成为 no-op。
+
+`scheduler.enable=false` 或缺省时保留原有拓扑、同步执行与生命周期语义；新增恢复行为不进入 legacy 路径。
+测试同时覆盖 launch 参数和运行时迟到结果、reset 与 Close 行为。
+
+Global 只接受 `InferenceServingStatus.scheduling_capability_schema_version == 1`；零值和未知版本均在
+状态准入时拒绝，不按旧版本兼容处理。三个私有 `*PipelineBinding.action` 的字段注释定义身份、重试和
+时间契约：`deadline` 必须是正值 UTC Unix 绝对时间，公开接口的默认值由 Global 解析；
+`obs_timestamp` 使用 pipeline 的 ROS 时钟，零值表示当前时刻。Dispatch 的 pipeline generation 必须
+来自成功 Open，不能为零；清理迟到 Open 的 Close 可用零 generation，但仍必须匹配 binding 和 boot。
+Open/Close 不支持 action 取消；Dispatch 取消依赖后端能力。取消被接受或调用超时均不代表设备完成，
+只有 Close 的 `success=true` 才证明该 binding 已排空或无需清理，失败的 `COMPLETED` 不能作为排空证明。
+私有 Close 以 `(session_id, operation_id)` 区分清理尝试：同 ID 重放，新 ID 经 binding 状态机确认后才排空，
+在途 Close 不允许重叠。正常成功必须满足 `drained_generation > closed_pipeline_generation > 0`；
+零/零仅允许 generation-zero 的 `cleanup_not_needed`。这些 action/status 是 policy/VLA 私有协议，
+感知和语音不承接 `action_chunk`。状态的 deadline-admission 能力来自实际 executor，表示支持该准入方式，
+不保证 deadline 内完成；公开优先级只用连续上界表达，不再重复发布 mask 或无消费者的能力指纹。
+
+priority-0 的资源排序和 fallback 取决于配置，默认不启用 profile 准入：
+
+| `global_policy` | `priority_zero_deadline_admission.enable` | 行为 |
+| --- | --- | --- |
+| `fifo`（默认） | `false`（默认） | 直接下发 target，不建立资源等待队列；不接受非空 fallback chain |
+| `fifo` | `true` | 用离线 profile 做完成时间准入，同资源按 FIFO 串行下发；支持 fallback，仅接受 sequential pipeline |
+| `edf` | `false` | 同资源等待中的请求按绝对 deadline 排序，同 deadline 按 FIFO；支持 fallback，仅接受 sequential pipeline，不使用 profile 预测完成时间 |
+
+EDF 不抢占已开始的请求，也不保证 deadline 前完成。deadline 驱动（EDF 或 FIFO profile 准入）的
+priority-0 是 sequential-only 契约：independent pipeline 把一个请求拆到两个 worker 上重叠执行，
+per-request deadline 排序无法评估也无法兑现；robot_config 会在配置加载期拒绝该组合的 target 和
+fallback 链，Global 也会按 serving status 能力跳过 independent 候选。FIFO profile 准入按 `[target, *fallback_chain]`
+检查匹配身份、输入契约、prompt 大小和有效期的离线测量：已绑定候选使用 `full_infer`，未绑定候选
+还需要 `session_open`。p99 估计加 safety margin 必须落在 deadline 内，获得资源下发权时再次检查。
+缺失或无效 profile 的候选会被跳过；无可行候选时返回 `no_feasible_deadline/NOT_STARTED`。
+启用 scheduler 时，不支持的默认 FIFO/fallback 组合和 deadline 驱动 priority-0 选择 independent pipeline
+都会在配置加载时报错。priority 大于 0 只使用 target，不受该 sequential-only 约束。
+仅 `NOT_STARTED` 允许继续 fallback；`UNKNOWN` 保持隔离，绝不重试或 fallback。Global ingress 仍保持有界：
 Open/Close 各两个执行 context；Dispatch 共四个 context，其中 lower-priority 最多占两个，不能耗尽为 priority-0
 保留的进入能力。priority-0 可使用任意空闲 Dispatch context。
 
@@ -721,13 +775,11 @@ artifact path、binding 或 digest。
 
 ## 验证
 
-从源码运行测试时优先使用 source package path，并禁用外部 pytest plugins：
+从工作区根目录加载项目环境，并禁用外部 pytest plugins。包测试同时收集 `tests/` 和 `test/`：
 
 ```bash
 source .shrc_local
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-PYTHONPATH=src/inference_manifest:src/inference_service \
-pytest -q src/inference_service/tests
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q src/inference_service
 ```
 
 只对本次修改的 Python 文件执行 Ruff。项目或 ROS 命令前必须先加载 `.shrc_local`。

@@ -93,6 +93,11 @@ class RuntimeAssembly:
     components: tuple[object, ...] = ()
     stateful: bool = False
     resettable: bool = False
+    # Scheduled drain recovery discovers reset support and skips stateless
+    # non-resettable resources; disabled runtimes retain legacy reset behavior.
+    retry_failed_reset: bool = False
+    # Runs after component reset succeeds, before request admission reopens.
+    reset_complete: Callable[[], None] | None = None
     state_scope: str = "request"
     state_bank_mode: str | None = None
     max_open_streams: int | None = None

@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping
+from concurrent.futures import Future
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -104,6 +105,12 @@ def _call_reset(resource: object, context: ExecutionContext) -> None:
             ((), {}),
         ),
     )
+
+
+def _is_superseded_frame(exc: BaseException) -> bool:
+    """Duck-typed coalescing marker (circular import: staged executor)."""
+
+    return bool(getattr(exc, "superseded_frame", False))
 
 
 def _call_close(resource: object) -> None:
@@ -460,6 +467,7 @@ class ModelRuntimeHandle:
         self._admission_open = False
         self._loading = False
         self._active_executions = 0
+        self._active_frame_executions = 0
         self._active_stream_steps = 0
         self._active_threads: dict[int, int] = {}
         self._execution_contexts: dict[str, ExecutionContext] = {}
@@ -675,6 +683,10 @@ class ModelRuntimeHandle:
             with self._condition:
                 if self._state is not LifecycleState.LOADING:
                     raise RuntimeError(f"runtime load ended in {self._state.value}")
+                # Some sessions discover reset support only after loading the model.
+                session_capabilities = getattr(self._assembly.session, "capabilities", None)
+                if self._assembly.retry_failed_reset:
+                    self._resettable = self._resettable or bool(getattr(session_capabilities, "resettable", False))
                 self._loaded_entries = tuple(attempted)
                 self._admission_open = True
                 self._transition_locked(LifecycleState.READY)
@@ -697,6 +709,8 @@ class ModelRuntimeHandle:
             )
             with self._condition:
                 self._admission_open = False
+                if any(getattr(error, "close_pending", False) for error in rollback_errors):
+                    self._loaded_entries = tuple(attempted)
                 if self._state is not LifecycleState.CLOSED and self._state is not LifecycleState.CLOSING:
                     self._transition_locked(LifecycleState.FAILED)
                 self._record_failure_locked(failure)
@@ -708,11 +722,7 @@ class ModelRuntimeHandle:
                 self._loading = False
                 self._condition.notify_all()
 
-    def execute(self, request: ModelRequest, context: ExecutionContext) -> ModelResult:
-        if not isinstance(request, ModelRequest):
-            raise TypeError("unified runtime execute requires a ModelRequest")
-        context = self._context_or_type_error(context)
-        tracker = OutcomeEvidenceTracker()
+    def _register_execution(self, context: ExecutionContext, *, frame: bool = False) -> None:
         with self._condition:
             if self._state is not LifecycleState.READY or not self._admission_open:
                 raise self._lifecycle_failure_locked("execute")
@@ -723,15 +733,126 @@ class ModelRuntimeHandle:
                     evidence=OutcomeEvidence.not_started("admission"),
                     details={"state_scope": self._state_scope},
                 )
-            if self._active_executions >= self._max_active_executions:
+            # Frames have one running and one pending slot; the third record
+            # owns a replacement until the executor settles the old pending frame.
+            active = self._active_frame_executions if frame else self._active_executions - self._active_frame_executions
+            limit = 3 if frame else self._max_active_executions
+            if active >= limit:
                 raise self._failure_factory.create(
                     "admission_rejected",
                     "runtime request admission limit is exhausted",
                     evidence=OutcomeEvidence.not_started("admission"),
-                    details={"active_executions": self._active_executions, "limit": self._max_active_executions},
+                    details={"active_executions": active, "limit": limit},
                 )
-        try:
+            if (frame or self._active_frame_executions) and context.request_id in self._execution_contexts:
+                raise self._failure_factory.create(
+                    "request_conflict",
+                    "runtime request ID is already active",
+                    evidence=OutcomeEvidence.not_started("admission"),
+                )
             context.check("admission")
+            self._active_executions += 1
+            self._active_frame_executions += int(frame)
+            if not frame:
+                thread_id = threading.get_ident()
+                self._active_threads[thread_id] = self._active_threads.get(thread_id, 0) + 1
+            self._execution_contexts[context.request_id] = context
+
+    def _release_execution(self, context: ExecutionContext, *, frame: bool = False) -> None:
+        with self._condition:
+            self._active_executions -= 1
+            self._active_frame_executions -= int(frame)
+            if not frame:
+                thread_id = threading.get_ident()
+                count = self._active_threads.get(thread_id, 0) - 1
+                if count > 0:
+                    self._active_threads[thread_id] = count
+                else:
+                    self._active_threads.pop(thread_id, None)
+            self._execution_contexts.pop(context.request_id, None)
+            self._condition.notify_all()
+
+    def _execution_failure(
+        self,
+        exc: Exception,
+        context: ExecutionContext,
+        *,
+        started: bool,
+        record: bool = True,
+    ) -> ExecutionFailure:
+        if isinstance(exc, ExecutionFailure):
+            failure = exc
+        else:
+            started = bool(getattr(exc, "operation_started", started))
+            failure = self._failure_factory.from_exception(
+                exc,
+                evidence=OutcomeEvidence(
+                    OutcomeState.STARTED if started else OutcomeState.NOT_STARTED,
+                    bool(getattr(exc, "outcome_known", not (started and self._stateful))),
+                    bool(getattr(exc, "state_mutated", started and self._stateful)),
+                    str(getattr(exc, "phase", "backend")),
+                ),
+                details={"request_id": context.request_id},
+            )
+        if record:
+            self._remember_failure(failure)
+            self._apply_uncertain_request_failure(failure, started)
+        return failure
+
+    def submit_frame(self, request: ModelRequest, context: ExecutionContext) -> Future:
+        """Own a coalesced producer request until its executor completion fence."""
+        if not isinstance(request, ModelRequest):
+            raise TypeError("unified runtime frame submission requires a ModelRequest")
+        context = self._context_or_type_error(context)
+        submit = getattr(self._executor, "submit_frame", None)
+        if not callable(submit):
+            raise TypeError("runtime executor does not support frame submission")
+        self._register_execution(context, frame=True)
+        result: Future = Future()
+        # Device work cannot be canceled by dropping the Future. cancel(request_id)
+        # signals the shared context while ownership lasts until completion.
+        result.set_running_or_notify_cancel()
+
+        def complete(done: Future) -> None:
+            value = error = None
+            try:
+                value = done.result()
+                context.check("frame_result")
+                with self._condition:
+                    self._last_successful_at = _now()
+                    self._last_outcome = OutcomeEvidence.completed("frame_result")
+            except Exception as exc:
+                if _is_superseded_frame(exc):
+                    # Normal coalescing: the newer frame owns the producer.
+                    # Propagated to the caller but excluded from health
+                    # accounting (no failure_count, no _last_failure).
+                    error = self._execution_failure(exc, context, started=True, record=False)
+                else:
+                    error = self._execution_failure(exc, context, started=True)
+            finally:
+                self._release_execution(context, frame=True)
+            if error is not None:
+                result.set_exception(error)
+            else:
+                result.set_result(value)
+
+        try:
+            submitted = submit(request, context=context)
+        except Exception as exc:
+            failure = self._execution_failure(exc, context, started=False)
+            self._release_execution(context, frame=True)
+            result.set_exception(failure)
+        else:
+            submitted.add_done_callback(complete)
+        return result
+
+    def execute(self, request: ModelRequest, context: ExecutionContext) -> ModelResult:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("unified runtime execute requires a ModelRequest")
+        context = self._context_or_type_error(context)
+        tracker = OutcomeEvidenceTracker()
+        try:
+            self._register_execution(context)
         except (DeadlineExceeded, CancellationRequested) as exc:
             failure = self._failure_factory.from_exception(
                 exc,
@@ -740,20 +861,6 @@ class ModelRuntimeHandle:
             )
             self._remember_failure(failure)
             raise failure from exc
-
-        with self._condition:
-            if self._state is not LifecycleState.READY or not self._admission_open:
-                raise self._lifecycle_failure_locked("execute")
-            if self._active_executions >= self._max_active_executions:
-                raise self._failure_factory.create(
-                    "admission_rejected",
-                    "runtime request admission limit is exhausted",
-                    evidence=OutcomeEvidence.not_started("admission"),
-                    details={"active_executions": self._active_executions, "limit": self._max_active_executions},
-                )
-            self._active_executions += 1
-            self._active_threads[threading.get_ident()] = self._active_threads.get(threading.get_ident(), 0) + 1
-            self._execution_contexts[context.request_id] = context
 
         started = False
         started_at = time.perf_counter()
@@ -835,35 +942,10 @@ class ModelRuntimeHandle:
             self._apply_uncertain_request_failure(failure, started)
             raise failure from exc
         except Exception as exc:
-            started_flag = bool(getattr(exc, "operation_started", started))
-            known = bool(getattr(exc, "outcome_known", not (started_flag and self._stateful)))
-            mutated = bool(getattr(exc, "state_mutated", started_flag and self._stateful))
-            phase = str(getattr(exc, "phase", "backend"))
-            evidence = tracker.mark_failed(
-                phase,
-                state=OutcomeState.STARTED if started_flag else OutcomeState.NOT_STARTED,
-                outcome_known=known,
-                state_mutated=mutated,
-            )
-            failure = self._failure_factory.from_exception(
-                exc,
-                evidence=evidence,
-                details={"request_id": context.request_id},
-            )
-            self._remember_failure(failure)
-            self._apply_uncertain_request_failure(failure, started_flag)
+            failure = self._execution_failure(exc, context, started=started)
             raise failure from exc
         finally:
-            with self._condition:
-                self._active_executions -= 1
-                thread_id = threading.get_ident()
-                count = self._active_threads.get(thread_id, 0) - 1
-                if count > 0:
-                    self._active_threads[thread_id] = count
-                else:
-                    self._active_threads.pop(thread_id, None)
-                self._execution_contexts.pop(context.request_id, None)
-                self._condition.notify_all()
+            self._release_execution(context)
 
     def cancel(self, request_id: str, *, deadline: Deadline | None = None) -> None:
         """Cancel an active request through the shared native cancellation token."""
@@ -937,6 +1019,15 @@ class ModelRuntimeHandle:
             self._recovery_requirement = failure.recovery
             self._recovery_available = failure.recoverable
 
+    def _reset_failure_state(self) -> LifecycleState:
+        """Scheduled pipelines may retry drain; other runtimes keep legacy failure."""
+
+        return (
+            LifecycleState.RESET_REQUIRED
+            if self._resettable and self._assembly.retry_failed_reset
+            else LifecycleState.FAILED
+        )
+
     def _control_context(self, context: ExecutionContext | None, deadline: Deadline | None) -> ExecutionContext:
         if context is not None and not isinstance(context, ExecutionContext):
             raise TypeError("control operations require an ExecutionContext")
@@ -1002,14 +1093,24 @@ class ModelRuntimeHandle:
                 for entry in reversed(self._entries):
                     if entry.resource is self._streaming_runtime:
                         continue
+                    capabilities = getattr(entry.resource, "capabilities", None)
+                    if (
+                        self._assembly.retry_failed_reset
+                        and entry.resource is not self._executor
+                        and getattr(capabilities, "resettable", None) is False
+                        and getattr(capabilities, "stateful", None) is False
+                    ):
+                        continue
                     if entry.resource is self._executor or callable(getattr(entry.resource, "reset", None)):
                         reset_started = True
                         _call_reset(entry.resource, control_context)
                 control_context.check("reset")
+                if self._assembly.reset_complete is not None:
+                    self._assembly.reset_complete()
             except ExecutionFailure as failure:
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
-                        self._transition_locked(LifecycleState.FAILED)
+                        self._transition_locked(self._reset_failure_state())
                     self._admission_open = False
                     self._record_failure_locked(failure)
                 raise
@@ -1025,7 +1126,7 @@ class ModelRuntimeHandle:
                 )
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
-                        self._transition_locked(LifecycleState.FAILED)
+                        self._transition_locked(self._reset_failure_state())
                     self._admission_open = False
                     self._record_failure_locked(failure)
                 raise failure from exc
@@ -1042,7 +1143,7 @@ class ModelRuntimeHandle:
                 )
                 with self._condition:
                     if self._state is LifecycleState.RESETTING:
-                        self._transition_locked(LifecycleState.FAILED)
+                        self._transition_locked(self._reset_failure_state())
                     self._admission_open = False
                     self._record_failure_locked(failure)
                 raise failure from exc
@@ -1078,7 +1179,7 @@ class ModelRuntimeHandle:
                         scope=RecoveryScope.RUNTIME,
                         action=RecoveryAction.RELOAD,
                         recoverable=self._reloadable,
-                        details={"runtime_id": self.runtime_id},
+                        details={"runtime_id": self.runtime_id, "close_pending": True},
                     )
                     self._close_error = failure
                     # Keep CLOSING so a later close can retry the drain.
@@ -1092,6 +1193,21 @@ class ModelRuntimeHandle:
                     errors.append(exc)
             entries_to_release = self._loaded_entries or (self._entries if release_unloaded else ())
             errors.extend(self._release_entries(tuple(reversed(entries_to_release))))
+            if any(getattr(error, "close_pending", False) for error in errors):
+                failure = self._failure_factory.create(
+                    "close_drain_failed",
+                    f"runtime {self.runtime_id!r} retains resources pending close drain",
+                    evidence=OutcomeEvidence.started("reset", outcome_known=False, state_mutated=False),
+                    details={
+                        "runtime_id": self.runtime_id,
+                        "close_pending": True,
+                        "errors": tuple(str(error) for error in errors),
+                    },
+                )
+                with self._condition:
+                    self._loaded_entries = entries_to_release
+                    self._close_error = failure
+                raise failure
             if self._admission is not None:
                 with suppress(BaseException):
                     self._admission.close()
@@ -1142,6 +1258,11 @@ class ModelRuntimeHandle:
                     _call_close(entry.resource)
             except BaseException as exc:
                 errors.append(exc)
+                if getattr(exc, "close_pending", False):
+                    with self._condition:
+                        self._released_ids.discard(resource_id)
+                    # Earlier acquisitions may provide buffers or leases to this resource.
+                    break
         return tuple(errors)
 
     def _health_snapshot(self) -> RuntimeHealth:

@@ -56,7 +56,20 @@ def test_policy_bootstrap_is_explicit_and_does_not_mutate_module_registries() ->
     try:
         assert dependencies.registry_set.frozen
         assert len(dependencies.registry_set.session_builder_registry.keys) == 11
-        assert len(dependencies.registry_set.runtime_assembler_registry.runtime_keys) == 11
+        keys = dependencies.registry_set.runtime_assembler_registry.runtime_keys
+        assert len(keys) == 15
+        for model_type, backend in (("pi05", "ascend"), ("pi05", "hmm"), ("smolvla", "hmm"), ("smolvla", "rknn")):
+            assert any(
+                key.model_type == model_type
+                and key.backend == backend
+                and key.execution_contract == "request-iterative"
+                and key.orchestration_visibility == "executor"
+                for key in keys
+            )
+            assert any(
+                key.model_type == model_type and key.backend == backend and key.execution_contract == "request-direct"
+                for key in keys
+            )
     finally:
         dependencies.providers.close()
 

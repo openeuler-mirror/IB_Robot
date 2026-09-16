@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterable, Mapping
+from contextlib import nullcontext
 from datetime import datetime
 from types import MappingProxyType
 
@@ -14,7 +15,7 @@ from inference_service.pipeline.types import PipelineDiagnostics, PipelineResult
 
 
 class InferencePipelineManager:
-    def __init__(self, pipelines: Iterable[InferencePipeline] = ()) -> None:
+    def __init__(self, pipelines: Iterable[InferencePipeline] = (), *, retry_pending_close: bool = False) -> None:
         owned: dict[str, InferencePipeline] = {}
         for pipeline in pipelines:
             if pipeline.pipeline_id in owned:
@@ -26,6 +27,8 @@ class InferencePipelineManager:
             owned[pipeline.pipeline_id] = pipeline
         self._pipelines = owned
         self._lock = threading.RLock()
+        self._cleanup_lock = threading.RLock() if retry_pending_close else None
+        self._unreleased_pipelines = set(owned) if retry_pending_close else None
         self._started = False
         self._starting = False
         self._closed = False
@@ -88,6 +91,14 @@ class InferencePipelineManager:
             capture_raw_action=capture_raw_action,
         )
 
+    def submit_frame(self, pipeline_id: str, request: object, *, deadline: datetime | None = None):
+        self._require_started()
+        pipeline = self._pipeline(pipeline_id)
+        submit = getattr(pipeline, "submit_frame", None)
+        if not callable(submit):
+            return None
+        return submit(request, deadline=deadline)
+
     def reset(self, pipeline_id: str, deadline: datetime | None = None) -> None:
         self._require_started()
         self._pipeline(pipeline_id).reset(deadline)
@@ -99,6 +110,10 @@ class InferencePipelineManager:
     def capabilities(self, pipeline_id: str) -> BackendCapabilities:
         self._require_started()
         return self._pipeline(pipeline_id).capabilities
+
+    def supports_priority_zero_deadline_admission(self, pipeline_id: str) -> bool:
+        self._require_started()
+        return self._pipeline(pipeline_id).supports_priority_zero_deadline_admission
 
     def runtime_handle(self, pipeline_id: str):
         """Return the migrated unified handle, if this pipeline has one."""
@@ -122,7 +137,7 @@ class InferencePipelineManager:
             self._pipeline(pipeline_id).close()
             return
         with self._lock:
-            if self._closed:
+            if self._closed and self._unreleased_pipelines is None:
                 return
             self._closed = True
             self._started = False
@@ -155,9 +170,16 @@ class InferencePipelineManager:
 
     def _close_owned_pipelines(self) -> tuple[Exception, ...]:
         errors: list[Exception] = []
-        for pipeline in reversed(tuple(self._pipelines.values())):
-            try:
-                pipeline.close()
-            except Exception as exc:
-                errors.append(exc)
+        with self._cleanup_lock or nullcontext():
+            for pipeline in reversed(tuple(self._pipelines.values())):
+                if self._unreleased_pipelines is not None and pipeline.pipeline_id not in self._unreleased_pipelines:
+                    continue
+                try:
+                    pipeline.close()
+                except Exception as exc:
+                    errors.append(exc)
+                    if getattr(exc, "close_pending", False):
+                        continue
+                if self._unreleased_pipelines is not None:
+                    self._unreleased_pipelines.discard(pipeline.pipeline_id)
         return tuple(errors)

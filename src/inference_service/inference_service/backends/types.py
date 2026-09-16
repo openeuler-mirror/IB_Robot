@@ -92,6 +92,8 @@ class BackendCapabilities:
     # None means the backend is single-priority and accepts only generic 0.
     # Multi-priority backends own validation and generic-to-native mapping.
     priority_mapping: BackendPriorityMapping | None = None
+    # Loaded backend can asynchronously execute roles with request-owned IO.
+    supports_isolated_stage_execution: bool = False
 
     def __post_init__(self) -> None:
         if self.max_in_flight_per_instance < 1:

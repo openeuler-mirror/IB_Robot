@@ -10,6 +10,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,10 +28,10 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import (
-    CloseInferenceSession,
+    ClosePipelineBinding,
     DispatchInfer,
-    OpenInferenceSession,
-    ScheduledDispatchInfer,
+    DispatchPipelineBinding,
+    OpenPipelineBinding,
 )
 from ibrobot_msgs.msg import (
     DistributedInferenceRequest,
@@ -43,7 +44,12 @@ from ibrobot_msgs.msg import (
     VideoStreamDescriptor,
     VideoStreamStatus,
 )
-from inference_manifest import ValidatedManifest, load_inference_manifest, load_inference_manifest_metadata
+from inference_manifest import (
+    ValidatedManifest,
+    is_image_semantic,
+    load_inference_manifest,
+    load_inference_manifest_metadata,
+)
 from inference_service.backends import InferenceRequest
 from inference_service.device_video_streams import DeviceVideoStreamManager
 from inference_service.distributed import (
@@ -67,7 +73,11 @@ from inference_service.distributed.ros_protocol import (
     video_status_from_message,
     video_status_to_message,
 )
-from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
+from inference_service.pipeline import (
+    InferencePipelineManager,
+    VisualFrameSupersededError,
+    create_pipeline_manager,
+)
 from inference_service.runtime_composition import (
     build_policy_runtime_dependencies,
     require_runtime_dependencies,
@@ -86,7 +96,6 @@ from inference_service.scheduler.ledger import (
     IdempotencyLedger,
     LedgerAction,
     LedgerError,
-    close_key,
     dispatch_key,
     open_key,
 )
@@ -157,6 +166,9 @@ class PipelineNodeConfig:
     terminal_result_cache_entries: int = 1
     max_duplicate_waiters_per_request: int = 1
     terminal_session_retention_ns: int = 1
+    pipeline_stage_policy: str = "sequential"
+    pipeline_scheduling_json: str = ""
+    max_supported_public_priority: int = 7
 
     @property
     def scheduler_enabled(self) -> bool:
@@ -402,6 +414,13 @@ class PipelinePolicyNode(Node):
         self._last_inference_time: float | None = None
         self._inference_count = 0
         self._last_error = ""
+        if config.scheduler_enabled and config.pipeline_stage_policy == "independent":
+            self._frame_trigger_future = None
+            self._frame_trigger_lock = threading.RLock()
+            self._pending_visual_sample_time_ns: int | None = None
+            self._visual_trigger_epoch = 0
+            self._visual_trigger_enabled = True
+            self._frame_trigger_priority = 0
         self._remote_state = "unavailable"
         self._distributed_started_monotonic = time.monotonic()
         self._last_cloud_status_received_monotonic: float | None = None
@@ -444,6 +463,13 @@ class PipelinePolicyNode(Node):
         if not isinstance(runtime_options, dict):
             raise RuntimeError(f"pipeline {config.pipeline_id!r} runtime_options_json must decode to an object")
         if config.execution_mode == "monolithic":
+            try:
+                scheduling = json.loads(config.pipeline_scheduling_json or "{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"pipeline scheduling JSON is invalid: {exc}") from exc
+            stage_scheduling = scheduling.get("stages", {}) if isinstance(scheduling, dict) else {}
+            if config.scheduler_enabled and config.pipeline_stage_policy == "independent":
+                self._frame_trigger_priority = int(scheduling.get("frame_base_priority", 0))
             self._manager = create_pipeline_manager(
                 config.pipeline_id,
                 self._manifest,
@@ -451,6 +477,9 @@ class PipelinePolicyNode(Node):
                 default_task=config.default_task or None,
                 runtime_options=runtime_options,
                 priority_scheduling=config.scheduler_enabled,
+                stage_policy=config.pipeline_stage_policy,
+                stage_scheduling=stage_scheduling,
+                frame_base_priority=int(scheduling.get("frame_base_priority", 0)),
                 registry_set=self._registry_set,
                 providers=self._providers,
             )
@@ -632,6 +661,22 @@ class PipelinePolicyNode(Node):
                 "control_modes.<mode>.inference.pipelines.<id>.runtime_options in the robot "
                 "configuration instead of overriding the runtime_options_json parameter"
             )
+        try:
+            scheduling = json.loads(self._config.pipeline_scheduling_json or "{}")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"pipeline scheduling JSON is invalid: {exc}") from exc
+        if not isinstance(scheduling, dict):
+            raise RuntimeError("pipeline scheduling JSON must decode to an object")
+        actual_scheduling = {
+            "stage_policy": self._config.pipeline_stage_policy,
+            "frame_base_priority": scheduling.get("frame_base_priority", 0),
+            "stages": scheduling.get("stages", {}),
+        }
+        if (
+            policy.get("scheduling") != actual_scheduling
+            or scheduling.get("stage_policy", self._config.pipeline_stage_policy) != self._config.pipeline_stage_policy
+        ):
+            raise RuntimeError("scheduled runtime policy scheduling mismatch")
 
     def _load_contract(self, robot_config_path: str) -> None:
         config_path = Path(robot_config_path)
@@ -778,6 +823,182 @@ class PipelinePolicyNode(Node):
             except Exception as exc:
                 self._last_error = f"video stream {spec.key} failed: {exc}"
                 self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
+        if stored and PipelinePolicyNode._should_trigger_visual(self, spec):
+            PipelinePolicyNode._request_visual_frame(self, int(timestamp or receive_time))
+
+    def _should_trigger_visual(self, spec: SpecView) -> bool:
+        config = getattr(self, "_config", None)
+        return bool(
+            config is not None
+            and getattr(config, "scheduler_enabled", False)
+            and config.pipeline_stage_policy == "independent"
+            and is_image_semantic(spec.key)
+            and PipelinePolicyNode._visual_admission_allowed(self)
+        )
+
+    def _visual_admission_allowed(self) -> bool:
+        """Return whether a frame-arrival Visual request belongs to the active binding."""
+
+        config = getattr(self, "_config", None)
+        if config is None or not getattr(config, "scheduler_enabled", False):
+            return False
+        if getattr(config, "pipeline_stage_policy", "sequential") != "independent":
+            return False
+        if not getattr(self, "_visual_trigger_enabled", True):
+            return False
+        reset_pending = getattr(self, "_reset_pending", None)
+        if reset_pending is not None and reset_pending.is_set():
+            return False
+        identity = getattr(self, "_scheduled_binding_identity", None)
+        if not identity or not identity[0]:
+            return False
+        controller = getattr(self, "_session_controller", None)
+        if controller is None:
+            return False
+        try:
+            from inference_service.scheduler.session_controller import ServingState
+
+            snapshot = controller.snapshot()
+        except (AttributeError, ImportError, TypeError):
+            return False
+        return bool(
+            snapshot.state == ServingState.ACTIVE
+            and snapshot.product_session_id == identity[0]
+            and snapshot.product_session_generation == int(identity[5])
+        )
+
+    def _request_visual_frame(self, sample_time_ns: int) -> None:
+        """Remember the newest frame and start the producer only when idle."""
+
+        with self._frame_trigger_lock:
+            if not PipelinePolicyNode._visual_admission_allowed(self):
+                return
+            pending = self._pending_visual_sample_time_ns
+            self._pending_visual_sample_time_ns = sample_time_ns if pending is None else max(pending, sample_time_ns)
+            if self._frame_trigger_future is not None:
+                return
+        self._start_next_visual_frame()
+
+    def _start_next_visual_frame(self) -> None:
+        manager = getattr(self, "_manager", None)
+        if manager is None:
+            return
+        with self._frame_trigger_lock:
+            if not PipelinePolicyNode._visual_admission_allowed(self):
+                return
+            previous = self._frame_trigger_future
+            if previous is not None:
+                return
+            sample_time_ns = self._pending_visual_sample_time_ns
+            self._pending_visual_sample_time_ns = None
+            trigger_epoch = getattr(self, "_visual_trigger_epoch", 0)
+            if sample_time_ns is None:
+                return
+            binding_identity = self._scheduled_binding_identity
+            # Reserve sampling as well as submission; other camera callbacks
+            # only update the pending timestamp until this attempt settles.
+            preparing = Future()
+            self._frame_trigger_future = preparing
+        future = None
+        try:
+            observations = self._sample_observations(sample_time_ns)
+            if "observation.state" in observations:
+                observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
+            session_id = binding_identity[0]
+            session_generation = int(binding_identity[1])
+            request = InferenceRequest(
+                request_id=f"visual-{trigger_epoch}-{sample_time_ns}",
+                inputs=self._to_policy_inputs(observations),
+                prompt=self._config.default_task or None,
+                priority=self._frame_trigger_priority,
+                metadata={
+                    "trigger": "frame_arrival",
+                    **self._observation_time_metadata(sample_time_ns),
+                    "visual_trigger_epoch": trigger_epoch,
+                    "product_session_id": session_id,
+                    "product_session_generation": session_generation,
+                },
+            )
+            with self._frame_trigger_lock:
+                if (
+                    trigger_epoch != self._visual_trigger_epoch
+                    or binding_identity != self._scheduled_binding_identity
+                    or not PipelinePolicyNode._visual_admission_allowed(self)
+                ):
+                    return
+                # Reset takes the same lock before draining the manager, so
+                # this request is either fenced out or owned by that drain.
+                future = manager.submit_frame(self._config.pipeline_id, request)
+                if future is None:
+                    raise RuntimeError("independent staged pipeline did not return a Visual future")
+                self._frame_trigger_future = future
+        except Exception as exc:
+            with self._frame_trigger_lock:
+                if trigger_epoch == self._visual_trigger_epoch:
+                    self._last_error = f"visual latest-frame producer failed: {exc}"
+                    self.get_logger().debug(self._last_error, throttle_duration_sec=1.0)
+        finally:
+            with self._frame_trigger_lock:
+                if self._frame_trigger_future is preparing:
+                    self._frame_trigger_future = None
+        if future is not None:
+            future.add_done_callback(
+                lambda completed, epoch=trigger_epoch: self._visual_frame_completed(completed, epoch)
+            )
+        elif PipelinePolicyNode._visual_admission_allowed(self):
+            self._start_next_visual_frame()
+
+    def _invalidate_visual_trigger(self) -> bool:
+        lock = getattr(self, "_frame_trigger_lock", None)
+        if lock is None:
+            return False
+        with lock:
+            self._visual_trigger_epoch += 1
+            self._visual_trigger_enabled = False
+            self._pending_visual_sample_time_ns = None
+            self._frame_trigger_future = None
+        return True
+
+    def _visual_frame_completed(self, future: object, trigger_epoch: int | None = None) -> None:
+        if trigger_epoch is None:
+            trigger_epoch = getattr(self, "_visual_trigger_epoch", 0)
+        with self._frame_trigger_lock:
+            if trigger_epoch != self._visual_trigger_epoch:
+                return
+        try:
+            future.result()
+        except Exception as exc:
+            # The unified handle wraps the producer error in an ExecutionFailure
+            # carrying the original as ``cause``; both spellings are coalescing.
+            superseded = isinstance(exc, VisualFrameSupersededError) or isinstance(
+                getattr(exc, "cause", None), VisualFrameSupersededError
+            )
+            with self._frame_trigger_lock:
+                if trigger_epoch != self._visual_trigger_epoch:
+                    return
+                if superseded:
+                    # A superseded frame is normal coalescing, not a failure.
+                    self.get_logger().debug("visual frame superseded by a newer frame", throttle_duration_sec=1.0)
+                else:
+                    self._last_error = f"visual stage failed: {exc}"
+                    self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
+                    evidence = getattr(exc, "evidence", None)
+                    if not bool(getattr(evidence, "outcome_known", getattr(exc, "outcome_known", True))):
+                        controller = getattr(self, "_session_controller", None)
+                        if controller is not None:
+                            with contextlib.suppress(Exception):
+                                controller.mark_failed_quarantine()
+                            with contextlib.suppress(Exception):
+                                self._publish_serving_status()
+        finally:
+            with self._frame_trigger_lock:
+                if self._frame_trigger_future is future:
+                    self._frame_trigger_future = None
+                restart = trigger_epoch == getattr(self, "_visual_trigger_epoch", 0)
+            # The completed VLM producer pulls the newest frame accumulated
+            # while it was running. Intermediate camera frames are coalesced.
+            if restart and PipelinePolicyNode._visual_admission_allowed(self):
+                self._start_next_visual_frame()
 
     def _store_observation(
         self,
@@ -1162,6 +1383,15 @@ class PipelinePolicyNode(Node):
         update = self._require_edge_session().fail(error)
         self._complete_invalidated(update.invalidated_request_ids, update.error)
 
+    def _observation_time_metadata(self, sample_time_ns: int) -> dict[str, int]:
+        """Anchor capture age in monotonic time without mixing ROS and UTC clocks."""
+        now_mono_ns = time.monotonic_ns()
+        age_ns = max(0, self.get_clock().now().nanoseconds - sample_time_ns)
+        return {
+            "observation_timestamp_ns": sample_time_ns,
+            "observation_monotonic_ns": now_mono_ns - age_ns,
+        }
+
     def _execute_inference_request(
         self,
         goal_handle: object,
@@ -1292,11 +1522,15 @@ class PipelinePolicyNode(Node):
         return PipelinePolicyNode._reset_with_deadline(self, response, deadline)
 
     def _reset_with_deadline(self, response: Trigger.Response, deadline: datetime) -> Trigger.Response:
+        visual_invalidated = PipelinePolicyNode._invalidate_visual_trigger(self)
         self._reset_pending.set()
         acquired = self._operation_lock.acquire(
             timeout=max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
         )
         if not acquired:
+            if visual_invalidated:
+                with self._frame_trigger_lock:
+                    self._visual_trigger_enabled = True
             self._reset_pending.clear()
             response.success = False
             response.message = f"pipeline {self._config.pipeline_id!r} reset timed out waiting for active operation"
@@ -1352,6 +1586,9 @@ class PipelinePolicyNode(Node):
                 self._last_error = ""
             return response
         finally:
+            if visual_invalidated:
+                with self._frame_trigger_lock:
+                    self._visual_trigger_enabled = True
             self._reset_pending.clear()
             self._operation_lock.release()
 
@@ -1524,6 +1761,7 @@ class PipelinePolicyNode(Node):
             now_ns=time.monotonic_ns,
         )
         self._session_controller.mark_ready()
+        self._scheduled_binding_identity = None
         self._pipeline_ledger = IdempotencyLedger(
             max_session_records=self._config.max_session_records,
             max_duplicate_waiters_per_request=self._config.max_duplicate_waiters_per_request,
@@ -1553,7 +1791,7 @@ class PipelinePolicyNode(Node):
         )
         self._scheduled_open_server = rclpy.action.ActionServer(
             self,
-            OpenInferenceSession,
+            OpenPipelineBinding,
             self._config.scheduled_open_session,
             execute_callback=lambda goal_handle: self._scheduled_lifecycle_goal_slots.run(
                 "open", self._scheduled_open_callback, goal_handle
@@ -1567,7 +1805,7 @@ class PipelinePolicyNode(Node):
         )
         self._scheduled_dispatch_server = rclpy.action.ActionServer(
             self,
-            ScheduledDispatchInfer,
+            DispatchPipelineBinding,
             self._config.scheduled_dispatch,
             execute_callback=lambda goal_handle: self._scheduled_dispatch_goal_slots.run(
                 "dispatch", self._scheduled_dispatch_callback, goal_handle
@@ -1582,7 +1820,7 @@ class PipelinePolicyNode(Node):
         )
         self._scheduled_close_server = rclpy.action.ActionServer(
             self,
-            CloseInferenceSession,
+            ClosePipelineBinding,
             self._config.scheduled_close_session,
             execute_callback=lambda goal_handle: self._scheduled_lifecycle_goal_slots.run(
                 "close", self._scheduled_close_callback, goal_handle
@@ -1623,6 +1861,12 @@ class PipelinePolicyNode(Node):
         runtime_resource_id = self._runtime_hardware_resource_id()
         msg.runtime_hardware_resource_id = runtime_resource_id
         msg.hardware_priority_levels = self._runtime_hardware_priority_levels()
+        msg.scheduling_capability_schema_version = 1
+        msg.stage_policy = self._config.pipeline_stage_policy.upper()
+        msg.max_supported_public_priority = self._config.max_supported_public_priority
+        msg.supports_priority_zero_deadline_admission = (
+            self._require_manager().supports_priority_zero_deadline_admission(self._config.pipeline_id)
+        )
         from inference_service.scheduler.session_controller import ServingState
         from inference_service.scheduler.work_classes import WorkClass, work_class_name
 
@@ -1657,30 +1901,39 @@ class PipelinePolicyNode(Node):
         mapping = self._require_manager().capabilities(self._config.pipeline_id).priority_mapping
         return mapping.generic_level_count if mapping is not None else 1
 
-    def _scheduled_open_callback(self, goal_handle) -> OpenInferenceSession.Result:
+    def _scheduled_open_callback(self, goal_handle) -> OpenPipelineBinding.Result:
         goal = goal_handle.request
         return self._execute_pipeline_idempotent(
             goal_handle=goal_handle,
             action=LedgerAction.OPEN,
             key=open_key(goal.session_id),
-            payload={"deadline": goal.deadline},
+            payload={
+                "logical_generation": goal.logical_generation,
+                "binding_id": goal.binding_id,
+                "binding_incarnation": goal.binding_incarnation,
+                "operation_id": goal.operation_id,
+                "expected_boot_id": goal.expected_boot_id,
+            },
             deadline=goal.deadline,
             execute=self._scheduled_open_once,
         )
 
-    def _scheduled_dispatch_callback(self, goal_handle) -> ScheduledDispatchInfer.Result:
+    def _scheduled_dispatch_callback(self, goal_handle) -> DispatchPipelineBinding.Result:
         goal = goal_handle.request
         return self._execute_pipeline_idempotent(
             goal_handle=goal_handle,
             action=LedgerAction.DISPATCH,
-            key=dispatch_key(goal.session_id, goal.session_generation, goal.request_id),
+            key=dispatch_key(goal.session_id, goal.logical_generation, goal.request_id),
             payload={
-                "session_generation": goal.session_generation,
+                "logical_generation": goal.logical_generation,
                 "obs_timestamp": goal.obs_timestamp,
                 "prompt": goal.prompt,
                 "priority": goal.priority,
-                "target_pipeline_id": goal.target_pipeline_id,
-                "fallback_chain": list(goal.fallback_chain),
+                "binding_id": goal.binding_id,
+                "binding_incarnation": goal.binding_incarnation,
+                "operation_id": goal.operation_id,
+                "expected_boot_id": goal.expected_boot_id,
+                "expected_pipeline_generation": goal.expected_pipeline_generation,
                 "deadline": goal.deadline,
             },
             deadline=goal.deadline,
@@ -1688,13 +1941,20 @@ class PipelinePolicyNode(Node):
             request_id=goal.request_id,
         )
 
-    def _scheduled_close_callback(self, goal_handle) -> CloseInferenceSession.Result:
+    def _scheduled_close_callback(self, goal_handle) -> ClosePipelineBinding.Result:
         goal = goal_handle.request
         return self._execute_pipeline_idempotent(
             goal_handle=goal_handle,
             action=LedgerAction.CLOSE,
-            key=close_key(goal.session_id, goal.session_generation),
-            payload={"session_generation": goal.session_generation},
+            key=("close", goal.session_id, goal.operation_id),
+            payload={
+                "logical_generation": goal.logical_generation,
+                "binding_id": goal.binding_id,
+                "binding_incarnation": goal.binding_incarnation,
+                "operation_id": goal.operation_id,
+                "expected_boot_id": goal.expected_boot_id,
+                "expected_pipeline_generation": goal.expected_pipeline_generation,
+            },
             deadline=goal.deadline,
             execute=self._scheduled_close_once,
         )
@@ -1718,6 +1978,8 @@ class PipelinePolicyNode(Node):
             )
         try:
             validate_uuid4(goal.session_id, field="session_id")
+            if action is LedgerAction.CLOSE:
+                validate_uuid4(goal.operation_id, field="operation_id")
             if request_id:
                 validate_uuid4(request_id, field="request_id")
             original_deadline_ns = int(deadline.sec) * 1_000_000_000 + int(deadline.nanosec)
@@ -1758,17 +2020,33 @@ class PipelinePolicyNode(Node):
         self, goal_handle, action, goal, request_id: str, code: str, message: str, outcome: int
     ):
         if action is LedgerAction.OPEN:
-            result = OpenInferenceSession.Result()
+            result = OpenPipelineBinding.Result()
             result.session_id = goal.session_id
+            result.logical_generation = getattr(goal, "logical_generation", 0)
+            result.binding_id = getattr(goal, "binding_id", "")
+            result.binding_incarnation = getattr(goal, "binding_incarnation", 0)
+            result.operation_id = getattr(goal, "operation_id", "")
+            result.boot_id = getattr(self, "_boot_id", "")
+            result.pipeline_id = self._config.pipeline_id
         elif action is LedgerAction.DISPATCH:
-            result = ScheduledDispatchInfer.Result()
+            result = DispatchPipelineBinding.Result()
             result.request_id = request_id
             result.session_id = goal.session_id
-            result.session_generation = goal.session_generation
+            result.logical_generation = goal.logical_generation
+            result.binding_id = getattr(goal, "binding_id", "")
+            result.binding_incarnation = getattr(goal, "binding_incarnation", 0)
+            result.operation_id = getattr(goal, "operation_id", "")
+            result.boot_id = getattr(self, "_boot_id", "")
             result.pipeline_id = self._config.pipeline_id
+            result.pipeline_generation = getattr(goal, "expected_pipeline_generation", 0)
         else:
-            result = CloseInferenceSession.Result()
+            result = ClosePipelineBinding.Result()
             result.session_id = goal.session_id
+            result.logical_generation = getattr(goal, "logical_generation", 0)
+            result.binding_id = getattr(goal, "binding_id", "")
+            result.binding_incarnation = getattr(goal, "binding_incarnation", 0)
+            result.operation_id = getattr(goal, "operation_id", "")
+            result.boot_id = getattr(self, "_boot_id", "")
             result.pipeline_id = self._config.pipeline_id
         result.outcome.value = outcome
         self._set_scheduled_error(
@@ -1781,16 +2059,28 @@ class PipelinePolicyNode(Node):
         goal_handle.abort()
         return result
 
-    def _scheduled_open_once(self, goal_handle) -> OpenInferenceSession.Result:
+    def _scheduled_open_once(self, goal_handle) -> OpenPipelineBinding.Result:
         """Perform atomic session admission and the reset barrier."""
         goal = goal_handle.request
-        result = OpenInferenceSession.Result()
+        result = OpenPipelineBinding.Result()
         result.session_id = goal.session_id
+        logical_generation = getattr(goal, "logical_generation", getattr(goal, "session_generation", 0))
+        result.logical_generation = logical_generation
+        result.binding_id = getattr(goal, "binding_id", "")
+        result.binding_incarnation = getattr(goal, "binding_incarnation", 0)
+        result.operation_id = getattr(goal, "operation_id", "")
+        result.boot_id = getattr(self, "_boot_id", "")
         ctrl = self._session_controller
         if ctrl is None:
             goal_handle.abort()
             result.outcome.value = InferenceOutcome.NOT_STARTED
             self._set_scheduled_error(result.error, code="session_not_configured", stage="open")
+            return result
+        identity_error = self._validate_scheduled_binding_goal(goal, allow_unopened=True)
+        if identity_error:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=identity_error, stage="binding")
             return result
         deadline = self._scheduled_deadline(goal.deadline)
         try:
@@ -1815,7 +2105,17 @@ class PipelinePolicyNode(Node):
             result.outcome.value = InferenceOutcome.NOT_STARTED
             self._set_scheduled_error(result.error, code=open_res.code, recoverable=True, stage="open")
             return result
-        result.session_generation = open_res.fence_generation
+        result.pipeline_generation = open_res.fence_generation
+        # Persist the accepted binding before reset starts. A failed or late
+        # Open still requires an identity-fenced generation-0 cleanup.
+        self._scheduled_binding_identity = (
+            goal.session_id,
+            logical_generation,
+            goal.binding_id,
+            int(goal.binding_incarnation),
+            goal.expected_boot_id,
+            int(result.pipeline_generation),
+        )
         # Run the whole-graph reset barrier.
         try:
             reset_response = self._reset_with_deadline(Trigger.Response(), deadline)
@@ -1824,8 +2124,7 @@ class PipelinePolicyNode(Node):
             ctrl.finish_open(success=True)
             self._publish_serving_status()
             result.success = True
-            result.actual_pipeline_id = self._config.pipeline_id
-            result.session_generation = open_res.fence_generation
+            result.pipeline_id = self._config.pipeline_id
             result.deployment_fingerprint = self._manifest.fingerprint
             result.runtime_policy_fingerprint = self._config.runtime_policy_fingerprint
             snapshot = ctrl.snapshot()
@@ -1849,16 +2148,22 @@ class PipelinePolicyNode(Node):
             goal_handle.abort()
         return result
 
-    def _scheduled_dispatch_once(self, goal_handle) -> ScheduledDispatchInfer.Result:
+    def _scheduled_dispatch_once(self, goal_handle) -> DispatchPipelineBinding.Result:
         """Dispatch scheduled inference within an active session."""
         goal = goal_handle.request
         operation_acquired = False
         side_effect_started = False
-        result = ScheduledDispatchInfer.Result()
+        result = DispatchPipelineBinding.Result()
         result.request_id = goal.request_id
         result.session_id = goal.session_id
-        result.session_generation = goal.session_generation
+        logical_generation = getattr(goal, "logical_generation", getattr(goal, "session_generation", 0))
+        result.logical_generation = logical_generation
+        result.binding_id = getattr(goal, "binding_id", "")
+        result.binding_incarnation = getattr(goal, "binding_incarnation", 0)
+        result.operation_id = getattr(goal, "operation_id", "")
+        result.boot_id = getattr(self, "_boot_id", "")
         result.pipeline_id = self._config.pipeline_id
+        result.pipeline_generation = getattr(goal, "expected_pipeline_generation", 0)
         result.deployment_fingerprint = self._manifest.fingerprint
         result.runtime_policy_fingerprint = self._config.runtime_policy_fingerprint
         ctrl = self._session_controller
@@ -1866,6 +2171,12 @@ class PipelinePolicyNode(Node):
             goal_handle.abort()
             result.outcome.value = InferenceOutcome.NOT_STARTED
             self._set_scheduled_error(result.error, code="session_not_configured", stage="dispatch")
+            return result
+        identity_error = self._validate_scheduled_binding_goal(goal)
+        if identity_error:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=identity_error, stage="binding")
             return result
         from inference_service.scheduler.work_classes import WorkClass
 
@@ -1884,16 +2195,6 @@ class PipelinePolicyNode(Node):
                 result.error,
                 code="prompt_too_large",
                 message=f"prompt exceeds max_prompt_bytes={self._config.max_prompt_bytes}",
-                recoverable=True,
-                stage="admission",
-            )
-            return result
-        if goal.target_pipeline_id not in ("", self._config.pipeline_id) or goal.fallback_chain:
-            goal_handle.abort()
-            result.outcome.value = InferenceOutcome.NOT_STARTED
-            self._set_scheduled_error(
-                result.error,
-                code="invalid_pipeline_scoped_dispatch",
                 recoverable=True,
                 stage="admission",
             )
@@ -1927,7 +2228,7 @@ class PipelinePolicyNode(Node):
             return result
         admission = ctrl.admit(
             WorkClass.ACTION_GENERATION,
-            generation=goal.session_generation,
+            generation=int(goal.expected_pipeline_generation),
             session_id=goal.session_id,
         )
         if not admission.accepted:
@@ -1965,7 +2266,8 @@ class PipelinePolicyNode(Node):
                 priority=goal.priority,
                 metadata={
                     "product_session_id": goal.session_id,
-                    "product_session_generation": goal.session_generation,
+                    "product_session_generation": logical_generation,
+                    **self._observation_time_metadata(sample_time),
                 },
             )
             backend_result = self._require_manager().infer(
@@ -1982,7 +2284,7 @@ class PipelinePolicyNode(Node):
                     f"scheduled dispatch {goal.request_id!r} was canceled before publication",
                     operation_started=side_effect_started,
                 )
-            if ctrl.is_stale_generation(goal.session_generation):
+            if ctrl.is_stale_generation(int(goal.expected_pipeline_generation)):
                 raise RuntimeError("dispatch completion crossed a session generation fence")
             action = self._lerobot_to_rad(raw_action)
             result.action_chunk = TensorMsgConverter.to_variant({"action": action})
@@ -2032,17 +2334,46 @@ class PipelinePolicyNode(Node):
             ctrl.release_in_flight(WorkClass.ACTION_GENERATION)
         return result
 
-    def _scheduled_close_once(self, goal_handle) -> CloseInferenceSession.Result:
+    def _scheduled_close_once(self, goal_handle) -> ClosePipelineBinding.Result:
         """Close the session through the drain barrier."""
         goal = goal_handle.request
-        result = CloseInferenceSession.Result()
+        result = ClosePipelineBinding.Result()
         result.session_id = goal.session_id
         result.pipeline_id = self._config.pipeline_id
+        result.logical_generation = goal.logical_generation
+        result.binding_id = goal.binding_id
+        result.binding_incarnation = goal.binding_incarnation
+        result.operation_id = goal.operation_id
+        result.boot_id = getattr(self, "_boot_id", "")
         ctrl = self._session_controller
+        # A lost successful Close reply may be retried with a new operation id.
+        # Retain only the last drained binding, never run reset again for it.
+        closed = getattr(self, "_scheduled_closed_binding", None)
+        if closed is not None:
+            identity, drained_generation = closed
+            if (
+                (goal.session_id, goal.binding_id, goal.binding_incarnation, goal.expected_boot_id)
+                == (identity[0], identity[2], identity[3], identity[4])
+                and goal.logical_generation in (0, identity[1])
+                and goal.expected_pipeline_generation in (0, identity[5])
+                and goal.expected_boot_id == result.boot_id
+            ):
+                result.closed_pipeline_generation = identity[5]
+                result.drained_generation = drained_generation
+                result.success = True
+                result.outcome.value = InferenceOutcome.COMPLETED
+                goal_handle.succeed()
+                return result
         if ctrl is None:
             goal_handle.abort()
             result.outcome.value = InferenceOutcome.NOT_STARTED
             self._set_scheduled_error(result.error, code="session_not_configured", stage="close")
+            return result
+        identity_error = self._validate_scheduled_binding_goal(goal)
+        if identity_error:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=identity_error, stage="binding")
             return result
         deadline = self._scheduled_deadline(goal.deadline)
         try:
@@ -2058,11 +2389,11 @@ class PipelinePolicyNode(Node):
             result.outcome.value = InferenceOutcome.NOT_STARTED
             self._set_scheduled_error(result.error, code="session_mismatch", recoverable=True, stage="close")
             return result
-        close_res = ctrl.begin_close(generation=goal.session_generation)
+        close_res = ctrl.begin_close(generation=goal.expected_pipeline_generation)
         if not close_res.accepted and close_res.code == "cleanup_not_needed":
             goal_handle.succeed()
             result.success = True
-            result.closed_session_generation = 0
+            result.closed_pipeline_generation = 0
             result.drained_generation = 0
             result.outcome.value = InferenceOutcome.COMPLETED
             return result
@@ -2072,7 +2403,7 @@ class PipelinePolicyNode(Node):
             result.outcome.value = InferenceOutcome.NOT_STARTED
             self._set_scheduled_error(result.error, code=close_res.code, recoverable=True, stage="close")
             return result
-        result.closed_session_generation = close_res.closed_generation
+        result.closed_pipeline_generation = close_res.closed_generation
         result.drained_generation = close_res.drain_generation
         # Reuse the whole-graph reset path for the Close drain barrier.
         drained_slots = 0
@@ -2082,6 +2413,8 @@ class PipelinePolicyNode(Node):
             if not reset_response.success:
                 raise RuntimeError(reset_response.message)
             ctrl.finish_close(success=True)
+            self._scheduled_closed_binding = (self._scheduled_binding_identity, result.drained_generation)
+            self._scheduled_binding_identity = None
             self._publish_serving_status()
             result.success = True
             result.outcome.value = InferenceOutcome.COMPLETED
@@ -2097,6 +2430,44 @@ class PipelinePolicyNode(Node):
         finally:
             self._release_scheduled_drain_slots(drained_slots)
         return result
+
+    def _validate_scheduled_binding_goal(self, goal, *, allow_unopened: bool = False) -> str:
+        """Validate the private Global->Pipeline binding identity at the execution boundary."""
+        if not goal.binding_id or int(goal.binding_incarnation) < 1 or not goal.expected_boot_id:
+            return "binding_identity_missing"
+        if goal.expected_boot_id != getattr(self, "_boot_id", ""):
+            return "boot_mismatch"
+        current = getattr(self, "_scheduled_binding_identity", None)
+        if allow_unopened:
+            if current is not None and tuple(current[:5]) != (
+                goal.session_id,
+                int(goal.logical_generation),
+                goal.binding_id,
+                int(goal.binding_incarnation),
+                goal.expected_boot_id,
+            ):
+                return "binding_identity_conflict"
+            return ""
+        if current is None:
+            return "binding_not_open"
+        expected = tuple(current[:5])
+        logical_generation = int(goal.logical_generation)
+        actual = (
+            goal.session_id,
+            int(current[1]) if logical_generation == 0 else logical_generation,
+            goal.binding_id,
+            int(goal.binding_incarnation),
+            goal.expected_boot_id,
+        )
+        if expected != actual:
+            return "binding_identity_mismatch"
+        expected_pipeline_generation = int(current[5])
+        if hasattr(goal, "expected_pipeline_generation") and int(goal.expected_pipeline_generation) not in (
+            0,
+            expected_pipeline_generation,
+        ):
+            return "pipeline_generation_mismatch"
+        return ""
 
     def _acquire_scheduled_drain_slots(self, deadline: datetime) -> int:
         slots = self._scheduled_operation_slots
@@ -2521,6 +2892,7 @@ class PipelinePolicyNode(Node):
         return self._edge_session
 
     def destroy_node(self) -> None:
+        self._invalidate_visual_trigger()
         video_stream_manager = self._video_stream_manager
         self._video_stream_manager = None
         if video_stream_manager is not None:
@@ -2587,9 +2959,20 @@ def _read_config() -> tuple[PipelineNodeConfig, str]:
         "video_status_topic": "/inference/policy/video/status",
         "external_video_producer": False,
     }
+    # Preserve the existing reader's parameter declarations and event order.
+    # Only the newly introduced staged options are conditional.
+    staged_defaults: dict[str, object] = {
+        "pipeline_stage_policy": "sequential",
+        "pipeline_scheduling_json": "",
+        "max_supported_public_priority": 7,
+    }
     for name, default in defaults.items():
         reader.declare_parameter(name, default)
     values = {name: reader.get_parameter(name).value for name in defaults}
+    if values["runtime_policy_json"]:
+        for name, default in staged_defaults.items():
+            reader.declare_parameter(name, default)
+        values.update({name: reader.get_parameter(name).value for name in staged_defaults})
     reader.destroy_node()
     node_name = str(values.pop("node_name"))
     return PipelineNodeConfig(**values), node_name

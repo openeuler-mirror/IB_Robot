@@ -66,6 +66,173 @@ class EchoExecutor(RecordingComponent):
         return {"outputs": {"value": request.inputs.get("value")}}
 
 
+@pytest.mark.parametrize("retry_failed_reset", [False, True])
+def test_reset_failure_retry_requires_explicit_opt_in(retry_failed_reset):
+    executor = EchoExecutor([])
+    executor.fail_reset = True
+    assembly = RuntimeAssembly(runtime_executor=executor, resettable=True)
+    if retry_failed_reset:
+        assembly.retry_failed_reset = True
+    handle = ModelRuntimeHandle(assembly)
+    handle.load()
+    try:
+        with pytest.raises(ExecutionFailure):
+            handle.reset()
+        assert handle.state is (LifecycleState.RESET_REQUIRED if retry_failed_reset else LifecycleState.FAILED)
+        with pytest.raises(ExecutionFailure):
+            handle.execute(ModelRequest({"value": 1}), context())
+        executor.fail_reset = False
+        if retry_failed_reset:
+            handle.reset()
+            assert handle.health.ready
+        else:
+            with pytest.raises(ExecutionFailure):
+                handle.reset()
+    finally:
+        handle.close()
+
+
+def test_reset_completion_runs_inside_admission_barrier():
+    events = []
+    executor = EchoExecutor(events)
+
+    def reset_complete():
+        assert events[-1] == "reset:executor"
+        assert handle.health.state is LifecycleState.RESETTING
+        with pytest.raises(ExecutionFailure):
+            handle.execute(ModelRequest({"value": 1}), context())
+        events.append("reset_complete")
+
+    handle = ModelRuntimeHandle(
+        RuntimeAssembly(
+            runtime_executor=executor,
+            resettable=True,
+            reset_complete=reset_complete,
+        )
+    )
+    handle.load()
+    try:
+        handle.reset()
+        assert handle.health.ready
+        assert events[-1] == "reset_complete"
+    finally:
+        handle.close()
+
+
+def test_failed_load_retains_pending_rollback_resources_for_close_retry():
+    from inference_service.backends.errors import BackendLifecycleError
+
+    events = []
+    provider = RecordingComponent("provider", events)
+    resource = RecordingComponent("device", events)
+    failing = RecordingComponent("failing", events, fail_load=True)
+    original_close = resource.close
+
+    def pending_close():
+        if resource.close_count == 0:
+            resource.close_count += 1
+            raise BackendLifecycleError("drain pending", close_pending=True)
+        original_close()
+
+    resource.close = pending_close
+    handle = ModelRuntimeHandle(
+        RuntimeAssembly(
+            runtime_executor=EchoExecutor(events),
+            owned_components=(provider, resource, failing),
+        )
+    )
+    with pytest.raises(ExecutionFailure, match="failed to load"):
+        handle.load()
+    assert provider.close_count == 0
+    handle.close()
+    handle.close()
+    assert resource.close_count == 2
+    assert provider.close_count == 1
+    assert failing.close_count == 0
+
+
+def test_non_pending_cleanup_error_releases_dependencies_once():
+    from types import SimpleNamespace
+
+    from inference_service.backends.errors import BackendLifecycleError
+    from inference_service.pipeline.errors import PipelineManagerError
+    from inference_service.pipeline.manager import InferencePipelineManager
+
+    events = []
+    executor = EchoExecutor(events)
+    provider = RecordingComponent("provider", events)
+
+    def close():
+        executor.close_count += 1
+        raise BackendLifecycleError("cleanup failed after release")
+
+    executor.close = close
+    handle = ModelRuntimeHandle(RuntimeAssembly(runtime_executor=executor, owned_components=(provider, executor)))
+    pipeline = SimpleNamespace(pipeline_id="policy", load=handle.load, close=handle.close)
+    manager = InferencePipelineManager((pipeline,))
+    manager.start()
+    with pytest.raises(PipelineManagerError):
+        manager.close()
+    assert handle.health.state is LifecycleState.CLOSED
+    manager.close()
+    assert executor.close_count == provider.close_count == 1
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_manager_pending_close_retry_requires_opt_in(scheduled):
+    from types import SimpleNamespace
+
+    from inference_service.backends.errors import BackendLifecycleError
+    from inference_service.pipeline.errors import PipelineManagerError
+    from inference_service.pipeline.manager import InferencePipelineManager
+
+    attempts = []
+
+    def close():
+        attempts.append("close")
+        if len(attempts) == 1:
+            raise BackendLifecycleError("drain pending", close_pending=True)
+
+    pipeline = SimpleNamespace(pipeline_id="policy", load=lambda: None, close=close)
+    manager = InferencePipelineManager((pipeline,), retry_pending_close=scheduled)
+    manager.start()
+    with pytest.raises(PipelineManagerError):
+        manager.close()
+    manager.close()
+    manager.close()
+    assert len(attempts) == (2 if scheduled else 1)
+
+
+@pytest.mark.parametrize("scheduled", [False, True])
+def test_stateless_component_reset_skip_requires_opt_in(scheduled):
+    from types import SimpleNamespace
+
+    events = []
+    executor = EchoExecutor(events)
+    component = RecordingComponent("stateless", events, fail_reset=True)
+    component.capabilities = SimpleNamespace(stateful=False, resettable=False)
+    handle = ModelRuntimeHandle(
+        RuntimeAssembly(
+            runtime_executor=executor,
+            owned_components=(component, executor),
+            resettable=True,
+            retry_failed_reset=scheduled,
+        )
+    )
+    handle.load()
+    try:
+        if scheduled:
+            handle.reset()
+            assert component.reset_count == 0
+            assert handle.health.ready
+        else:
+            with pytest.raises(ExecutionFailure):
+                handle.reset()
+            assert component.reset_count == 1
+    finally:
+        handle.close()
+
+
 def test_typed_values_are_read_only_and_deadline_is_absolute() -> None:
     inputs = {"value": 4}
     metadata = {"nested": {"source": "test"}}
@@ -270,6 +437,27 @@ def test_control_operations_drain_active_requests_and_stop_admission() -> None:
     assert reset_done.is_set()
     assert handle.state is LifecycleState.READY
     handle.close()
+
+
+def test_legacy_parallel_requests_keep_accepting_the_same_request_id() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    both_entered = threading.Barrier(2)
+
+    class Executor(EchoExecutor):
+        def execute(self, request, execution_context):
+            both_entered.wait(timeout=2)
+            return super().execute(request, execution_context)
+
+    handle = ModelRuntimeHandle(Executor([]), max_active_executions=2)
+    handle.load()
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(handle.execute, ModelRequest({"value": value}), context("same")) for value in (1, 2)]
+            assert [future.result(timeout=3).outputs["value"] for future in futures] == [1, 2]
+        assert handle._active_executions == 0
+    finally:
+        handle.close()
 
 
 class FakeStreaming:

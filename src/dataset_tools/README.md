@@ -174,21 +174,22 @@ ros2 run dataset_tools record_cli --ros-args -p control_mode:=model_inference
 分支匹配的完整 `record_cli` 命令；客户端不通过 ROS service 是否存在来猜测：
 
 - **调度启用路径**：显式传入
-  `-p restart_session_service:=/action_dispatcher/restart_session`。record_cli 调用它执行 safe-stop + Close 旧
+  ROS 参数 `restart_session_service:=/action_dispatcher/restart_session`。record_cli 调用它执行 safe-stop + Close 旧
   session + Open 新 UUID；失败时不会回退到 direct policy reset，避免绕过 Close 屏障。
-- **legacy/关闭路径**：`restart_session_service` 默认为空。record_cli 优先调用
+- **legacy/关闭路径**：保持 `restart_session_service` 为空。record_cli 优先调用
   `/action_dispatcher/reset` 清理动作队列，并由 legacy dispatcher best-effort 触发 pipeline `/reset`；无
   dispatcher 时回退到 direct policy reset。
 
 Scheduler-enabled 录制命令：
 
 ```bash
-ros2 run dataset_tools record_cli --ros-args \
-  -p control_mode:=model_inference \
+ros2 run dataset_tools record_cli \
+  --ros-args -p control_mode:=model_inference \
   -p restart_session_service:=/action_dispatcher/restart_session
 ```
 
-可通过 `reset_before_episode`、`dispatcher_reset_service`、`policy_reset_service`、`restart_session_service` 和 `reset_timeout_sec` 参数覆写对应行为、服务名和等待时间。
+可通过 `reset_before_episode`、`dispatcher_reset_service`、`policy_reset_service` 和 `reset_timeout_sec` ROS 参数覆写
+legacy 行为；scheduled restart endpoint 统一使用 `restart_session_service` ROS 参数，默认空值。
 
 录制完成后，推荐直接把整个 dataset 根目录转换成 LeRobot v3 数据集：
 

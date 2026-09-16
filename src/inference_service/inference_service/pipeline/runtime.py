@@ -43,6 +43,7 @@ from inference_service.pipeline.runtime_core import (
     ModelExecutor,
     StageFrame,
 )
+from inference_service.pipeline.staged_executor import StagedModelExecutor, StagedScheduling
 from inference_service.pipeline.state import PipelineState
 from inference_service.pipeline.types import PipelineDiagnostics, PipelineResult
 from inference_service.pipeline.validation import validate_action_output
@@ -449,7 +450,9 @@ _PROMPT_KEY = "__ibrobot_policy_prompt"
 _PRIORITY_KEY = "__ibrobot_policy_priority"
 
 
-def _policy_contract(context: RuntimeContext, executor: SequentialModelExecutor) -> ExecutionContract:
+def _policy_contract(
+    context: RuntimeContext, executor: SequentialModelExecutor | StagedModelExecutor
+) -> ExecutionContract:
     """Derive the request contract for the migrated local policy executor."""
 
     model_type = context.model_type
@@ -473,7 +476,7 @@ def _policy_contract(context: RuntimeContext, executor: SequentialModelExecutor)
 def _finalize_policy_assembly(
     assembly: RuntimeAssembly,
     context: RuntimeContext,
-    executor: SequentialModelExecutor,
+    executor: SequentialModelExecutor | StagedModelExecutor,
     *,
     resettable: bool,
 ) -> RuntimeAssembly:
@@ -506,7 +509,8 @@ def _finalize_policy_assembly(
     assembly.session = capability_source
     assembly.execution_contract = contract
     assembly.stateful = False
-    assembly.resettable = resettable
+    # Independent execution owns snapshots even when the vendor session is stateless.
+    assembly.resettable = resettable or isinstance(executor, StagedModelExecutor)
     assembly.declared_capabilities = {
         **dict(assembly.declared_capabilities),
         "stateful": False,
@@ -598,6 +602,9 @@ class InferencePipeline:
         request_timeout: float | None = None,
         default_task: str | None = None,
         execution_mode: str = "monolithic",
+        stage_policy: str = "sequential",
+        stage_scheduling: Mapping[str, object] | None = None,
+        frame_base_priority: int = 0,
     ) -> None:
         if not pipeline_id:
             raise PipelineConfigurationError("pipeline_id must be non-empty")
@@ -639,6 +646,9 @@ class InferencePipeline:
         self._request_timeout = request_timeout
         self._default_task = default_task
         self._execution_mode = execution_mode
+        self._stage_policy = stage_policy
+        self._stage_scheduling = stage_scheduling or {}
+        self._frame_base_priority = frame_base_priority
         self._execution_plan: ExecutionPlan | None = None
         self._action_output_role: str | None = None
         self._policy_failure: BackendHealth | None = None
@@ -647,16 +657,21 @@ class InferencePipeline:
         self._bind_processors()
 
         resolved_executor: ModelExecutor = self._build_session_executor(session_handle)
+        self._session_executor = resolved_executor
         _finalize_policy_assembly(
             runtime_assembly,
             runtime_context,
             resolved_executor,
             resettable=bool(self.capabilities.resettable),
         )
+        runtime_assembly.reset_complete = self._clear_policy_failure if runtime_context.priority_scheduling else None
+        runtime_assembly.retry_failed_reset = runtime_context.priority_scheduling
         self._unified_handle = ModelRuntimeHandle(runtime_assembly)
+        if isinstance(resolved_executor, StagedModelExecutor):
+            resolved_executor.frame_submitter = self._unified_handle.submit_frame
         self._pipeline = None
 
-    def _build_session_executor(self, handle: _PolicySessionHandle) -> SequentialModelExecutor:
+    def _build_session_executor(self, handle: _PolicySessionHandle) -> ModelExecutor:
         model_executor = handle.model_executor
         if not isinstance(model_executor, SequentialModelExecutor):
             raise PipelineConfigurationError(
@@ -671,21 +686,54 @@ class InferencePipeline:
             components.append(self._postprocessor)
         component_contexts = dict(model_executor.component_contexts)
         component_contexts.update({id(component): handle.session_context for component in model_executor.components})
-        return SequentialModelExecutor(
-            (
-                _PolicyPreprocessStage(self),
-                _PolicyModelRequestStage(self),
-                *model_executor.stages,
-                _PolicyModelResultStage(
-                    self,
-                    handle.action_semantic,
-                    handle.schedule_metadata,
-                    handle.metadata_provider,
-                ),
-                _PolicyDecodeStage(self),
-                _PolicyPostprocessStage(self),
-                _PolicyCompletionStage(lambda: self._write_curvature_log(handle)),
+        stages = (
+            _PolicyPreprocessStage(self),
+            _PolicyModelRequestStage(self),
+            *model_executor.stages,
+            _PolicyModelResultStage(
+                self,
+                handle.action_semantic,
+                handle.schedule_metadata,
+                handle.metadata_provider,
             ),
+            _PolicyDecodeStage(self),
+            _PolicyPostprocessStage(self),
+            _PolicyCompletionStage(lambda: self._write_curvature_log(handle)),
+        )
+        if self._stage_policy == "independent":
+            deployment = self._context.deployment
+            validate_staged = getattr(self._codec, "validate_staged_deployment", None)
+            if not isinstance(deployment, CompiledDeployment) or not callable(validate_staged):
+                raise PipelineConfigurationError(
+                    "independent staged execution requires a validated policy-family adapter",
+                    pipeline_id=self.pipeline_id,
+                    code="staged_policy_adapter_required",
+                )
+            validate_staged(deployment)
+            priorities = {
+                stage_id: int(self._stage_option(value, "priority_offset", 0))
+                for stage_id, value in self._stage_scheduling.items()
+            }
+            producer_role, terminal_role = deployment.execution
+            return StagedModelExecutor(
+                stages,
+                _PolicyResultAdapter(self),
+                components=components,
+                execution_plan=build_execution_plan(deployment.execution, deployment.bindings),
+                scheduling=StagedScheduling(
+                    priorities,
+                    {producer_role: "frame_arrival", terminal_role: "dispatch"},
+                    frame_base_priority=self._frame_base_priority,
+                    max_snapshot_age_ms=self._stage_option(
+                        self._stage_scheduling.get(producer_role, {}), "max_snapshot_age_ms", 5000
+                    ),
+                ),
+                component_contexts=component_contexts,
+                error_handler=self._record_policy_failure,
+                health_override=lambda: self._policy_failure,
+            )
+        return SequentialModelExecutor(
+            stages,
             _PolicyResultAdapter(self),
             components=components,
             execution_plan=model_executor.execution_plan,
@@ -695,6 +743,12 @@ class InferencePipeline:
             execution_contract=model_executor.execution_contract,
             orchestration_visibility=model_executor.orchestration_visibility,
         )
+
+    @staticmethod
+    def _stage_option(value: object, name: str, default: object) -> object:
+        if isinstance(value, Mapping):
+            return value.get(name, default)
+        return getattr(value, name, default)
 
     def _write_curvature_log(self, handle: _PolicySessionHandle) -> None:
         if handle.curvature_log_path is None or not handle.velocity_trace:
@@ -732,6 +786,10 @@ class InferencePipeline:
         """Return the unified handle when this pipeline uses the migrated path."""
 
         return self._unified_handle
+
+    @property
+    def supports_priority_zero_deadline_admission(self) -> bool:
+        return bool(self._session_executor.supports_priority_zero_deadline_admission)
 
     @property
     def capabilities(self):
@@ -776,6 +834,24 @@ class InferencePipeline:
                 pipeline_id=self.pipeline_id,
             )
         return result
+
+    def submit_frame(self, request: InferenceRequest, *, deadline: datetime | None = None):
+        submit = getattr(self._session_executor, "submit_frame", None)
+        if not callable(submit):
+            return None
+        inputs = dict(request.inputs)
+        inputs[_CONTROL_INPUTS_KEY] = {}
+        inputs[_CAPTURE_RAW_ACTION_KEY] = False
+        inputs[_PROMPT_KEY] = request.prompt
+        inputs[_PRIORITY_KEY] = request.priority
+        model_request = ModelRequest(
+            inputs,
+            {**request.metadata, "request_id": request.request_id},
+        )
+        return self._unified_handle.submit_frame(
+            model_request,
+            ExecutionContext(request.request_id, self._effective_request_deadline(deadline or request.deadline)),
+        )
 
     def reset(self, deadline: datetime | None = None) -> None:
         if self.capabilities.stateful and not self.capabilities.resettable:
@@ -955,7 +1031,8 @@ class InferencePipeline:
     def _ensure_session_ready_after_call(self) -> None:
         if self._session_handle is None:
             return
-        health = self._session_handle.model_executor.health()
+        executor = self._session_executor if self._context.priority_scheduling else self._session_handle.model_executor
+        health = executor.health()
         if not health.ready:
             raise PipelineNotReadyError(
                 f"pipeline {self.pipeline_id!r} session left READY during inference",
@@ -1020,6 +1097,9 @@ class InferencePipeline:
             backend_completed=backend_completed,
             cancellation_supported=self.capabilities.supports_cancellation,
         )
+
+    def _clear_policy_failure(self) -> None:
+        self._policy_failure = None
 
     def _record_policy_failure(self, exc: Exception, backend_execution_started: bool) -> None:
         if not hasattr(exc, "operation_started"):

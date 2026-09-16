@@ -549,6 +549,8 @@ def launch_setup(context, *args, **kwargs):
 
     logger.info(f"Final with_inference={with_inference}")
     scheduler_enabled = with_inference and scheduler_enabled_from_raw_config(robot_config, active_control_mode)
+    if scheduler_enabled and runtime_target is RuntimeTarget.SIMULATION:
+        raise ValueError("simulation does not support inference.scheduler.enable=true; set scheduler.enable=false")
 
     # Benchmark-specific transport is derived only after all launch overlays and
     # the effective runtime target are known. The generic loader stays neutral.
@@ -641,19 +643,12 @@ def launch_setup(context, *args, **kwargs):
             if sim_platform == "mujoco" and scene_name == "pick_banana":
                 from launch_ros.actions import Node as LaunchNode  # noqa: PLC0415
 
-                restart_service = "/action_dispatcher/restart_session" if scheduler_enabled else ""
-
                 actions.append(
                     LaunchNode(
                         package="sim_models",
                         executable="pick_banana_task_node",
                         name="pick_banana_task_node",
-                        parameters=[
-                            {
-                                "use_sim_time": True,
-                                "restart_session_service": restart_service,
-                            }
-                        ],
+                        parameters=[{"use_sim_time": True}],
                         output="screen",
                     )
                 )

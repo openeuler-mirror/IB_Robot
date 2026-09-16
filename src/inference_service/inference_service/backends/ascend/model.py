@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -85,6 +87,14 @@ class AclDeviceBuffer:
     size: int
 
 
+@dataclass(frozen=True)
+class AclAsyncExecution:
+    """Submitted ACL execution whose output becomes readable after completion."""
+
+    stream: object
+    completion: Future[dict[int, np.ndarray]]
+
+
 @dataclass
 class _DatasetBuffer:
     pointer: object
@@ -109,7 +119,15 @@ class AclModel:
     调用方须全程用 ``execute_bank``。两条路径不会在同一实例上混用。
     """
 
-    def __init__(self, lease: AclRuntimeLease, role: str, path: Path, bindings: ArtifactBindings) -> None:
+    def __init__(
+        self,
+        lease: AclRuntimeLease,
+        role: str,
+        path: Path,
+        bindings: ArtifactBindings,
+        *,
+        async_execution: bool = False,
+    ) -> None:
         self._lease = lease
         self._acl = lease.acl
         self.role = role
@@ -131,6 +149,16 @@ class AclModel:
         self._host_output_indices: set[int] = set()
         self._owned_device_buffers: list[_DatasetBuffer] = []
         self._closed = False
+        self._closing = False
+        # Legacy execution keeps the pre-scheduler runtime surface: no lock or
+        # completion worker is created. Scheduled execution owns the async
+        # gate and worker used by stream completion callbacks.
+        self._execution_lock = RLock() if async_execution else None
+        self._completion_executor = (
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"acl-{role}-complete") if async_execution else None
+        )
+        self._quarantined_datasets: list[tuple[object, object, list[_DatasetBuffer], object, list[_DatasetBuffer]]] = []
+        self._quarantined_shared_stream: object | None = None
 
     def load_descriptor(self) -> None:
         try:
@@ -202,6 +230,12 @@ class AclModel:
 
     def execute_bank(self, bank: int, inputs: BoundInputs | dict[int, np.ndarray]) -> dict[int, np.ndarray]:
         """执行指定静态dataset；非owned输入（包括hidden/cell）绝不H2D。"""
+        if self._execution_lock is None:
+            return self._execute_bank_unlocked(bank, inputs)
+        with self._execution_lock:
+            return self._execute_bank_unlocked(bank, inputs)
+
+    def _execute_bank_unlocked(self, bank: int, inputs: BoundInputs | dict[int, np.ndarray]) -> dict[int, np.ndarray]:
         if not self._dataset_banks:
             raise BackendInferenceError(f"Ascend role {self.role!r}没有dataset bank", code="runtime_not_loaded")
         try:
@@ -266,6 +300,29 @@ class AclModel:
         read_outputs: set[int] | None = None,
         stream: object | None = None,
     ) -> dict[int, np.ndarray]:
+        """Execute one request while exclusively owning this model's buffers."""
+
+        if self._execution_lock is None:
+            return self._execute_unlocked(inputs, read_outputs=read_outputs, stream=stream)
+        with self._execution_lock:
+            return self._execute_unlocked(inputs, read_outputs=read_outputs, stream=stream)
+
+    def _execute_unlocked(
+        self,
+        inputs: BoundInputs | dict[int, np.ndarray],
+        *,
+        read_outputs: set[int] | None = None,
+        stream: object | None = None,
+    ) -> dict[int, np.ndarray]:
+        if self._execution_lock is not None and (
+            self._closing or self._closed or self._quarantined_shared_stream is not None or self._quarantined_datasets
+        ):
+            raise BackendInferenceError(
+                "Ascend model is closing or quarantined",
+                code="runtime_not_ready",
+                operation_started=False,
+                outcome_known=True,
+            )
         if self.input_dataset is None or self.output_dataset is None or self.model_id is None:
             raise BackendInferenceError(f"Ascend role {self.role!r} is not fully loaded", code="runtime_not_loaded")
         self._lease.bind_current_thread()
@@ -309,6 +366,7 @@ class AclModel:
                     f"acl.rt.synchronize_stream({self.role})",
                 )
             except Exception as exc:
+                self._quarantined_shared_stream = stream
                 raise BackendInferenceError(
                     str(exc),
                     code="async_execution_uncertain",
@@ -336,6 +394,163 @@ class AclModel:
             if descriptor.shape is not None and all(dimension > 0 for dimension in descriptor.shape):
                 value = value.reshape(descriptor.shape)
             outputs[descriptor.index] = value
+        return outputs
+
+    def _prepare_async_inputs(
+        self,
+        inputs: BoundInputs | dict[int, np.ndarray],
+        buffers: list[_DatasetBuffer],
+        *,
+        operation_name: str,
+    ) -> None:
+        """Copy request inputs before ACL submission, with known outcomes."""
+
+        try:
+            values = self._indexed_inputs(inputs)
+            for descriptor, buffer in zip(self.input_descriptors, buffers, strict=True):
+                if not buffer.owned:
+                    continue
+                try:
+                    payload = np.ascontiguousarray(values[descriptor.index]).tobytes()
+                except KeyError as exc:
+                    raise BackendInferenceError(
+                        f"Ascend role {self.role!r} is missing runtime input index {descriptor.index}",
+                        code="missing_runtime_input",
+                        operation_started=False,
+                        outcome_known=True,
+                    ) from exc
+                if len(payload) != buffer.size:
+                    raise BackendInferenceError(
+                        "input size mismatch",
+                        code="input_size_mismatch",
+                        operation_started=False,
+                        outcome_known=True,
+                    )
+                source = self._acl.util.bytes_to_ptr(payload)
+                check_acl_ret(
+                    self._acl.rt.memcpy(
+                        buffer.pointer,
+                        buffer.size,
+                        source,
+                        len(payload),
+                        ACL_MEMCPY_HOST_TO_DEVICE,
+                    ),
+                    f"acl.rt.memcpy {operation_name}({self.role} input {descriptor.index})",
+                )
+        except BackendInferenceError:
+            raise
+        except Exception as exc:
+            raise BackendInferenceError(
+                str(exc),
+                code="async_input_preparation_failed",
+                operation_started=False,
+                outcome_known=True,
+            ) from exc
+
+    def submit_async_isolated(
+        self,
+        inputs: BoundInputs | dict[int, np.ndarray],
+        *,
+        stream: object,
+        read_outputs: set[int] | None = None,
+    ) -> AclAsyncExecution:
+        """Submit with request-owned datasets so another stage model may overlap."""
+
+        if self._execution_lock is None or self._completion_executor is None:
+            raise BackendInferenceError("async execution is disabled", code="async_execution_not_enabled")
+        with self._execution_lock:
+            if (
+                self._closed
+                or self._closing
+                or self._quarantined_datasets
+                or self._quarantined_shared_stream is not None
+            ):
+                raise BackendInferenceError("model is closed or quarantined", code="runtime_unavailable")
+            self._lease.bind_current_thread()
+            input_dataset, input_buffers = self._create_dataset(self.input_descriptors, {})
+            try:
+                output_dataset, output_buffers = self._create_dataset(self.output_descriptors, {})
+            except Exception:
+                self._destroy_dataset(input_dataset, input_buffers)
+                raise
+            try:
+                self._prepare_async_inputs(inputs, input_buffers, operation_name="isolated H2D")
+            except Exception:
+                self._destroy_dataset(output_dataset, output_buffers)
+                self._destroy_dataset(input_dataset, input_buffers)
+                raise
+            try:
+                check_acl_ret(
+                    self._acl.mdl.execute_async(self.model_id, input_dataset, output_dataset, stream),
+                    f"acl.mdl.execute_async({self.role})",
+                )
+            except Exception as exc:
+                self._quarantined_datasets.append(
+                    (stream, input_dataset, input_buffers, output_dataset, output_buffers)
+                )
+                raise BackendInferenceError(
+                    str(exc), code="async_execution_uncertain", operation_started=True, outcome_known=False
+                ) from exc
+
+            def complete() -> dict[int, np.ndarray]:
+                synchronized = False
+                try:
+                    self._lease.bind_current_thread()
+                    check_acl_ret(self._acl.rt.synchronize_stream(stream), f"acl.rt.synchronize_stream({self.role})")
+                    synchronized = True
+                    return self._read_dataset_outputs(output_buffers, read_outputs)
+                except Exception as exc:
+                    raise BackendInferenceError(
+                        str(exc),
+                        code="async_output_failed" if synchronized else "async_execution_uncertain",
+                        operation_started=True,
+                        outcome_known=synchronized,
+                    ) from exc
+                finally:
+                    if synchronized:
+                        self._destroy_dataset(output_dataset, output_buffers)
+                        self._destroy_dataset(input_dataset, input_buffers)
+                    else:
+                        with self._execution_lock:
+                            self._quarantined_datasets.append(
+                                (stream, input_dataset, input_buffers, output_dataset, output_buffers)
+                            )
+
+            try:
+                completion = self._completion_executor.submit(complete)
+            except Exception as exc:
+                self._quarantined_datasets.append(
+                    (stream, input_dataset, input_buffers, output_dataset, output_buffers)
+                )
+                raise BackendInferenceError(
+                    str(exc), code="async_execution_uncertain", operation_started=True, outcome_known=False
+                ) from exc
+        return AclAsyncExecution(stream, completion)
+
+    def _read_dataset_outputs(
+        self, output_buffers: list[_DatasetBuffer], read_outputs: set[int] | None
+    ) -> dict[int, np.ndarray]:
+        selected = read_outputs if read_outputs is not None else set(range(len(self.output_descriptors)))
+        outputs: dict[int, np.ndarray] = {}
+        for descriptor, buffer in zip(self.output_descriptors, output_buffers, strict=True):
+            if descriptor.index not in selected:
+                continue
+            host_buffer, ret = self._acl.rt.malloc_host(descriptor.size)
+            check_acl_ret(ret, f"acl.rt.malloc_host({self.role} isolated output {descriptor.index})")
+            try:
+                check_acl_ret(
+                    self._acl.rt.memcpy(
+                        host_buffer, buffer.size, buffer.pointer, buffer.size, ACL_MEMCPY_DEVICE_TO_HOST
+                    ),
+                    f"acl.rt.memcpy isolated D2H({self.role} output {descriptor.index})",
+                )
+                dtype = descriptor.dtype or np.dtype("float32")
+                value = np.frombuffer(self._acl.util.ptr_to_bytes(host_buffer, buffer.size), dtype=dtype).copy()
+                if descriptor.shape is not None and all(dimension > 0 for dimension in descriptor.shape):
+                    value = value.reshape(descriptor.shape)
+                outputs[descriptor.index] = value
+            finally:
+                self._acl.rt.free_host(host_buffer)
         return outputs
 
     def allocate_device_buffer(self, size: int) -> AclDeviceBuffer:
@@ -369,13 +584,48 @@ class AclModel:
             ) from exc
         return AclDeviceBuffer(pointer=buffer.pointer, size=buffer.size)
 
+    def drain_quarantined(self) -> None:
+        """排空隔离中的设备资源：同步隔离流并销毁隔离数据集。
+
+        reset 复用 close 的排空语义在不卸载模型的前提下恢复确定性：
+        失败时保留隔离资源以便重试（与 close 一致，失败不是完成栅栏）。
+        """
+        if self._quarantined_shared_stream is not None:
+            self._lease.bind_current_thread()
+            check_acl_ret(
+                self._acl.rt.synchronize_stream(self._quarantined_shared_stream),
+                f"acl.rt.synchronize_stream({self.role} shared drain)",
+            )
+            self._quarantined_shared_stream = None
+        if self._quarantined_datasets:
+            self._lease.bind_current_thread()
+            for stream, *_datasets in self._quarantined_datasets:
+                check_acl_ret(self._acl.rt.synchronize_stream(stream), f"acl.rt.synchronize_stream({self.role} drain)")
+            for _stream, inputs, input_buffers, outputs, output_buffers in self._quarantined_datasets:
+                self._destroy_dataset(outputs, output_buffers)
+                self._destroy_dataset(inputs, input_buffers)
+            self._quarantined_datasets.clear()
+
     def close(self) -> None:
         if self._closed:
             return
+        if self._completion_executor is not None:
+            with self._execution_lock:
+                self._closing = True
+            self._completion_executor.shutdown(wait=True, cancel_futures=False)
+        # An unsuccessful synchronization is not a device completion fence.
+        # Retain the model, context and datasets so close can be retried.
+        self.drain_quarantined()
         self._closed = True
-        acl = self._acl
-        self._lease.bind_current_thread()
-        self._close_dataset_banks()
+        if self._execution_lock is None:
+            acl = self._acl
+            self._lease.bind_current_thread()
+            self._close_dataset_banks()
+        else:
+            with self._execution_lock:
+                acl = self._acl
+                self._lease.bind_current_thread()
+                self._close_dataset_banks()
         for host_buffer in reversed(self.output_host_buffers):
             if host_buffer is not None:
                 acl.rt.free_host(host_buffer)

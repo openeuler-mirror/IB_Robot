@@ -6,23 +6,39 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from std_srvs.srv import Trigger
 
-from ibrobot_msgs.action import CloseInferenceSession, OpenInferenceSession, ScheduledDispatchInfer
+from ibrobot_msgs.action import (
+    CloseInferenceSession,
+    ClosePipelineBinding,
+    DispatchPipelineBinding,
+    OpenInferenceSession,
+    OpenPipelineBinding,
+    ScheduledDispatchInfer,
+)
 from ibrobot_msgs.msg import InferenceOutcome, InferenceServingStatus, InferenceWorkCapacity, ScheduledInferenceError
 from inference_service import pipeline_policy_node as pipeline_policy_module
 from inference_service.backends import BackendCapabilities
+from inference_service.backends.errors import BackendInferenceError
 from inference_service.global_inference_scheduler_node import (
     GlobalInferenceSchedulerNode,
     _DownstreamCall,
 )
 from inference_service.pipeline_policy_node import PipelinePolicyNode
 from inference_service.scheduler.action_idempotency import replay_terminal
-from inference_service.scheduler.global_scheduler_core import SchedulerError
+from inference_service.scheduler.deadline_reservations import DeadlineReservationTable
+from inference_service.scheduler.global_scheduler_core import (
+    GlobalSchedulerCore,
+    GlobalSessionState,
+    PipelineCandidate,
+    SchedulerError,
+)
 from inference_service.scheduler.goal_slots import GoalSlotPool
 from inference_service.scheduler.ledger import IdempotencyLedger, LedgerAction
+from inference_service.scheduler.operations import Certainty, OperationIdentity, OperationKind, OperationRegistry
 from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
 from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from inference_service.scheduler.work_classes import WorkClass, work_class_name
@@ -33,6 +49,7 @@ SESSION_ID = "00112233-4455-4677-8899-aabbccddeeff"
 REQUEST_ID = "11112233-4455-4677-8899-aabbccddeeff"
 BOOT_ID = "22222222-2222-4222-8222-222222222222"
 NEW_BOOT_ID = "33333333-3333-4333-8333-333333333333"
+BINDING_ID = "44444444-4444-4444-8444-444444444444"
 
 
 class _Feature:
@@ -61,6 +78,141 @@ class _GoalHandle:
 
     def canceled(self) -> None:
         self.canceled_status = True
+
+
+def _close_protocol_node():
+    from inference_service.scheduler.session_controller import ProductSessionController, WorkClassCapacity
+
+    node = object.__new__(PipelinePolicyNode)
+    node._boot_id = BOOT_ID
+    node._config = SimpleNamespace(pipeline_id="policy", max_error_message_bytes=1024, max_error_details_bytes=8192)
+    node._pipeline_ledger = IdempotencyLedger(
+        max_session_records=4,
+        max_duplicate_waiters_per_request=4,
+        terminal_session_retention_ns=10**12,
+        now_ns=time.monotonic_ns,
+        max_entries=32,
+    )
+    ctrl = node._session_controller = ProductSessionController(
+        boot_id=BOOT_ID,
+        capacities={
+            WorkClass.SESSION_CONTROL: WorkClassCapacity(WorkClass.SESSION_CONTROL, 1),
+            WorkClass.ACTION_GENERATION: WorkClassCapacity(WorkClass.ACTION_GENERATION, 1),
+        },
+        session_idle_timeout_ns=10**12,
+        now_ns=time.monotonic_ns,
+    )
+    opened = ctrl.begin_open(SESSION_ID)
+    ctrl.finish_open(success=True)
+    node._scheduled_binding_identity = (SESSION_ID, 1, BINDING_ID, 1, BOOT_ID, opened.fence_generation)
+    node._scheduled_operation_slots = threading.BoundedSemaphore(1)
+    node._scheduled_operation_capacity = 1
+    node._acquire_scheduled_drain_slots = lambda _deadline: 1
+    node._release_scheduled_drain_slots = lambda _count: None
+    node._publish_serving_status = lambda: None
+    node.get_logger = lambda: SimpleNamespace(exception=lambda message: pytest.fail(message))
+
+    def goal(operation_id=None):
+        value = ClosePipelineBinding.Goal()
+        value.session_id, value.logical_generation = SESSION_ID, 1
+        value.binding_id, value.binding_incarnation = BINDING_ID, 1
+        value.expected_boot_id = BOOT_ID
+        value.expected_pipeline_generation = opened.fence_generation
+        value.operation_id = operation_id or str(uuid4())
+        value.deadline.sec, value.deadline.nanosec = divmod(time.time_ns() + 10**10, 10**9)
+        return value
+
+    return node, goal
+
+
+@pytest.mark.parametrize("first_outcome", [InferenceOutcome.COMPLETED, InferenceOutcome.UNKNOWN])
+def test_private_close_failed_drain_new_attempt_and_replays(first_outcome):
+    node, goal = _close_protocol_node()
+    resets = []
+
+    def reset(response, _deadline):
+        resets.append(1)
+        response.success = len(resets) > 1
+        response.message = "drain result"
+        return response
+
+    node._reset_with_deadline = reset
+    execute_close = node._scheduled_close_once
+
+    def execute(goal_handle):
+        result = execute_close(goal_handle)
+        if not result.success:
+            result.outcome.value = first_outcome
+        return result
+
+    node._scheduled_close_once = execute
+    first_goal = goal()
+    first = node._scheduled_close_callback(_GoalHandle(first_goal))
+    assert not first.success and first.error.code == "close_drain_failed"
+    assert node._scheduled_close_callback(_GoalHandle(first_goal)).error.code == "close_drain_failed"
+    assert len(resets) == 1
+    second = node._scheduled_close_callback(_GoalHandle(goal()))
+    assert second.success
+    assert second.drained_generation > second.closed_pipeline_generation > 0
+    assert len(resets) == 2
+    # A caller that lost the successful reply can confirm the drained identity.
+    replay = node._scheduled_close_callback(_GoalHandle(goal()))
+    assert replay.success and replay.drained_generation == second.drained_generation
+    assert len(resets) == 2
+
+
+def test_private_close_new_attempt_cannot_overlap_active_drain():
+    node, goal = _close_protocol_node()
+    entered, release = threading.Event(), threading.Event()
+    results = []
+
+    def reset(response, _deadline):
+        entered.set()
+        assert release.wait(5)
+        response.success = True
+        return response
+
+    node._reset_with_deadline = reset
+    worker = threading.Thread(target=lambda: results.append(node._scheduled_close_callback(_GoalHandle(goal()))))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        retry = node._scheduled_close_callback(_GoalHandle(goal()))
+        assert not retry.success and retry.outcome.value == InferenceOutcome.NOT_STARTED
+        assert retry.error.code in {"close_in_progress", "no_session_capacity"}
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive() and results[0].success
+
+
+@pytest.mark.parametrize(
+    "expected,closed,drained,valid",
+    [
+        (3, 3, 4, True),
+        (3, 3, 3, False),
+        (3, 3, 0, False),
+        (3, 2, 4, False),
+        (3, 0, 0, False),
+        (0, 0, 0, True),
+        (0, 3, 4, True),
+        (0, 0, 4, False),
+    ],
+)
+def test_private_close_validates_successful_drain_generation(expected, closed, drained, valid):
+    node, goal_factory = _close_protocol_node()
+    goal = goal_factory()
+    goal.expected_pipeline_generation = expected
+    result = ClosePipelineBinding.Result()
+    for field in ("session_id", "logical_generation", "binding_id", "binding_incarnation", "operation_id"):
+        setattr(result, field, getattr(goal, field))
+    result.boot_id, result.pipeline_id = BOOT_ID, "policy"
+    result.success, result.outcome.value = True, InferenceOutcome.COMPLETED
+    result.closed_pipeline_generation, result.drained_generation = closed, drained
+    reason = GlobalInferenceSchedulerNode._validate_downstream_result(
+        "close", goal, result, SimpleNamespace(pipeline_id="policy")
+    )
+    assert (reason == "") is valid
 
 
 def _compatibility_node(*, state_shape: tuple[int, ...]) -> PipelinePolicyNode:
@@ -126,9 +278,167 @@ def _scheduler_stub(**overrides):
         "_max_prompt_bytes": 4,
         "_max_error_message_bytes": 32,
         "_max_error_details_bytes": 32,
+        "_downstream_operations": OperationRegistry(max_records=8, max_waiters_per_operation=2),
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def test_pipeline_binding_guard_rejects_wrong_boot_and_stale_binding():
+    node = object.__new__(PipelinePolicyNode)
+    node._boot_id = BOOT_ID
+    node._scheduled_binding_identity = (SESSION_ID, 7, BINDING_ID, 2, BOOT_ID, 11)
+    goal = DispatchPipelineBinding.Goal()
+    goal.session_id = SESSION_ID
+    goal.logical_generation = 7
+    goal.binding_id = BINDING_ID
+    goal.binding_incarnation = 2
+    goal.expected_boot_id = NEW_BOOT_ID
+    goal.expected_pipeline_generation = 11
+
+    assert PipelinePolicyNode._validate_scheduled_binding_goal(node, goal) == "boot_mismatch"
+    goal.expected_boot_id = BOOT_ID
+    goal.binding_incarnation = 3
+    assert PipelinePolicyNode._validate_scheduled_binding_goal(node, goal) == "binding_identity_mismatch"
+
+
+def test_pipeline_binding_guard_accepts_exact_identity_and_generation_zero_cleanup():
+    node = object.__new__(PipelinePolicyNode)
+    node._boot_id = BOOT_ID
+    node._scheduled_binding_identity = (SESSION_ID, 7, BINDING_ID, 2, BOOT_ID, 11)
+    goal = DispatchPipelineBinding.Goal()
+    goal.session_id = SESSION_ID
+    goal.logical_generation = 7
+    goal.binding_id = BINDING_ID
+    goal.binding_incarnation = 2
+    goal.expected_boot_id = BOOT_ID
+    goal.expected_pipeline_generation = 11
+    assert PipelinePolicyNode._validate_scheduled_binding_goal(node, goal) == ""
+    goal.logical_generation = 0
+    goal.expected_pipeline_generation = 0
+    assert PipelinePolicyNode._validate_scheduled_binding_goal(node, goal) == ""
+
+
+def test_global_validates_private_result_operation_and_boot_identity():
+    goal = DispatchPipelineBinding.Goal()
+    goal.session_id = SESSION_ID
+    goal.logical_generation = 7
+    goal.request_id = REQUEST_ID
+    goal.binding_id = BINDING_ID
+    goal.binding_incarnation = 2
+    goal.operation_id = "55555555-5555-4555-8555-555555555555"
+    goal.expected_boot_id = BOOT_ID
+    goal.expected_pipeline_generation = 11
+
+    result = DispatchPipelineBinding.Result()
+    result.session_id = goal.session_id
+    result.logical_generation = goal.logical_generation
+    result.request_id = goal.request_id
+    result.binding_id = goal.binding_id
+    result.binding_incarnation = goal.binding_incarnation
+    result.operation_id = goal.operation_id
+    result.boot_id = goal.expected_boot_id
+    result.pipeline_id = "policy"
+    result.pipeline_generation = goal.expected_pipeline_generation
+    result.deployment_fingerprint = "d" * 64
+    result.runtime_policy_fingerprint = "r" * 64
+
+    candidate = SimpleNamespace(
+        pipeline_id="policy",
+        deployment_fingerprint="d" * 64,
+        runtime_policy_fingerprint="r" * 64,
+    )
+    assert not GlobalInferenceSchedulerNode._validate_downstream_result("dispatch", goal, result, candidate)
+
+    result.operation_id = "66666666-6666-4666-8666-666666666666"
+    assert (
+        GlobalInferenceSchedulerNode._validate_downstream_result("dispatch", goal, result, candidate)
+        == "dispatch_operation_id_mismatch"
+    )
+    result.operation_id = goal.operation_id
+    result.boot_id = NEW_BOOT_ID
+    assert (
+        GlobalInferenceSchedulerNode._validate_downstream_result("dispatch", goal, result, candidate)
+        == "dispatch_boot_id_mismatch"
+    )
+
+
+def test_pipeline_param_reader_preserves_legacy_parameters_without_new_staged_options(monkeypatch):
+    class _Reader:
+        def __init__(self, overrides=None):
+            self.overrides = dict(overrides or {})
+            self.declared = set()
+
+        def declare_parameter(self, name, default):
+            self.declared.add(name)
+
+        def get_parameter(self, name):
+            return SimpleNamespace(
+                value=self.overrides.get(name, "")
+                if name == "runtime_policy_json"
+                else {
+                    "node_name": "inference_policy",
+                }.get(name)
+            )
+
+        def undeclare_parameter(self, name):
+            self.declared.remove(name)
+
+        def destroy_node(self):
+            return None
+
+    reader = _Reader()
+    monkeypatch.setattr(pipeline_policy_module, "Node", lambda _name: reader)
+
+    config, node_name = pipeline_policy_module._read_config()
+
+    assert node_name == "inference_policy"
+    assert config.scheduler_enabled is False
+    assert "runtime_policy_json" in reader.declared
+    assert reader.declared.issuperset(
+        {
+            "scheduled_open_session",
+            "scheduled_dispatch",
+            "scheduled_close_session",
+            "scheduled_serving_status",
+            "runtime_policy_fingerprint",
+            "public_capacity_json",
+        }
+    )
+    assert not reader.declared.intersection(
+        {"pipeline_stage_policy", "pipeline_scheduling_json", "max_supported_public_priority"}
+    )
+
+
+@pytest.mark.parametrize("runtime_policy", ["", "{}"])
+@pytest.mark.parametrize("external", [False, True])
+def test_parameter_reader_declares_common_video_parameters_once(monkeypatch, runtime_policy, external):
+    values = {}
+    overrides = {"runtime_policy_json": runtime_policy, "external_video_producer": external}
+
+    class Reader:
+        def __init__(self, name):
+            pass
+
+        def declare_parameter(self, name, default):
+            assert name not in values, f"duplicate parameter: {name}"
+            values[name] = overrides.get(name, default)
+
+        def get_parameter(self, name):
+            return SimpleNamespace(value=values[name])
+
+        def undeclare_parameter(self, name):
+            del values[name]
+
+        def destroy_node(self):
+            pass
+
+    monkeypatch.setattr(pipeline_policy_module, "Node", Reader)
+    config, _ = pipeline_policy_module._read_config()
+    assert config.external_video_producer is external
+    assert config.scheduler_enabled is bool(runtime_policy)
+    assert values["video_descriptor_topic"] == config.video_descriptor_topic
+    assert values["video_status_topic"] == config.video_status_topic
 
 
 def test_expired_deadline_is_not_sent_downstream():
@@ -149,7 +459,11 @@ def test_expired_deadline_is_not_sent_downstream():
     client.send_goal_async = send_goal_async
 
     call = GlobalInferenceSchedulerNode._call_downstream(
-        _scheduler_stub(), client, object(), deadline_monotonic_ns=time.monotonic_ns() - 1
+        _scheduler_stub(),
+        client,
+        object(),
+        operation_kind=OperationKind.DISPATCH,
+        deadline_monotonic_ns=time.monotonic_ns() - 1,
     )
 
     assert call.certainty == "not_started"
@@ -183,19 +497,85 @@ def test_late_goal_acceptance_runs_cleanup_after_acceptance_timeout():
     node = _scheduler_stub(_goal_acceptance_timeout_ns=1_000_000)
     late_acceptances: list[object] = []
 
+    goal = OpenPipelineBinding.Goal()
+    goal.session_id = SESSION_ID
+    goal.logical_generation = 1
+    goal.binding_id = REQUEST_ID
+    goal.binding_incarnation = 1
+    goal.operation_id = NEW_BOOT_ID
+    goal.expected_boot_id = BOOT_ID
     call = GlobalInferenceSchedulerNode._call_downstream(
         node,
         client,
-        object(),
+        goal,
+        operation_kind=OperationKind.OPEN,
         deadline_monotonic_ns=time.monotonic_ns() + 1_000_000_000,
         late_acceptance_callback=late_acceptances.append,
     )
 
     assert call.certainty == "unknown"
     assert call.reason == "goal_acceptance_timeout"
-    late_goal_handle = SimpleNamespace(accepted=True)
+    late_goal_handle = SimpleNamespace(accepted=True, get_result_async=lambda: _DeferredFuture())
     sent.complete(late_goal_handle)
     assert late_acceptances == [late_goal_handle]
+
+
+def test_late_known_result_after_waiter_timeout_reclaims_operation():
+    class _DeferredFuture:
+        def __init__(self) -> None:
+            self.callback = None
+            self.value = None
+
+        def add_done_callback(self, callback):
+            self.callback = callback
+            if self.value is not None:
+                callback(self)
+
+        def result(self):
+            return self.value
+
+        def complete(self, value) -> None:
+            self.value = value
+            if self.callback is not None:
+                self.callback(self)
+
+    result_future = _DeferredFuture()
+    goal_handle = SimpleNamespace(
+        accepted=True,
+        get_result_async=lambda: result_future,
+        cancel_goal_async=lambda: None,
+    )
+    sent = _DeferredFuture()
+    sent.complete(goal_handle)
+    node = _scheduler_stub(_goal_acceptance_timeout_ns=100_000_000)
+    goal = OpenPipelineBinding.Goal()
+    goal.session_id = SESSION_ID
+    goal.logical_generation = 1
+    goal.binding_id = REQUEST_ID
+    goal.binding_incarnation = 1
+    goal.operation_id = NEW_BOOT_ID
+    goal.expected_boot_id = BOOT_ID
+
+    call = GlobalInferenceSchedulerNode._call_downstream(
+        node,
+        SimpleNamespace(
+            wait_for_server=lambda **_kwargs: True,
+            send_goal_async=lambda _goal: sent,
+        ),
+        goal,
+        operation_kind=OperationKind.OPEN,
+        deadline_monotonic_ns=time.monotonic_ns() + 50_000_000,
+    )
+    assert call.certainty == "unknown"
+    assert call.reason == "downstream_result_timeout"
+    assert len(node._downstream_operations) == 1
+
+    result = OpenPipelineBinding.Result()
+    result.success = True
+    result.outcome.value = InferenceOutcome.COMPLETED
+    result_future.complete(SimpleNamespace(result=result))
+
+    assert len(node._downstream_operations) == 0
 
 
 def test_global_rejects_prompt_above_configured_byte_limit_before_ledger():
@@ -381,6 +761,102 @@ def test_global_close_without_pipeline_bindings_completes_locally():
     assert result.drained_generation == 2
 
 
+@pytest.mark.parametrize("reply", ["success", "failed", "unknown", "wrong_boot", "wrong_binding", "no_drain"])
+@pytest.mark.parametrize("path", ["public_close", "late_open_cleanup"])
+def test_global_close_releases_unknown_reservation_only_after_validated_drain(reply, path):
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._default_request_timeout_ns = 2_000_000_000
+    node._max_error_message_bytes = 1024
+    node._max_error_details_bytes = 8192
+    node._global_policy = "edf"
+    node._priority_zero_deadline_admission_enabled = False
+    table = node._deadline_reservations = DeadlineReservationTable(policy="edf")
+    owner = dict(session_id=SESSION_ID, binding_id=BINDING_ID, binding_incarnation=1, expected_boot_id=BOOT_ID)
+    operations = node._downstream_operations = OperationRegistry(max_records=1, max_waiters_per_operation=1)
+    operation, _ = operations.create_or_get(
+        kind=OperationKind.DISPATCH,
+        idempotency_key=("dispatch", "old"),
+        identity=OperationIdentity(logical_generation=1, **owner),
+        deadline_mono_ns=10,
+        waiter_id="caller",
+    )
+    operation.claim_send()
+    operations.finish(operation.operation_id, certainty=Certainty.UNKNOWN)
+    operations.detach_waiter(operation.operation_id, "caller")
+    reservation, _ = node._reserve_priority_zero(
+        pipeline_id="policy",
+        hardware_resource_id="ascend:0",
+        requires_open=False,
+        prompt_bytes=0,
+        deadline_monotonic_ns=time.monotonic_ns() + 10**9,
+        **owner,
+    )
+    assert reservation is not None
+    table.mark_unknown(reservation)
+    binding = SimpleNamespace(pipeline_id="policy", pipeline_generation=7, close_operation_id="close-op", **owner)
+    closed = []
+    node._core = SimpleNamespace(
+        begin_close=lambda **_kwargs: None,
+        session_record=lambda _session_id: SimpleNamespace(session_generation=1),
+        wait_for_bindings_to_settle=lambda *_args: True,
+        close_bindings=lambda _session_id: [binding],
+        mark_session_failed=lambda *_args, **_kwargs: None,
+        record_binding_close_success=lambda *args: closed.append(args),
+        record_close_complete=lambda *_args, **_kwargs: 2,
+    )
+    node._candidate_by_id = {"policy": SimpleNamespace(pipeline_id="policy")}
+    node._pipeline_clients = {"policy": {"close": object()}}
+
+    def close(_client, goal, **_kwargs):
+        if reply == "unknown":
+            return _DownstreamCall("unknown")
+        result = ClosePipelineBinding.Result()
+        for field in ("session_id", "logical_generation", "binding_id", "binding_incarnation", "operation_id"):
+            setattr(result, field, getattr(goal, field))
+        result.boot_id = NEW_BOOT_ID if reply == "wrong_boot" else BOOT_ID
+        if reply == "wrong_binding":
+            result.binding_id = str(uuid4())
+        result.pipeline_id = "policy"
+        result.success = reply != "failed"
+        result.outcome.value = InferenceOutcome.COMPLETED
+        result.closed_pipeline_generation = 7
+        result.drained_generation = 7 if reply == "no_drain" else 8
+        return _DownstreamCall("completed", result=result)
+
+    node._call_downstream = close
+    goal = CloseInferenceSession.Goal()
+    goal.session_id, goal.session_generation = SESSION_ID, 1
+    if path == "public_close":
+        result = node._close_once(_GoalHandle(goal), None)
+        assert result.success is (reply == "success")
+    else:
+        from concurrent.futures import Future
+
+        def done(value):
+            future = Future()
+            future.set_result(value)
+            return future
+
+        def send_close(close_goal):
+            call = close(None, close_goal)
+            return done(
+                SimpleNamespace(accepted=True, get_result_async=lambda: done(SimpleNamespace(result=call.result)))
+            )
+
+        node._pipeline_clients["policy"]["close"] = SimpleNamespace(send_goal_async=send_close)
+        late_open = SimpleNamespace(cancel_goal_async=lambda: None, get_result_async=lambda: done(None))
+        node._cleanup_late_open("policy", SimpleNamespace(**owner), late_open)
+    next_reservation = table.try_reserve(
+        pipeline_id="backup",
+        hardware_resource_id="ascend:0",
+        now_ns=0,
+        deadline_ns=10,
+    )
+    assert bool(closed) is (reply == "success")
+    assert (next_reservation is not None) is (reply == "success")
+    assert len(operations) == (0 if reply == "success" else 1)
+
+
 def test_global_close_scheduler_error_uses_clean_wire_code():
     node = object.__new__(GlobalInferenceSchedulerNode)
     node._default_request_timeout_ns = 2_000_000_000
@@ -403,16 +879,23 @@ def test_global_close_scheduler_error_uses_clean_wire_code():
     assert result.error.code == "close_in_progress"
 
 
-def test_global_close_explicit_not_started_restores_session_for_retry():
-    restored: list[str] = []
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_global_close_explicit_not_started_keeps_close_irreversible(recoverable):
     failures: list[str] = []
-    downstream = CloseInferenceSession.Result()
+    completed: list[tuple[object, ...]] = []
+    pending: list[str] = []
+    downstream = ClosePipelineBinding.Result()
     downstream.session_id = SESSION_ID
+    downstream.logical_generation = 1
+    downstream.binding_id = ""
+    downstream.binding_incarnation = 1
+    downstream.operation_id = "close-op"
+    downstream.boot_id = ""
     downstream.pipeline_id = "policy"
     downstream.success = False
     downstream.outcome.value = InferenceOutcome.NOT_STARTED
     downstream.error.code = "no_session_capacity"
-    downstream.error.recoverable = True
+    downstream.error.recoverable = recoverable
 
     node = object.__new__(GlobalInferenceSchedulerNode)
     node._default_request_timeout_ns = 2_000_000_000
@@ -422,8 +905,18 @@ def test_global_close_explicit_not_started_restores_session_for_retry():
         begin_close=lambda **_kwargs: None,
         session_record=lambda _session_id: SimpleNamespace(session_generation=1),
         wait_for_bindings_to_settle=lambda *_args: True,
-        close_bindings=lambda _session_id: [SimpleNamespace(pipeline_id="policy", pipeline_generation=7)],
-        record_close_not_started=restored.append,
+        close_bindings=lambda _session_id: [
+            SimpleNamespace(
+                pipeline_id="policy",
+                pipeline_generation=7,
+                binding_id="",
+                binding_incarnation=1,
+                close_operation_id="close-op",
+                expected_boot_id="",
+            )
+        ],
+        record_close_complete=lambda *args, **kwargs: completed.append((args, kwargs)) or 1,
+        record_close_not_started=lambda session_id: pending.append(session_id),
         mark_session_failed=lambda session_id, **_kwargs: failures.append(session_id),
     )
     node._pipeline_clients = {"policy": {"close": object()}}
@@ -450,9 +943,97 @@ def test_global_close_explicit_not_started_restores_session_for_retry():
     assert not result.success
     assert result.outcome.value == InferenceOutcome.NOT_STARTED
     assert result.error.code == "no_session_capacity"
-    assert result.error.recoverable
-    assert restored == [SESSION_ID]
-    assert failures == []
+    assert result.error.recoverable is recoverable
+    assert not completed
+    assert not failures
+    assert pending == [SESSION_ID]
+
+
+@pytest.mark.parametrize("other_outcome", ["success", "unknown", "failed"])
+@pytest.mark.parametrize("not_started_reason", ["downstream_unavailable", "goal_rejected"])
+def test_global_close_partial_drain_and_not_started_retry(other_outcome, not_started_reason):
+    node = _idempotent_node()
+    node._downstream_operations = OperationRegistry(max_records=8, max_waiters_per_operation=2)
+    candidates = [
+        PipelineCandidate(pid, "g", "ascend:0", "h", "d", "r", "/open", "/dispatch", "/close", "/status", "")
+        for pid in ("a", "b")
+    ]
+    core = node._core = GlobalSchedulerCore(
+        candidates=candidates,
+        max_session_records=4,
+        max_product_requests_per_session=4,
+        terminal_session_retention_ns=10**9,
+        session_idle_timeout_ns=30 * 10**9,
+        max_fallback_pipelines=4,
+        now_ns=time.monotonic_ns,
+    )
+    core.open_session(session_id=SESSION_ID)
+    for candidate in candidates:
+        core.prepare_dispatch_candidate(session_id=SESSION_ID, session_generation=1, pipeline_id=candidate.pipeline_id)
+        core.record_binding_open_success(
+            session_id=SESSION_ID,
+            pipeline_id=candidate.pipeline_id,
+            pipeline_generation=7,
+            hardware_resource_id="ascend:0",
+        )
+    node._candidate_by_id = {candidate.pipeline_id: candidate for candidate in candidates}
+    node._pipeline_clients = {candidate.pipeline_id: {"close": candidate.pipeline_id} for candidate in candidates}
+    node._deadline_reservations = DeadlineReservationTable(policy="fifo")
+    calls = []
+    retry = False
+
+    def close(pid, goal, **_kwargs):
+        calls.append((pid, goal.operation_id))
+        if pid == "b" and not retry:
+            return _DownstreamCall("not_started", reason=not_started_reason)
+        if other_outcome == "unknown":
+            return _DownstreamCall("unknown", reason="result_timeout")
+        result = ClosePipelineBinding.Result()
+        for field in ("session_id", "logical_generation", "binding_id", "binding_incarnation", "operation_id"):
+            setattr(result, field, getattr(goal, field))
+        result.boot_id = goal.expected_boot_id
+        result.pipeline_id = pid
+        result.success = other_outcome == "success"
+        result.outcome.value = InferenceOutcome.COMPLETED
+        result.closed_pipeline_generation = 7
+        result.drained_generation = 8 if result.success else 0
+        result.error.code = "" if result.success else "close_failed"
+        return _DownstreamCall("completed", result=result)
+
+    node._call_downstream = close
+    goal = CloseInferenceSession.Goal()
+    goal.session_id, goal.session_generation = SESSION_ID, 1
+    first = node._close_endpoint(_GoalHandle(goal))
+    record = core.session_record(SESSION_ID)
+    assert [pid for pid, _ in calls] == ["a", "b"]
+    assert not record.bindings["b"].quarantine
+    with pytest.raises(SchedulerError, match="session_not_active" if other_outcome == "success" else "session_failed"):
+        core.prepare_dispatch_candidate(session_id=SESSION_ID, session_generation=1, pipeline_id="b")
+    if other_outcome != "success":
+        assert first.outcome.value == (
+            InferenceOutcome.UNKNOWN if other_outcome == "unknown" else InferenceOutcome.COMPLETED
+        )
+        assert record.quarantine and record.bindings["a"].quarantine
+        return
+    assert first.outcome.value == InferenceOutcome.NOT_STARTED and first.error.recoverable
+    assert record.state == GlobalSessionState.CLOSING and not record.quarantine
+    assert set(record.bindings) == {"b"}
+    retry = True
+    second = node._close_endpoint(_GoalHandle(goal))
+    assert second.success and second.drained_generation == 2
+    assert [pid for pid, _ in calls] == ["a", "b", "b"]
+    assert calls[1][1] != calls[2][1]
+    assert core.session_state(SESSION_ID) == GlobalSessionState.CLOSED
+
+
+@pytest.mark.parametrize("ros_now_ns", [10**9, 1_800_000_000 * 10**9])
+def test_observation_age_uses_ros_clock_then_monotonic_anchor(monkeypatch, ros_now_ns):
+    node = object.__new__(PipelinePolicyNode)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=ros_now_ns))
+    monkeypatch.setattr(time, "monotonic_ns", lambda: 20 * 10**9)
+    metadata = node._observation_time_metadata(ros_now_ns - 200_000_000)
+    assert metadata["observation_timestamp_ns"] == ros_now_ns - 200_000_000
+    assert metadata["observation_monotonic_ns"] == 19_800_000_000
 
 
 def test_work_class_source_matches_wire_contract():
@@ -547,6 +1128,7 @@ def test_priority_zero_estimate_includes_lazy_open_and_dispatch_profiles():
     node._profile_errors = {}
     node._goal_acceptance_safety_margin_ms = 3
     node._dispatch_safety_margin_ms = 4
+    node._priority_zero_deadline_admission_safety_margin_ms = 5
     node._status_lock = threading.Lock()
     status = InferenceServingStatus()
     status.pipeline_compatibility_fingerprint = "c" * 64
@@ -560,7 +1142,7 @@ def test_priority_zero_estimate_includes_lazy_open_and_dispatch_profiles():
     )
 
     assert reason == ""
-    assert estimate_ms == 43.0
+    assert estimate_ms == 48.0
     assert calls == [
         ("closure", 1, "session_open"),
         ("acceptance", 1, ""),
@@ -688,10 +1270,13 @@ def _routing_node(candidate_ids: tuple[str, ...]):
                 pipeline_id=pipeline_id,
                 pipeline_generation=7,
                 needs_open=False,
+                binding_id=BINDING_ID,
+                binding_incarnation=1,
+                expected_boot_id=BOOT_ID,
             )
 
         @staticmethod
-        def record_request_terminal(session_id):
+        def record_request_terminal(session_id, *, request_id=None, session_generation=None):
             terminal_sessions.append(session_id)
 
     node = object.__new__(GlobalInferenceSchedulerNode)
@@ -701,19 +1286,194 @@ def _routing_node(candidate_ids: tuple[str, ...]):
         for pipeline_id in candidate_ids
     }
     node._default_request_timeout_ns = 2_000_000_000
-    node._status_reason = lambda _candidate: ""
+    node._status_reason = lambda _candidate, **_kwargs: ""
     node._compatibility_reason = lambda _target, _candidate: ""
     node._capacity_accepting = lambda _pipeline_id, _work_class: True
     node._max_error_message_bytes = 1024
     node._max_error_details_bytes = 8192
     node._release_reservation = lambda _reservation: None
-    node._mark_reservation_unknown = lambda _reservation: None
+    node._mark_reservation_unknown = lambda _reservation, **_kwargs: None
     node._deadline_reservations = SimpleNamespace(wait_for_turn=lambda *_args, **_kwargs: "ready")
+    node._priority_zero_deadline_admission_enabled = False
     return node, terminal_sessions
+
+
+def test_dispatch_waits_for_an_opening_binding_before_sending_generation_zero():
+    terminal_sessions: list[str] = []
+    wait_calls: list[str] = []
+    dispatch_generations: list[int] = []
+    binding_active = False
+
+    class _Core:
+        @staticmethod
+        def resolve_dispatch_plan(**_kwargs):
+            return SimpleNamespace(candidate_ids=("policy",))
+
+        @staticmethod
+        def prepare_dispatch_candidate(*, pipeline_id, **_kwargs):
+            return SimpleNamespace(
+                pipeline_id=pipeline_id,
+                reason="" if binding_active else "binding_open_in_progress",
+                pipeline_generation=7 if binding_active else 0,
+                needs_open=False,
+            )
+
+        @staticmethod
+        def wait_for_binding_open(**_kwargs):
+            nonlocal binding_active
+            wait_calls.append("policy")
+            binding_active = True
+            return True
+
+        @staticmethod
+        def record_request_terminal(session_id, **_kwargs):
+            terminal_sessions.append(session_id)
+
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._core = _Core()
+    node._candidate_by_id = {"policy": SimpleNamespace(pipeline_id="policy", hardware_resource_id="ascend:0")}
+    node._default_request_timeout_ns = 2_000_000_000
+    node._status_reason = lambda _candidate, **_kwargs: ""
+    node._compatibility_reason = lambda _target, _candidate: ""
+    node._capacity_accepting = lambda _pipeline_id, _work_class: True
+    node._max_error_message_bytes = 1024
+    node._max_error_details_bytes = 8192
+    node._serving_status = {}
+    node._priority_zero_deadline_admission_enabled = False
+
+    def dispatch(_goal_handle, goal, _candidate, *, pipeline_generation, **_kwargs):
+        dispatch_generations.append(pipeline_generation)
+        result = ScheduledDispatchInfer.Result()
+        result.request_id = goal.request_id
+        result.session_id = goal.session_id
+        result.pipeline_id = "policy"
+        result.session_generation = goal.session_generation
+        result.success = True
+        result.outcome.value = InferenceOutcome.COMPLETED
+        return _DownstreamCall("completed", result=result), goal
+
+    node._dispatch_bound_pipeline = dispatch
+    result = GlobalInferenceSchedulerNode._dispatch_once(
+        node,
+        _GoalHandle(_dispatch_goal(priority=1, deadline_ns=0, fallback_chain=[])),
+        None,
+    )
+
+    assert result.success
+    assert wait_calls == ["policy"]
+    assert dispatch_generations == [7]
+    assert terminal_sessions == [SESSION_ID]
+
+
+def test_visual_unknown_quarantines_pipeline_session_controller():
+    quarantined: list[bool] = []
+    published: list[bool] = []
+
+    class _FailedFuture:
+        @staticmethod
+        def result():
+            raise BackendInferenceError(
+                "async completion is uncertain",
+                code="async_execution_uncertain",
+                operation_started=True,
+                outcome_known=False,
+            )
+
+    node = object.__new__(PipelinePolicyNode)
+    node._frame_trigger_lock = threading.Lock()
+    node._frame_trigger_future = _FailedFuture()
+    node._visual_trigger_epoch = 0
+    node._last_error = ""
+    node._session_controller = SimpleNamespace(mark_failed_quarantine=lambda: quarantined.append(True))
+    node.get_logger = lambda: SimpleNamespace(error=lambda *_args, **_kwargs: None)
+    node._publish_serving_status = lambda: published.append(True)
+
+    PipelinePolicyNode._visual_frame_completed(node, node._frame_trigger_future, 0)
+
+    assert quarantined == [True]
+    assert published == [True]
+
+
+@pytest.mark.parametrize("invalidate_during_result", [False, True])
+def test_old_visual_failure_cannot_quarantine_new_epoch(invalidate_during_result):
+    node = object.__new__(PipelinePolicyNode)
+    node._frame_trigger_lock = threading.RLock()
+    node._visual_trigger_epoch = 0
+    node._last_error = ""
+    quarantined = []
+    node._session_controller = SimpleNamespace(mark_failed_quarantine=lambda: quarantined.append(True))
+
+    class FailedFuture:
+        def result(self):
+            if invalidate_during_result:
+                node._invalidate_visual_trigger()
+            raise BackendInferenceError("uncertain", operation_started=True, outcome_known=False)
+
+    future = FailedFuture()
+    node._frame_trigger_future = future
+    if not invalidate_during_result:
+        node._invalidate_visual_trigger()
+    node._visual_frame_completed(future, 0)
+    assert quarantined == []
+    assert node._last_error == ""
+
+
+def test_visual_sampling_is_reserved_and_fenced_before_submission():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from inference_service.scheduler.session_controller import ServingState
+
+    entered, release = threading.Event(), threading.Event()
+    sampled, submitted = [], []
+    node = object.__new__(PipelinePolicyNode)
+    node._config = SimpleNamespace(
+        scheduler_enabled=True, pipeline_stage_policy="independent", pipeline_id="policy", default_task="task"
+    )
+    node._frame_trigger_lock = threading.RLock()
+    node._frame_trigger_future = None
+    node._pending_visual_sample_time_ns = None
+    node._visual_trigger_epoch = 0
+    node._visual_trigger_enabled = True
+    node._frame_trigger_priority = 1
+    node._scheduled_binding_identity = (SESSION_ID, 1, BINDING_ID, 1, BOOT_ID, 1)
+    node._session_controller = SimpleNamespace(
+        snapshot=lambda: SimpleNamespace(
+            state=ServingState.ACTIVE, product_session_id=SESSION_ID, product_session_generation=1
+        )
+    )
+    node._manager = SimpleNamespace(submit_frame=lambda *args: submitted.append(args))
+    node._to_policy_inputs = lambda value: value
+    node._current_task = "task"
+    node._last_error = ""
+    node.get_logger = lambda: SimpleNamespace(debug=lambda *args, **kwargs: None)
+
+    def sample(timestamp):
+        sampled.append(timestamp)
+        entered.set()
+        assert release.wait(2)
+        return {}
+
+    node._sample_observations = sample
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(node._request_visual_frame, 10)
+        try:
+            assert entered.wait(1)
+            node._request_visual_frame(20)
+            assert sampled == [10]
+            node._invalidate_visual_trigger()
+            node._visual_trigger_enabled = True
+            release.set()
+            first.result(timeout=2)
+            assert submitted == []
+            assert node._frame_trigger_future is None
+            assert node._last_error == ""
+        finally:
+            release.set()
 
 
 def test_priority_zero_checks_each_candidate_and_dispatches_first_feasible_fallback():
     node, terminal_sessions = _routing_node(("policy", "backup"))
+    node._priority_zero_deadline_admission_enabled = True
     checked: list[tuple[str, bool]] = []
     dispatched: list[str] = []
 
@@ -749,6 +1509,7 @@ def test_priority_zero_checks_each_candidate_and_dispatches_first_feasible_fallb
 
 def test_priority_zero_returns_error_without_dispatch_when_all_candidates_miss_deadline():
     node, _terminal_sessions = _routing_node(("policy", "backup"))
+    node._priority_zero_deadline_admission_enabled = True
     node._reserve_priority_zero = lambda **_kwargs: (None, "measured closure exceeds deadline")
     node._dispatch_bound_pipeline = lambda *_args, **_kwargs: (_ for _ in ()).throw(
         AssertionError("infeasible priority-0 request must not be dispatched")
@@ -766,6 +1527,104 @@ def test_priority_zero_returns_error_without_dispatch_when_all_candidates_miss_d
     assert result.outcome.value == InferenceOutcome.NOT_STARTED
     assert result.error.code == "no_feasible_deadline"
     assert result.error.message == "measured closure exceeds deadline"
+
+
+def test_edf_priority_zero_uses_unprofiled_reservation_and_fallback() -> None:
+    node, terminal_sessions = _routing_node(("policy", "backup"))
+    node._global_policy = "edf"
+    node._priority_zero_deadline_admission_enabled = False
+    node._serving_status = {}
+    reserved: list[tuple[str, int | None]] = []
+
+    class _Reservations:
+        @staticmethod
+        def try_reserve(*, pipeline_id, estimate_ns=None, **_kwargs):
+            reserved.append((pipeline_id, estimate_ns))
+            return None if pipeline_id == "policy" else SimpleNamespace()
+
+        @staticmethod
+        def wait_for_turn(*_args, **_kwargs):
+            return "ready"
+
+    node._deadline_reservations = _Reservations()
+    node._priority_zero_estimate_ms = lambda **_kwargs: (_ for _ in ()).throw(
+        AssertionError("EDF must not require a profile estimate")
+    )
+    dispatched: list[str] = []
+
+    def dispatch(_goal_handle, goal, candidate, **_kwargs):
+        dispatched.append(candidate.pipeline_id)
+        result = ScheduledDispatchInfer.Result()
+        result.success = True
+        result.session_generation = 7
+        result.outcome.value = InferenceOutcome.COMPLETED
+        return _DownstreamCall("completed", result=result), goal
+
+    node._dispatch_bound_pipeline = dispatch
+    goal_handle = _GoalHandle(
+        _dispatch_goal(
+            priority=0,
+            deadline_ns=time.time_ns() + 1_000_000_000,
+            fallback_chain=["backup"],
+        )
+    )
+
+    result = GlobalInferenceSchedulerNode._dispatch_once(node, goal_handle, None)
+
+    assert result.success
+    assert reserved == [("policy", None), ("backup", None)]
+    assert dispatched == ["backup"]
+    assert terminal_sessions == [SESSION_ID]
+
+
+def test_edf_global_dispatch_orders_concurrent_requests_by_absolute_deadline() -> None:
+    node, terminal_sessions = _routing_node(("policy",))
+    node._global_policy = "edf"
+    node._priority_zero_deadline_admission_enabled = False
+    node._serving_status = {}
+    both_waiting = threading.Barrier(2)
+
+    class _SynchronizedReservations(DeadlineReservationTable):
+        def wait_for_turn(self, reservation, **kwargs):
+            both_waiting.wait(timeout=1.0)
+            return super().wait_for_turn(reservation, **kwargs)
+
+    reservations = _SynchronizedReservations(policy="edf")
+    node._deadline_reservations = reservations
+    node._release_reservation = reservations.release
+    node._mark_reservation_unknown = lambda reservation, **_kwargs: reservations.mark_unknown(reservation)
+    dispatch_order: list[str] = []
+
+    def dispatch(_goal_handle, goal, candidate, **_kwargs):
+        dispatch_order.append(goal.request_id)
+        result = ScheduledDispatchInfer.Result()
+        result.success = True
+        result.session_generation = goal.session_generation
+        result.request_id = goal.request_id
+        result.pipeline_id = candidate.pipeline_id
+        result.outcome.value = InferenceOutcome.COMPLETED
+        return _DownstreamCall("completed", result=result), goal
+
+    node._dispatch_bound_pipeline = dispatch
+    later = _dispatch_goal(priority=0, deadline_ns=time.time_ns() + 1_500_000_000, fallback_chain=[])
+    earlier = _dispatch_goal(priority=0, deadline_ns=time.time_ns() + 1_000_000_000, fallback_chain=[])
+    earlier.request_id = NEW_BOOT_ID
+    results: list[ScheduledDispatchInfer.Result] = []
+
+    def run(goal):
+        results.append(GlobalInferenceSchedulerNode._dispatch_once(node, _GoalHandle(goal), None))
+
+    later_thread = threading.Thread(target=run, args=(later,))
+    earlier_thread = threading.Thread(target=run, args=(earlier,))
+    later_thread.start()
+    earlier_thread.start()
+    later_thread.join(timeout=2.0)
+    earlier_thread.join(timeout=2.0)
+
+    assert not later_thread.is_alive() and not earlier_thread.is_alive()
+    assert all(result.success for result in results)
+    assert dispatch_order == [NEW_BOOT_ID, REQUEST_ID]
+    assert terminal_sessions == [SESSION_ID, SESSION_ID]
 
 
 def test_first_dispatch_lazily_opens_selected_pipeline_binding():
@@ -789,20 +1648,21 @@ def test_first_dispatch_lazily_opens_selected_pipeline_binding():
             return False
 
         @staticmethod
-        def record_request_terminal(session_id):
+        def record_request_terminal(session_id, *, request_id=None, session_generation=None):
             terminal_sessions.append(session_id)
 
     node = object.__new__(GlobalInferenceSchedulerNode)
     node._core = _Core()
     node._candidate_by_id = {"policy": SimpleNamespace(pipeline_id="policy", hardware_resource_id="ascend:0")}
     node._default_request_timeout_ns = 2_000_000_000
-    node._status_reason = lambda _candidate: ""
+    node._status_reason = lambda _candidate, **_kwargs: ""
     node._compatibility_reason = lambda _target, _candidate: ""
     node._capacity_accepting = lambda _pipeline_id, _work_class: True
     node._reserve_priority_zero = lambda **_kwargs: (SimpleNamespace(), "")
     node._release_reservation = lambda _reservation: None
-    node._mark_reservation_unknown = lambda _reservation: None
+    node._mark_reservation_unknown = lambda _reservation, **_kwargs: None
     node._deadline_reservations = SimpleNamespace(wait_for_turn=lambda *_args, **_kwargs: "ready")
+    node._priority_zero_deadline_admission_enabled = False
     node._max_error_message_bytes = 1024
     node._max_error_details_bytes = 8192
     open_result = OpenInferenceSession.Result()
@@ -835,6 +1695,243 @@ def test_first_dispatch_lazily_opens_selected_pipeline_binding():
     assert terminal_sessions == [SESSION_ID]
 
 
+@pytest.mark.parametrize("open_certainty", ["completed", "not_started"])
+def test_close_racing_real_lazy_open_settles_binding_and_releases_reservation(open_certainty):
+    candidate = PipelineCandidate(
+        pipeline_id="policy",
+        compatibility_group="g",
+        hardware_resource_id="ascend:0",
+        hardware_profile_fingerprint="a" * 64,
+        deployment_fingerprint="d" * 64,
+        runtime_policy_fingerprint="r" * 64,
+        endpoint_open="/open",
+        endpoint_dispatch="/dispatch",
+        endpoint_close="/close",
+        endpoint_serving_status="/status",
+        profile_path="",
+    )
+    core = GlobalSchedulerCore(
+        candidates=[candidate],
+        max_session_records=4,
+        max_product_requests_per_session=4,
+        terminal_session_retention_ns=1_000_000_000,
+        session_idle_timeout_ns=30_000_000_000,
+        max_fallback_pipelines=4,
+        now_ns=time.monotonic_ns,
+    )
+    core.open_session(session_id=SESSION_ID)
+    node, _ = _routing_node(("policy",))
+    node._core = core
+    node._candidate_by_id = {"policy": candidate}
+    node._global_policy = "edf"
+    node._serving_status = {
+        "policy": SimpleNamespace(
+            message=SimpleNamespace(supports_priority_zero_deadline_admission=True, boot_id=BOOT_ID)
+        )
+    }
+    node._status_lock = threading.RLock()
+    node._trusted_status_cursors = {"policy": (BOOT_ID, 1)}
+    node._pipeline_clients = {"policy": {"open": object()}}
+    table = node._deadline_reservations = DeadlineReservationTable(policy="edf")
+    node._release_reservation = table.release
+    del node._mark_reservation_unknown
+    sent = []
+
+    def reserve(**kwargs):
+        # Deterministically linearize Close after prepare, before the real Open helper.
+        core.begin_close(session_id=SESSION_ID, session_generation=1)
+        return table.try_reserve(
+            pipeline_id="policy",
+            hardware_resource_id="ascend:0",
+            now_ns=time.monotonic_ns(),
+            deadline_ns=kwargs["deadline_monotonic_ns"],
+        ), ""
+
+    node._reserve_priority_zero = reserve
+
+    def send(_client, goal, **_kwargs):
+        sent.append(goal)
+        assert core.session_state(SESSION_ID) == GlobalSessionState.CLOSING
+        if open_certainty == "not_started":
+            return _DownstreamCall("not_started", reason="downstream_rejected")
+        result = OpenPipelineBinding.Result()
+        for field in ("session_id", "logical_generation", "binding_id", "binding_incarnation", "operation_id"):
+            setattr(result, field, getattr(goal, field))
+        result.boot_id = goal.expected_boot_id
+        result.pipeline_id = candidate.pipeline_id
+        result.pipeline_generation = 2
+        result.deployment_fingerprint = candidate.deployment_fingerprint
+        result.runtime_policy_fingerprint = candidate.runtime_policy_fingerprint
+        result.success = True
+        result.outcome.value = InferenceOutcome.COMPLETED
+        return _DownstreamCall("completed", result=result)
+
+    node._call_downstream = send
+    result = node._dispatch_once(
+        _GoalHandle(_dispatch_goal(priority=0, deadline_ns=time.time_ns() + 1_000_000_000, fallback_chain=[])), None
+    )
+
+    assert len(sent) == 1
+    assert result.outcome.value == InferenceOutcome.NOT_STARTED
+    assert core.wait_for_bindings_to_settle(SESSION_ID, time.monotonic_ns() + 100_000_000)
+    assert core.session_state(SESSION_ID) == GlobalSessionState.CLOSING
+    assert (
+        table.try_reserve(
+            pipeline_id="policy",
+            hardware_resource_id="ascend:0",
+            now_ns=time.monotonic_ns(),
+            deadline_ns=time.monotonic_ns() + 1_000_000_000,
+        )
+        is not None
+    )
+    if open_certainty == "not_started":
+        assert core.session_record(SESSION_ID).bindings == {}
+    else:
+        assert core.session_record(SESSION_ID).bindings["policy"].pipeline_generation == 2
+
+
+@pytest.mark.parametrize("fence_order", ["before_unknown", "after_unknown", "no_fence"])
+def test_late_unknown_reservation_respects_trusted_boot_fence(fence_order):
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._status_lock = threading.RLock()
+    node._trusted_status_cursors = {"policy": (BOOT_ID, 1)}
+    table = node._deadline_reservations = DeadlineReservationTable()
+    now = time.monotonic_ns()
+    reservation = table.try_reserve(
+        pipeline_id="policy", hardware_resource_id="ascend:0", now_ns=now, deadline_ns=now + 10**9
+    )
+
+    def fence():
+        with node._status_lock:
+            table.reconcile_pipeline("policy")
+            node._trusted_status_cursors["policy"] = (NEW_BOOT_ID, 1)
+
+    if fence_order == "before_unknown":
+        fence()
+    node._mark_reservation_unknown(reservation, expected_boot_id=BOOT_ID)
+    if fence_order == "after_unknown":
+        fence()
+    replacement = table.try_reserve(
+        pipeline_id="policy", hardware_resource_id="ascend:0", now_ns=now, deadline_ns=now + 10**9
+    )
+    if fence_order == "no_fence":
+        assert replacement is None
+    else:
+        assert replacement is not None
+        assert table.wait_for_turn(replacement, deadline_ns=now + 10**9) == "ready"
+
+
+def test_unsupported_profile_admission_releases_unsent_binding():
+    candidate = PipelineCandidate(
+        pipeline_id="policy",
+        compatibility_group="g",
+        hardware_resource_id="ascend:0",
+        hardware_profile_fingerprint="a" * 64,
+        deployment_fingerprint="d" * 64,
+        runtime_policy_fingerprint="r" * 64,
+        endpoint_open="/open",
+        endpoint_dispatch="/dispatch",
+        endpoint_close="/close",
+        endpoint_serving_status="/status",
+        profile_path="",
+    )
+    core = GlobalSchedulerCore(
+        candidates=[candidate],
+        max_session_records=4,
+        max_product_requests_per_session=4,
+        terminal_session_retention_ns=1_000_000_000,
+        session_idle_timeout_ns=30_000_000_000,
+        max_fallback_pipelines=4,
+        now_ns=time.monotonic_ns,
+    )
+    core.open_session(session_id=SESSION_ID)
+    node, _ = _routing_node(("policy",))
+    node._core = core
+    node._candidate_by_id = {"policy": candidate}
+    node._global_policy = "fifo"
+    node._priority_zero_deadline_admission_enabled = True
+    node._serving_status = {
+        "policy": SimpleNamespace(
+            message=SimpleNamespace(supports_priority_zero_deadline_admission=False, boot_id=BOOT_ID)
+        )
+    }
+    result = node._dispatch_once(
+        _GoalHandle(_dispatch_goal(priority=0, deadline_ns=time.time_ns() + 1_000_000_000, fallback_chain=[])), None
+    )
+    assert not result.success
+    assert result.error.code == "priority_zero_deadline_admission_not_supported"
+    assert core.session_record(SESSION_ID).bindings == {}
+    next_binding = core.prepare_dispatch_candidate(session_id=SESSION_ID, session_generation=1, pipeline_id="policy")
+    assert next_binding.needs_open
+
+
+def test_edf_priority_zero_skips_independent_stage_candidates():
+    """EDF is deadline-driven ordering: independent stages cannot honor it."""
+
+    node, terminal_sessions = _routing_node(("policy", "backup"))
+    node._global_policy = "edf"
+    node._priority_zero_deadline_admission_enabled = False
+    node._serving_status = {
+        "policy": SimpleNamespace(
+            message=SimpleNamespace(supports_priority_zero_deadline_admission=False, boot_id=BOOT_ID)
+        ),
+        "backup": SimpleNamespace(
+            message=SimpleNamespace(supports_priority_zero_deadline_admission=True, boot_id=BOOT_ID)
+        ),
+    }
+    reserved: list[str] = []
+
+    def reserve(*, pipeline_id, **_kwargs):
+        reserved.append(pipeline_id)
+        return SimpleNamespace(), ""
+
+    node._reserve_priority_zero = reserve
+    dispatched: list[str] = []
+
+    def dispatch(_goal_handle, goal, candidate, **_kwargs):
+        dispatched.append(candidate.pipeline_id)
+        result = ScheduledDispatchInfer.Result()
+        result.success = True
+        result.session_generation = 7
+        result.outcome.value = InferenceOutcome.COMPLETED
+        return _DownstreamCall("completed", result=result), goal
+
+    node._dispatch_bound_pipeline = dispatch
+    result = GlobalInferenceSchedulerNode._dispatch_once(
+        node,
+        _GoalHandle(_dispatch_goal(priority=0, deadline_ns=time.time_ns() + 1_000_000_000, fallback_chain=["backup"])),
+        None,
+    )
+
+    assert result.success
+    assert reserved == ["backup"]
+    assert dispatched == ["backup"]
+    assert terminal_sessions == [SESSION_ID]
+
+
+def test_edf_priority_zero_reports_no_feasible_candidate_when_all_independent():
+    node, _terminal_sessions = _routing_node(("policy", "backup"))
+    node._global_policy = "edf"
+    node._priority_zero_deadline_admission_enabled = False
+    node._serving_status = {
+        pipeline_id: SimpleNamespace(
+            message=SimpleNamespace(supports_priority_zero_deadline_admission=False, boot_id=BOOT_ID)
+        )
+        for pipeline_id in ("policy", "backup")
+    }
+    node._dispatch_bound_pipeline = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("deadline-driven priority-0 must not dispatch to independent stages")
+    )
+    result = GlobalInferenceSchedulerNode._dispatch_once(
+        node,
+        _GoalHandle(_dispatch_goal(priority=0, deadline_ns=time.time_ns() + 1_000_000_000, fallback_chain=["backup"])),
+        None,
+    )
+
+    assert result.outcome.value == InferenceOutcome.NOT_STARTED
+    assert result.error.code == "priority_zero_deadline_admission_not_supported"
+
+
 def test_positive_priority_dispatches_target_without_profile_admission():
     node, _terminal_sessions = _routing_node(("policy",))
     node._reserve_priority_zero = lambda **_kwargs: (_ for _ in ()).throw(
@@ -863,6 +1960,36 @@ def test_positive_priority_dispatches_target_without_profile_admission():
 
     assert result.success
     assert dispatched == ["policy"]
+
+
+def test_dispatch_rejects_priority_missing_from_public_status_mask():
+    node, terminal_sessions = _routing_node(("policy",))
+    checked: list[int | None] = []
+
+    def status_reason(_candidate, **kwargs):
+        checked.append(kwargs.get("required_priority"))
+        return "unsupported_public_priority"
+
+    node._status_reason = status_reason
+    node._dispatch_bound_pipeline = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("priority rejected by Global must not reach downstream")
+    )
+    result = GlobalInferenceSchedulerNode._dispatch_once(
+        node,
+        _GoalHandle(
+            _dispatch_goal(
+                priority=3,
+                deadline_ns=time.time_ns() + 1_000_000_000,
+                fallback_chain=[],
+            )
+        ),
+        None,
+    )
+
+    assert result.outcome.value == InferenceOutcome.NOT_STARTED
+    assert result.error.code == "unsupported_public_priority"
+    assert checked == [3]
+    assert terminal_sessions == [SESSION_ID]
 
 
 def test_pipeline_executor_preserves_legacy_thread_count(monkeypatch):
@@ -894,7 +2021,11 @@ def test_pipeline_executor_preserves_legacy_thread_count(monkeypatch):
     monkeypatch.setattr(pipeline_policy_module.rclpy, "init", lambda **_kwargs: None)
     monkeypatch.setattr(pipeline_policy_module.rclpy, "ok", lambda: False)
     monkeypatch.setattr(pipeline_policy_module, "_read_config", lambda: next(configs))
-    monkeypatch.setattr(pipeline_policy_module, "PipelinePolicyNode", lambda _config, node_name: _Node())
+    monkeypatch.setattr(
+        pipeline_policy_module,
+        "PipelinePolicyNode",
+        lambda _config, node_name, registry_set, providers: _Node(),
+    )
     monkeypatch.setattr(pipeline_policy_module, "MultiThreadedExecutor", _Executor)
 
     pipeline_policy_module.main()
@@ -951,6 +2082,8 @@ def _runtime_policy_node(runtime_options_json: str) -> PipelinePolicyNode:
         hardware_resource_id="ascend:0",
         public_capacity_json='{"session_control": {"max_in_flight": 1}}',
         runtime_options_json=runtime_options_json,
+        pipeline_stage_policy="sequential",
+        pipeline_scheduling_json='{"stage_policy":"sequential","frame_base_priority":0,"stages":{}}',
         scheduled_open_session="/inference/policy/session/open",
         scheduled_dispatch="/inference/policy/scheduled_dispatch",
         scheduled_close_session="/inference/policy/session/close",
@@ -969,6 +2102,7 @@ def _runtime_policy(runtime_options: dict) -> dict:
         "deployment_fingerprint": "d" * 64,
         "public_capacity": {"session_control": {"max_in_flight": 1}},
         "runtime_options": effective_latency_runtime_options(runtime_options),
+        "scheduling": {"stage_policy": "sequential", "frame_base_priority": 0, "stages": {}},
         "transport": {
             "open_session": "/inference/policy/session/open",
             "dispatch": "/inference/policy/scheduled_dispatch",
@@ -1011,6 +2145,23 @@ def test_scheduled_runtime_policy_accepts_matching_and_normalized_options():
         }
     )
     PipelinePolicyNode._validate_runtime_policy(default_node, explicit)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"pipeline_stage_policy": "independent"},
+        {"pipeline_scheduling_json": '{"stage_policy":"independent"}'},
+        {"pipeline_scheduling_json": '{"frame_base_priority":3}'},
+        {"pipeline_scheduling_json": '{"stages":{"encoder":{"priority_offset":2,"instance_count":1}}}'},
+    ],
+)
+def test_scheduled_runtime_policy_rejects_scheduling_parameter_overrides(override):
+    node = _runtime_policy_node("{}")
+    for key, value in override.items():
+        setattr(node._config, key, value)
+    with pytest.raises(RuntimeError, match="scheduling mismatch"):
+        node._validate_runtime_policy(_runtime_policy({}))
 
 
 def test_scheduled_runtime_policy_rejects_policy_without_options_identity():
@@ -1087,8 +2238,9 @@ def test_mismatched_pipeline_id_cannot_reconcile_a_new_boot():
     node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=now_ns))
     node._clock_skew_tolerance_ns = 1_000_000_000
     node._status_stale_timeout_ns = 5_000_000_000
-    node._core = SimpleNamespace(reconcile_pipeline_boot=reconciled.append)
+    node._core = SimpleNamespace(reconcile_pipeline_boot=lambda pipeline_id, boot_id: reconciled.append(pipeline_id))
     node._deadline_reservations = SimpleNamespace(reconcile_pipeline=deadline_reconciled.append)
+    node._downstream_operations = SimpleNamespace(fence_boot=lambda _boot_id: None)
     callback = node._make_status_callback("policy")
 
     previous = InferenceServingStatus()
@@ -1157,8 +2309,9 @@ def test_invalid_new_boot_status_cannot_reconcile_quarantine(mutation, expected_
     node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=now_ns))
     node._clock_skew_tolerance_ns = 1_000_000_000
     node._status_stale_timeout_ns = 5_000_000_000
-    node._core = SimpleNamespace(reconcile_pipeline_boot=reconciled.append)
+    node._core = SimpleNamespace(reconcile_pipeline_boot=lambda pipeline_id, boot_id: reconciled.append(pipeline_id))
     node._deadline_reservations = SimpleNamespace(reconcile_pipeline=deadline_reconciled.append)
+    node._downstream_operations = SimpleNamespace(fence_boot=lambda _boot_id: None)
     callback = node._make_status_callback("policy")
     status = InferenceServingStatus()
     status.pipeline_id = "policy"
@@ -1182,7 +2335,8 @@ def test_invalid_new_boot_status_cannot_reconcile_quarantine(mutation, expected_
     assert node._serving_status["policy"].invalid_reason == expected_reason
 
 
-def test_fully_valid_new_boot_reconciles_quarantine_once():
+@pytest.mark.parametrize("schema_version", [0, 1, 2])
+def test_only_supported_schema_new_boot_reconciles_quarantine_once(schema_version):
     reconciled = []
     deadline_reconciled = []
     node = object.__new__(GlobalInferenceSchedulerNode)
@@ -1201,8 +2355,9 @@ def test_fully_valid_new_boot_reconciles_quarantine_once():
     node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=now_ns))
     node._clock_skew_tolerance_ns = 1_000_000_000
     node._status_stale_timeout_ns = 5_000_000_000
-    node._core = SimpleNamespace(reconcile_pipeline_boot=reconciled.append)
+    node._core = SimpleNamespace(reconcile_pipeline_boot=lambda pipeline_id, boot_id: reconciled.append(pipeline_id))
     node._deadline_reservations = SimpleNamespace(reconcile_pipeline=deadline_reconciled.append)
+    node._downstream_operations = SimpleNamespace(fence_boot=lambda _boot_id: None)
     status = InferenceServingStatus()
     status.pipeline_id = "policy"
     status.boot_id = NEW_BOOT_ID
@@ -1216,14 +2371,23 @@ def test_fully_valid_new_boot_reconciles_quarantine_once():
     status.runtime_hardware_resource_id = "resource"
     status.hardware_priority_levels = 1
 
+    status.scheduling_capability_schema_version = schema_version
+    status.stage_policy = "SEQUENTIAL"
+
     callback = node._make_status_callback("policy")
     callback(status)
     status.sequence = 2
     callback(status)
 
-    assert reconciled == ["policy"]
-    assert deadline_reconciled == ["policy"]
-    assert node._trusted_status_cursors["policy"] == (NEW_BOOT_ID, 2)
+    if schema_version == 1:
+        assert reconciled == ["policy"]
+        assert deadline_reconciled == ["policy"]
+        assert node._trusted_status_cursors["policy"] == (NEW_BOOT_ID, 2)
+    else:
+        assert reconciled == []
+        assert deadline_reconciled == []
+        assert node._trusted_status_cursors["policy"] == (BOOT_ID, 7)
+        assert node._serving_status["policy"].invalid_reason == "scheduling_capability_schema_mismatch"
 
 
 def test_fallback_compatibility_does_not_require_primary_status():
@@ -1248,7 +2412,7 @@ def test_fallback_compatibility_still_compares_a_healthy_primary():
         "primary": SimpleNamespace(message=SimpleNamespace(pipeline_compatibility_fingerprint="primary-contract")),
         "fallback": SimpleNamespace(message=SimpleNamespace(pipeline_compatibility_fingerprint="fallback-contract")),
     }
-    node._status_reason = lambda _candidate: ""
+    node._status_reason = lambda _candidate, **_kwargs: ""
 
     assert (
         GlobalInferenceSchedulerNode._compatibility_reason(node, target, fallback) == "pipeline_compatibility_mismatch"
@@ -1270,15 +2434,21 @@ def test_idle_close_identity_mismatch_marks_session_failed():
     node = object.__new__(GlobalInferenceSchedulerNode)
     node._core = SimpleNamespace(
         expired_sessions=lambda: [session_id],
-        session_record=lambda _session_id: SimpleNamespace(session_generation=3),
+        session_record=lambda _session_id: SimpleNamespace(
+            session_generation=3,
+            state=GlobalSessionState.ACTIVE,
+            in_flight_requests=0,
+        ),
         begin_close=lambda **_kwargs: None,
         wait_for_bindings_to_settle=lambda *_args: True,
         close_bindings=lambda _session_id: [SimpleNamespace(pipeline_id="policy", pipeline_generation=3)],
         record_binding_close_success=lambda *args: close_successes.append(args),
         record_close_complete=lambda *args, **_kwargs: 4,
-        record_close_not_started=lambda _session_id: None,
         mark_session_failed=lambda session_id, **_kwargs: failures.append(session_id),
+        aged_quarantined_sessions=lambda _age_ns: [],
     )
+    node._close_retry_exhausted = set()
+    node._session_idle_timeout_ns = 30_000_000_000
     node._pipeline_clients = {"policy": {"close": object()}}
     node._candidate_by_id = {
         "policy": SimpleNamespace(
@@ -1291,6 +2461,7 @@ def test_idle_close_identity_mismatch_marks_session_failed():
     node._max_error_message_bytes = 1024
     node._max_error_details_bytes = 8192
     node._call_downstream = lambda *_args, **_kwargs: _DownstreamCall("completed", result=result)
+    node.get_logger = lambda: SimpleNamespace(warning=lambda *_args: None, error=lambda *_args: None)
 
     node._idle_sweep()
 
@@ -1303,14 +2474,21 @@ def test_pipeline_rejects_expired_open_before_session_admission():
         def begin_open(self, _session_id):
             raise AssertionError("expired Open must not reach session admission")
 
-    goal = OpenInferenceSession.Goal()
+    goal = OpenPipelineBinding.Goal()
     goal.session_id = "00112233-4455-4677-8899-aabbccddeeff"
+    goal.logical_generation = 1
+    goal.binding_id = BINDING_ID
+    goal.binding_incarnation = 1
+    goal.operation_id = REQUEST_ID
+    goal.expected_boot_id = BOOT_ID
     expired_ns = time.time_ns() - 1_000_000
     goal.deadline.sec = expired_ns // 1_000_000_000
     goal.deadline.nanosec = expired_ns % 1_000_000_000
     goal_handle = _GoalHandle(goal)
     node = object.__new__(PipelinePolicyNode)
     node._session_controller = _Controller()
+    node._boot_id = BOOT_ID
+    node._scheduled_binding_identity = None
     node._config = SimpleNamespace(
         pipeline_id="policy",
         request_timeout=1.0,
@@ -1327,17 +2505,23 @@ def test_pipeline_rejects_expired_open_before_session_admission():
 
 
 def test_pipeline_rejects_priority_not_supported_by_single_priority_backend():
-    goal = ScheduledDispatchInfer.Goal()
+    goal = DispatchPipelineBinding.Goal()
     goal.request_id = REQUEST_ID
     goal.session_id = SESSION_ID
-    goal.session_generation = 1
-    goal.target_pipeline_id = "policy"
+    goal.logical_generation = 1
+    goal.binding_id = BINDING_ID
+    goal.binding_incarnation = 1
+    goal.operation_id = NEW_BOOT_ID
+    goal.expected_boot_id = BOOT_ID
+    goal.expected_pipeline_generation = 1
     goal.priority = 1
     deadline_ns = time.time_ns() + 1_000_000_000
     goal.deadline.sec, goal.deadline.nanosec = divmod(deadline_ns, 1_000_000_000)
     goal_handle = _GoalHandle(goal)
     node = object.__new__(PipelinePolicyNode)
     node._session_controller = SimpleNamespace()
+    node._boot_id = BOOT_ID
+    node._scheduled_binding_identity = (SESSION_ID, 1, BINDING_ID, 1, BOOT_ID, 1)
     node._config = SimpleNamespace(
         pipeline_id="policy",
         request_timeout=1.0,
@@ -1375,11 +2559,15 @@ def test_pipeline_post_inference_failure_is_completed_not_not_started():
         def release_in_flight(_work_class):
             return None
 
-    goal = ScheduledDispatchInfer.Goal()
+    goal = DispatchPipelineBinding.Goal()
     goal.request_id = REQUEST_ID
     goal.session_id = SESSION_ID
-    goal.session_generation = 1
-    goal.target_pipeline_id = "policy"
+    goal.logical_generation = 1
+    goal.binding_id = BINDING_ID
+    goal.binding_incarnation = 1
+    goal.operation_id = NEW_BOOT_ID
+    goal.expected_boot_id = BOOT_ID
+    goal.expected_pipeline_generation = 1
     goal.priority = 0
     goal.obs_timestamp.sec = 1
     deadline_ns = time.time_ns() + 1_000_000_000
@@ -1396,6 +2584,8 @@ def test_pipeline_post_inference_failure_is_completed_not_not_started():
     )
     node = object.__new__(PipelinePolicyNode)
     node._session_controller = _Controller()
+    node._boot_id = BOOT_ID
+    node._scheduled_binding_identity = (SESSION_ID, 1, BINDING_ID, 1, BOOT_ID, 1)
     node._scheduled_operation_slots = threading.BoundedSemaphore(1)
     node._config = SimpleNamespace(
         pipeline_id="policy",
@@ -1411,6 +2601,7 @@ def test_pipeline_post_inference_failure_is_completed_not_not_started():
     node._raise_if_deadline_expired = lambda *_args: None
     node._goal_cancel_requested = lambda _goal_handle: False
     node._sample_observations = lambda _sample_time: {"observation.state": [0.0]}
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
     node._rad_to_lerobot = lambda value: value
     node._to_policy_inputs = lambda observations: observations
     node._last_error = ""
@@ -1456,3 +2647,366 @@ def test_wire_error_truncation_preserves_utf8_and_valid_details_json():
     assert utf8_size(error.code) == 64
     assert utf8_size(error.message) <= 10
     assert error.details_json == '{"truncated":true}'
+
+
+def _capability_status(*, stage_policy: str, deadline_admission: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        pipeline_id="policy",
+        boot_id=BOOT_ID,
+        sequence=1,
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=1, nanosec=0)),
+        state=InferenceServingStatus.IDLE,
+        error=SimpleNamespace(code=""),
+        deployment_fingerprint="d" * 64,
+        runtime_policy_fingerprint="r" * 64,
+        pipeline_compatibility_fingerprint="c" * 64,
+        configured_hardware_resource_id="ascend:0",
+        runtime_hardware_resource_id="ascend:0",
+        hardware_priority_levels=8,
+        scheduling_capability_schema_version=1,
+        stage_policy=stage_policy,
+        supports_priority_zero_deadline_admission=deadline_admission,
+        max_supported_public_priority=7,
+        capacities=[],
+    )
+
+
+def test_independent_status_claiming_deadline_admission_is_rejected():
+    candidate = SimpleNamespace(
+        pipeline_id="policy",
+        deployment_fingerprint="d" * 64,
+        runtime_policy_fingerprint="r" * 64,
+        hardware_resource_id="ascend:0",
+        public_capacity={},
+    )
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._clock_skew_tolerance_ns = 0
+    node._status_stale_timeout_ns = 10**30  # bypass stale checks with a synthetic clock
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000))
+    message = _capability_status(stage_policy="INDEPENDENT", deadline_admission=True)
+
+    reason = GlobalInferenceSchedulerNode._status_message_reason(node, candidate, message)
+
+    assert reason == "priority_zero_deadline_admission_capability_invalid"
+    consistent = _capability_status(stage_policy="INDEPENDENT", deadline_admission=False)
+    assert GlobalInferenceSchedulerNode._status_message_reason(node, candidate, consistent) == ""
+    sequential = _capability_status(stage_policy="SEQUENTIAL", deadline_admission=True)
+    assert GlobalInferenceSchedulerNode._status_message_reason(node, candidate, sequential) == ""
+
+
+def test_public_dispatch_result_fields_cover_private_result():
+    """The Global node copies private dispatch results onto the public result
+    field-by-field (see _dispatch_scheduled in global_inference_scheduler_node).
+    This guard fails when either message definition drifts so a field is
+    silently dropped or added without updating the copy list."""
+    private_fields = set(DispatchPipelineBinding.Result.get_fields_and_field_types())
+    public_fields = set(ScheduledDispatchInfer.Result.get_fields_and_field_types())
+    # Every public result field must exist on the private result so the copy
+    # loop's getattr never fails at runtime.
+    missing_on_private = public_fields - private_fields - {"session_generation"}
+    assert not missing_on_private, f"public fields missing on private result: {sorted(missing_on_private)}"
+    # session_generation is copied from the public goal, not the private result.
+    assert "session_generation" in public_fields
+    # Fields the private result carries beyond the public contract must stay
+    # private-only; extend this set only when the private protocol adds
+    # identity bookkeeping the public API deliberately hides.
+    private_only = {
+        "logical_generation",
+        "binding_id",
+        "binding_incarnation",
+        "operation_id",
+        "boot_id",
+        "pipeline_generation",
+    }
+    unexpected_private_only = private_fields - public_fields - private_only
+    assert not unexpected_private_only, (
+        f"private result fields missing from the public contract or the private-only allowlist: "
+        f"{sorted(unexpected_private_only)}"
+    )
+
+
+def test_call_downstream_unknown_cache_is_not_replayed_but_resent():
+    """A cached UNKNOWN downstream outcome must never be replayed (P0-2):
+    the quarantined record is fenced and the goal re-sent under a fresh
+    operation id, so a Close retry actually reaches the pipeline again."""
+    from inference_service.scheduler.operations import OperationRegistry
+
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._downstream_operations = OperationRegistry(max_records=4, max_waiters_per_operation=2)
+    node._goal_acceptance_timeout_ns = 100_000_000
+
+    class _Client:
+        def wait_for_server(self, timeout_sec=None):
+            return True
+
+        sent_goals = []
+
+        def send_goal_async(self, goal):
+            _Client.sent_goals.append(goal)
+
+            class _Future:
+                def add_done_callback(self, callback):
+                    class _GoalHandle:
+                        accepted = True
+
+                        def get_result_async(self):
+                            class _ResultFuture:
+                                def add_done_callback(self, result_callback):
+                                    result = ClosePipelineBinding.Result()
+                                    result.session_id = goal.session_id
+                                    result.logical_generation = goal.logical_generation
+                                    result.binding_id = goal.binding_id
+                                    result.binding_incarnation = goal.binding_incarnation
+                                    result.operation_id = goal.operation_id
+                                    result.boot_id = goal.expected_boot_id
+                                    result.pipeline_id = "policy"
+                                    result.success = True
+                                    result.outcome.value = InferenceOutcome.COMPLETED
+
+                                    class _Done:
+                                        def result(self):
+                                            return SimpleNamespace(result=result)
+
+                                    result_callback(_Done())
+                                    return self
+
+                            return _ResultFuture()
+
+                    class _SentDone:
+                        def result(self):
+                            return _GoalHandle()
+
+                    callback(_SentDone())
+                    return self
+
+            return _Future()
+
+    downstream_goal = ClosePipelineBinding.Goal()
+    downstream_goal.session_id = SESSION_ID
+    downstream_goal.logical_generation = 1
+    downstream_goal.binding_id = str(uuid4())
+    downstream_goal.binding_incarnation = 1
+    downstream_goal.operation_id = "close-op-unknown"
+    downstream_goal.expected_boot_id = str(uuid4())
+
+    # Seed the cache with a quarantined UNKNOWN record for the first attempt.
+    seeded, created = node._downstream_operations.create_or_get(
+        kind=OperationKind.CLOSE,
+        idempotency_key=(OperationKind.CLOSE.value, "close-op-unknown"),
+        identity=OperationIdentity(SESSION_ID, 1, downstream_goal.binding_id, 1, downstream_goal.expected_boot_id),
+        deadline_mono_ns=time.monotonic_ns() + 5_000_000_000,
+        waiter_id="seed",
+    )
+    assert created
+    seeded.claim_send()
+    node._downstream_operations.finish(seeded.operation_id, certainty=Certainty.UNKNOWN, error="timeout")
+    node._downstream_operations.detach_waiter(seeded.operation_id, "seed")
+
+    call = GlobalInferenceSchedulerNode._call_downstream(
+        node,
+        _Client(),
+        downstream_goal,
+        operation_kind=OperationKind.CLOSE,
+        deadline_monotonic_ns=time.monotonic_ns() + 5_000_000_000,
+    )
+
+    assert call.certainty == "completed"
+    assert downstream_goal.operation_id != "close-op-unknown"
+    assert _Client.sent_goals[0].operation_id == downstream_goal.operation_id
+    assert node._downstream_operations.find((OperationKind.CLOSE.value, "close-op-unknown")) is None
+    assert node._downstream_operations.find((OperationKind.CLOSE.value, downstream_goal.operation_id)) is None
+
+
+def test_call_downstream_completed_cache_replays_without_resend():
+    """A known terminal outcome still replays for concurrent waiters without
+    re-sending; the detached-record case simply creates a fresh send."""
+    from inference_service.scheduler.operations import OperationRegistry
+
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._downstream_operations = OperationRegistry(max_records=4, max_waiters_per_operation=4)
+    node._goal_acceptance_timeout_ns = 100_000_000
+
+    class _Client:
+        def wait_for_server(self, timeout_sec=None):
+            return True
+
+        def send_goal_async(self, goal):
+            raise AssertionError("cached COMPLETED outcome must not re-send")
+
+    downstream_goal = ClosePipelineBinding.Goal()
+    downstream_goal.session_id = SESSION_ID
+    downstream_goal.logical_generation = 1
+    downstream_goal.binding_id = str(uuid4())
+    downstream_goal.binding_incarnation = 1
+    downstream_goal.operation_id = "close-op-done"
+    downstream_goal.expected_boot_id = str(uuid4())
+
+    seeded, created = node._downstream_operations.create_or_get(
+        kind=OperationKind.CLOSE,
+        idempotency_key=(OperationKind.CLOSE.value, "close-op-done"),
+        identity=OperationIdentity(SESSION_ID, 1, downstream_goal.binding_id, 1, downstream_goal.expected_boot_id),
+        deadline_mono_ns=time.monotonic_ns() + 5_000_000_000,
+        waiter_id="seed",
+    )
+    assert created
+    seeded.claim_send()
+    node._downstream_operations.finish(seeded.operation_id, certainty=Certainty.COMPLETED, result="cached-result")
+    # The seed waiter stays attached, so the terminal record is retained and
+    # a concurrent caller with the same idempotency key replays it.
+    seeded.attach_waiter("seed2", max_waiters=4)
+    assert seeded.waiter_count == 2
+
+    call = GlobalInferenceSchedulerNode._call_downstream(
+        node,
+        _Client(),
+        downstream_goal,
+        operation_kind=OperationKind.CLOSE,
+        deadline_monotonic_ns=time.monotonic_ns() + 5_000_000_000,
+    )
+
+    assert call.certainty == "completed"
+    assert call.result == "cached-result"
+    assert downstream_goal.operation_id == "close-op-done"
+    # Cleanup: dropping the last two waiters reclaims the terminal record.
+    node._downstream_operations.detach_waiter(seeded.operation_id, "seed2")
+    node._downstream_operations.detach_waiter(seeded.operation_id, "seed")
+    assert node._downstream_operations.get(seeded.operation_id) is None
+
+
+def test_idle_sweep_retries_quarantined_close_once_then_retains_ownership():
+    """Exhaustion must leave cleanup ownership available to a later Close."""
+    sweep_calls: list[str] = []
+    record = SimpleNamespace(
+        session_generation=2,
+        state=GlobalSessionState.QUARANTINED,
+        in_flight_requests=0,
+        unresolved_cleanup=True,
+        bindings={"policy": BINDING_ID},
+    )
+
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._core = SimpleNamespace(
+        expired_sessions=lambda: [],
+        session_record=lambda _session_id: record,
+        aged_quarantined_sessions=lambda _age_ns: [SESSION_ID] if len(sweep_calls) < 3 else [],
+        begin_close=lambda **_kwargs: None,
+        wait_for_bindings_to_settle=lambda *_args: True,
+        close_bindings=lambda _session_id: [],
+        record_close_complete=lambda *args, **kwargs: 2,
+    )
+    node._close_retry_exhausted = set()
+    node._session_idle_timeout_ns = 1
+    node._default_request_timeout_ns = 1_000_000_000
+    node._max_error_message_bytes = 1024
+    node._max_error_details_bytes = 8192
+    node._pipeline_clients = {}
+    node._candidate_by_id = {}
+    node.get_logger = lambda: SimpleNamespace(warning=lambda *_args: None, error=lambda *_args: None)
+
+    def _close_once(goal_handle, _ledger):
+        sweep_calls.append(goal_handle.request.session_id)
+        result = CloseInferenceSession.Result()
+        result.outcome.value = InferenceOutcome.UNKNOWN
+        return result
+
+    node._close_once = _close_once
+
+    # First sweep: the aged quarantined session is retried once.
+    node._idle_sweep()
+    assert sweep_calls == [SESSION_ID]
+    assert SESSION_ID in node._close_retry_exhausted
+
+    # Further sweeps cannot forget ownership without a drain or boot fence.
+    node._idle_sweep()
+    node._idle_sweep()
+    assert sweep_calls == [SESSION_ID]
+    assert record.bindings == {"policy": BINDING_ID}
+    assert record.state is GlobalSessionState.QUARANTINED
+    assert record.unresolved_cleanup
+    assert SESSION_ID in node._close_retry_exhausted
+
+
+@pytest.mark.parametrize("wrapped_in_failure", [False, True])
+def test_superseded_visual_frame_is_debug_not_failure(wrapped_in_failure):
+    """P2: a superseded Visual frame is normal coalescing. It must not set
+    _last_error, log at ERROR, or quarantine the session controller — whether
+    the raw VisualFrameSupersededError or its ExecutionFailure-wrapped form
+    (with the original as ``cause``) arrives."""
+    from inference_service.pipeline import VisualFrameSupersededError
+    from inference_service.unified_runtime import ExecutionFailure, OutcomeEvidence
+
+    quarantined: list[bool] = []
+    logged: list[tuple[str, object]] = []
+
+    class _SupersededFuture:
+        @staticmethod
+        def result():
+            raise VisualFrameSupersededError("pending Visual frame was replaced by a newer frame")
+
+    node = object.__new__(PipelinePolicyNode)
+    node._frame_trigger_lock = threading.Lock()
+    node._frame_trigger_future = _SupersededFuture()
+    node._visual_trigger_epoch = 0
+    node._last_error = "previous"
+    node._session_controller = SimpleNamespace(mark_failed_quarantine=lambda: quarantined.append(True))
+
+    class _Logger:
+        def debug(self, *_args, **_kwargs):
+            logged.append(("debug", None))
+
+        def error(self, message, *_args, **_kwargs):
+            logged.append(("error", message))
+
+    node.get_logger = lambda: _Logger()
+    node._publish_serving_status = lambda: logged.append(("publish", None))
+
+    if wrapped_in_failure:
+
+        class _WrappedFuture:
+            @staticmethod
+            def result():
+                raise ExecutionFailure(
+                    "execution_failed",
+                    "pending Visual frame was replaced by a newer frame",
+                    evidence=OutcomeEvidence.not_started("backend"),
+                    cause=VisualFrameSupersededError("superseded"),
+                )
+
+        PipelinePolicyNode._visual_frame_completed(node, _WrappedFuture(), 0)
+    else:
+        PipelinePolicyNode._visual_frame_completed(node, node._frame_trigger_future, 0)
+
+    assert quarantined == []
+    assert node._last_error == "previous"
+    assert [level for level, _ in logged] == ["debug"]
+
+
+def test_idle_sweep_preserves_retry_slot_when_close_already_in_progress():
+    """A concurrently running Close must not consume the bounded retry slot:
+    begin_close's close_in_progress rejection dispatches nothing, so the next
+    sweep still gets its one real retry."""
+    from inference_service.scheduler.global_scheduler_core import SchedulerError as _SchedulerError
+
+    node = object.__new__(GlobalInferenceSchedulerNode)
+    node._core = SimpleNamespace(
+        expired_sessions=lambda: [],
+        session_record=lambda _session_id: SimpleNamespace(
+            session_generation=2,
+            state=GlobalSessionState.QUARANTINED,
+            in_flight_requests=0,
+        ),
+        aged_quarantined_sessions=lambda _age_ns: [SESSION_ID],
+        begin_close=lambda **_kwargs: (_ for _ in ()).throw(_SchedulerError("close_in_progress")),
+    )
+    node._close_retry_exhausted = set()
+    node._session_idle_timeout_ns = 1
+    node._default_request_timeout_ns = 1_000_000_000
+    node._max_error_message_bytes = 1024
+    node._max_error_details_bytes = 8192
+    node.get_logger = lambda: SimpleNamespace(warning=lambda *_args: None, error=lambda *_args: None)
+
+    for _ in range(3):
+        node._idle_sweep()
+
+    # The slot is never consumed: no release ever fires.
+    assert node._close_retry_exhausted == set()

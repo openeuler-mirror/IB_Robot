@@ -21,7 +21,9 @@ from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.dispatch_strategies import DispatchStrategyError
+from robot_config.inference_config import InferenceConfigError
 from robot_config.launch_builders.execution import generate_execution_nodes
+from robot_config.runtime_target import RuntimeTarget
 
 _BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 _DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
@@ -196,6 +198,35 @@ def _scheduled_robot_config(config_path: Path, bundle: Path, profile: Path) -> d
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("use_sim", [True, "true", False])
+def test_simulation_rejects_enabled_inference_scheduler(tmp_path: Path, use_sim) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+
+    with pytest.raises(InferenceConfigError, match="simulation does not support"):
+        generate_execution_nodes(config, use_sim=use_sim, runtime_target=RuntimeTarget.SIMULATION)
+
+
+def test_legacy_use_sim_argument_rejects_enabled_inference_scheduler(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _scheduled_robot_config(tmp_path / "robot.yaml", bundle, _profile_file(tmp_path))
+
+    with pytest.raises(InferenceConfigError, match="simulation does not support"):
+        generate_execution_nodes(config, use_sim="true")
+
+
+@pytest.mark.parametrize("explicit_false", [False, True])
+def test_simulation_uses_legacy_inference_without_scheduler(tmp_path: Path, explicit_false) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
+    if explicit_false:
+        config["control_modes"]["model_inference"]["inference"]["scheduler"] = {"enable": False}
+
+    nodes = generate_execution_nodes(config, use_sim=True, runtime_target=RuntimeTarget.SIMULATION)
+
+    assert [node.node_executable for node in nodes] == ["pipeline_policy_node", "action_dispatcher_node"]
+
+
 def test_absent_scheduler_produces_legacy_dispatcher_only(tmp_path: Path) -> None:
     bundle = _create_bundle(tmp_path / "bundle")
     robot_config = _legacy_robot_config(tmp_path / "robot.yaml", bundle)
@@ -311,6 +342,21 @@ def test_complete_scheduled_config_needs_only_enable_false_for_legacy_launch(tmp
         "terminal_session_retention_ns",
     ):
         assert key not in pipeline_params
+
+
+def test_edf_policy_is_forwarded_to_global_scheduler(tmp_path: Path) -> None:
+    bundle = _create_bundle(tmp_path / "bundle")
+    profile = _profile_file(tmp_path)
+    config_path = tmp_path / "robot.yaml"
+    robot_config = _scheduled_robot_config(config_path, bundle, profile)
+    robot_config["control_modes"]["model_inference"]["inference"]["scheduler"]["global_policy"] = "edf"
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+    scheduler = next(node for node in nodes if node.node_executable == "global_inference_scheduler_node")
+    parameters = _node_parameters(scheduler)
+
+    assert parameters["global_policy"] == "edf"
+    assert parameters["priority_zero_deadline_admission_enabled"] is False
 
 
 def test_scheduler_disabled_matches_63d80599_legacy_launch_contract(tmp_path: Path) -> None:
@@ -495,6 +541,7 @@ def test_scheduled_dispatcher_receives_global_endpoints_and_runtime_policy(tmp_p
     pipeline_params = _node_parameters(pipeline)
     assert "scheduler_enabled" not in pipeline_params
     assert pipeline_params["runtime_policy_json"]
+    assert json.loads(pipeline_params["pipeline_scheduling_json"])["stages"]["policy"]["max_snapshot_age_ms"] == 5000
     assert pipeline_params["max_prompt_bytes"] == 4096
     assert pipeline_params["max_error_message_bytes"] == 1024
     assert pipeline_params["max_error_details_bytes"] == 8192

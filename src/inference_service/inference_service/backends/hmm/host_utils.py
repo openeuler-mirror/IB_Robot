@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from inference_manifest import CompiledDeployment, TensorBinding
+from inference_manifest import CompiledDeployment, TensorBinding, is_image_semantic
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.types import RuntimeContext
 
@@ -124,14 +124,6 @@ def to_additive_attention(mask: np.ndarray, dtype: str) -> np.ndarray:
 def validate_token_ids(tokens: np.ndarray, vocabulary_size: int) -> None:
     if tokens.min(initial=0) < 0 or tokens.max(initial=0) >= vocabulary_size:
         raise BackendInferenceError("HMM token id is outside the embedding table", code="invalid_token_id")
-
-
-def is_image_semantic(semantic: str) -> bool:
-    return (
-        semantic == "observation.image"
-        or semantic.startswith("observation.image.")
-        or semantic.startswith("observation.images.")
-    )
 
 
 def require_positive_config(config: Mapping[str, object], key: str, policy: str) -> None:

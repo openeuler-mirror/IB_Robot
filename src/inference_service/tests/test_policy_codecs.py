@@ -82,6 +82,66 @@ def _policy_metadata(policy_type: str, *, action_dim: int = 3) -> PolicyMetadata
     )
 
 
+@pytest.mark.parametrize("invalid", [None, "state", "cache_abi", "terminal_input", "stateful", "reverse_link"])
+def test_pi05_staged_reuse_rejects_unverified_dependencies(invalid):
+    from inference_manifest import CompiledDeployment
+
+    def bindings(inputs, outputs):
+        return {
+            direction: [dict(semantic=name, index=i, dtype="float32", shape=[1]) for i, name in enumerate(names)]
+            for direction, names in (("inputs", inputs), ("outputs", outputs))
+        }
+
+    prefix = ["internal.past_kv", "internal.prefix_pad_masks"]
+    value = {
+        "execution_contract": {
+            "state_scope": "request",
+            "execution_structure": "iterative",
+            "orchestration_visibility": "executor",
+            "cancellation_granularity": "checkpoint",
+        },
+        "runtime_profile": {"backend": "ascend", "target": {"runtime": "acl"}, "profile": {"device_id": 0}},
+        "execution": ["vlm", "action_expert"],
+        "artifacts": {role: {"path": f"{role}.om", "format": "om"} for role in ("vlm", "action_expert")},
+        "bindings": {
+            "vlm": bindings(["observation.images.top", "observation.language.tokens"], prefix),
+            "action_expert": bindings(prefix + ["time", "noise"], ["action"]),
+        },
+    }
+    if invalid == "state":
+        value["bindings"]["vlm"]["inputs"][0]["semantic"] = "observation.state"
+    elif invalid == "cache_abi":
+        value["bindings"]["action_expert"]["inputs"][0]["shape"] = [2]
+    elif invalid == "terminal_input":
+        value["bindings"]["action_expert"]["inputs"][-1]["semantic"] = "observation.state"
+    elif invalid == "stateful":
+        value["execution_contract"]["state_scope"] = "stream"
+        value["execution_contract"].update(state_bank_mode="runtime_exclusive", max_open_streams=1)
+    elif invalid == "reverse_link":
+        value["device_links"] = [
+            dict(
+                semantic="internal.past_kv",
+                producer="action_expert",
+                consumer="vlm",
+                transport="device_pointer",
+                owner="producer",
+            )
+        ]
+    # Family validation also guards callers that construct a deployment directly.
+    deployment = CompiledDeployment.model_validate({**value, "device_links": []})
+    if invalid == "reverse_link":
+        from inference_manifest import DeviceLink
+
+        deployment = deployment.model_copy(
+            update={"device_links": tuple(DeviceLink(**link) for link in value["device_links"])}
+        )
+    if invalid is None:
+        PI05PolicyCodec.validate_staged_deployment(deployment)
+    else:
+        with pytest.raises(ValueError, match="PI0.5"):
+            PI05PolicyCodec.validate_staged_deployment(deployment)
+
+
 def test_codec_maps_variable_camera_semantics_runtime_names_and_explicit_indices():
     bindings = _artifact_bindings(
         (

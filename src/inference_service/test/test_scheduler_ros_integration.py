@@ -10,6 +10,7 @@ import uuid
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import rclpy
 from rclpy.action import ActionClient, ActionServer
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -23,14 +24,34 @@ from std_srvs.srv import Trigger
 
 from action_dispatch.safe_stop import build_safe_stop_plan
 from action_dispatch.scheduled_action_dispatcher_node import DispatcherState, ScheduledActionDispatcherNode
-from ibrobot_msgs.action import CloseInferenceSession, DispatchInfer, OpenInferenceSession, ScheduledDispatchInfer
+from ibrobot_msgs.action import (
+    CloseInferenceSession,
+    ClosePipelineBinding,
+    DispatchInfer,
+    DispatchPipelineBinding,
+    OpenInferenceSession,
+    OpenPipelineBinding,
+    ScheduledDispatchInfer,
+)
 from ibrobot_msgs.msg import InferenceOutcome, InferenceServingStatus, InferenceWorkCapacity
 from inference_service import pipeline_policy_node as pipeline_policy_module
 from inference_service.backends import BackendCapabilities
 from inference_service.global_inference_scheduler_node import GlobalInferenceSchedulerNode
 from inference_service.pipeline_policy_node import PipelineNodeConfig, PipelinePolicyNode
+from inference_service.runtime_composition import build_policy_runtime_dependencies
 from robot_config.contract_utils import ActionSpec, Contract, ObservationSpec, iter_specs
 from robot_config.inference_runtime_options import effective_latency_runtime_options
+
+
+@pytest.fixture
+def runtime_dependencies():
+    dependencies = build_policy_runtime_dependencies()
+    try:
+        yield {"registry_set": dependencies.registry_set, "providers": dependencies.providers}
+    finally:
+        dependencies.providers.close()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def _wait_future(future, timeout: float = 5.0):
@@ -48,21 +69,21 @@ class _PipelineServer(Node):
         group = ReentrantCallbackGroup()
         self.open_server = ActionServer(
             self,
-            OpenInferenceSession,
+            OpenPipelineBinding,
             endpoints["open"],
             execute_callback=self._open,
             callback_group=group,
         )
         self.dispatch_server = ActionServer(
             self,
-            ScheduledDispatchInfer,
+            DispatchPipelineBinding,
             endpoints["dispatch"],
             execute_callback=self._dispatch,
             callback_group=group,
         )
         self.close_server = ActionServer(
             self,
-            CloseInferenceSession,
+            ClosePipelineBinding,
             endpoints["close"],
             execute_callback=self._close,
             callback_group=group,
@@ -83,6 +104,10 @@ class _PipelineServer(Node):
         status.configured_hardware_resource_id = "ascend:0"
         status.runtime_hardware_resource_id = "ascend:0"
         status.hardware_priority_levels = 8
+        status.scheduling_capability_schema_version = 1
+        status.stage_policy = "SEQUENTIAL"
+        status.supports_priority_zero_deadline_admission = True
+        status.max_supported_public_priority = 7
         for work_class in (InferenceWorkCapacity.SESSION_CONTROL, InferenceWorkCapacity.ACTION_GENERATION):
             capacity = InferenceWorkCapacity()
             capacity.work_class = work_class
@@ -93,11 +118,17 @@ class _PipelineServer(Node):
 
     def _open(self, goal_handle):
         self.calls.append("open")
-        result = OpenInferenceSession.Result()
+        goal = goal_handle.request
+        result = OpenPipelineBinding.Result()
         result.success = True
-        result.session_id = goal_handle.request.session_id
-        result.actual_pipeline_id = "policy"
-        result.session_generation = 11
+        result.session_id = goal.session_id
+        result.logical_generation = goal.logical_generation
+        result.binding_id = goal.binding_id
+        result.binding_incarnation = goal.binding_incarnation
+        result.operation_id = goal.operation_id
+        result.boot_id = goal.expected_boot_id
+        result.pipeline_id = "policy"
+        result.pipeline_generation = 11
         result.deployment_fingerprint = self.identity["deployment"]
         result.runtime_policy_fingerprint = self.identity["runtime"]
         result.outcome.value = InferenceOutcome.COMPLETED
@@ -107,12 +138,17 @@ class _PipelineServer(Node):
     def _dispatch(self, goal_handle):
         self.calls.append("dispatch")
         goal = goal_handle.request
-        result = ScheduledDispatchInfer.Result()
+        result = DispatchPipelineBinding.Result()
         result.success = True
         result.request_id = goal.request_id
         result.session_id = goal.session_id
-        result.session_generation = goal.session_generation
+        result.logical_generation = goal.logical_generation
+        result.binding_id = goal.binding_id
+        result.binding_incarnation = goal.binding_incarnation
+        result.operation_id = goal.operation_id
+        result.boot_id = goal.expected_boot_id
         result.pipeline_id = "policy"
+        result.pipeline_generation = goal.expected_pipeline_generation
         result.deployment_fingerprint = self.identity["deployment"]
         result.runtime_policy_fingerprint = self.identity["runtime"]
         result.chunk_size = 1
@@ -123,12 +159,17 @@ class _PipelineServer(Node):
     def _close(self, goal_handle):
         self.calls.append("close")
         goal = goal_handle.request
-        result = CloseInferenceSession.Result()
+        result = ClosePipelineBinding.Result()
         result.success = True
         result.session_id = goal.session_id
         result.pipeline_id = "policy"
-        result.closed_session_generation = goal.session_generation
-        result.drained_generation = goal.session_generation + 1
+        result.logical_generation = goal.logical_generation
+        result.binding_id = goal.binding_id
+        result.binding_incarnation = goal.binding_incarnation
+        result.operation_id = goal.operation_id
+        result.boot_id = goal.expected_boot_id
+        result.closed_pipeline_generation = goal.expected_pipeline_generation
+        result.drained_generation = goal.expected_pipeline_generation + 1
         result.outcome.value = InferenceOutcome.COMPLETED
         goal_handle.succeed()
         return result
@@ -166,7 +207,7 @@ def _parameters(candidate: dict, endpoints: dict[str, str]) -> list[Parameter]:
     return [Parameter(name, value=value) for name, value in values.items()]
 
 
-def test_global_to_pipeline_action_closure(tmp_path) -> None:
+def test_global_to_pipeline_action_closure(tmp_path, runtime_dependencies) -> None:
     suffix = f"test_{uuid.uuid4().hex}"
     base = f"/scheduler_test/{suffix}"
     endpoints = {
@@ -244,7 +285,9 @@ def test_global_to_pipeline_action_closure(tmp_path) -> None:
 
     rclpy.init()
     pipeline = _PipelineServer(endpoints, identity)
-    scheduler = GlobalInferenceSchedulerNode(parameter_overrides=_parameters(candidate, endpoints))
+    scheduler = GlobalInferenceSchedulerNode(
+        parameter_overrides=_parameters(candidate, endpoints), **runtime_dependencies
+    )
     client_node = Node("scheduler_test_client")
     executor = MultiThreadedExecutor(num_threads=8)
     for node in (pipeline, scheduler, client_node):
@@ -312,9 +355,14 @@ class _PolicyFeature:
 
 
 class _FakePipelineManager:
+    @staticmethod
+    def supports_priority_zero_deadline_admission(_pipeline_id: str) -> bool:
+        return False
+
     def __init__(self) -> None:
         self.priorities: list[int] = []
         self.reset_count = 0
+        self.frames: list[object] = []
 
     @staticmethod
     def capabilities(_pipeline_id: str) -> BackendCapabilities:
@@ -327,17 +375,27 @@ class _FakePipelineManager:
             actual_chunk_size=2,
             backend_latency_ms=1.0,
             total_latency_ms=2.0,
+            metadata={},
         )
 
     def reset(self, _pipeline_id: str, _deadline) -> None:
         self.reset_count += 1
+
+    def submit_frame(self, _pipeline_id: str, request, *, deadline=None):
+        del deadline
+        from concurrent.futures import Future
+
+        self.frames.append(request)
+        future = Future()
+        future.set_result(len(self.frames))
+        return future
 
     @staticmethod
     def close() -> None:
         return None
 
 
-def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkeypatch) -> None:
+def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkeypatch, runtime_dependencies) -> None:
     suffix = uuid.uuid4().hex
     base = f"/scheduler_disabled/test_{suffix}"
     contract = Contract(
@@ -389,7 +447,13 @@ def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkey
         node._joint_rad_limits = []
 
     monkeypatch.setattr(pipeline_policy_module, "load_inference_manifest", lambda *_args, **_kwargs: manifest)
-    monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", lambda *_args, **_kwargs: manager)
+    manager_options = {}
+
+    def _create_manager(*_args, **kwargs):
+        manager_options.update(kwargs)
+        return manager
+
+    monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", _create_manager)
     monkeypatch.setattr(PipelinePolicyNode, "_load_contract", _load_contract)
 
     config = PipelineNodeConfig(
@@ -412,12 +476,18 @@ def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkey
     )
 
     rclpy.init()
-    pipeline = PipelinePolicyNode(config, node_name=f"pipeline_disabled_{suffix}")
+    pipeline = PipelinePolicyNode(config, node_name=f"pipeline_disabled_{suffix}", **runtime_dependencies)
     try:
         assert pipeline._action_pub is not None
         assert pipeline._action_server is not None
         assert pipeline._reset_server is not None
         for scheduled_state in (
+            "_frame_trigger_lock",
+            "_frame_trigger_future",
+            "_visual_trigger_epoch",
+            "_visual_trigger_enabled",
+            "_pending_visual_sample_time_ns",
+            "_frame_trigger_priority",
             "_scheduled_operation_slots",
             "_scheduled_operation_capacity",
             "_pipeline_compatibility_fingerprint",
@@ -434,7 +504,9 @@ def test_disabled_pipeline_materializes_only_legacy_ros_runtime(tmp_path, monkey
         rclpy.shutdown()
 
 
-def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(tmp_path, monkeypatch) -> None:
+def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(
+    tmp_path, monkeypatch, runtime_dependencies
+) -> None:
     suffix = uuid.uuid4().hex
     base = f"/scheduler_legacy/test_{suffix}"
     action_server = f"{base}/dispatch"
@@ -488,7 +560,13 @@ def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(tmp_path, mo
         node._joint_rad_limits = []
 
     monkeypatch.setattr(pipeline_policy_module, "load_inference_manifest", lambda *_args, **_kwargs: manifest)
-    monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", lambda *_args, **_kwargs: manager)
+    manager_options = {}
+
+    def _create_manager(*_args, **kwargs):
+        manager_options.update(kwargs)
+        return manager
+
+    monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", _create_manager)
     monkeypatch.setattr(PipelinePolicyNode, "_load_contract", _load_contract)
     config = PipelineNodeConfig(
         pipeline_id="policy",
@@ -510,7 +588,7 @@ def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(tmp_path, mo
     )
 
     rclpy.init()
-    pipeline = PipelinePolicyNode(config, node_name=f"pipeline_legacy_{suffix}")
+    pipeline = PipelinePolicyNode(config, node_name=f"pipeline_legacy_{suffix}", **runtime_dependencies)
     pipeline._sample_observations = lambda _sample_time, **_kwargs: {
         "observation.state": np.asarray([0.0, 0.0], dtype=np.float32)
     }
@@ -553,7 +631,7 @@ def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(tmp_path, mo
         rclpy.shutdown()
 
 
-def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeypatch) -> None:
+def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeypatch, runtime_dependencies) -> None:
     suffix = uuid.uuid4().hex
     base = f"/scheduler_real/test_{suffix}"
     endpoints = {
@@ -622,7 +700,13 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeyp
         node._joint_max_age_ns = 1_000_000_000
 
     monkeypatch.setattr(pipeline_policy_module, "load_inference_manifest", lambda *_args, **_kwargs: manifest)
-    monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", lambda *_args, **_kwargs: manager)
+    manager_options = {}
+
+    def _create_manager(*_args, **kwargs):
+        manager_options.update(kwargs)
+        return manager
+
+    monkeypatch.setattr(pipeline_policy_module, "create_pipeline_manager", _create_manager)
     monkeypatch.setattr(PipelinePolicyNode, "_load_contract", _load_contract)
     monkeypatch.setattr(ScheduledActionDispatcherNode, "_load_contract_and_plan", _load_dispatch_contract)
 
@@ -645,6 +729,15 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeyp
             "health_topic": f"{base}/health",
         },
     }
+    scheduling = {
+        "stage_policy": "independent",
+        "frame_base_priority": 0,
+        "stages": {
+            "vlm": {"priority_offset": 1},
+            "action_expert": {"priority_offset": 2},
+        },
+    }
+    runtime_policy["scheduling"] = scheduling
     runtime_policy_json = json.dumps(runtime_policy, sort_keys=True, separators=(",", ":"))
     pipeline_config = PipelineNodeConfig(
         pipeline_id="policy",
@@ -676,10 +769,14 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeyp
         terminal_result_cache_entries=4,
         max_duplicate_waiters_per_request=2,
         terminal_session_retention_ns=1_000_000_000,
+        pipeline_stage_policy="independent",
+        pipeline_scheduling_json=json.dumps(scheduling),
     )
 
     rclpy.init()
-    pipeline = PipelinePolicyNode(pipeline_config, node_name=f"pipeline_{suffix}")
+    pipeline = PipelinePolicyNode(pipeline_config, node_name=f"pipeline_{suffix}", **runtime_dependencies)
+    assert manager_options["stage_policy"] == "independent"
+    assert manager_options["stage_scheduling"]["vlm"]["priority_offset"] == 1
     pipeline._sample_observations = lambda _sample_time: {"observation.state": np.asarray([0.0, 0.0], dtype=np.float32)}
     compatibility = pipeline._pipeline_compatibility_fingerprint
     profile_identity = "f" * 64
@@ -740,7 +837,9 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeyp
         "required": True,
         "public_capacity": capacity,
     }
-    scheduler = GlobalInferenceSchedulerNode(parameter_overrides=_parameters(candidate, endpoints))
+    scheduler = GlobalInferenceSchedulerNode(
+        parameter_overrides=_parameters(candidate, endpoints), **runtime_dependencies
+    )
     dispatcher = ScheduledActionDispatcherNode(
         parameter_overrides=[
             Parameter("joint_state_topic", value=joint_topic),

@@ -791,6 +791,8 @@ robot:
 ### 推理调度控制面
 
 调度只有一个功能开关：`control_modes.<mode>.inference.scheduler.enable`，缺失时按 `false` 处理。
+仿真暂不支持启用该开关：`runtime_target=simulation`（含 Gazebo、MuJoCo、mock）运行推理时必须设置
+`scheduler.enable=false`，否则 launch 在生成控制与仿真节点前报错。仿真场景不管理调度 session/binding。
 `inference.enabled` 仍只表示该控制模式是否启用推理，不是调度模式开关。
 
 当 `scheduler.enable` 缺失或为 `false` 时，launch graph 与原路径相同：
@@ -856,19 +858,30 @@ control_modes:
 ```
 
 Scheduler 开启时只接受 schema v3 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
+对于 `scheduling.stage_policy: independent`，可在 `scheduling.stages.<producer>` 下设置
+`max_snapshot_age_ms: 5000`（默认值，正整数）。producer 是 manifest `execution` 中的第一个角色；
+terminal 或 sequential stage 不允许设置该字段。时效从观测采样开始计算，包含 producer 排队与执行时间，
+阈值进入 runtime policy fingerprint 并经 launch 下发。刷新不能使过期的同一观测重新有效。
 分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
 最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
-priority-0 的每个请求独立使用自己的 target、fallback chain 和 deadline 做
-准入；同一 `hardware_resource_id` 上已准入的 priority-0 会按 reservation FIFO 串行下发，并在实际轮到执行时
-重新检查 deadline，但不设置 pipeline 数量上限。`hardware_profile_fingerprint` 独立标识离线标定环境，不能使用
+默认 `global_policy: fifo` 且 `priority_zero_deadline_admission.enable: false` 时，priority-0 直接下发 target，
+不建立资源等待队列、不使用 profile，也不接受非空 fallback chain；启用 scheduler 后该无效组合会在配置加载时报错。
+FIFO 开启 profile 准入时，同一 `hardware_resource_id` 上已准入的 priority-0 按 reservation FIFO 串行下发，
+实际轮到执行时重新检查 deadline，支持 fallback，但仅支持 sequential pipeline。
+`global_policy: edf` 按绝对 deadline 排序尚未开始的 priority-0，同 deadline 按 FIFO，支持 fallback；
+EDF 必须关闭 profile 准入，不抢占执行中的请求，不预测或保证完成时间。
+deadline 驱动（EDF 或 FIFO profile 准入）的 priority-0 只服务 sequential pipeline：
+independent pipeline 把一个请求拆到两个 worker 重叠执行，per-request deadline 排序无法评估也无法兑现。
+`inference_priority=0` 时 target 或 fallback 链选择 independent pipeline 会在配置加载时报错，
+Global 也会按 serving status 能力在运行时跳过 independent 候选。
+`hardware_profile_fingerprint` 独立标识离线标定环境，不能使用
 资源 ID 代替。
 profile entry 使用 `global_proxy` scope。action-generation entry 必须声明 pipeline serving status 发布的
 `input_contract_fingerprint` 和标定覆盖的 `prompt_bytes_max`；session-control entry 使用空 fingerprint 和
 `prompt_bytes_max: 0`。profile identity 使用 `profile_compatibility_fingerprint`，不再绑定 endpoint 名称、
 required 状态或 compatibility group。其他 priority 只下发 target，
-不做 fallback 或 deadline 准入。缺失或无效 profile 不影响 readiness 和非零优先级请求；priority-0 实际遍历到
-该候选时会将其判为不可准入并继续 fallback，所有候选都不可准入时返回 `no_feasible_deadline`。Global/pipeline
-不保存等待队列，每个
+不做 fallback 或 deadline 准入。缺失或无效 profile 不影响 readiness、EDF 和非零优先级请求；仅在 FIFO
+profile 准入实际遍历到该候选时将其判为不可准入并继续 fallback，全部不可准入时返回 `no_feasible_deadline`。
 Global Dispatch ingress 共四个有界 context，lower-priority 最多占两个；因此低优先级请求不能耗尽 priority-0
 保留容量。Open/Close 和 pipeline-local endpoint 仍各使用两个有界 context。
 公开 Open 只创建逻辑 session，不使用 `executor.inference_pipeline` 或 fallback 做初始模型绑定；pipeline

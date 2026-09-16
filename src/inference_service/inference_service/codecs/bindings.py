@@ -7,7 +7,7 @@ from importlib import import_module
 
 import numpy as np
 
-from inference_manifest import ArtifactBindings, TensorBinding
+from inference_manifest import ArtifactBindings, TensorBinding, is_image_semantic
 from inference_service.codecs.types import (
     BoundInputs,
     BoundTensor,
@@ -23,14 +23,6 @@ class BindingError(ValueError):
 
 class MissingSemanticTensorError(BindingError, KeyError):
     """Raised when the canonical batch does not contain a required semantic."""
-
-
-def _is_image_semantic(semantic: str) -> bool:
-    return (
-        semantic == "observation.image"
-        or semantic.startswith("observation.image.")
-        or semantic.startswith("observation.images.")
-    )
 
 
 def _validate_direction(bindings: tuple[TensorBinding, ...], direction: str) -> None:
@@ -51,7 +43,7 @@ def _validate_direction(bindings: tuple[TensorBinding, ...], direction: str) -> 
         raise BindingError(f"{direction} runtime indices must be contiguous and start at zero")
 
     for binding in bindings:
-        needs_layout = len(binding.shape) == 4 and _is_image_semantic(binding.semantic)
+        needs_layout = len(binding.shape) == 4 and is_image_semantic(binding.semantic)
         if needs_layout and binding.layout not in {"NCHW", "NHWC"}:
             raise BindingError(f"rank-4 image binding {binding.semantic!r} requires NCHW or NHWC layout")
         if len(binding.shape) != 4 and binding.layout is not None:
@@ -121,7 +113,7 @@ def convert_input(binding: TensorBinding, value: object) -> np.ndarray:
     """Convert one canonical tensor to its declared runtime ABI."""
 
     converted = _as_numpy(value, binding.dtype)
-    if _is_image_semantic(binding.semantic) and binding.layout == "NHWC":
+    if is_image_semantic(binding.semantic) and binding.layout == "NHWC":
         if converted.ndim != 4:
             raise BindingError(
                 f"image binding {binding.semantic!r} requires rank-4 canonical NCHW input for NHWC conversion"

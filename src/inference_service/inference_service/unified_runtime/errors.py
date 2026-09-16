@@ -216,6 +216,10 @@ class ExecutionFailure(RuntimeError):
         return f"{self.code}: {self.message}"
 
     @property
+    def close_pending(self) -> bool:
+        return self.details.get("close_pending", False) is True
+
+    @property
     def recovery_scope(self) -> RecoveryScope:
         return self.recovery.scope
 

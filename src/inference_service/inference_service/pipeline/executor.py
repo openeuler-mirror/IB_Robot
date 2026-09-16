@@ -11,8 +11,10 @@ from inference_service.pipeline.stages import InferenceStage, ResultAdapter
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
 
 
-class SequentialModelExecutor(ModelExecutor):
-    """Run a fixed stage sequence while delegating resources to owned components."""
+class ComponentModelExecutor(ModelExecutor):
+    """Shared component ownership views and stage execution helpers."""
+
+    supports_priority_zero_deadline_admission = False
 
     def __init__(
         self,
@@ -29,7 +31,7 @@ class SequentialModelExecutor(ModelExecutor):
     ) -> None:
         self._stages = tuple(stages)
         if not self._stages:
-            raise ValueError("sequential executor requires at least one stage")
+            raise ValueError("executor requires at least one stage")
         self._result_adapter = result_adapter
         self._components = self._unique(tuple(components))
         self._execution_plan = execution_plan
@@ -68,7 +70,7 @@ class SequentialModelExecutor(ModelExecutor):
         del context
         # Components are owned and loaded by ModelRuntimeHandle.
 
-    def execute(self, request: ModelRequest, context: ExecutionContext) -> object:
+    def _execute_stages(self, request: ModelRequest, context: ExecutionContext) -> object:
         if not isinstance(request, ModelRequest):
             raise TypeError("SequentialModelExecutor requires a ModelRequest")
         if not isinstance(context, ExecutionContext):
@@ -154,3 +156,12 @@ class SequentialModelExecutor(ModelExecutor):
                 seen.add(id(component))
                 unique.append(component)
         return tuple(unique)
+
+
+class SequentialModelExecutor(ComponentModelExecutor):
+    """Run a fixed stage sequence while delegating resources to owned components."""
+
+    supports_priority_zero_deadline_admission = True
+
+    def execute(self, request: ModelRequest, context: ExecutionContext) -> object:
+        return self._execute_stages(request, context)

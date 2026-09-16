@@ -67,6 +67,14 @@ class ExecutionPlan:
         return tuple(link for link in self.device_links if link.consumer == role)
 
 
+@dataclass(frozen=True)
+class ExecutionFrameSnapshot:
+    """Immutable host-owned continuation captured between functional stages."""
+
+    next_position: int
+    host_tensors: Mapping[str, np.ndarray]
+
+
 def _compatible_shapes(producer: TensorBinding, consumer: TensorBinding) -> bool:
     if len(producer.shape) != len(consumer.shape):
         return False
@@ -297,6 +305,24 @@ class ExecutionFrame:
         }
         self._active_role = role
         return MappingProxyType(required)
+
+    def snapshot(self) -> ExecutionFrameSnapshot:
+        if self._active_role is not None or self._loop_start is not None:
+            raise ExecutionPlanError("execution frame can only snapshot at a functional stage boundary")
+        tensors = MappingProxyType(
+            {semantic: np.array(value, copy=True, order="C") for semantic, value in self._host_tensors.items()}
+        )
+        return ExecutionFrameSnapshot(self._next_position, tensors)
+
+    def restore(self, snapshot: ExecutionFrameSnapshot) -> None:
+        if self._active_role is not None or self._next_position != 0 or self._host_tensors:
+            raise ExecutionPlanError("execution frame restore requires a fresh frame")
+        if snapshot.next_position < 0 or snapshot.next_position > len(self._plan.roles):
+            raise ExecutionPlanError("execution frame snapshot position is invalid")
+        self._next_position = snapshot.next_position
+        self._host_tensors = {
+            semantic: np.array(value, copy=True, order="C") for semantic, value in snapshot.host_tensors.items()
+        }
 
     def finish_role(self, role: str, semantic_outputs: Mapping[str, np.ndarray] | None = None) -> None:
         if self._active_role != role:

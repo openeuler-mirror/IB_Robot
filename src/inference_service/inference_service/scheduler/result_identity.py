@@ -22,7 +22,7 @@ def result_identity_error(
         if getattr(result, field, None) != expected:
             return f"{action}_{field}_mismatch"
     if require_higher_drained_generation:
-        closed = int(getattr(result, "closed_session_generation", 0))
+        closed = int(getattr(result, "closed_pipeline_generation", getattr(result, "closed_session_generation", 0)))
         drained = int(getattr(result, "drained_generation", 0))
         if closed <= 0 or drained <= closed:
             return f"{action}_drained_generation_invalid"

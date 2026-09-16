@@ -230,6 +230,46 @@ class PI05PolicyCodec(_ManifestPolicyCodec):
     pad_state = True
     crop_action = True
 
+    @staticmethod
+    def validate_staged_deployment(deployment) -> None:
+        """Validate the PI0.5 prefix-cache ABI before reuse across requests.
+
+        The prefix depends only on images and language, never action state,
+        noise, time or a previous request. The executor enforces prompt,
+        freshness and generation matching on each cached prefix.
+        """
+        if deployment.execution != ("vlm", "action_expert") or deployment.execution_contract.state_scope != "request":
+            raise ValueError("independent execution requires the request-scoped PI0.5 split ABI")
+        producer = deployment.bindings["vlm"]
+        terminal = deployment.bindings["action_expert"]
+        prefix = {"internal.past_kv", "internal.prefix_pad_masks"}
+        allowed = {
+            "observation.language.tokens",
+            "observation.language.attention_mask",
+            "prefix_att_2d_masks_4d",
+            "observation.prefix_att_2d_masks_4d",
+        }
+        if any(b.semantic not in allowed and not b.semantic.startswith("observation.images.") for b in producer.inputs):
+            raise ValueError("PI0.5 prefix reuse forbids state, iterative and hidden input dependencies")
+        if (
+            {b.semantic for b in producer.outputs} != prefix
+            or {b.semantic for b in terminal.inputs} != prefix | {"time", "noise"}
+            or {b.semantic for b in terminal.outputs} != {"action"}
+        ):
+            raise ValueError("PI0.5 prefix reuse requires the validated cache and denoising bindings")
+        for output in producer.outputs:
+            target = next(b for b in terminal.inputs if b.semantic == output.semantic)
+            if output.dtype != target.dtype or output.shape != target.shape:
+                raise ValueError("PI0.5 prefix cache input/output ABI mismatch")
+        if any(
+            link.producer != "vlm"
+            or link.consumer != "action_expert"
+            or link.producer_binding != "output"
+            or link.semantic not in prefix
+            for link in deployment.device_links
+        ):
+            raise ValueError("PI0.5 prefix reuse forbids reverse or input-sourced device links")
+
     def encode_execution(self, request: CodecRequest, plan: ExecutionPlan) -> Mapping[str, BoundInputs]:
         """Bind external tensors while leaving runtime-owned links and denoising inputs unmaterialized."""
 
