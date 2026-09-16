@@ -32,7 +32,6 @@ from observation_transport.video_codec import (
     VideoEncoder,
     VideoFrame,
 )
-from tensormsg.converter import nv12_to_hwc_uint8
 
 _BACKEND = "ascend"
 _PRIVATE_FFMPEG_PATHS = (
@@ -885,16 +884,13 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
         self._start()
 
     def _start(self) -> None:
-        udp_socket = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_socket.bind(("127.0.0.1", 0))
-        reservation = self._socket_factory(socket.AF_INET, socket.SOCK_DGRAM)
-        reservation.bind(("127.0.0.1", 0))
-        host, port = reservation.getsockname()[:2]
-        reservation.close()
-        self._input_endpoint = (host, port)
+        # Feed the annex-B access units through stdin instead of a loopback
+        # UDP socket: with probesize-limited stream inputs FFmpeg cannot
+        # negotiate an rgb24 filtergraph before packets arrive, and the UDP
+        # datagram boundary is another loss surface. A pipe is also the shape
+        # the encoder side already uses.
         command = [
             self._ffmpeg,
-            "-nostdin",
             "-hide_banner",
             "-loglevel",
             "warning",
@@ -913,39 +909,38 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             "-channel_id",
             str(self._channel_id),
             "-i",
-            f"udp://{host}:{port}?fifo_size=1048576&overrun_nonfatal=1",
+            "pipe:0",
             "-an",
+            # The decoder emits limited-range BT.709 NV12; swscale converts to
+            # full-range rgb24 inside ffmpeg so the Python side never pays the
+            # per-frame numpy color conversion on the GIL-constrained host.
+            "-vf",
+            "scale=in_color_matrix=bt709:in_range=tv",
             "-f",
             "rawvideo",
             "-pix_fmt",
-            "nv12",
+            self._output_pixel_format,
             "-vsync",
             "0",
             "pipe:1",
         ]
         try:
-            self._socket = udp_socket
-            process = self._spawn(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+            process = self._spawn(command, stdout=subprocess.PIPE)
             if process.stdout is None:
                 raise VideoCodecError("process_start_failed", "FFmpeg stdout pipe was not created", backend=_BACKEND)
             self._output_pipe = process.stdout
         except Exception:
-            udp_socket.close()
             if self._output_pipe is not None:
                 self._output_pipe.close()
-            self._socket = None
             self._output_pipe = None
             raise
-        self._reader = _FixedFrameReader(self._output_pipe, self._width * self._height * 3 // 2, max_frames=3)
+        self._reader = _FixedFrameReader(self._output_pipe, self._width * self._height * 3, max_frames=3)
 
     def decode(self, packet: EncodedPacket) -> list[VideoFrame]:
         self._require_running()
         self._frame_metadata.append((packet.capture_timestamp_ns, packet.keyframe))
         try:
-            assert self._socket is not None
-            assert self._input_endpoint is not None
-            for offset in range(0, len(packet.payload), 1200):
-                self._socket.sendto(packet.payload[offset : offset + 1200], self._input_endpoint)
+            self._write(packet.payload)
             assert self._reader is not None
             self._retire_reader_drops()
             frames = self._reader.drain()
@@ -1027,16 +1022,10 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             )
         return dropped
 
-    def _convert_frame(self, nv12: bytes, capture_timestamp_ns: int, keyframe: bool) -> VideoFrame:
+    def _convert_frame(self, raw: bytes, capture_timestamp_ns: int, keyframe: bool) -> VideoFrame:
         if capture_timestamp_ns < 0:
             self._fail("timestamp_underflow", "decoded output has no input timestamp")
-        image = nv12_to_hwc_uint8(
-            nv12,
-            width=self._width,
-            height=self._height,
-            output_encoding="rgb8" if self._output_pixel_format == "rgb24" else "bgr8",
-            color_range="limited",
-        )
+        image = np.frombuffer(raw, dtype=np.uint8).reshape(self._height, self._width, 3).copy()
         return VideoFrame(
             image,
             capture_timestamp_ns,
@@ -1045,7 +1034,7 @@ class AscendFfmpegH264Decoder(_AscendProcessCodec, VideoDecoder):
             self._height,
             self._output_pixel_format,
             color_space="bt709",
-            color_range="limited",
+            color_range="full",
             keyframe=keyframe,
         )
 

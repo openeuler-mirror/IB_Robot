@@ -30,7 +30,6 @@ from inference_service.video_codec import (
     VideoFrame,
 )
 from inference_service.video_rtp import RtpPacket
-from tensormsg.converter import hwc_uint8_to_nv12
 
 
 class _QueuePipe:
@@ -466,7 +465,7 @@ def test_encoder_writes_raw_rgb_and_reset_recreates_process_and_socket(tmp_path:
     encoder.close()
 
 
-def test_decoder_command_fixed_nv12_output_and_fifo_timestamp_pairing(tmp_path: Path):
+def test_decoder_command_fixed_rgb24_output_and_fifo_timestamp_pairing(tmp_path: Path):
     ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
     output_pipe = _QueuePipe()
     process = _FakeProcess(stdout=output_pipe)
@@ -488,8 +487,8 @@ def test_decoder_command_fixed_nv12_output_and_fifo_timestamp_pairing(tmp_path: 
         process_factory=process_factory,
         socket_factory=lambda *_args: sockets.pop(0),
     )
-    nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
-    output_pipe.put(nv12)
+    rgb = np.full((2, 4, 3), 80, dtype=np.uint8).tobytes()
+    output_pipe.put(rgb)
 
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True))
 
@@ -501,8 +500,11 @@ def test_decoder_command_fixed_nv12_output_and_fifo_timestamp_pairing(tmp_path: 
     assert _option(command, "-analyzeduration") == "0"
     assert _option(command, "-probesize") == "32"
     assert _option(command, "-vsync") == "0"
+    assert _option(command, "-pix_fmt") == "rgb24"
+    assert _option(command, "-vf") == "scale=in_color_matrix=bt709:in_range=tv"
     assert spawned[0][1]["stdout"] is subprocess.PIPE
-    assert _option(command, "-i").startswith("udp://127.0.0.1:24000?")
+    assert spawned[0][1]["stdin"] is subprocess.PIPE
+    assert _option(command, "-i") == "pipe:0"
     assert frames[0].capture_timestamp_ns == 123_456
     assert frames[0].pixel_format == "rgb24"
     assert frames[0].data.shape == (2, 4, 3)
@@ -543,13 +545,13 @@ def test_decoder_preserves_delayed_output_and_matching_metadata(tmp_path: Path):
         process_factory=lambda *_args, **_kwargs: _FakeProcess(stdout=output_pipe),
         socket_factory=lambda *_args: sockets.pop(0),
     )
-    nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
+    rgb = np.full((2, 4, 3), 80, dtype=np.uint8).tobytes()
 
     old_timestamp = time.time_ns() - 1_000_000_000
     current_timestamp = time.time_ns()
     assert decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65old", 999, old_timestamp)) == []
-    output_pipe.put(nv12)
-    output_pipe.put(nv12)
+    output_pipe.put(rgb)
+    output_pipe.put(rgb)
     time.sleep(0.01)
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65new", 999, current_timestamp))
 
@@ -574,9 +576,9 @@ def test_decoder_waits_for_asynchronous_ffmpeg_output(tmp_path: Path):
         process_factory=lambda *_args, **_kwargs: process,
         socket_factory=lambda *_args: sockets.pop(0),
     )
-    nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
+    rgb = np.full((2, 4, 3), 80, dtype=np.uint8).tobytes()
 
-    producer = threading.Thread(target=lambda: (time.sleep(0.01), output_pipe.put(nv12)))
+    producer = threading.Thread(target=lambda: (time.sleep(0.01), output_pipe.put(rgb)))
     producer.start()
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True))
     producer.join()
@@ -622,9 +624,9 @@ def test_decoder_reader_reassembles_output_datagrams(tmp_path: Path):
         process_factory=lambda *_args, **_kwargs: _FakeProcess(stdout=output_pipe),
         socket_factory=lambda *_args: sockets.pop(0),
     )
-    nv12 = hwc_uint8_to_nv12(np.full((2, 4, 3), 80, dtype=np.uint8)).tobytes()
-    output_pipe.put(nv12[:5])
-    output_pipe.put(nv12[5:])
+    rgb = np.full((2, 4, 3), 80, dtype=np.uint8).tobytes()
+    output_pipe.put(rgb[:5])
+    output_pipe.put(rgb[5:])
 
     frames = decoder.decode(EncodedPacket(b"\x00\x00\x00\x01\x65x", 999, 123_456, keyframe=True))
 
