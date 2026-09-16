@@ -1,0 +1,46 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>aimdk_robot</name>
+  <version>0.1.0</version>
+  <description>
+    AgiBot X2 (AimDK) robot runtime: the independently deployable unit through
+    which the X2 joins IB-Robot. The vendor owns balance, whole-body control,
+    arbitration and sensing; this package serves the public runtime contract by
+    bridging to the vendor motion-control tier. It launches no controller
+    manager, no ros2_control hardware component and no sensor driver, and it
+    does not use the unprotected low-level joint command tier.
+  </description>
+  <maintainer email="wuxiaoqiang.rtos@huawei.com">xqw</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <!-- runtime contract layer (the only IB-Robot packages a runtime may depend on) -->
+  <exec_depend>ibrobot_msgs</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
+
+  <!-- vendor interface definitions: provided by a developer-supplied AimDK
+       overlay, NOT vendored into this repository (no license declared upstream;
+       see README.md "Vendor dependency"). -->
+  <exec_depend>aimdk_msgs</exec_depend>
+
+  <!-- message packages the bridge publishes on the neutral surface -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>diagnostic_msgs</exec_depend>
+  <exec_depend>audio_common_msgs</exec_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

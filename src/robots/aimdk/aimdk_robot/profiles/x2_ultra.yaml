@@ -1,0 +1,799 @@
+# AgiBot X2 Ultra (OmniPicker gripper) runtime profile.
+#
+# The single source of runtime parameters for the X2 runtime bridge and the
+# conformance suite. Every vendor fact below is cited to the AimDK SDK shipped
+# as `aimdk v0.0.0-gcdc995c` (docs build AimDK_X2 1.1.0); nothing here is
+# inferred. See openspec/changes/aimdk-runtime-migration/design.md.
+#
+# Scope notes (design D1/D5, decided 2026-09-16): this runtime bridges the
+# vendor MC tier. It launches no controller manager and no ros2_control
+# hardware component, so `controller_manager`, `ros2_control` and
+# `hardware_components` are deliberately absent, and every mode's controller
+# set is empty. No public model is published in this stage: no URDF is
+# rendered, so consumers needing normalization metadata fail closed on X2.
+
+runtime:
+  name: aimdk_robot
+  version: 0.1.0
+  type: x2_ultra
+
+# true: the bridge talks to the in-repo vendor mock instead of a robot
+# (aimdk_vendor_mock). There is no vendor-provided physics simulation here.
+simulated: false
+
+joint_state_topic: /joint_states
+
+# Public commandable joints only (design D2). Head, waist and legs are vendor
+# controlled: head has its own mode and channel, waist and legs are read-only
+# state, and none of them are public joint-group members.
+joints:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_yaw_joint
+  - left_wrist_pitch_joint
+  - left_wrist_roll_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_yaw_joint
+  - right_wrist_pitch_joint
+  - right_wrist_roll_joint
+  - left_hand
+  - right_hand
+
+arm_joints:
+  - left_shoulder_pitch_joint
+  - left_shoulder_roll_joint
+  - left_shoulder_yaw_joint
+  - left_elbow_joint
+  - left_wrist_yaw_joint
+  - left_wrist_pitch_joint
+  - left_wrist_roll_joint
+  - right_shoulder_pitch_joint
+  - right_shoulder_roll_joint
+  - right_shoulder_yaw_joint
+  - right_elbow_joint
+  - right_wrist_yaw_joint
+  - right_wrist_pitch_joint
+  - right_wrist_roll_joint
+gripper_joints: [left_hand, right_hand]
+
+# Mode = named vendor motion mode (design D3). Controller sets are empty: the
+# bridge performs the vendor-side switch, not a controller activation.
+modes:
+  initial: idle
+  idle:
+    controllers: []
+    transitions: [stream, policy_stream, head, locomotion]
+  stream:
+    controllers: []
+    allows_stream: true
+    transitions: [idle, policy_stream, head, locomotion]
+  policy_stream:
+    controllers: []
+    allows_stream: true
+    transitions: [idle, stream, head, locomotion]
+  # Separate mode because the vendor ignores head targets outside HEAD_ONLY
+  # (Interface/control_mod/upper_body_control.html).
+  head:
+    controllers: []
+    allows_stream: true
+    transitions: [idle, stream, policy_stream, locomotion]
+  locomotion:
+    controllers: []
+    allows_stream: true
+    allows_base: true
+    transitions: [idle, stream, policy_stream, head]
+
+# Streaming command topics observed for rejected-command counting; the bridge
+# is their only subscriber and translates them to vendor messages.
+command_channels:
+  - channel: arm_stream
+    topic: /aimdk/arm/commands
+    joints:
+      - left_shoulder_pitch_joint
+      - left_shoulder_roll_joint
+      - left_shoulder_yaw_joint
+      - left_elbow_joint
+      - left_wrist_yaw_joint
+      - left_wrist_pitch_joint
+      - left_wrist_roll_joint
+      - right_shoulder_pitch_joint
+      - right_shoulder_roll_joint
+      - right_shoulder_yaw_joint
+      - right_elbow_joint
+      - right_wrist_yaw_joint
+      - right_wrist_pitch_joint
+      - right_wrist_roll_joint
+    modes: [stream, policy_stream]
+  - channel: gripper_stream
+    topic: /aimdk/gripper/commands
+    joints: [left_hand, right_hand]
+    modes: [stream, policy_stream]
+  - channel: head_stream
+    topic: /aimdk/head/commands
+    joints: [head_yaw_joint, head_pitch_joint]
+    modes: [head]
+  - channel: base_velocity
+    topic: /cmd_vel
+    type: twist
+    modes: [locomotion]
+
+# No joint-trajectory endpoint exists at the vendor MC tier.
+trajectory_actions: []
+
+capabilities:
+  joint.state: {joint_count: 16, rate_hz: 50.0}
+  joint.position_stream: {joint_count: 16, rate_hz: 50.0}
+  gripper.1d: {count: 2}
+  base.cmd_vel: {max_vx: 1.0, max_vy: 1.0, max_wz: 1.0, staleness_s: 0.5}
+  base.navigation_gate: {}
+  motion.named:
+    names: [wave, handshake, raise_hand, blow_kiss, clap]
+  motion.posture:
+    postures: [sit_down, crouch_down, lie_down, stand_up, ascend_stairs, descend_stairs]
+  perception.camera:
+    topics:
+      - /aima/hal/sensor/rgbd_head_front/rgb_image
+      - /aima/hal/sensor/rgbd_head_front/depth_image
+      - /aima/hal/sensor/stereo_head_front_left/rgb_image
+      - /aima/hal/sensor/stereo_head_front_right/rgb_image
+      - /aima/hal/sensor/rgb_head_rear/rgb_image
+      - /aima/hal/sensor/rgbd_head_front/rgb_image/compressed
+      - /aima/hal/sensor/stereo_head_front_left/rgb_image/compressed
+      - /aima/hal/sensor/stereo_head_front_right/rgb_image/compressed
+      - /aima/hal/sensor/rgb_head_rear/rgb_image/compressed
+  # perception.lidar is NOT declared: the point cloud endpoint the SDK
+  # documents (lidar_chest_front/lidar_pointcloud, PointCloud2 10 Hz) is absent
+  # on the firmware verified 2026-09-22, which publishes `lidar_raw_data`
+  # (`aimdk_msgs/msg/LidarRawData`) instead — a type the public SDK's message
+  # package does not even define, so no SDK consumer can subscribe to it. A deployment whose firmware serves the documented
+  # topic declares the capability and the `lidar.chest_front.points` interface
+  # itself, after confirming the type with `ros2 topic info -v`. The lidar's own
+  # IMU is a plain Imu topic and stays declared under perception.imu.
+  perception.imu:
+    topics:
+      - /aima/hal/imu/chest/state
+      - /aima/hal/imu/torso/state
+      - /aima/hal/sensor/lidar_chest_front/imu
+      - /aima/hal/sensor/rgbd_head_front/imu
+      - /aima/hal/sensor/stereo_head_front/imu
+  perception.touch:
+    topics: [/aima/hal/sensor/touch_head]
+  # perception.gnss is NOT declared: /aima/hal/sensor/gnss arrived in firmware
+  # v1.1.0, and the v1.1.0+ unit verified 2026-09-22 does not publish it, so the
+  # GNSS module is an installed option rather than part of the platform. A unit
+  # that has it declares the capability and a `gnss.fix` NavSatFix interface.
+  localization.pose:
+    topics: [/localization/pose]
+    reference_frame: map
+  # localization.map is NOT declared by default: relocalization belongs to the
+  # vendor's optional SLAM component ("contact after-sales"), whose
+  # /integrated_command and /relocalization_pose topics are absent on the
+  # verified unit even though /slam/lidar_odom is present. A deployment with
+  # that component and a stored map declares the capability, the
+  # `localization.relocalize` interface, and the map ids under vendor.slam.maps.
+  power.state:
+    topics: [/power_state]
+  diagnostics.codes:
+    topics: [/diagnostics]
+  interaction.tts:
+    endpoints: [/speech/speak]
+    # Neutral 0..100 priorities step through the platform's TTS layers
+    # (interaction/msg/TtsPriorityLevel.msg), lowest first: 0-19 background,
+    # 20-39 service, 40-59 mission, 60-79 interaction, 80-94 system,
+    # 95-100 warning. The platform's life-safety layer is not reachable.
+    priority_levels: [background, service, mission, interaction, system, warning]
+  interaction.expression:
+    endpoints: [/expression/play]
+    # The screen priority scale is not 0..100: the platform shows its own
+    # fault indications at 8-10, and anything above 10 hides them. Neutral
+    # 0-39 background, 40-79 normal, 80-94 foreground, 95-100 over_fault
+    # (the only band that can cover a fault indication).
+    priority_levels: [background, normal, foreground, over_fault]
+  interaction.led:
+    endpoints: [/led/set_pattern]
+    # The platform ratchets a priority threshold upward on each accepted
+    # request, so the neutral range steps into a small band that leaves
+    # headroom: 0-39 background, 40-79 normal, 80-100 foreground.
+    priority_levels: [background, normal, foreground]
+  interaction.audio_capture:
+    topics: [/audio/capture_stamped]
+    sample_rate_hz: 16000.0
+    # 6 = the built-in array's total: 4 microphones + 2 echo-reference
+    # channels, interleaved per sample (int16), not 6 copies of one signal and
+    # not mono. A consumer that assumes mono reads it as noise. Switching to an
+    # external microphone makes it 2 (1 + 1); this runtime does not bridge the
+    # mic-source service, so the built-in array is what is declared.
+    channels: 6
+  interaction.audio_playback:
+    endpoints: [/audio/play]
+    sample_rate_hz: 16000.0
+    channels: 1
+  runtime.status: {}
+  # Placeholders. Replaced by conformance measurements, then by the values
+  # measured on hardware (tasks 4.3 / 7.5).
+  runtime.stop: {cancel_bound_s: 1.0, idle_bound_s: 3.0, torque_off_bound_s: 5.0}
+
+stop_default_policy: HOLD
+
+# Teleoperation is not advertised: the public projection binds exactly one arm
+# group and one gripper (robot_runtime.interface_description).
+teleoperation:
+  enabled: false
+
+# ---------------------------------------------------------------------------
+# Vendor-specific facts (read only by the X2 bridge; never by generic layers).
+# ---------------------------------------------------------------------------
+vendor:
+  sdk_version: "aimdk v0.0.0-gcdc995c"
+  docs_version: "AimDK_X2 1.1.0"
+  # Runtime mode -> vendor MC action (Interface/control_mod/modeswitch.html).
+  mc_actions:
+    idle: STAND_DEFAULT
+    stream: UPPERBODY_REMOTE_SPLIT
+    policy_stream: UPPERBODY_REMOTE_SPLIT
+    head: HEAD_ONLY
+    locomotion: STAND_DEFAULT
+  services:
+    set_action: /aimdk_5Fmsgs/srv/SetMcAction
+    get_action: /aimdk_5Fmsgs/srv/GetMcAction
+    set_input_source: /aimdk_5Fmsgs/srv/SetMcInputSource
+    get_input_source: /aimdk_5Fmsgs/srv/GetCurrentInputSource
+    get_hand_type: /aimdk_5Fmsgs/srv/GetHandType
+    set_preset_motion: /aimdk_5Fmsgs/srv/SetMcPresetMotion
+    get_preset_motion_state: /aimdk_5Fmsgs/srv/GetMcPresetMotionState
+    play_tts: /aimdk_5Fmsgs/srv/PlayTts
+    play_emoji: /aimdk_5Fmsgs/srv/PlayEmoji
+    set_led: /aimdk_5Fmsgs/srv/SetPmuLed
+    request_audio_focus: /aimdk_5Fmsgs/srv/RequestAudioFocus
+    abandon_audio_focus: /aimdk_5Fmsgs/srv/AbandonAudioFocus
+  topics:
+    upper_body_command: /mc/upper_body_command
+    locomotion_command: /aima/mc/locomotion/velocity
+    mc_state: /aima/mc/common/state
+    system_state: /aima/sm/system_state
+    alert_codes: /aima/hds/alert_code_list
+    diag_codes: /aima/hds/diag_code_list
+    power_state: /aima/hal/pmu/state
+    audio_capture: /aima/hal/audio/capture
+    audio_playback: /aima/hal/audio/playback
+    audio_focus_response: /aima/hal/audio/focus_response
+    localization_pose: /slam/lidar_odom
+    joint_state:
+      arm: /aima/hal/joint/arm/state
+      head: /aima/hal/joint/head/state
+      waist: /aima/hal/joint/waist/state
+      leg: /aima/hal/joint/leg/state
+    hand_state: /aima/hal/joint/hand/state
+  # QoS per vendor endpoint, taken from the SDK's own interface tables. This is
+  # part of the endpoint contract, not a style choice: a BEST_EFFORT publisher
+  # cannot serve the platform's RELIABLE subscription (every message is dropped
+  # silently — observed on /aima/hal/audio/playback, 2026-09-22), and a VOLATILE
+  # subscription forgoes the latched last sample a TRANSIENT_LOCAL publisher
+  # offers, which is how the platform's state topics deliver their current value
+  # immediately on subscribe.
+  qos:
+    upper_body_command: {reliability: best_effort, durability: volatile}
+    locomotion_command: {reliability: best_effort, durability: volatile}
+    mc_state: {reliability: best_effort, durability: transient_local}
+    system_state: {reliability: best_effort, durability: transient_local}
+    joint_state: {reliability: best_effort, durability: transient_local}
+    hand_state: {reliability: best_effort, durability: transient_local}
+    power_state: {reliability: best_effort, durability: transient_local}
+    diag_codes: {reliability: best_effort, durability: transient_local}
+    alert_codes: {reliability: best_effort, durability: transient_local}
+    audio_capture: {reliability: reliable, durability: volatile}
+    audio_playback: {reliability: reliable, durability: volatile}
+    audio_focus_response: {reliability: reliable, durability: transient_local}
+    localization_pose: {reliability: reliable, durability: volatile}
+  # Arbitration is a takeover rule, not a reservation (MC_control.html
+  # "仲裁流程"): a registered source becomes the holder by sending a non-zero
+  # command when there is no holder, the holder has timed out, or it outranks
+  # the holder. So an empty holder means "nothing has sent a valid command
+  # yet" — the SDK says so outright — and the runtime must stream to claim
+  # rather than wait to be handed the claim. The rule covers continuous
+  # commands (locomotion, posture); the vendor's own upper-body example
+  # publishes without registering at all. Registration is still required to
+  # avoid being discarded, and SDK software uses the 20-39 band.
+  #
+  # Priority stays at 30 deliberately. The SDK's preset-motion example
+  # registers at 40, but 40 is exactly the platform's own `pnc` planner
+  # priority, and takeover needs *strictly* higher — so 40 would not even
+  # outrank it, while moving this runtime out of the documented 20-39
+  # secondary-development band into "中级控制". It would also change nothing
+  # for preset motions, which the SDK states have no priority protection at
+  # all ("离散动作命令没有优先级保护"): what decides those is whether the
+  # source is registered and enabled, which the bridge re-asserts before each
+  # dispatch. Raise this only to contend with a named platform source on
+  # *continuous* commands, and then deliberately.
+  input_source:
+    name: ibrobot.aimdk_robot
+    priority: 30
+    timeout_ms: 1000
+  command:
+    # Recommended publish rate for /mc/upper_body_command and locomotion.
+    rate_hz: 50.0
+    # Commands whose stamp is older than this are dropped by the vendor.
+    stamp_window_s: 0.2
+    # How far this host's clock may differ from the platform's before every
+    # stream is silently discarded. Must stay well inside stamp_window_s: on a
+    # separate compute pack the two clocks are only as close as NTP/PTP makes
+    # them, and a drifting one looks exactly like a robot ignoring commands.
+    clock_skew_limit_s: 0.1
+    mode_confirm_timeout_s: 5.0
+    # An upper-body target older than this is no longer repeated: the
+    # platform holds where it is instead of chasing a frozen last value.
+    stream_staleness_s: 0.5
+  # Joint feedback sources must have reported within this window to be
+  # aggregated into /joint_states, to serve as a hold target for uncommanded
+  # joints, and (for the required groups) to keep the runtime ACTIVE.
+  feedback:
+    staleness_s: 0.5
+    required_groups: [arm, hand]
+  # Head travel, from the platform's own McServoStatus comments
+  # (yaw -0.38..0.38, pitch -0.35..0.35 rad). A target outside it is refused,
+  # not clamped: clamping would execute a motion the caller did not ask for.
+  head:
+    limits:
+      head_yaw_joint: 0.38
+      head_pitch_joint: 0.35
+  hand:
+    # OmniPicker gripper. hand_sub_mode 1 (HAND_CLAW_OPEN_CLOSE); command range
+    # 0.0 (closed) .. 1.0 (open) per hand, order [left, right].
+    type: claw
+    sub_mode: 1
+    command_min: 0.0
+    command_max: 1.0
+  locomotion:
+    # mc has thresholds to start movement (py_examples/mc_locomotion_velocity.py).
+    deadband: 0.005
+    min_linear_mps: 0.2
+    min_angular_radps: 0.1
+    max_linear_mps: 1.0
+    max_angular_radps: 1.0
+  stop:
+    # Every name here must be one the firmware *registers*, which is the
+    # documented mode table — not the McAction IDL enumeration, which still
+    # carries names the firmware dropped (SetMcAction matches on action_desc
+    # and answers code 3 "动作未在配置中登记" for those). Verified against the
+    # robot 2026-09-22: the registered set is exactly PASSIVE_DEFAULT,
+    # DAMPING_DEFAULT, JOINT_DEFAULT, STAND_DEFAULT, LOCOMOTION_DEFAULT,
+    # HEAD_ONLY, UPPERBODY_REMOTE_SPLIT.
+    #
+    # HOLD switches no mode. No registered mode holds the robot from every
+    # posture: leaving STAND_DEFAULT trades active balance for a position-held
+    # stand, JOINT_DEFAULT is refused from a seated posture ("姿态限制"), and
+    # STAND_DEFAULT from a seated posture is a stand-up — motion, not a stop.
+    # Closing command admission holds the robot where it is, and the platform's
+    # own 1 s input timeout zeroes the stream.
+    hold_action: ""
+    # TORQUE_OFF on a balancing biped is a fall (design D4), so it is served by
+    # the platform's damping mode: joints compliant, balance released, and
+    # "始终允许" even while the safety mechanism is engaged. PASSIVE_DEFAULT is
+    # the true zero-torque mode and equally always permitted, so it serves
+    # TORQUE_OFF when the robot is already supported by a seated or lying pose.
+    torque_off_policy: soft_estop
+    soft_estop_action: DAMPING_DEFAULT
+    zero_torque_action: PASSIVE_DEFAULT
+  # Preset motions: (motion, area) pairs documented in
+  # Interface/control_mod/preset_motion.html. `target` is the default side.
+  preset_motions:
+    wave: {motion: 1002, target: right}
+    handshake: {motion: 1003, target: right}
+    raise_hand: {motion: 1001, target: right}
+    blow_kiss: {motion: 1004, target: right}
+    clap: {motion: 3017, area: 11}
+  # Whole-body posture actions (mc/action/McAction.msg skill values).
+  postures:
+    sit_down: SIT_DOWN_DEFAULT
+    crouch_down: CROUCH_DOWN_DEFAULT
+    lie_down: LIE_DOWN_DEFAULT
+    stand_up: STAND_UP_DEFAULT
+    ascend_stairs: ASCEND_STAIRS
+    descend_stairs: DESCEND_STAIRS
+  # Body pose the platform must report before a posture counts as reached.
+  posture_poses:
+    sit_down: sit
+    crouch_down: squat
+    lie_down: lie_face_up
+    stand_up: stand
+  posture_timeout_s: 20.0
+  # Named motions share the streaming channels' admission (ACTIVE, holding
+  # arbitration) and are only dispatched from these modes: SetMcPresetMotion
+  # has no priority protection of its own (preset_motion.html), and preset
+  # motions require Stable Stand, which is the idle mode's vendor action.
+  # Completion is observed through GetMcPresetMotionState, bounded by
+  # preset_timeout_s.
+  named_motion:
+    allowed_modes: [idle]
+    # The platform runs preset motions only from stable stand: the SDK's own
+    # table annotates every (motion, area) pair "稳定站立模式下执行". Checked
+    # against the platform's reported action, not against the runtime's mode.
+    required_action: STAND_DEFAULT
+    preset_timeout_s: 30.0
+    poll_s: 0.2
+  # Semantic expression name -> vendor emotion id (face_ui/srv/PlayEmoji.srv).
+  expressions:
+    blink: 1
+    calm: 10
+    happy: 90
+    very_happy: 100
+    sad: 110
+    sympathy: 120
+    confused: 130
+    shocked: 140
+    serious: 160
+    thinking: 170
+    angry: 180
+    adore: 200
+    charging: 220
+  tts:
+    domain: ibrobot
+  audio:
+    capture_topic: /audio/capture_stamped
+    info_topic: /audio/info
+    play_topic: /audio/play
+    playback_channels: 1
+    playback_sample_rate: 16000
+    playback_sample_format: S16LE
+    playback_coding_format: pcm
+    # hal_audio does not request audio focus for the clients that publish to
+    # the playback topic — only the file-playback service manages focus
+    # internally — so the bridge holds focus itself for as long as it is
+    # streaming. Band is 1..10 (default 6); weight subdivides one band.
+    focus_priority: 6
+    focus_priority_weight: 0
+    # Release the speaker once the stream has been quiet this long: holding
+    # focus while idle would keep preempting the platform's own announcements.
+    focus_release_idle_s: 1.0
+    # Chunks held while a focus request is in flight, so an utterance does not
+    # start mid-word. Oldest are dropped first.
+    focus_buffer_chunks: 50
+  # Optional vendor SLAM component ("contact after-sales"). Declaring
+  # localization.map requires this component to be running: /integrated_command
+  # is absent when it is not, even though /slam/lidar_odom may be present.
+  slam:
+    # Optional vendor component: relocalization is required before goal
+    # navigation is accepted. Map ids come from the deployment.
+    command_topic: /integrated_command
+    maps: {}
+  # Optional vendor component ("contact after-sales technical support").
+  navigation:
+    enabled: false
+  # Platform system modes that disable the tier this runtime depends on.
+  blocking_system_states: [Develop_MC, EStop, OTA, Poweroff, Reboot]
+  # Vendor restriction: raw image streams are ~80-90 MB/s and "must not be
+  # subscribed across compute units" (Interface/hal/sensor.html). Consumers of
+  # these interfaces run on the unit named here.
+  compute_units:
+    cameras: PC2
+    motion_control: PC1
+    interaction: PC3
+  # Expert tier, default OFF (design D14). The low-level joint stream carries
+  # impedance but has no fail-safe and requires stopping the vendor MC
+  # application; enabling it forfeits vendor balance control.
+  expert_joint_tier:
+    enabled: false
+    requires_system_mode: Develop_MC
+    command_topics:
+      arm: /aima/hal/joint/arm/command
+      head: /aima/hal/joint/head/command
+      waist: /aima/hal/joint/waist/command
+      leg: /aima/hal/joint/leg/command
+    # Per-joint gains from py_examples/motocontrol.py; data only while the
+    # tier is disabled.
+    gains:
+      arm: {stiffness: 20.0, damping: 2.0}
+      head: {stiffness: 20.0, damping: 2.0}
+      waist: {stiffness: 20.0, damping: 4.0}
+      leg: {stiffness: 40.0, damping: 4.0}
+
+# ---------------------------------------------------------------------------
+# Public interfaces merged verbatim into the exported description.
+#
+# Vendor-published sensors are declared, never re-driven (design D7); vendor
+# capabilities that need a request/response surface are served on neutral
+# endpoints with ibrobot_msgs types, so no generic consumer links aimdk_msgs.
+#
+# Image geometry is declared as null: the vendor documents that resolution and
+# encoding vary across hardware and software revisions and that consumers must
+# read them from CameraInfo.
+# ---------------------------------------------------------------------------
+interfaces:
+  joint.body_state:
+    capability: joint.state
+    kind: topic
+    direction: publish
+    endpoint: /aimdk/body_joint_states
+    message_type: sensor_msgs/msg/JointState
+    joint_names:
+      - head_yaw_joint
+      - head_pitch_joint
+      - waist_yaw_joint
+      - waist_pitch_joint
+      - waist_roll_joint
+      - left_hip_pitch_joint
+      - left_hip_roll_joint
+      - left_hip_yaw_joint
+      - left_knee_joint
+      - left_ankle_pitch_joint
+      - left_ankle_roll_joint
+      - right_hip_pitch_joint
+      - right_hip_roll_joint
+      - right_hip_yaw_joint
+      - right_knee_joint
+      - right_ankle_pitch_joint
+      - right_ankle_roll_joint
+    units: {position: rad, velocity: rad/s}
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+
+  motion.named:
+    capability: motion.named
+    kind: action
+    direction: serve
+    endpoint: /motion/execute_named
+    message_type: ibrobot_msgs/action/ExecuteNamedMotion
+  speech.speak:
+    capability: interaction.tts
+    kind: service
+    direction: serve
+    endpoint: /speech/speak
+    message_type: ibrobot_msgs/srv/SpeakText
+  expression.play:
+    capability: interaction.expression
+    kind: service
+    direction: serve
+    endpoint: /expression/play
+    message_type: ibrobot_msgs/srv/PlayExpression
+  led.set_pattern:
+    capability: interaction.led
+    kind: service
+    direction: serve
+    endpoint: /led/set_pattern
+    message_type: ibrobot_msgs/srv/SetLedPattern
+  localization.pose:
+    capability: localization.pose
+    kind: topic
+    direction: publish
+    endpoint: /localization/pose
+    message_type: geometry_msgs/msg/PoseWithCovarianceStamped
+    frame_id: map
+    units: {position: m, orientation: quaternion}
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  power.state:
+    capability: power.state
+    kind: topic
+    direction: publish
+    endpoint: /power_state
+    message_type: ibrobot_msgs/msg/PowerState
+    rate_hz: 1.0
+    units: {battery_voltage: V, battery_current: A, battery_temperature: degC}
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  diagnostics.codes:
+    capability: diagnostics.codes
+    kind: topic
+    direction: publish
+    endpoint: /diagnostics
+    message_type: diagnostic_msgs/msg/DiagnosticArray
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  audio.capture:
+    capability: interaction.audio_capture
+    kind: topic
+    direction: publish
+    endpoint: /audio/capture_stamped
+    message_type: audio_common_msgs/msg/AudioDataStamped
+    rate_hz: 33.3
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 10}
+  audio.play:
+    capability: interaction.audio_playback
+    kind: topic
+    direction: subscribe
+    endpoint: /audio/play
+    message_type: audio_common_msgs/msg/AudioDataStamped
+    qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
+
+  imu.chest:
+    capability: perception.imu
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/imu/chest/state
+    message_type: sensor_msgs/msg/Imu
+    frame_id: base_link
+    rate_hz: 500.0
+    qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
+  imu.torso:
+    capability: perception.imu
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/imu/torso/state
+    message_type: sensor_msgs/msg/Imu
+    frame_id: base_link
+    rate_hz: 500.0
+    qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
+  # IMU built into the head RGB-D camera (sensor.html); frame not documented.
+  imu.rgbd_head_front:
+    capability: perception.imu
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgbd_head_front/imu
+    message_type: sensor_msgs/msg/Imu
+    rate_hz: 200.0
+    qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
+  # IMU built into the head stereo camera (sensor.html, 200 Hz).
+  imu.stereo_head_front:
+    capability: perception.imu
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front/imu
+    message_type: sensor_msgs/msg/Imu
+    rate_hz: 200.0
+    qos: {reliability: best_effort, durability: volatile, history: keep_last, depth: 10}
+  # IMU built into the chest lidar. frame_id is lidar_imu_chest_front, which
+  # differs from the point cloud's frame; the platform publishes the static
+  # transform between them on /tf_static.
+  imu.lidar_chest_front:
+    capability: perception.imu
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/lidar_chest_front/imu
+    message_type: sensor_msgs/msg/Imu
+    rate_hz: 200.0
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+  touch.head:
+    capability: perception.touch
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/touch_head
+    message_type: aimdk_msgs/msg/TouchState
+    rate_hz: 100.0
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+  camera.rgbd_head_front.color:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgbd_head_front/rgb_image
+    message_type: sensor_msgs/msg/Image
+    camera_info_topic: /aima/hal/sensor/rgbd_head_front/rgb_camera_info
+    rate_hz: 30.0
+    configured_profile: null
+    supported_profiles: null
+    frame_id: null
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+  camera.rgbd_head_front.color_info:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgbd_head_front/rgb_camera_info
+    message_type: sensor_msgs/msg/CameraInfo
+    rate_hz: 30.0
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+  camera.rgbd_head_front.depth:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgbd_head_front/depth_image
+    message_type: sensor_msgs/msg/Image
+    camera_info_topic: /aima/hal/sensor/rgbd_head_front/depth_camera_info
+    rate_hz: 30.0
+    configured_profile: null
+    supported_profiles: null
+    frame_id: null
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+  camera.rgbd_head_front.depth_info:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgbd_head_front/depth_camera_info
+    message_type: sensor_msgs/msg/CameraInfo
+    rate_hz: 30.0
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+
+  camera.stereo_head_front_left.color:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front_left/rgb_image
+    message_type: sensor_msgs/msg/Image
+    camera_info_topic: /aima/hal/sensor/stereo_head_front_left/camera_info
+    # Left camera is the stereo reference frame; its frame_id has no _left
+    # suffix (Interface/hal/sensor.html).
+    frame_id: stereo_head_front
+    rate_hz: 10.0
+    configured_profile: null
+    supported_profiles: null
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+  camera.stereo_head_front_left.color_info:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front_left/camera_info
+    message_type: sensor_msgs/msg/CameraInfo
+    frame_id: stereo_head_front
+    rate_hz: 1.0
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+  camera.stereo_head_front_right.color:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front_right/rgb_image
+    message_type: sensor_msgs/msg/Image
+    camera_info_topic: /aima/hal/sensor/stereo_head_front_right/camera_info
+    frame_id: stereo_head_front_right
+    rate_hz: 10.0
+    configured_profile: null
+    supported_profiles: null
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+  camera.stereo_head_front_right.color_info:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front_right/camera_info
+    message_type: sensor_msgs/msg/CameraInfo
+    frame_id: stereo_head_front_right
+    rate_hz: 1.0
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+
+  camera.rgb_head_rear.color:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgb_head_rear/rgb_image
+    message_type: sensor_msgs/msg/Image
+    camera_info_topic: /aima/hal/sensor/rgb_head_rear/camera_info
+    rate_hz: 10.0
+    configured_profile: null
+    supported_profiles: null
+    frame_id: null
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+  camera.rgb_head_rear.color_info:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgb_head_rear/camera_info
+    message_type: sensor_msgs/msg/CameraInfo
+    rate_hz: 1.0
+    qos: {reliability: reliable, durability: transient_local, history: keep_last, depth: 5}
+
+
+  # Vendor-side JPEG streams of the same cameras (declared, not re-driven):
+  # the bandwidth-friendly alternative to the raw images above.
+  camera.rgbd_head_front.color_compressed:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgbd_head_front/rgb_image/compressed
+    message_type: sensor_msgs/msg/CompressedImage
+    camera_info_topic: /aima/hal/sensor/rgbd_head_front/rgb_camera_info
+    rate_hz: 30.0
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+  camera.stereo_head_front_left.color_compressed:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front_left/rgb_image/compressed
+    message_type: sensor_msgs/msg/CompressedImage
+    camera_info_topic: /aima/hal/sensor/stereo_head_front_left/camera_info
+    rate_hz: 30.0
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+  camera.stereo_head_front_right.color_compressed:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/stereo_head_front_right/rgb_image/compressed
+    message_type: sensor_msgs/msg/CompressedImage
+    camera_info_topic: /aima/hal/sensor/stereo_head_front_right/camera_info
+    rate_hz: 30.0
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
+  camera.rgb_head_rear.color_compressed:
+    capability: perception.camera
+    kind: topic
+    direction: publish
+    endpoint: /aima/hal/sensor/rgb_head_rear/rgb_image/compressed
+    message_type: sensor_msgs/msg/CompressedImage
+    camera_info_topic: /aima/hal/sensor/rgb_head_rear/camera_info
+    rate_hz: 30.0
+    qos: {reliability: reliable, durability: volatile, history: keep_last, depth: 5}
