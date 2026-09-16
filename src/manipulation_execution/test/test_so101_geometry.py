@@ -54,7 +54,9 @@ def test_quaternion_error_treats_sign_equivalent_quaternions_as_equal():
 
 
 def test_batch_gripper_geometry_matches_scalar_checks():
-    mesh_directory = Path(__file__).parents[2] / "robot_description" / "meshes" / "lerobot" / "so101"
+    mesh_directory = (
+        Path(__file__).parents[2] / "robots" / "so101" / "so101_description" / "meshes" / "lerobot" / "so101"
+    )
     plane = TablePlane(normal=(0.0, 0.0, 1.0), offset=0.02)
     candidates = [
         ((0.10, -0.16, 0.18), (0.10, -0.16, 0.08), (0.0, 0.0, 0.0, 1.0), 0.035),

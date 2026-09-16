@@ -279,21 +279,22 @@ def test_runtime_snapshot_uses_configured_context_schema(monkeypatch, context_sc
     node._finalize_workflow_service = "/embodied/finalize_workflow_execution"
     node._task_executor_action_name = "/task_executor/execute_task_plan"
     node._arm_trajectory_action_name = "/arm_trajectory_controller/follow_joint_trajectory"
-    node._move_configuration_service = "/moveit_gateway/move_to_configuration"
+    node._move_configuration_service = skill_executor_node.RUNTIME.MOVE_TO_JOINT_SERVICE
     node._navigation_action_name = "/navigation/execute"
     node._skill_catalog_source_mode = "development"
     node._skill_catalog_source_root = "."
     node._skill_catalog_profile = "unused"
     node._delegated_executor_descriptors = lambda: {}
+    snapshot = type("Snapshot", (), {"enabled_skill_names": ()})()
 
     def compile_catalog(_compiler, _source, *, profile_name, context):
         captured["profile_name"] = profile_name
         captured["context"] = context
-        return "snapshot"
+        return snapshot
 
     monkeypatch.setattr(skill_executor_node.SkillCatalogCompiler, "compile", compile_catalog)
 
-    assert node._compile_runtime_snapshot() == "snapshot"
+    assert node._compile_runtime_snapshot() is snapshot
     robot_context = captured["context"].robot
     assert robot_context.context_schema_version == context_schema_version
     assert ("navigation_action" in robot_context.execution_endpoints) is has_navigation
@@ -565,6 +566,29 @@ def test_rejected_control_mode_switch_prevents_skill_primitive_dispatch():
     assert result.message == "base controller unavailable"
     assert goal_handle.abort_count == 1
     assert primitive_dispatches == []
+
+
+@pytest.mark.parametrize("executor", ["", "grasp_pipeline", "placement_pipeline", "imitate_human_motion"])
+def test_missing_explicit_runtime_status_prevents_primitive_and_delegated_dispatch(executor):
+    dispatches = []
+    node = _make_skill_node(_Future(done=False))
+    node._runtime_enabled = True
+    node._runtime_status_snapshot = None
+    node._motion_mode_switch_lock = RLock()
+    node._skill_templates = {"test_skill": {"executor": executor}}
+    node._primitive_client.send_goal_async = lambda *_args, **_kwargs: dispatches.append("primitive")
+    node._execute_pick_skill = lambda *_args, **_kwargs: dispatches.append("pick")
+    node._execute_place_skill = lambda *_args, **_kwargs: dispatches.append("place")
+    node._execute_imitate_human_motion_skill = lambda *_args, **_kwargs: dispatches.append("imitate")
+    goal_handle = _NoCancelParentGoalHandle()
+
+    result = node._execute_skill(goal_handle)
+
+    assert result.success is False
+    assert result.error_code == "CONTROL_MODE_MISMATCH"
+    assert "not been received" in result.message
+    assert goal_handle.abort_count == 1
+    assert dispatches == []
 
 
 def test_wait_for_future_runs_cancel_callback_once(monkeypatch):

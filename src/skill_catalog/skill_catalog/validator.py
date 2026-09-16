@@ -90,7 +90,16 @@ DESCRIPTION_FIELDS = frozenset(
     }
 )
 CAPABILITY_FIELDS = frozenset(
-    {"schema_version", "summary", "domain", "moves_robot", "required_control_mode", "parameters", "recovery_policy"}
+    {
+        "schema_version",
+        "summary",
+        "domain",
+        "moves_robot",
+        "required_control_mode",
+        "parameters",
+        "recovery_policy",
+        "required_capabilities",
+    }
 )
 PROFILE_FIELDS = frozenset({"schema_version", "name", "robot_name", "enabled_skills"})
 PROFILE_ENTRY_FIELDS = frozenset({"name", "implementation", "planner_visible"})
@@ -696,6 +705,7 @@ def _validate_capability(
         "capability.parameters",
         allowed_parameter_names=allowed_parameter_names,
     )
+    _validate_required_capabilities(capability, diagnostics, path)
     if capability.get("recovery_policy") not in RECOVERY_POLICIES:
         _error(
             diagnostics,
@@ -704,6 +714,36 @@ def _validate_capability(
             source_relative_path=path,
             field_path="capability.recovery_policy",
         )
+
+
+def _validate_required_capabilities(
+    capability: Mapping[str, Any],
+    diagnostics: list[SkillDiagnostic],
+    path: str,
+) -> None:
+    """Validate format; RuntimeStatus supplies the runtime capability vocabulary."""
+    if "required_capabilities" not in capability:
+        return
+    required = capability["required_capabilities"]
+    if not isinstance(required, list) or not required:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "required_capabilities must be a non-empty list when present",
+            source_relative_path=path,
+            field_path="capability.required_capabilities",
+        )
+        return
+    for item in required:
+        if not isinstance(item, str) or not item.strip():
+            _error(
+                diagnostics,
+                "SKILL_SCHEMA_INVALID",
+                "required_capabilities entries must be non-empty strings",
+                source_relative_path=path,
+                field_path="capability.required_capabilities",
+            )
+            return
 
 
 def _validate_parameter_schema(

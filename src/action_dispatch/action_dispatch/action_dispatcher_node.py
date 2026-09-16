@@ -30,11 +30,14 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Int32
 from std_srvs.srv import Empty, Trigger
 
+from action_dispatch.contract_binding import resolve_joint_feedback
+from action_dispatch.policy_admission import PolicyAdmission
 from ibrobot_msgs.action import DispatchInfer, RunPolicy
 from ibrobot_msgs.srv import PreparePolicyEpisode
 from ibrobot_tracing import get_trace_emitter
 from robot_config.contract_utils import iter_specs
 from robot_config.dispatch_strategies import resolve_dispatch_strategies
+from robot_config.interface_binding import InterfaceBindingError
 from tensormsg.converter import TensorMsgConverter
 
 from .action_chunk import normalize_action_chunk, validate_execution_horizon
@@ -255,6 +258,8 @@ class ActionDispatcherNode(Node):
         # 4. Load Contract (Essential for TopicExecutor mapping)
         robot_config_path = self.get_parameter("robot_config_path").value
         self._action_specs = []
+        self._joint_state_topic = self.get_parameter("joint_state_topic").value
+        self._joint_state_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         if robot_config_path:
             try:
                 from robot_config.loader import load_robot_config
@@ -262,7 +267,13 @@ class ActionDispatcherNode(Node):
                 robot_cfg = load_robot_config(robot_config_path)
                 self._contract = robot_cfg.to_contract()
                 self._action_specs = [s for s in iter_specs(self._contract) if s.is_action]
+                self._robot_config = robot_cfg
+                self._joint_state_topic, self._joint_state_qos, _ = resolve_joint_feedback(
+                    self._contract, self._joint_state_topic, self._joint_state_qos, robot_cfg.runtime
+                )
                 self.get_logger().info(f"Loaded {len(self._action_specs)} action specs from robot_config")
+            except InterfaceBindingError:
+                raise
             except Exception as e:
                 self.get_logger().error(f"Failed to load contract from {robot_config_path}: {e}")
         else:
@@ -272,8 +283,14 @@ class ActionDispatcherNode(Node):
         # Base spec: 3 names with first index >= 6 (e.g. action.6, action.7, action.8).
         self._base_act_spec = None
         for sv in self._action_specs:
+            if sv.ros_type == "geometry_msgs/msg/Twist":
+                self._base_act_spec = sv
+                break
             if sv.names and len(sv.names) == 3:
-                first_idx = int(sv.names[0].split(".")[-1])
+                suffix = sv.names[0].split(".")[-1]
+                if not suffix.isdigit():
+                    continue
+                first_idx = int(suffix)
                 if first_idx >= 6:
                     self._base_act_spec = sv
                     break
@@ -377,12 +394,11 @@ class ActionDispatcherNode(Node):
         )
 
         # Subscriptions
-        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         self._joint_sub = self.create_subscription(
             JointState,
-            self.get_parameter("joint_state_topic").value,
+            self._joint_state_topic,
             self._joint_cb,
-            qos,
+            self._joint_state_qos,
         )
 
         # Publishers
@@ -452,6 +468,30 @@ class ActionDispatcherNode(Node):
         self._last_queue_refill_monotonic_ns = 0
         self._last_stall_log_ns = time.monotonic_ns()
         self._benchmark_inference_timings: dict[str, dict[str, object]] = {}
+        self._runtime_admission = None
+        runtime = getattr(getattr(self, "_robot_config", None), "runtime", {})
+        if isinstance(runtime, dict) and runtime.get("provider"):
+            self._is_running = False
+            self._runtime_admission = PolicyAdmission(
+                self, robot_config_path, runtime, self._dispatch_lock, self._runtime_revoked
+            )
+
+    @_dispatch_locked
+    def _runtime_revoked(self):
+        self._is_running = False
+        self._request_generation += 1
+        self._inference_in_progress = False
+        self._inflight_request_id = ""
+        self._inference_started_at = 0.0
+        self._policy_reset_future = None
+        self._policy_reset_in_progress = False
+        self._policy_reset_started_at = 0.0
+        self._executor.invalidate_pending()
+        self._clear_plan()
+        self._last_action = None
+        self._reservation_context = None
+        self._plan_reservation = None
+        self._reserved_action = None
 
     def _joint_cb(self, msg):
         """Optional: could use current state for safety or initialization."""
@@ -464,6 +504,9 @@ class ActionDispatcherNode(Node):
 
     @_dispatch_locked
     def _control_loop(self):
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None and not admission.owned:
+            return
         # benchmark episode controller: benchmark/wait_for_feedback uses the episode gate (opened by
         # RunPolicy goal, closed on terminal), NOT the legacy ``_is_running``
         # flag. Both paths serialize their plan operations with lifecycle changes.
@@ -620,6 +663,9 @@ class ActionDispatcherNode(Node):
         the dispatcher wall clock. Continuous mode always passes ``None`` and
         keeps using ``get_clock().now()`` exactly as before.
         """
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None and (not admission.owned or not self._is_running):
+            return
         if not self._infer_client.server_is_ready():
             return
 
@@ -1439,18 +1485,33 @@ class ActionDispatcherNode(Node):
             self.get_logger().warn("No base action spec found, cannot stop base")
             return
 
-        from std_msgs.msg import Float64MultiArray
-
         for topic, info in self._executor._publishers.items():
             if info["spec"] is self._base_act_spec:
-                msg = Float64MultiArray()
-                msg.data = [0.0, 0.0, 0.0]
-                info["pub"].publish(msg)
+                self._executor.execute_channel(topic, np.zeros(3))
                 self.get_logger().info(f"Published zero base command to {topic}")
                 break
 
-    @_dispatch_locked
     def _start_nav_cb(self, request, response):
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is None or self._is_benchmark:
+            return self._start_nav_locked(request, response)
+        event = threading.Event()
+
+        def admitted(success, message):
+            with self._dispatch_lock:
+                if success:
+                    self._start_nav_locked(request, response)
+                else:
+                    response.success, response.message = False, message
+                event.set()
+
+        admission.acquire(admitted, own_active_session=self._is_running)
+        if not event.wait(2.0):
+            admission.cancel()
+        return response
+
+    @_dispatch_locked
+    def _start_nav_locked(self, request, response):
         """Start or resume dispatcher evaluation (idempotent clean restart).
 
         In model_inference mode the dispatcher auto-runs, so a control panel
@@ -1479,8 +1540,19 @@ class ActionDispatcherNode(Node):
         self.get_logger().info(response.message)
         return response
 
-    @_dispatch_locked
     def _stop_nav_cb(self, request, response):
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is None or self._is_benchmark:
+            return self._stop_nav_locked(request, response)
+        with self._dispatch_lock:
+            admission.cancel()
+            self._runtime_revoked()
+        response.success = admission.release()
+        response.message = "Evaluate stopped" if response.success else "runtime idle transition failed"
+        return response
+
+    @_dispatch_locked
+    def _stop_nav_locked(self, request, response):
         """Stop or pause dispatcher evaluation (idempotent).
 
         Always succeeds and clears any in-flight inference so a later start is

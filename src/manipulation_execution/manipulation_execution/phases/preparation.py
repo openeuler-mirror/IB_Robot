@@ -10,11 +10,11 @@ from dataclasses import replace
 from pathlib import Path
 
 from geometry_msgs.msg import Pose
-from moveit_msgs.srv import GetPositionFK, GetPositionIK
-from rclpy.duration import Duration
 from sensor_msgs.msg import JointState
 
+from ibrobot_msgs.srv import ComputeFk, ComputeIk
 from manipulation_execution.contact_compensation import ContactPrediction, compensate_contact_xy
+from manipulation_execution.geometry import axis_error_deg, quaternion_error_deg
 from manipulation_execution.grasp_geometry import (
     CandidatePlan,
     FixedFingerBaseSide,
@@ -34,19 +34,6 @@ from manipulation_execution.pick_executor_models import (
     PickFlowError,
     PreparedCandidate,
     RankedCandidate,
-)
-from manipulation_execution.so101_geometry import (
-    axis_error_deg,
-    gripper_mesh_min_z,
-    quaternion_error_deg,
-    tabletop_clearance,
-)
-from manipulation_execution.so101_kinematics_guard import (
-    apply_joint5_retry,
-    canonicalize_joint5,
-    joint5_branch_continuity_check,
-    joint5_closing_axis_correction,
-    joint5_within_abs_limit,
 )
 
 JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 27.0
@@ -73,8 +60,25 @@ class PreparationPhase:
                 'ros2_control.reset_positions["5"] is required when joint 5 orientation constraints are enabled'
             )
 
+    def _validate_provider_requirements(self) -> None:
+        guard = self._orientation_guard()
+        guard_needs_wrist_provider = (
+            bool(guard.get("enabled", False))
+            or bool(guard.get("joint5_constraints_enabled", False))
+            or bool(guard.get("joint5_stage_continuity", False))
+        )
+        if guard_needs_wrist_provider and self._wrist_guard is None:
+            raise ValueError(
+                "target_gripper.ik_orientation_guard.wrist_guard_provider is required when the "
+                "orientation guard or joint 5 constraints are enabled"
+            )
+        if bool(self._target_geometry.get("tabletop_filter", False)) and self._grasp_geometry is None:
+            raise ValueError(
+                "target_geometry.grasp_geometry_provider is required when target_geometry.tabletop_filter is enabled"
+            )
+
     def _kinematics_joint_state(self, joint_state: JointState) -> JointState:
-        """Build the position-only arm state accepted by MoveIt IK/FK services."""
+        """Build the position-only arm state accepted by the kinematics service."""
         names = [str(name) for name in joint_state.name]
         positions = [float(position) for position in joint_state.position]
         if len(names) != len(positions):
@@ -118,39 +122,71 @@ class PreparationPhase:
     ) -> JointState:
         client = self._ik_client if client is None else client
         ik_config = self._config.get("ik", {})
-        request = GetPositionIK.Request()
-        request.ik_request.group_name = str(ik_config.get("group_name", "arm"))
-        request.ik_request.ik_link_name = self._ee_frame
-        request.ik_request.pose_stamped.header.frame_id = self._base_frame
-        request.ik_request.pose_stamped.pose = pose
-        request.ik_request.avoid_collisions = bool(ik_config.get("avoid_collisions", False))
-        if seed is not None:
-            request.ik_request.robot_state.joint_state = self._kinematics_joint_state(seed)
-        # The solver budget must stay small. LMA retries from a random joint
-        # configuration whenever the seeded attempt fails and keeps retrying
-        # until this timeout expires, which discards the joint5 seed the
-        # orientation guard depends on. The service wait is budgeted separately
-        # so a loaded host cannot be mistaken for an unhealthy IK worker.
+        if self._kinematics_backend == "legacy_moveit":
+            from moveit_msgs.srv import GetPositionIK
+            from rclpy.duration import Duration
+
+            request = GetPositionIK.Request()
+            request.ik_request.group_name = str(ik_config.get("group_name", "arm"))
+            request.ik_request.ik_link_name = self._ee_frame
+            request.ik_request.pose_stamped.header.frame_id = self._base_frame
+            request.ik_request.pose_stamped.pose = pose
+            request.ik_request.avoid_collisions = bool(ik_config.get("avoid_collisions", False))
+            if seed is not None:
+                request.ik_request.robot_state.joint_state = self._kinematics_joint_state(seed)
+        else:
+            request = ComputeIk.Request()
+            request.target.header.frame_id = self._base_frame
+            request.target.pose = pose
+            if seed is not None:
+                request.seed = self._kinematics_joint_state(seed)
+            # Position-priority: the pipeline validates orientation itself through
+            # FK and the orientation guard, so accept any residual orientation error.
+            request.orientation_tolerance = math.pi
+        # The solver budget must stay small. Retrying from random seeds until a
+        # long timeout would discard the joint5 seed the orientation guard
+        # depends on. The service wait is budgeted separately so a loaded host
+        # cannot be mistaken for an unhealthy IK worker.
         ik_timeout = float(ik_config.get("timeout_sec", 0.20))
-        request.ik_request.timeout = Duration(seconds=ik_timeout).to_msg()
+        if self._kinematics_backend == "legacy_moveit":
+            request.ik_request.timeout = Duration(seconds=ik_timeout).to_msg()
+        else:
+            request.timeout = ik_timeout
         rpc_timeout = max(float(ik_config.get("rpc_timeout_sec", self._rpc_timeout)), ik_timeout + 1.0)
         future = client.call_async(request)
         response = self._wait_future(future, goal_handle, deadline, rpc_timeout, "IK", retryable=True)
-        if int(response.error_code.val) != 1:
-            raise PickFlowError("IK_FAILED", f"IK failed with code {response.error_code.val}", retryable=True)
-        return response.solution.joint_state
+        if self._kinematics_backend == "legacy_moveit":
+            if int(response.error_code.val) != 1:
+                raise PickFlowError("IK_FAILED", f"IK failed with code {response.error_code.val}", retryable=True)
+            return response.solution.joint_state
+        if not response.success:
+            raise PickFlowError("IK_FAILED", f"IK failed: {response.code or response.message}", retryable=True)
+        return response.solution
 
     def _compute_fk(self, joint_state: JointState, goal_handle, deadline: float, *, client=None) -> Pose:
         client = self._fk_client if client is None else client
-        request = GetPositionFK.Request()
-        request.header.frame_id = self._base_frame
-        request.fk_link_names = [self._ee_frame]
-        request.robot_state.joint_state = self._kinematics_joint_state(joint_state)
+        if self._kinematics_backend == "legacy_moveit":
+            from moveit_msgs.srv import GetPositionFK
+
+            request = GetPositionFK.Request()
+            request.header.frame_id = self._base_frame
+            request.fk_link_names = [self._ee_frame]
+            request.robot_state.joint_state = self._kinematics_joint_state(joint_state)
+        else:
+            request = ComputeFk.Request()
+            request.joint_state = self._kinematics_joint_state(joint_state)
+            request.link_names = [self._ee_frame]
         future = client.call_async(request)
         response = self._wait_future(future, goal_handle, deadline, self._rpc_timeout, "FK", retryable=True)
-        if int(response.error_code.val) != 1 or not response.pose_stamped:
-            raise PickFlowError("FK_FAILED", f"FK failed with code {response.error_code.val}", retryable=True)
-        return response.pose_stamped[0].pose
+        if self._kinematics_backend == "legacy_moveit":
+            if int(response.error_code.val) != 1 or not response.pose_stamped:
+                raise PickFlowError("FK_FAILED", f"FK failed with code {response.error_code.val}", retryable=True)
+            return response.pose_stamped[0].pose
+        if not response.success or not response.poses:
+            raise PickFlowError("FK_FAILED", f"FK failed: {response.message}", retryable=True)
+        if len(response.poses) != 1 or response.poses[0].header.frame_id != self._base_frame:
+            raise PickFlowError("FK_FAILED", "FK response does not match the requested base frame", retryable=True)
+        return response.poses[0].pose
 
     def _orientation_guard(self) -> dict:
         target_gripper = self._config.get("target_gripper", {})
@@ -195,7 +231,7 @@ class PreparationPhase:
         value = self._joint_position(joint_state, "5")
         if value is None:
             raise PickFlowError("IK_JOINT5_MISSING", "IK result has no joint 5", retryable=True)
-        if not joint5_within_abs_limit(value, limit, center=center, epsilon=epsilon):
+        if not self._wrist_guard.joint5_within_abs_limit(value, limit, center=center, epsilon=epsilon):
             raise PickFlowError(
                 "IK_JOINT5_LIMIT",
                 f"joint 5 HOME delta {abs(value - center):.4f} exceeds {limit:.4f} + {epsilon:.4f}",
@@ -220,7 +256,7 @@ class PreparationPhase:
         def retry_solver(retry_seed: JointState) -> JointState | None:
             return self._solve_ik(pose, goal_handle, deadline, retry_seed, client=ik_client)
 
-        result = apply_joint5_retry(
+        result = self._wrist_guard.apply_joint5_retry(
             joint_state=solution,
             safety_limit=limit,
             solve_ik=retry_solver,
@@ -366,7 +402,7 @@ class PreparationPhase:
                 f"closing={closing_error:.3f}/{max_closing:.3f}"
             )
             try:
-                correction = joint5_closing_axis_correction(
+                correction = self._wrist_guard.joint5_closing_axis_correction(
                     target_quaternion,
                     payload.ee_quaternion,
                     guard.get("approach_axis_ee", [0.0, 0.0, 1.0]),
@@ -376,7 +412,7 @@ class PreparationPhase:
             except ValueError as exc:
                 last_reason = str(exc)
                 break
-            corrected_joint5 = canonicalize_joint5(joint5 + correction, self._joint5_home_center())
+            corrected_joint5 = self._wrist_guard.canonicalize_joint5(joint5 + correction, self._joint5_home_center())
             correction_key = round(corrected_joint5, 9)
             if correction_key in seen_joint5 or abs(corrected_joint5 - joint5) <= 1e-6:
                 break
@@ -403,7 +439,7 @@ class PreparationPhase:
                 "ik_orientation_guard.joint5_stage_max_delta_rad must be positive",
             )
         delta = abs(solution_joint5 - seed_joint5)
-        if not joint5_branch_continuity_check(seed_joint5, solution_joint5, threshold):
+        if not self._wrist_guard.joint5_branch_continuity_check(seed_joint5, solution_joint5, threshold):
             raise PickFlowError(
                 "IK_JOINT5_BRANCH_CHANGED",
                 f"joint 5 branch changed by {delta:.4f} rad ({seed_joint5:.4f} -> {solution_joint5:.4f})",
@@ -605,7 +641,7 @@ class PreparationPhase:
         actual_tabletop_clearance = None
         if self._mesh_directory is not None:
             try:
-                mesh_min_z = gripper_mesh_min_z(
+                mesh_min_z = self._grasp_geometry.gripper_mesh_min_z(
                     self._mesh_directory,
                     payload.ee_xyz,
                     payload.ee_quaternion,
@@ -614,7 +650,7 @@ class PreparationPhase:
                 if bool(self._target_geometry.get("tabletop_filter", False)):
                     if scene_base.table_plane is None:
                         raise PickFlowError("TARGET_TABLETOP_UNAVAILABLE", "fitted table plane is unavailable")
-                    actual_tabletop_clearance = tabletop_clearance(
+                    actual_tabletop_clearance = self._grasp_geometry.tabletop_clearance(
                         self._mesh_directory,
                         payload.ee_xyz,
                         payload.ee_xyz,

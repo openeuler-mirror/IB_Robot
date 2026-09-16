@@ -68,6 +68,7 @@ Notes
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shutil
@@ -96,7 +97,11 @@ from std_srvs.srv import Trigger
 from ibrobot_msgs.action import RecordEpisode
 from robot_config.contract_utils import contract_fingerprint, qos_profile_from_dict
 from robot_config.observation_transport import effective_observation_transport
-from robot_config.utils import build_lerobot_conversion_metadata, resolve_calibration_source_specs_from_config
+from robot_config.utils import (
+    build_lerobot_conversion_metadata,
+    build_public_lerobot_conversion_metadata,
+    resolve_calibration_source_specs_from_config,
+)
 
 # ------------------------------ Constants ------------------------------
 
@@ -217,6 +222,38 @@ class WriterState:
     counts: dict[str, _TopicCounter] = field(default_factory=dict)
 
 
+@dataclass
+class _ActionStreamWatchdog:
+    """Episode-local receive-time checks; caller holds the writer lock."""
+
+    topics: set[str]
+    start_timeout: float
+    gap_timeout: float
+    started: float
+    last_received: dict[str, float] = field(default_factory=dict)
+    error: str = ""
+
+    def check(self, now: float, *, final: bool = False) -> str:
+        if not self.error:
+            for topic in sorted(self.topics):
+                last = self.last_received.get(topic)
+                if last is None and (final or now - self.started > self.start_timeout):
+                    self.error = f"Required action stream {topic}: no commands received; episode discarded"
+                    break
+                if last is not None and now - last > self.gap_timeout:
+                    self.error = (
+                        f"Required action stream {topic}: command gap exceeded {self.gap_timeout}s; episode discarded"
+                    )
+                    break
+        return self.error
+
+    def observe(self, topic: str, now: float) -> None:
+        # Check before updating, so a resumed stream cannot hide a gap between monitor ticks.
+        self.check(now)
+        if topic in self.topics:
+            self.last_received[topic] = now
+
+
 def _normalize_max_cache_size(value: int) -> int:
     """Normalize rosbag cache size values so negative inputs disable caching."""
     return max(0, int(value))
@@ -298,11 +335,29 @@ class EpisodeRecorderServer(Node):
         self.declare_parameter("bag_base_dir", "")
         self.declare_parameter("dataset_name", "")
         self.declare_parameter("control_mode", "")
+        self.declare_parameter("runtime_set_mode_service", "")
+        self.declare_parameter("teleop_rearm_service", "/robot_teleop_node/rearm")
+        self.declare_parameter("teleop_stop_service", "")
+        self.declare_parameter("runtime_status_topic", "/runtime_status")
+        self.declare_parameter("admission_timeout_sec", 5.0)
+        self.declare_parameter("admission_attempts", 3)
+        self.declare_parameter("require_action_stream", False)
+        self.declare_parameter("action_stream_start_timeout_sec", 2.0)
+        self.declare_parameter("action_stream_gap_timeout_sec", 1.0)
+        self._require_action_stream = bool(self.get_parameter("require_action_stream").value)
+        self._action_start_timeout = float(self.get_parameter("action_stream_start_timeout_sec").value)
+        self._action_gap_timeout = float(self.get_parameter("action_stream_gap_timeout_sec").value)
+        if self._action_start_timeout <= 0 or self._action_gap_timeout <= 0:
+            raise ValueError("Action stream timeouts must be positive")
+        self._action_watchdog = None
+        self._goal_reserved = False
         self.declare_parameter("default_task", "")
         self.declare_parameter("task_family", "")
         self.declare_parameter("lerobot_norm_mode", "")
         self.declare_parameter("joint_names", [""])
         self.declare_parameter("gripper_joints", [""])
+        self.declare_parameter("robot_model_json", "")
+        self.declare_parameter("interface_description_json", "")
         # Storage tuning (kept optional & conservative by default)
         self.declare_parameter("max_cache_size", DEFAULT_MAX_CACHE_SIZE)
         self.declare_parameter("storage_preset_profile", "")  # e.g., "zstd_fast"
@@ -321,6 +376,9 @@ class EpisodeRecorderServer(Node):
             self._contract = build_contract_from_robot_config_dict(robot_config)
         else:
             raise RuntimeError("The 'robot_config_path' parameter is required.")
+
+        if self._require_action_stream and not self._contract.actions:
+            raise ValueError("require_action_stream needs at least one contract action topic")
 
         # Resolved after the config is loaded so the `recording` section can act
         # as the fallback; RTP recording never passes these as parameters.
@@ -341,6 +399,14 @@ class EpisodeRecorderServer(Node):
         self._gripper_joints = [
             j for j in self.get_parameter("gripper_joints").get_parameter_value().string_array_value if j
         ]
+        robot_model_json = self.get_parameter("robot_model_json").get_parameter_value().string_value
+        description_json = self.get_parameter("interface_description_json").get_parameter_value().string_value
+        if robot_model_json and description_json:
+            try:
+                robot_config["robot_model"] = json.loads(robot_model_json)
+                robot_config.setdefault("runtime", {})["interface_description"] = json.loads(description_json)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"public recording metadata is invalid JSON: {exc}") from exc
         self._dataset_root = self._bag_base / self._dataset_name
         self._episodes_dir = self._dataset_root / "episodes"
         self._dataset_metadata_path = self._dataset_root / "dataset.yaml"
@@ -352,7 +418,17 @@ class EpisodeRecorderServer(Node):
         except Exception:
             self._contract_fingerprint = ""
         self._lerobot_conversion_meta: dict[str, Any] = {}
-        if self._joint_names and self._lerobot_norm_mode:
+        if robot_config.get("robot_model") and robot_config.get("runtime", {}).get("interface_description"):
+            try:
+                self._lerobot_conversion_meta = build_public_lerobot_conversion_metadata(
+                    robot_config["robot_model"],
+                    robot_config["runtime"]["interface_description"],
+                    {"observation.state": self._joint_names},
+                    self._lerobot_norm_mode,
+                )
+            except (KeyError, ValueError) as exc:
+                raise RuntimeError(f"invalid public model conversion metadata: {exc}") from exc
+        elif self._joint_names and self._lerobot_norm_mode:
             try:
                 calibration_source_specs = resolve_calibration_source_specs_from_config(robot_config)
             except (TypeError, ValueError) as exc:
@@ -476,10 +552,12 @@ class EpisodeRecorderServer(Node):
         GoalResponse
             ACCEPT if not currently recording; otherwise REJECT.
         """
-        if self._flags.is_recording:
-            self.get_logger().warning("Rejecting goal: already recording")
-            return GoalResponse.REJECT
-        return GoalResponse.ACCEPT
+        with self._ws.writer_lock:
+            if self._flags.is_recording or self._goal_reserved:
+                self.get_logger().warning("Rejecting goal: already recording")
+                return GoalResponse.REJECT
+            self._goal_reserved = True
+            return GoalResponse.ACCEPT
 
     def cancel_callback(self, goal_handle: Any) -> CancelResponse:
         """Handle a cancel request.
@@ -494,7 +572,9 @@ class EpisodeRecorderServer(Node):
         CancelResponse
             ACCEPT only for the active goal; otherwise REJECT.
         """
-        if not self._flags.is_recording or goal_handle is not self._current_goal_handle:
+        if goal_handle is not self._current_goal_handle and not (
+            self._goal_reserved and self._current_goal_handle is None
+        ):
             self.get_logger().warning("Rejecting cancel: not recording/active")
             return CancelResponse.REJECT
         self.get_logger().info("Action cancel requested - transitioning to CANCELING state")
@@ -513,7 +593,20 @@ class EpisodeRecorderServer(Node):
     def _info_service_cb(self, _req: Trigger.Request, resp: Trigger.Response) -> Trigger.Response:
         """Return current dataset path and episode count as JSON."""
         resp.success = True
-        resp.message = json.dumps({"path": str(self._dataset_root), "episodes": len(self._episode_dirs())})
+        info = {"path": str(self._dataset_root), "episodes": len(self._episode_dirs())}
+        if self._control_mode == "teleop" and self.get_parameter("runtime_set_mode_service").value:
+            info["teleop_admission"] = {
+                name: self.get_parameter(name).value
+                for name in (
+                    "runtime_set_mode_service",
+                    "teleop_rearm_service",
+                    "teleop_stop_service",
+                    "runtime_status_topic",
+                    "admission_timeout_sec",
+                    "admission_attempts",
+                )
+            }
+        resp.message = json.dumps(info)
         return resp
 
     def _last_episode_service_cb(self, _req: Trigger.Request, resp: Trigger.Response) -> Trigger.Response:
@@ -678,34 +771,25 @@ class EpisodeRecorderServer(Node):
         qos = qos_profile_from_dict(qos_dict) or QoSProfile(depth=DEFAULT_QOS_DEPTH)
 
         def cb(msg: Any, _topic: str = topic) -> None:
-            # Counters
-            cnt = self._ws.counts.get(_topic)
-            if cnt:
-                cnt.seen += 1
-
-            # Writer snapshot (cheap read)
             with self._ws.writer_lock:
-                writer = self._ws.writer
-
-            if not self._flags.is_recording or writer is None or self._flags.shutting_down:
-                return  # not recording or shutting down
-
-            # Timestamp: always use arrival time
-            ts_ns = self.get_clock().now().nanoseconds
-
-            data = _ensure_serialized_message(msg)
-            try:
-                with self._ws.writer_lock:
-                    if self._ws.writer is not None:
-                        self._ws.writer.write(_topic, data, ts_ns)
-                        if cnt:
-                            cnt.written += 1
-            except (RuntimeError, OSError, ValueError) as exc:
-                # Signal fatal; execute loop will finalize
-                self._flags.fatal_error = True
-                self.get_logger().error(f"Write failed on {_topic}: {exc!r}\n{traceback.format_exc()}")
-                self._flags.stop_requested = True
-                self._episode_done_evt.set()
+                if not self._flags.is_recording or self._ws.writer is None or self._flags.shutting_down:
+                    return
+                cnt = self._ws.counts[_topic]
+                cnt.seen += 1
+                if self._action_watchdog is not None:
+                    self._action_watchdog.observe(_topic, time.monotonic())
+                    if self._action_watchdog.error:
+                        self._flags.stop_requested = True
+                        self._episode_done_evt.set()
+                        return
+                try:
+                    self._ws.writer.write(_topic, _ensure_serialized_message(msg), self.get_clock().now().nanoseconds)
+                    cnt.written += 1
+                except (RuntimeError, OSError, ValueError) as exc:
+                    self._flags.fatal_error = True
+                    self.get_logger().error(f"Write failed on {_topic}: {exc!r}\n{traceback.format_exc()}")
+                    self._flags.stop_requested = True
+                    self._episode_done_evt.set()
 
         return self.create_subscription(msg_cls, topic, cb, qos, callback_group=self._cbg, raw=True)
 
@@ -728,10 +812,11 @@ class EpisodeRecorderServer(Node):
             self._feedback_timer = None
 
         fb = RecordEpisode.Feedback()
+        goal_handle = self._current_goal_handle
 
         def _tick() -> None:
             # If not recording, allow executor to clean this up after finalize
-            if not self._flags.is_recording or self._current_goal_handle is None:
+            if not self._flags.is_recording or self._current_goal_handle is not goal_handle:
                 return
             # Early return if goal is canceled to prevent spurious publish
             if self._current_goal_handle.is_cancel_requested:
@@ -753,8 +838,10 @@ class EpisodeRecorderServer(Node):
             self.destroy_timer(self._timeout_timer)
             self._timeout_timer = None
 
+        goal_handle = self._current_goal_handle
+
         def _on_timeout() -> None:
-            if not self._flags.is_recording:
+            if not self._flags.is_recording or self._current_goal_handle is not goal_handle:
                 return
             self.get_logger().info("Episode timeout reached.")
             self._flags.stop_requested = True
@@ -885,7 +972,6 @@ class EpisodeRecorderServer(Node):
         # Clear latch and reset flags
         self._episode_done_evt.clear()
         self._flags.stop_requested = False
-        self._flags.is_recording = False
 
     # ---------- main action loop ----------
 
@@ -912,6 +998,7 @@ class EpisodeRecorderServer(Node):
         self._flags.is_recording = True
         self._flags.fatal_error = False
         self._flags.stop_requested = False
+        self._episode_done_evt.clear()
         # A new goal invalidates the previous episode as a destructive target.
         # The Trigger-based delete service cannot accept an explicit episode id,
         # so keeping the old target around during a failed new recording could
@@ -936,6 +1023,16 @@ class EpisodeRecorderServer(Node):
                 self._ws.writer = self._open_writer(str(bag_dir), storage)
                 for t, typ, _ in self._topics:
                     self._register_topic(t, typ)
+                self._action_watchdog = (
+                    _ActionStreamWatchdog(
+                        {action.publish_topic for action in self._contract.actions or []},
+                        self._action_start_timeout,
+                        self._action_gap_timeout,
+                        time.monotonic(),
+                    )
+                    if self._require_action_stream
+                    else None
+                )
             if self._video_recording_coordinator is not None:
                 self._video_recording_coordinator.start_episode(bag_dir)
         except (RuntimeError, OSError, ValueError) as exc:
@@ -943,6 +1040,7 @@ class EpisodeRecorderServer(Node):
                 self._ws.writer = None
             self._flags.is_recording = False
             self._current_goal_handle = None
+            self._goal_reserved = False
             goal_handle.abort()
             msg = f"Failed to open writer: {exc!r}"
             self.get_logger().error(msg)
@@ -959,6 +1057,10 @@ class EpisodeRecorderServer(Node):
 
         # Main execution loop - check for cancel requests and wait for completion
         while self._flags.is_recording and not self._flags.fatal_error and not self._flags.stop_requested:
+            with self._ws.writer_lock:
+                if self._action_watchdog is not None and self._action_watchdog.check(time.monotonic()):
+                    self._flags.stop_requested = True
+                    break
             if goal_handle.is_cancel_requested:
                 # Transition to CANCELING state
                 self._flags.stop_requested = True
@@ -967,22 +1069,55 @@ class EpisodeRecorderServer(Node):
             self._episode_done_evt.wait(timeout=0.1)
 
         # Finalize episode (cleanup first)
-        total_written = self._get_total_messages_written()
-        was_fatal_error = self._flags.fatal_error
-        was_stop_requested = self._flags.stop_requested or goal_handle.is_cancel_requested
-        video_valid = True
-        if self._video_recording_coordinator is not None and self._video_recording_coordinator.is_recording():
-            video_valid = self._video_recording_coordinator.stop_episode()
-        self._finalize_episode(bag_dir, prompt, episode_index)
-        if not was_fatal_error and video_valid:
-            self._last_episode_dir = bag_dir
-            self._last_episode_index = episode_index
-            self._last_episode_messages = total_written
-            self._last_episode_prompt = prompt
-        self._current_goal_handle = None
+        # Freeze writes and validation together. A late callback cannot repair a
+        # missing command or change the fatal-error snapshot during finalization.
+        finalization_started = time.monotonic()
+        self.get_logger().info(f"Finalizing {bag_dir.name}: closing bag writer...")
+        with self._ws.writer_lock:
+            action_error = self._action_watchdog.check(time.monotonic(), final=True) if self._action_watchdog else ""
+            self._ws.writer = None
+            total_written = self._get_total_messages_written()
+            was_fatal_error = self._flags.fatal_error
+            was_stop_requested = self._flags.stop_requested or goal_handle.is_cancel_requested
+        self.get_logger().info(
+            f"Bag writer closed in {time.monotonic() - finalization_started:.2f}s; finalizing episode metadata/video."
+        )
+        try:
+            video_valid = True
+            if self._video_recording_coordinator is not None and self._video_recording_coordinator.is_recording():
+                video_valid = self._video_recording_coordinator.stop_episode()
+            self._finalize_episode(bag_dir, prompt, episode_index)
+            if action_error:
+                self.get_logger().error(action_error)
+                try:
+                    shutil.rmtree(bag_dir)
+                    self._write_dataset_metadata()
+                except OSError as exc:
+                    action_error += f"; failed to remove invalid episode {bag_dir}: {exc}"
+            if not was_fatal_error and video_valid and not action_error:
+                self._last_episode_dir = bag_dir
+                self._last_episode_index = episode_index
+                self._last_episode_messages = total_written
+                self._last_episode_prompt = prompt
+        finally:
+            self._current_goal_handle = None
+            # A finalization failure must not leave per-episode timers live:
+            # cancel them defensively (normally _finalize_episode owns this).
+            for attr in ("_feedback_timer", "_timeout_timer"):
+                tmr = getattr(self, attr, None)
+                if tmr is not None:
+                    with contextlib.suppress(Exception):  # already-destroyed handle
+                        tmr.cancel()
+                    setattr(self, attr, None)
+            with self._ws.writer_lock:
+                self._flags.is_recording = False
+                self._goal_reserved = False
 
         # Emit terminal transition exactly once, after cleanup
-        if was_fatal_error:
+        if action_error:
+            goal_handle.abort()
+            return RecordEpisode.Result(success=False, message=action_error)
+        elif was_fatal_error:
             goal_handle.abort()
             return RecordEpisode.Result(success=False, message="Writer error")
         elif not video_valid:

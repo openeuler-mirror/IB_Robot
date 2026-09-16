@@ -135,10 +135,11 @@ def test_lekiwi_lidar_profile_compiles_three_atomic_navigation_skills():
         context=_navigation_context(),
     )
 
-    assert snapshot.enabled_skill_names == tuple(sorted(NAVIGATION_SKILLS))
-    assert snapshot.planner_visible_skill_names == tuple(sorted(NAVIGATION_SKILLS))
+    navigation_skills = tuple(sorted(name for name in NAVIGATION_SKILLS if name != "resolve_object_pose"))
+    assert snapshot.enabled_skill_names == navigation_skills
+    assert snapshot.planner_visible_skill_names == navigation_skills
     assert snapshot.primitive_contract_digest == primitive_contract_for_version(2).digest
-    for skill_name in NAVIGATION_SKILLS:
+    for skill_name in navigation_skills:
         assert snapshot.semantic_levels[skill_name] == "atomic_operator"
         assert snapshot.capability_view[skill_name]["schema_version"] == 2
         template = snapshot.templates[skill_name]

@@ -205,7 +205,7 @@ def test_submit_preserves_receipt_and_single_publication(monkeypatch, enabled):
     node = MagicMock()
     sink = MagicMock(enabled=enabled)
     monkeypatch.setattr(topic_executor_module, "trace", sink)
-    spec = SimpleNamespace(topic="/commands", ros_type="Float64MultiArray", names=["a", "b"])
+    spec = SimpleNamespace(topic="/commands", ros_type="std_msgs/msg/Float64MultiArray", names=["a", "b"])
     executor = TopicExecutor(node, {"action_specs": [spec]})
     executor.initialize()
     receipt = executor.submit(np.array([1.0, 2.0]), ExecutionContext(correlation_id="r"))

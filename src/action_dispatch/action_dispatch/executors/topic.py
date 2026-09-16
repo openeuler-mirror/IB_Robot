@@ -1,9 +1,8 @@
 """Topic-based ActionExecutor.
 
-This is the real TopicExecutor implementation moved from ``topic_executor.py``.
-Behaviour is preserved exactly: ROS topics, QoS, action spec ordering, value
-conversion, JointTrajectory 10ms point and trace metadata. Only the location and
-the ``ActionExecutor`` base class are new.
+Routes contract action channels with per-spec QoS. Legacy array and trajectory
+channels retain their default QoS, ordering, value conversion, JointTrajectory
+10ms point and trace metadata. Twist channels carry exactly vx/vy/wz.
 
 completion-aware executor contract adds ``submit`` and ``drain_completions`` so the topic executor satisfies
 the v2 contract. ``submit`` reuses the existing ``execute`` publish path so
@@ -19,12 +18,14 @@ from contextvars import ContextVar
 from typing import Any
 
 import numpy as np
+from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Float64MultiArray
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from ibrobot_tracing import get_trace_emitter
+from robot_config.contract_utils import qos_profile_from_dict
 
 from .base import ActionExecutor
 from .completion import (
@@ -179,17 +180,19 @@ def execution_trace(request_id, consumed_index, execute_index, queue_size):
 
 
 class TopicExecutor(ActionExecutor):
-    """Topic-based action executor for high-frequency position control.
+    """Topic-based action executor for position and planar velocity control.
 
     Uses action_specs from contract to route actions to correct topics. Supports
-    ``Float64MultiArray`` and ``JointTrajectory`` message types with
-    ``RELIABLE + VOLATILE + depth=1`` QoS.
+    ``Float64MultiArray``, ``JointTrajectory`` and ``Twist`` message types.
+    Specs without QoS use ``RELIABLE + VOLATILE + depth=1``.
+    Twist channels require ``safety_behavior=zeros``; holding velocity is not a stop.
     """
 
     def __init__(self, node: Node, config: dict[str, Any]):
         self.node = node
         self.action_specs = config.get("action_specs", [])
         self._publishers: dict[str, Any] = {}
+        self._action_width: int | None = None
 
         # Use Reliable delivery so ros2_control command subscribers accept live action topics.
         self._qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE, depth=1)
@@ -200,19 +203,40 @@ class TopicExecutor(ActionExecutor):
 
     def initialize(self) -> bool:
         """Initialize publishers based on contract."""
+        message_types = {
+            "std_msgs/msg/Float64MultiArray": (Float64MultiArray, "float"),
+            "trajectory_msgs/msg/JointTrajectory": (JointTrajectory, "trajectory"),
+            "geometry_msgs/msg/Twist": (Twist, "twist"),
+        }
+        publisher_specs = []
         for spec in self.action_specs:
-            topic = spec.topic
-            if not topic:
+            if not spec.topic:
                 continue
+            if spec.ros_type not in message_types:
+                raise ValueError(f"unsupported TopicExecutor ROS type {spec.ros_type!r} for topic {spec.topic!r}")
+            message_type, kind = message_types[spec.ros_type]
+            if kind == "twist" and spec.names and len(spec.names) != 3:
+                raise ValueError(f"Twist channel {spec.topic!r} expects exactly 3 components (vx, vy, wz)")
+            if kind == "twist" and getattr(spec, "safety_behavior", "zeros") != "zeros":
+                raise ValueError(
+                    f"Twist channel {spec.topic!r} requires safety_behavior='zeros'; holding velocity is unsafe"
+                )
+            qos = qos_profile_from_dict(getattr(spec, "qos", None)) or self._qos
+            publisher_specs.append((spec, message_type, kind, qos))
 
-            if "Float64MultiArray" in spec.ros_type:
-                pub = self.node.create_publisher(Float64MultiArray, topic, self._qos)
-                self._publishers[topic] = {"pub": pub, "type": "float", "spec": spec}
-            elif "JointTrajectory" in spec.ros_type:
-                pub = self.node.create_publisher(JointTrajectory, topic, self._qos)
-                self._publishers[topic] = {"pub": pub, "type": "trajectory", "spec": spec}
+        if any(kind == "twist" for _, _, kind, _ in publisher_specs):
+            if len({spec.topic for spec, _, _, _ in publisher_specs}) != len(publisher_specs):
+                raise ValueError("action channels with Twist require distinct topics")
+            if any(kind != "twist" and not spec.names for spec, _, kind, _ in publisher_specs):
+                raise ValueError("action channels alongside Twist require selector.names to define their widths")
 
-            self.node.get_logger().info(f"Created publisher for {topic}")
+        if all(kind == "twist" or spec.names for spec, _, kind, _ in publisher_specs):
+            self._action_width = sum(3 if kind == "twist" else len(spec.names) for spec, _, kind, _ in publisher_specs)
+
+        for spec, message_type, kind, qos in publisher_specs:
+            pub = self.node.create_publisher(message_type, spec.topic, qos)
+            self._publishers[spec.topic] = {"pub": pub, "type": kind, "spec": spec}
+            self.node.get_logger().info(f"Created publisher for {spec.topic}")
         return True
 
     def execute(self, action: np.ndarray, metadata: Mapping[str, Any] | None = None) -> bool:
@@ -223,14 +247,21 @@ class TopicExecutor(ActionExecutor):
         queue_size = int(metadata.get("queue_size", -1))
         trace_step = _execution_trace.get() if trace.enabled else None
 
+        # Validate the complete vector before any publish, including earlier arm channels.
+        action = np.asarray(action, dtype=float).reshape(-1)
+        if not np.isfinite(action).all():
+            raise ValueError("action requires finite values")
+        if self._action_width is not None and action.size != self._action_width:
+            raise ValueError(f"action expects {self._action_width} values, got {action.size}")
+
         # Flat tracking of index in the action vector
         current_idx = 0
 
         for topic, info in self._publishers.items():
             spec = info["spec"]
 
-            # Determine how many joints this topic expects
-            num_joints = len(spec.names) if spec.names else 0
+            # Twist has an intrinsic width even without selector names.
+            num_joints = 3 if info["type"] == "twist" else len(spec.names) if spec.names else 0
 
             # 1. Slice action based on expected joint count
             if num_joints > 0:
@@ -252,6 +283,10 @@ class TopicExecutor(ActionExecutor):
                 point.time_from_start.nanosec = 10000000  # 10ms
                 traj.points.append(point)
                 info["pub"].publish(traj)
+            elif info["type"] == "twist":
+                msg = Twist()
+                msg.linear.x, msg.linear.y, msg.angular.z = data_list
+                info["pub"].publish(msg)
             if trace_step:
                 capture_event(
                     trace,
@@ -275,7 +310,7 @@ class TopicExecutor(ActionExecutor):
         info = self._publishers.get(topic)
         if info is None:
             raise ValueError(f"no TopicExecutor publisher for {topic!r}")
-        expected = len(info["spec"].names) if info["spec"].names else 0
+        expected = 3 if info["type"] == "twist" else len(info["spec"].names) if info["spec"].names else 0
         flat = np.asarray(action).reshape(-1)
         if expected and len(flat) != expected:
             raise ValueError(f"channel {topic!r} expects {expected} values, got {len(flat)}")
@@ -288,6 +323,12 @@ class TopicExecutor(ActionExecutor):
             point.time_from_start.nanosec = 10000000  # 10ms
             trajectory.points.append(point)
             info["pub"].publish(trajectory)
+        elif info["type"] == "twist":
+            if not np.isfinite(data_list).all():
+                raise ValueError(f"Twist channel {topic!r} requires finite values")
+            msg = Twist()
+            msg.linear.x, msg.linear.y, msg.angular.z = data_list
+            info["pub"].publish(msg)
         if trace.enabled:
             capture_event(
                 trace,

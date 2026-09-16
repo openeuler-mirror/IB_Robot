@@ -33,7 +33,7 @@ class ArmKinematicModel:
 
 
 MODEL_URDF_PATHS = {
-    "so101_arm_v1": "$(find robot_description)/urdf/lerobot/so101/so101_base.xacro",
+    "so101_arm_v1": "$(find so101_description)/urdf/lerobot/so101/so101_base.xacro",
 }
 
 

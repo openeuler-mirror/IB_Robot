@@ -112,6 +112,7 @@ def test_compiler_builds_immutable_snapshot(tmp_path):
     assert snapshot.planner_visible_skill_names == ("open_gripper_skill",)
     assert snapshot.capability_view["open_gripper_skill"]["semantic_level"] == "atomic_operator"
     assert "schema_version" not in snapshot.capability_view["open_gripper_skill"]
+    assert "required_capabilities" not in snapshot.capability_view["open_gripper_skill"]
     with pytest.raises(TypeError):
         snapshot.templates["new"] = {}
 
@@ -162,3 +163,74 @@ def test_compiler_reports_malformed_yaml_as_schema_diagnostic(tmp_path):
         compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
 
     assert any(diagnostic.error_code == "SKILL_SCHEMA_INVALID" for diagnostic in raised.value.diagnostics)
+
+
+def test_compiler_accepts_valid_required_capabilities(tmp_path):
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config" / "skills" / "open_gripper_skill" / "manifest.yaml"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = manifest.replace(
+        "  recovery_policy: never_retry",
+        "  recovery_policy: never_retry\n  required_capabilities: [joint.trajectory, gripper.1d]",
+    )
+    manifest_path.write_text(manifest, encoding="utf-8")
+
+    snapshot = compile_skill_catalog(
+        DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context()
+    )
+    assert tuple(snapshot.capability_view["open_gripper_skill"]["required_capabilities"]) == (
+        "joint.trajectory",
+        "gripper.1d",
+    )
+
+
+def test_compiler_rejects_empty_required_capabilities_list(tmp_path):
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config" / "skills" / "open_gripper_skill" / "manifest.yaml"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = manifest.replace(
+        "  recovery_policy: never_retry",
+        "  recovery_policy: never_retry\n  required_capabilities: []",
+    )
+    manifest_path.write_text(manifest, encoding="utf-8")
+
+    with pytest.raises(SkillCompileError) as raised:
+        compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
+
+    assert any(
+        diagnostic.error_code == "SKILL_SCHEMA_INVALID" and "required_capabilities" in diagnostic.message
+        for diagnostic in raised.value.diagnostics
+    )
+
+
+def test_compiler_rejects_non_string_required_capabilities_entry(tmp_path):
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config" / "skills" / "open_gripper_skill" / "manifest.yaml"
+    manifest = manifest_path.read_text(encoding="utf-8")
+    manifest = manifest.replace(
+        "  recovery_policy: never_retry",
+        "  recovery_policy: never_retry\n  required_capabilities: [123]",
+    )
+    manifest_path.write_text(manifest, encoding="utf-8")
+
+    with pytest.raises(SkillCompileError) as raised:
+        compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
+
+    assert any(
+        diagnostic.error_code == "SKILL_SCHEMA_INVALID" and "required_capabilities" in diagnostic.message
+        for diagnostic in raised.value.diagnostics
+    )
+
+
+@pytest.mark.parametrize("value", ["null", "joint.trajectory", "['']", "['   ']", "{}"])
+def test_compiler_rejects_malformed_required_capabilities(tmp_path, value):
+    _write_catalog(tmp_path)
+    manifest_path = tmp_path / "config" / "skills" / "open_gripper_skill" / "manifest.yaml"
+    manifest = manifest_path.read_text(encoding="utf-8").replace(
+        "  recovery_policy: never_retry",
+        f"  recovery_policy: never_retry\n  required_capabilities: {value}",
+    )
+    manifest_path.write_text(manifest, encoding="utf-8")
+    with pytest.raises(SkillCompileError) as raised:
+        compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
+    assert any(diagnostic.field_path == "capability.required_capabilities" for diagnostic in raised.value.diagnostics)

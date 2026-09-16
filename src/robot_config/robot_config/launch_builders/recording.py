@@ -9,11 +9,13 @@ Supports two recording modes:
 """
 
 import json
+import math
 import os
 import re
 from datetime import datetime
 from pathlib import Path
 
+import yaml
 from launch.actions import EmitEvent, ExecuteProcess, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -343,6 +345,40 @@ def generate_episodic_recording_node(
     storage_preset_profile = str(recording_config.get("storage_preset_profile", "") or "")
     storage_config_uri = str(recording_config.get("storage_config_uri", "") or "")
 
+    admission_params = {}
+    teleop = robot_config.get("teleoperation") or {}
+    runtime = robot_config.get("runtime") or {}
+    if (
+        active_control_mode == "teleop"
+        and runtime.get("provider")
+        and teleop.get("target")
+        and teleop.get("enabled", True)
+    ):
+        with open(resolve_ros_path(teleop["input_config"]), encoding="utf-8") as handle:
+            inputs = yaml.safe_load(handle)
+        selected = [device for device in inputs["devices"] if device["name"] == teleop["active_device"]]
+        if len(selected) != 1:
+            raise ValueError("recording requires exactly one configured teleop input")
+        # Deadman-driven phone/VR/gamepad sessions are armed by their operator.
+        # Only a continuously publishing leader can be admitted by a new Prompt.
+        if selected[0]["type"] == "leader_topic":
+            interfaces = runtime["interface_description"]["interfaces"]
+            rearm_timeout = float(selected[0].get("rearm_timeout_s", teleop.get("rearm_timeout_s", 5.0)))
+            admission_timeout = float(recording_config.get("admission_timeout_sec", rearm_timeout + 1.0))
+            if not math.isfinite(admission_timeout) or not admission_timeout > rearm_timeout > 0:
+                raise ValueError("recording.admission_timeout_sec must exceed the positive teleop rearm_timeout_s")
+            admission_params = {
+                "runtime_set_mode_service": interfaces["runtime.set_mode"]["endpoint"],
+                "runtime_status_topic": interfaces["runtime.status"]["endpoint"],
+                "teleop_rearm_service": str(recording_config.get("teleop_rearm_service", "/robot_teleop_node/rearm")),
+                "teleop_stop_service": interfaces["motion.arm.stop"]["endpoint"],
+                "admission_timeout_sec": admission_timeout,
+                "admission_attempts": int(recording_config.get("admission_attempts", 3)),
+                "require_action_stream": True,
+                "action_stream_start_timeout_sec": float(recording_config.get("action_stream_start_timeout_sec", 2.0)),
+                "action_stream_gap_timeout_sec": float(recording_config.get("action_stream_gap_timeout_sec", 1.0)),
+            }
+
     # Create episode_recorder node (Action Server)
     episode_recorder_node = Node(
         package="dataset_tools",
@@ -374,6 +410,7 @@ def generate_episodic_recording_node(
             {"max_cache_size": max_cache_size},
             {"storage_preset_profile": storage_preset_profile},
             {"storage_config_uri": storage_config_uri},
+            admission_params,
         ],
     )
 
@@ -384,6 +421,8 @@ def generate_episodic_recording_node(
     logger.info("=" * 70)
     logger.warning("IMPORTANT: Use SEPARATE TERMINAL to trigger recordings:")
     logger.info(f"    {_record_cli_command(active_control_mode, scheduler_enabled=scheduler_enabled)}")
+    if admission_params:
+        logger.info("Each Prompt admits the leader session via idle -> rearm -> fresh stream status before recording.")
     logger.info("Convert later with:")
     logger.info(
         f"    ros2 run dataset_tools bag_to_lerobot --bags-dir {dataset_root} "

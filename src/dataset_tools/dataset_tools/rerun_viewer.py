@@ -654,43 +654,33 @@ class RerunViewer(Node):
             return None
 
     def _extract_joint_state(self, msg: Any, names: list[str]) -> list[float] | None:
-        """Extract values from JointState using selector names.
+        """Extract values from JointState using ``<field>.<joint_name>`` selectors.
 
-        Selector names follow the pattern ``position.N`` where N is
-        a 1-based index, or direct joint names matched against msg.name.
+        The suffix is the joint name, matched against ``msg.name`` — the same
+        semantics as tensormsg's dot_get and the conversion contract. The
+        JointState message order is hardware-defined (e.g. ``2,4,1,3,5,6``),
+        so treating the suffix as a positional index reads the wrong joint;
+        unknown names resolve to NaN instead of a silent 0.0.
         """
         values: list[float] = []
         joint_names = list(getattr(msg, "name", []))
-        if not joint_names and any("." not in sel_name for sel_name in names) and not self._joint_state_name_warned:
+        if not joint_names and not self._joint_state_name_warned:
             self._joint_state_name_warned = True
-            self.get_logger().warning("JointState.name is empty; named selectors will fall back to 0.0 values")
+            self.get_logger().warning("JointState.name is empty; joint selectors resolve to NaN")
 
         for sel_name in names:
-            # Pattern: "position.N" → index into msg.position
-            if "." in sel_name:
-                parts = sel_name.split(".", 1)
-                field_name = parts[0]  # "position", "velocity", "effort"
-                try:
-                    idx = int(parts[1]) - 1  # 1-based → 0-based
-                except (ValueError, IndexError):
-                    values.append(0.0)
-                    continue
-
-                field_data = getattr(msg, field_name, None)
-                if field_data is not None and idx < len(field_data):
-                    values.append(float(field_data[idx]))
-                else:
-                    values.append(0.0)
+            field, _, suffix = sel_name.partition(".")
+            if not suffix:
+                field, suffix = "position", sel_name
+            if suffix not in joint_names:
+                values.append(float("nan"))
+                continue
+            idx = joint_names.index(suffix)
+            field_data = getattr(msg, field, None)
+            if field_data is not None and idx < len(field_data):
+                values.append(float(field_data[idx]))
             else:
-                # Direct joint name match
-                if sel_name in joint_names:
-                    idx = joint_names.index(sel_name)
-                    if idx < len(msg.position):
-                        values.append(float(msg.position[idx]))
-                    else:
-                        values.append(0.0)
-                else:
-                    values.append(0.0)
+                values.append(float("nan"))
 
         return values if values else None
 

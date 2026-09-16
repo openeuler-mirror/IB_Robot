@@ -1,5 +1,6 @@
 """Launch the base robot stack plus embodied runtime nodes."""
 
+import importlib.util
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -7,20 +8,23 @@ from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
+    GroupAction,
     IncludeLaunchDescription,
     OpaqueFunction,
     RegisterEventHandler,
     SetEnvironmentVariable,
+    SetLaunchConfiguration,
 )
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
-from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
+from robot_config.interface_binding import required_interface_ids
 from robot_config.loader import load_robot_config_dict, validate_embodied_launch_dict
 from robot_config.logger_utils import get_colored_logger
-from robot_config.utils import parse_bool
+from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("embodied_bringup.launch")
 
@@ -99,38 +103,9 @@ def _load_config(robot_config_name: str, config_path_override: str, nav_stage: s
         if config_path_override
         else Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml"
     )
-    config = load_robot_config_dict(config_path, nav_stage=nav_stage)
+    config = load_robot_config_dict(config_path, nav_stage=nav_stage, defer_interface_binding=True)
     config["_config_path"] = str(config_path)
     return config
-
-
-def _parallel_ik_worker_action(config: dict, use_sim_time: str):
-    grasp_execution = config.get("grasp_execution", {})
-    if not isinstance(grasp_execution, dict) or not bool(grasp_execution.get("enabled", False)):
-        return None
-    if not bool(grasp_execution.get("auto_start_dependencies", True)):
-        return None
-    ik_config = grasp_execution.get("ik", {})
-    worker_count = int(ik_config.get("worker_count", 0)) if isinstance(ik_config, dict) else 0
-    if worker_count <= 0 or not bool(ik_config.get("auto_start_workers", True)):
-        return None
-    if worker_count > 8:
-        raise ValueError("grasp_execution.ik.worker_count must be between 0 and 8")
-    namespace_prefix = str(ik_config.get("worker_namespace_prefix", "/ik_worker")).strip("/")
-    if not namespace_prefix:
-        raise ValueError("grasp_execution.ik.worker_namespace_prefix must not be empty")
-    worker_launch_path = Path(get_package_share_directory("robot_moveit")) / "launch" / "so101_ik_workers.launch.py"
-    joint_state_topic = str(config.get("moveit", {}).get("joint_state_topic", "/joint_states")).strip()
-    logger.info(f"Launching {worker_count} parallel grasp IK/FK workers under /{namespace_prefix}_<n>")
-    return IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(str(worker_launch_path)),
-        launch_arguments={
-            "worker_count": str(worker_count),
-            "namespace_prefix": namespace_prefix,
-            "use_sim_time": use_sim_time,
-            "joint_state_topic": joint_state_topic,
-        }.items(),
-    )
 
 
 def launch_setup(context, *_args, **_kwargs):
@@ -170,7 +145,6 @@ def launch_setup(context, *_args, **_kwargs):
 
     active_control_mode = config.get("default_control_mode", "moveit_planning")
     motion_authorized = parse_bool(authorize_motion_str, default=False)
-    use_sim = parse_bool(context.launch_configurations.get("use_sim", "false"), default=False)
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"
     requested_moveit = context.launch_configurations.get("with_moveit", "")
     if (
@@ -195,12 +169,102 @@ def launch_setup(context, *_args, **_kwargs):
         "with_perception": "false",
     }
 
-    actions = [
+    if config.get("runtime", {}).get("provider") or required_interface_ids(config):
+        # Base launch owns normalization, provider startup and the live snapshot.
+        # Keep embodied settings in that snapshot; the base has no embodied builders.
+        del base_launch_arguments["with_embodied"]
+        del base_launch_arguments["with_perception"]
+        base_launch_arguments["config_path"] = config["_config_path"]
+        catalog_root = embodied_config.get("skill_catalog_source_root", "")
+        if catalog_root and not Path(catalog_root).is_absolute():
+            resolved_root = _resolve_development_source_root(Path(config["_config_path"]), catalog_root)
+            if resolved_root is not None:
+                embodied_config["skill_catalog_source_root"] = str(resolved_root)
+        spec = importlib.util.spec_from_file_location("embodied_base_robot_launch", base_launch_path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Cannot load base robot launch: {base_launch_path}")
+        base_launch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(base_launch)
+
+        return [
+            GroupAction(
+                # Match include argument lifetime for the asynchronous readiness callback.
+                scoped=False,
+                actions=[
+                    *[SetLaunchConfiguration(name, value) for name, value in base_launch_arguments.items()],
+                    OpaqueFunction(
+                        function=base_launch.launch_setup,
+                        kwargs={
+                            "loaded_config": config,
+                            "extra_consumers": lambda effective: _construct_embodied_actions(
+                                effective,
+                                effective.get("default_control_mode", "moveit_planning"),
+                                motion_authorized=motion_authorized,
+                                use_sim=parse_bool(base_launch_arguments["use_sim"], default=False),
+                                # Runtime readiness replaces the legacy controller barrier.
+                                auto_start=False,
+                            ),
+                        },
+                    ),
+                ],
+            )
+        ]
+
+    return [
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(str(base_launch_path)),
             launch_arguments=base_launch_arguments.items(),
-        )
+        ),
+        *_construct_embodied_actions(
+            config,
+            active_control_mode,
+            motion_authorized=motion_authorized,
+            use_sim=parse_bool(base_launch_arguments["use_sim"], default=False),
+            auto_start=parse_bool(base_launch_arguments["auto_start_controllers"], default=True),
+        ),
     ]
+
+
+def _parallel_ik_worker_action(config: dict, use_sim_time: str):
+    if config.get("runtime", {}).get("provider"):
+        return None
+    grasp = config.get("grasp_execution", {})
+    if not grasp.get("enabled", False) or not grasp.get("auto_start_dependencies", True):
+        return None
+    ik = grasp.get("ik", {})
+    count = int(ik.get("worker_count", 0))
+    if count <= 0 or not ik.get("auto_start_workers", True):
+        return None
+    if count > 8:
+        raise ValueError("grasp_execution.ik.worker_count must be between 0 and 8")
+    prefix = str(ik.get("worker_namespace_prefix", "/ik_worker")).strip("/")
+    if not prefix:
+        raise ValueError("grasp_execution.ik.worker_namespace_prefix must not be empty")
+    # Providerless (legacy) bring-up: the IK/FK worker pool is a robot-suite
+    # launch file; the generic bringup only includes what the YAML names.
+    workers_launch = resolve_ros_path(str(ik.get("workers_launch", "") or "")).strip()
+    if not workers_launch:
+        raise ValueError(
+            "grasp_execution.ik.workers_launch is required when auto-starting IK workers without "
+            "runtime.provider (e.g. $(find so101_motion)/launch/ik_workers.launch.py)"
+        )
+    path = Path(workers_launch)
+    if not path.is_file():
+        raise FileNotFoundError(f"grasp_execution.ik.workers_launch not found: {path}")
+    return IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(str(path)),
+        launch_arguments={
+            "worker_count": str(count),
+            "namespace_prefix": prefix,
+            "use_sim_time": use_sim_time,
+            "joint_state_topic": str(config.get("moveit", {}).get("joint_state_topic", "/joint_states")),
+        }.items(),
+    )
+
+
+def _construct_embodied_actions(config, active_control_mode, *, motion_authorized, use_sim, auto_start):
+    actions = []
+    embodied_config = config["embodied"]
     if embodied_config["enabled"]:
         logger.info("Preparing embodied runtime nodes from embodied_bringup")
         visual_games = embodied_config.get("visual_games", {})
@@ -217,9 +281,9 @@ def launch_setup(context, *_args, **_kwargs):
         )
         actions.extend(visual_actions)
         runtime_actions = []
-        worker_action = _parallel_ik_worker_action(config, base_launch_arguments["use_sim"])
-        if worker_action is not None:
-            runtime_actions.append(worker_action)
+        worker = _parallel_ik_worker_action(config, str(use_sim).lower())
+        if worker is not None:
+            runtime_actions.append(worker)
         runtime_actions.extend(
             generate_embodied_nodes(
                 config,
@@ -230,7 +294,6 @@ def launch_setup(context, *_args, **_kwargs):
                 use_sim=use_sim,
             )
         )
-        auto_start = parse_bool(base_launch_arguments["auto_start_controllers"], default=True)
         ready_waiter = _controller_ready_waiter(config, active_control_mode, use_sim, auto_start)
         if ready_waiter is None:
             actions.extend(runtime_actions)

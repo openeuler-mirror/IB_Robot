@@ -180,9 +180,8 @@ class PickFlowPhase:
         ):
             if index in unhealthy_workers:
                 continue
-            namespace = f"{self._ik_worker_prefix}_{index}"
-            self._wait_for_service(ik_client, deadline, f"{namespace}/compute_ik")
-            self._wait_for_service(fk_client, deadline, f"{namespace}/compute_fk")
+            self._wait_for_service(ik_client, deadline, self._ik_worker_endpoints[index])
+            self._wait_for_service(fk_client, deadline, fk_client.srv_name)
         joint_state_deadline = min(deadline, time.monotonic() + self._ready_timeout)
         while self._snapshot_joint_state() is None:
             self._check_cancel(goal_handle)

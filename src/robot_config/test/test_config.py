@@ -1626,3 +1626,43 @@ def test_validate_embodied_skill_template_requires_pose_source():
     errors = validate_config(config)
 
     assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
+
+
+def test_resolve_joint_names_strips_field_selectors_under_public_model():
+    from robot_config.utils import resolve_joint_names_from_config
+
+    robot_config = {
+        "robot_model": {"joint_groups": {"all": ["1", "2", "3", "4", "5", "6"]}},
+        "contract": {
+            "observations": [
+                {"key": "observation.images.front", "interface": "camera.front.color"},
+                {
+                    "key": "observation.state",
+                    "interface": "joint.state",
+                    "selector": {
+                        "names": ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"]
+                    },
+                },
+                {
+                    "key": "observation.current",
+                    "interface": "joint.current",
+                    "selector": {"names": ["current.1", "current.6"]},
+                },
+            ]
+        },
+    }
+
+    # Field selectors carry the joint name in the suffix; returning them raw
+    # made every public conversion lookup fail with "missing contract joints".
+    assert resolve_joint_names_from_config(robot_config) == ["1", "2", "3", "4", "5", "6"]
+
+
+def test_resolve_joint_names_keeps_bare_selector_names():
+    from robot_config.utils import resolve_joint_names_from_config
+
+    robot_config = {
+        "robot_model": {"joint_groups": {"all": ["left_arm", "right_arm"]}},
+        "contract": {"observations": [{"key": "observation.state", "selector": {"names": ["left_arm", "right_arm"]}}]},
+    }
+
+    assert resolve_joint_names_from_config(robot_config) == ["left_arm", "right_arm"]

@@ -43,7 +43,9 @@ from std_srvs.srv import Empty, Trigger
 from action_dispatch.action_chunk import validate_action_chunk, validate_execution_horizon
 from action_dispatch.active_plan import ActivePlan, PlanSource
 from action_dispatch.chunk_planning import create_chunk_planner
+from action_dispatch.contract_binding import resolve_joint_feedback
 from action_dispatch.executors.topic import capture_event, capture_time, capture_traces, execution_trace
+from action_dispatch.policy_admission import PolicyAdmission
 from action_dispatch.safe_stop import (
     JointSnapshot,
     SafeStopError,
@@ -91,6 +93,7 @@ class ScheduledActionDispatcherNode(Node):
     def __init__(self, *, parameter_overrides=None) -> None:
         super().__init__("action_dispatcher", parameter_overrides=parameter_overrides)
         self._load_parameters()
+        self._joint_state_qos = rclpy.qos.qos_profile_sensor_data
         self._blending_update = None
         self.add_on_set_parameters_callback(self._validate_blending_update)
         self._load_contract_and_plan()
@@ -148,7 +151,7 @@ class ScheduledActionDispatcherNode(Node):
             JointState,
             self._joint_state_topic,
             self._joint_cb,
-            rclpy.qos.qos_profile_sensor_data,
+            self._joint_state_qos,
             callback_group=ReentrantCallbackGroup(),
         )
         # Services: stable names shared with legacy dispatcher (never coexist).
@@ -183,6 +186,11 @@ class ScheduledActionDispatcherNode(Node):
         self._readiness_client = self.create_client(
             Trigger, self._readiness_endpoint, callback_group=self._client_group
         )
+        self._runtime_admission = None
+        if self._robot_config.runtime.get("provider"):
+            self._runtime_admission = PolicyAdmission(
+                self, self._robot_config_path, self._robot_config.runtime, self._state_lock, self._runtime_revoked
+            )
 
         # Live dispatches use zero obs_timestamp.
         self._control_timer = self.create_timer(
@@ -286,15 +294,14 @@ class ScheduledActionDispatcherNode(Node):
         from robot_config.contract_utils import iter_specs
 
         rc = load_robot_config(self._robot_config_path)
+        self._robot_config = rc
         contract = rc.to_contract()
         self._action_specs = [s for s in iter_specs(contract) if s.is_action]
         joint_order = list(rc.joints.get("all") or []) if hasattr(rc, "joints") and rc.joints else []
         self._safe_stop_plan = build_safe_stop_plan(action_specs=self._action_specs, joint_order=joint_order)
-        joint_observation = next(
-            (spec for spec in iter_specs(contract) if not spec.is_action and spec.topic == self._joint_state_topic),
-            None,
+        self._joint_state_topic, self._joint_state_qos, self._joint_max_age_ns = resolve_joint_feedback(
+            contract, self._joint_state_topic, self._joint_state_qos, rc.runtime
         )
-        self._joint_max_age_ns = int(getattr(joint_observation, "max_age_ms", 0)) * 1_000_000
 
     # ------------------------------------------------------------------
     # Contract-validating joint callback; snapshot under lock.
@@ -339,7 +346,7 @@ class ScheduledActionDispatcherNode(Node):
             with self._state_lock:
                 if self._state != DispatcherState.WAITING_READY:
                     return
-                if self._navigation_mode:
+                if self._navigation_mode or getattr(self, "_runtime_admission", None) is not None:
                     self._set_state(DispatcherState.STOPPED)
                 else:
                     self._open_new_session()
@@ -361,7 +368,39 @@ class ScheduledActionDispatcherNode(Node):
         session_id: str | None = None,
         completion: threading.Event | None = None,
     ) -> None:
-        """Open a fresh UUID4 session. Called under the state lock briefly."""
+        """Acquire the runtime before opening a fresh scheduler session."""
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is None:
+            self._open_admitted_session(session_id=session_id, completion=completion)
+            return
+        with self._state_lock:
+            if self._state not in (DispatcherState.WAITING_READY, DispatcherState.STOPPED):
+                if completion is not None:
+                    completion.set()
+                return
+
+        def admitted(success, message):
+            if success:
+                self._open_admitted_session(session_id=session_id, completion=completion)
+            else:
+                self.get_logger().warning(f"policy admission rejected: {message}")
+                if completion is not None:
+                    completion.set()
+
+        admission.acquire(admitted)
+
+    def _runtime_revoked(self):
+        with self._state_lock:
+            self._cancel_inflight_dispatch()
+            self._clear_inflight_locked()
+            self._clear_plans_locked()
+            self._last_action = None
+            self._executor.invalidate_pending()
+            # Preserve scheduler identity for explicit Close/restart reconciliation.
+            self._close_after_open = True
+            self._state = DispatcherState.FAILED if self._session_id else DispatcherState.STOPPED
+
+    def _open_admitted_session(self, *, session_id=None, completion=None):
         with self._state_lock:
             if self._state not in (DispatcherState.WAITING_READY, DispatcherState.STOPPED):
                 return
@@ -498,12 +537,27 @@ class ScheduledActionDispatcherNode(Node):
         with self._state_lock:
             state = self._state
         if state == DispatcherState.ACTIVE:
+            admission = getattr(self, "_runtime_admission", None)
+            if admission is not None:
+                completion = threading.Event()
+
+                def admitted(success, message):
+                    resp.success, resp.message = success, message
+                    completion.set()
+
+                admission.acquire(admitted, own_active_session=True)
+                if not completion.wait(2.0):
+                    admission.cancel()
+                return resp
             resp.success = True
             return resp
         if state == DispatcherState.STOPPED:
             completion = threading.Event()
             self._open_new_session(completion=completion)
-            completion.wait(self._default_open_timeout_ns / 1_000_000_000)
+            if not completion.wait(self._default_open_timeout_ns / 1_000_000_000):
+                admission = getattr(self, "_runtime_admission", None)
+                if admission is not None:
+                    admission.cancel()
             with self._state_lock:
                 resp.success = self._state == DispatcherState.ACTIVE
                 resp.message = "" if resp.success else f"Open did not complete ({self._state.value})"
@@ -523,6 +577,9 @@ class ScheduledActionDispatcherNode(Node):
         # Safe-stop first, then Close; both succeed -> STOPPED.
         safe_ok = self._safe_stop()
         close_ok = self._close_session_sync()
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            safe_ok = admission.release() and safe_ok
         with self._state_lock:
             self._state = DispatcherState.STOPPED if (safe_ok and close_ok) else DispatcherState.FAILED
         resp.success = safe_ok and close_ok
@@ -537,6 +594,9 @@ class ScheduledActionDispatcherNode(Node):
         # Safe-stop -> Close -> clear local -> Open new UUID.
         safe_ok = self._safe_stop()
         close_ok = self._close_session_sync()
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            safe_ok = admission.release() and safe_ok
         with self._state_lock:
             self._received_results.clear()
             self._clear_plans_locked()
@@ -555,7 +615,8 @@ class ScheduledActionDispatcherNode(Node):
         self._set_state(DispatcherState.STOPPED)
         completion = threading.Event()
         self._open_new_session(completion=completion)
-        completion.wait(self._default_open_timeout_ns / 1_000_000_000)
+        if not completion.wait(self._default_open_timeout_ns / 1_000_000_000) and admission is not None:
+            admission.cancel()
         with self._state_lock:
             resp.success = self._state == DispatcherState.ACTIVE
             if not resp.success:
@@ -939,6 +1000,9 @@ class ScheduledActionDispatcherNode(Node):
             self.get_logger().error(reason)
             self._safe_stop()
             self._close_session_sync()
+            admission = getattr(self, "_runtime_admission", None)
+            if admission is not None:
+                admission.release()
             self._set_state(DispatcherState.FAILED)
         finally:
             with self._state_lock:
@@ -1128,6 +1192,16 @@ class ScheduledActionDispatcherNode(Node):
     # ------------------------------------------------------------------
 
     def _safe_stop(self) -> bool:
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            with self._state_lock:
+                admission.cancel()
+                self._cancel_inflight_dispatch()
+                self._clear_plans_locked()
+                self._clear_inflight_locked()
+                self._last_action = None
+                self._state = DispatcherState.CLOSING
+            return True
         self._cancel_inflight_dispatch()
         with self._state_lock:
             # freeze: stop control timer output + new dispatch
@@ -1298,6 +1372,9 @@ class ScheduledActionDispatcherNode(Node):
         try:
             safe_ok = self._safe_stop()
             close_ok = self._close_session_sync(spin_once=spin_once)
+            admission = getattr(self, "_runtime_admission", None)
+            if admission is not None:
+                safe_ok = admission.release(spin_once=spin_once) and safe_ok
             if not safe_ok or not close_ok:
                 self.get_logger().error("scheduled dispatcher shutdown cleanup did not complete")
             return safe_ok and close_ok

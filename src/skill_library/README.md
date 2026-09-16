@@ -566,10 +566,28 @@ Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admissio
 | `arm_trajectory_action_name` | `/arm_trajectory_controller/follow_joint_trajectory` | 手臂轨迹 action 名 |
 | `task_executor_action_name` | `/task_executor/execute_task_plan` | task_dispatch 执行动作名 |
 | `pick_action_name` | `/manipulation/execute_pick` | 委托型抓取技能 action 名 |
-| `move_configuration_service` | `/moveit_gateway/move_to_configuration` | 精确 IK 配置 MoveIt 服务 |
+| `move_configuration_service` | legacy: `/moveit_gateway/move_to_configuration`; runtime: `/motion/move_to_joint` | 精确关节配置服务；仅显式 runtime 使用中立默认端点 |
+| `runtime_enabled` | `false` | 启动时固定；由 launch 根据显式 `runtime.provider` 设置，不根据收到的状态推断 |
+| `runtime_name` | 空字符串 | runtime 启用时必填，必须匹配选定 provider 发布的 `RuntimeStatus.runtime_name` |
+| `runtime_status_topic` | `/runtime_status` | reliable / volatile / keep-last 10，与公共 runtime 发布端一致 |
+| `runtime_mode_service` | `/runtime/set_mode` | `SetRuntimeMode` 服务；不得退回 legacy motion-mode 服务 |
+| `runtime_status_freshness_sec` | `3.0` | 正有限值；同时约束本机 monotonic 收包年龄和 ROS 消息时间戳年龄 |
+| `runtime_mode_map_json` | `{"moveit_planning":"trajectory","teleop":"stream","model_inference":"stream"}` | 应用控制模式到 runtime 模式的映射；目标必须在 `declared_modes` 中 |
 | `ee_pose_topic` | `/robot_status/ee_pose` | 末端位姿反馈 topic |
 | `joint_state_topic` | `/joint_states` | 关节状态反馈 topic |
 | `debug_tracing` | `false` | 是否输出调试日志 |
+
+显式 runtime 路径在技能和外部 primitive 分发前检查新鲜状态、`ACTIVE` 生命周期、空 faults、
+未锁存 stop、声明的模式以及技能 manifest 可选的 `capability.required_capabilities`。
+`DEGRADED` 可能代表控制器不可用或硬件读取失败，不允许运动准入。模式 RPC 成功后仍需收到
+请求之后的新鲜状态确认；服务等待、RPC 和状态确认分别受 `rpc_timeout_sec` 约束。
+执行器不会自动请求 `idle` 清除 stop latch。runtime 与执行器必须使用一致的 ROS 时钟。
+
+父 launch 负责从已验证的 `descriptor.model` 绑定到 `config.robot_model`，按选定命名 group 的
+`joints` 顺序投影 `arm_joint_names_json`，从同一模型投影 `joint_limits_json`（应用限制只能收窄），
+并投影 `arm_trajectory_action_name`、`joint_state_topic`、`ee_pose_topic`、`move_configuration_service`。
+这里不读取 provider 私有 profile/calibration，也不自行选取第一个 group。无 provider 的旧配置
+保留旧端点及控制模式逻辑，即使 DDS 中存在其他 runtime 的状态。
 
 ### 取消终态契约
 

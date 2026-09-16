@@ -118,7 +118,7 @@ float32 progress                 # 0.0 ~ 1.0
 ### 1. Build
 
 ```bash
-colcon build --packages-select ibrobot_msgs robot_config robot_moveit task_dispatch
+colcon build --packages-select ibrobot_msgs robot_config so101_motion task_dispatch
 source install/setup.bash
 ```
 

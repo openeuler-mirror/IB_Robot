@@ -6,8 +6,10 @@ from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVaria
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
+from robot_config.interface_binding import bind_robot_interfaces
 from robot_config.launch_builders.perception_models import generate_perception_model_nodes
-from robot_config.loader import load_robot_config_dict
+from robot_config.loader import load_robot_config_dict, robot_execution_endpoints
+from robot_runtime import contract as RUNTIME
 
 
 def _sorting_hat_game(*, enabled: bool = True, announce: bool = False) -> dict:
@@ -117,14 +119,26 @@ def test_launch_does_not_inject_legacy_skill_templates():
     assert "skill_templates_json" not in params
 
 
+@pytest.mark.parametrize("service", [None, "/custom/move_to_joint"])
+def test_providerless_motion_defaults_match_digest_endpoints(service):
+    execution = {} if service is None else {"move_configuration_service": service}
+    config = {"embodied": {"enabled": True, "entry_mode": "hermes", "execution": execution}}
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+    expected = service or RUNTIME.MOVE_TO_JOINT_SERVICE
+    assert _decode_launch_string(params["move_configuration_service"]) == expected
+    assert robot_execution_endpoints(config)["move_configuration_service"] == expected
+
+
 @pytest.mark.parametrize("config_name", ["so101_single_arm"])
-def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name):
+def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name, public_description):
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / f"{config_name}.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
 
-    config = load_robot_config_dict(config_path)
+    config = bind_robot_interfaces(
+        load_robot_config_dict(config_path, defer_interface_binding=True), public_description
+    )
     config["embodied"]["enabled"] = True
     nodes = generate_embodied_nodes(config, "moveit_planning")
 
@@ -132,6 +146,12 @@ def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name):
 
     assert _decode_launch_json_string(params["arm_joint_names_json"]) == ["1", "2", "3", "4", "5"]
     assert set(_decode_launch_json_string(params["joint_limits_json"]).keys()) >= {"1", "2", "3", "4", "5"}
+    assert params["runtime_enabled"] is True
+    assert _decode_launch_string(params["move_configuration_service"]) == "/test/motion/move_to_joint"
+    assert _decode_launch_string(params["joint_state_topic"]) == "/test/joint_states"
+    assert _decode_launch_string(params["ee_pose_topic"]) == "/test/ee_pose"
+    assert _decode_launch_string(params["arm_trajectory_action_name"]) == "/test/arm/follow_joint_trajectory"
+    assert _decode_launch_json_string(params["runtime_mode_map_json"])["model_inference"] == "policy_stream"
 
 
 def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
@@ -204,7 +224,8 @@ def test_navigation_profile_uses_base_navigation_mode_and_action_endpoint():
     assert _decode_launch_string(params["skill_required_control_mode"]) == "base_navigation"
     assert _decode_launch_string(params["navigation_action_name"]) == "/robot/navigation/execute"
     assert params.get("context_schema_version") == 2
-    assert all(vars(node).get("_Node__package") != "robot_moveit" for node in nodes)
+    # Navigation-only bring-up never spawns a planner/motion node from the embodied layer.
+    assert all(vars(node).get("_Node__package") not in {"so101_motion", "robot_moveit"} for node in nodes)
 
 
 def test_sound_orientation_node_is_projected_from_robot_config():
@@ -253,7 +274,7 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
         "base_navigation",
     ]
     assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
-    assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/resolve_target"
+    assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/get_objects"
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 
 
@@ -1016,9 +1037,10 @@ def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
 
 
-def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_path):
+def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(tmp_path):
     module = _load_launch_module()
-    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+    workers_launch = tmp_path / "ik_workers.launch.py"
+    workers_launch.write_text("")
     config = {
         "moveit": {"joint_state_topic": "/arm_joint_state_broadcaster/joint_states"},
         "grasp_execution": {
@@ -1028,6 +1050,7 @@ def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_p
                 "worker_count": 4,
                 "worker_namespace_prefix": "/ik_worker",
                 "auto_start_workers": True,
+                "workers_launch": str(workers_launch),
             },
         },
     }
@@ -1038,11 +1061,32 @@ def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_p
     assert action.__class__.__name__ == "IncludeLaunchDescription"
     arguments = dict(action._IncludeLaunchDescription__launch_arguments)
     assert arguments["joint_state_topic"] == "/arm_joint_state_broadcaster/joint_states"
+    config["runtime"] = {"provider": "so101_robot"}
+    assert module._parallel_ik_worker_action(config, "false") is None
 
 
-def test_source_workspace_profile_uses_absolute_development_catalog_root():
+def test_providerless_ik_workers_require_an_explicit_suite_launch(tmp_path):
+    module = _load_launch_module()
+    config = {
+        "grasp_execution": {
+            "enabled": True,
+            "ik": {"worker_count": 2, "auto_start_workers": True},
+        },
+    }
+
+    with pytest.raises(ValueError, match="grasp_execution.ik.workers_launch"):
+        module._parallel_ik_worker_action(config, "false")
+
+    config["grasp_execution"]["ik"]["workers_launch"] = str(tmp_path / "missing.launch.py")
+    with pytest.raises(FileNotFoundError, match="workers_launch"):
+        module._parallel_ik_worker_action(config, "false")
+
+
+def test_source_workspace_profile_uses_absolute_development_catalog_root(public_description):
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
-    config = load_robot_config_dict(config_path)
+    config = bind_robot_interfaces(
+        load_robot_config_dict(config_path, defer_interface_binding=True), public_description
+    )
     config["embodied"]["enabled"] = True
 
     params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))

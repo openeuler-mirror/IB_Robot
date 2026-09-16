@@ -26,9 +26,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -55,7 +52,7 @@ from ibrobot_msgs.action import (
     PrimitiveCommand,
     SkillCommand,
 )
-from ibrobot_msgs.msg import SkillCapabilityStatus, SkillDiagnostic, SkillRegistryEvent, TaskStep
+from ibrobot_msgs.msg import RuntimeStatus, SkillCapabilityStatus, SkillDiagnostic, SkillRegistryEvent, TaskStep
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
     FinalizeWorkflowExecution,
@@ -64,10 +61,16 @@ from ibrobot_msgs.srv import (
     GetSkillSnapshot,
     MoveToConfiguration,
     ReloadSkillCatalog,
+    SetRuntimeMode,
     ValidatePrimitive,
     ValidateSkill,
 )
+from robot_config.contract_utils import qos_profile_from_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from robot_runtime import contract as RUNTIME
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -356,6 +359,10 @@ class SkillExecutorNode(Node):
         super().__init__(node_name or "skill_executor_node", parameter_overrides=parameter_overrides)
         validate_public_request_wire_contracts()
         startup_descriptor = ParameterDescriptor(read_only=True)
+        self._runtime_enabled = self.declare_parameter("runtime_enabled", False, descriptor=startup_descriptor).value
+        self._runtime_name = self.declare_parameter("runtime_name", "", descriptor=startup_descriptor).value.strip()
+        if self._runtime_enabled and not self._runtime_name:
+            raise ValueError("runtime_name is required when runtime_enabled is true")
         self.declare_parameter("skill_action_name", "/embodied/execute_skill")
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("validate_skill_service", "/embodied/validate_skill")
@@ -382,7 +389,10 @@ class SkillExecutorNode(Node):
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
         self.declare_parameter("semantic_map_stand_off_distance_m", 0.3)
-        self.declare_parameter("move_configuration_service", "/moveit_gateway/move_to_configuration")
+        self.declare_parameter(
+            "move_configuration_service",
+            RUNTIME.MOVE_TO_JOINT_SERVICE,
+        )
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("cmd_pose_topic", "/cmd_pose")
@@ -474,6 +484,52 @@ class SkillExecutorNode(Node):
         self._skill_required_control_mode = (
             self.get_parameter("skill_required_control_mode").get_parameter_value().string_value
         )
+        self._runtime_status_snapshot = None
+        self._runtime_status_event = threading.Event()
+        self._runtime_status_topic = self.declare_parameter(
+            "runtime_status_topic", RUNTIME.STATUS_TOPIC, descriptor=startup_descriptor
+        ).value
+        self._runtime_mode_service = self.declare_parameter(
+            "runtime_mode_service", RUNTIME.SET_MODE_SERVICE, descriptor=startup_descriptor
+        ).value
+        self._runtime_status_freshness_sec = self.declare_parameter(
+            "runtime_status_freshness_sec", 3.0, descriptor=startup_descriptor
+        ).value
+        if not math.isfinite(self._runtime_status_freshness_sec) or self._runtime_status_freshness_sec <= 0:
+            raise ValueError("runtime_status_freshness_sec must be finite and positive")
+        self._runtime_mode_map = load_json_mapping(
+            self.declare_parameter(
+                "runtime_mode_map_json",
+                json.dumps({"moveit_planning": "trajectory", "teleop": "stream", "model_inference": "policy_stream"}),
+                descriptor=startup_descriptor,
+            ).value
+        )
+        if any(not isinstance(mode, str) or not mode.strip() for mode in self._runtime_mode_map.values()):
+            raise ValueError("runtime_mode_map_json values must be non-empty mode names")
+        runtime_status_qos = qos_profile_from_dict(
+            load_json_mapping(
+                self.declare_parameter(
+                    "runtime_status_qos_json",
+                    json.dumps(
+                        {"history": "keep_last", "depth": 10, "reliability": "reliable", "durability": "volatile"}
+                    ),
+                    descriptor=startup_descriptor,
+                ).value
+            )
+        )
+        if self._runtime_enabled:
+            if not self._runtime_status_topic.strip() or not self._runtime_mode_service.strip():
+                raise ValueError("runtime status and mode endpoints must be non-empty")
+            self.create_subscription(
+                RuntimeStatus,
+                self._runtime_status_topic,
+                self._on_runtime_status,
+                runtime_status_qos,
+                callback_group=ReentrantCallbackGroup(),
+            )
+            self._runtime_mode_client = self.create_client(
+                SetRuntimeMode, self._runtime_mode_service, callback_group=ReentrantCallbackGroup()
+            )
         self._supported_control_modes = tuple(
             str(mode).strip()
             for mode in json.loads(self.get_parameter("supported_control_modes_json").value)
@@ -1173,9 +1229,16 @@ class SkillExecutorNode(Node):
     def _runtime_snapshot(self) -> RuntimeSnapshot:
         owner = self._gateway_lease.owner
         active_workflow = self._active_workflow
+        active_control_mode = self._active_control_mode
+        if getattr(self, "_runtime_enabled", False):
+            status, _ = self._runtime_status_for_admission()
+            active_control_mode = next(
+                (name for name, mode in self._runtime_mode_map.items() if status and mode == status.active_mode),
+                "",
+            )
         return RuntimeSnapshot(
             motion_authorized=self._motion_authorized,
-            active_control_mode=self._active_control_mode,
+            active_control_mode=active_control_mode,
             required_control_mode=self._skill_required_control_mode,
             busy=owner is not None or active_workflow is not None,
             active_task_id=(
@@ -1193,9 +1256,12 @@ class SkillExecutorNode(Node):
                 self._navigation_client.server_is_ready() if self._context_schema_version >= 2 else False
             ),
             control_mode_switching_enabled=(
-                self._context_schema_version >= 3
-                and bool(getattr(self, "_supported_control_modes", ()))
-                and bool(getattr(self, "_motion_mode_service", ""))
+                bool(getattr(self, "_runtime_enabled", False))
+                or (
+                    self._context_schema_version >= 3
+                    and bool(getattr(self, "_supported_control_modes", ()))
+                    and bool(getattr(self, "_motion_mode_service", ""))
+                )
             ),
         )
 
@@ -1946,12 +2012,145 @@ class SkillExecutorNode(Node):
                 return mode
         return str(getattr(self, "_skill_control_modes", {}).get(str(skill_name), "")).strip()
 
-    def _ensure_skill_control_mode(self, skill_name: str, goal_handle) -> tuple[bool, str]:
-        """Switch arm/base ownership through the existing motion-mode service.
+    def _required_capabilities_for_skill(self, skill_name: str) -> list[str]:
+        """Read the skill's declared runtime capability requirements (if any)."""
+        bundle = getattr(self, "_active_runtime_bundle", None)
+        if bundle is None:
+            return []
+        capability = bundle.snapshot.capability_view.get(str(skill_name), {})
+        raw = capability.get("required_capabilities", [])
+        return [str(c) for c in raw if str(c).strip()]
 
-        The switch is deliberately performed before any delegated executor or
-        primitive is dispatched.  A failed transition therefore fails closed.
-        """
+    def _on_runtime_status(self, msg) -> None:
+        """Only the explicitly selected runtime can supply admission evidence."""
+        if not getattr(self, "_runtime_enabled", False) or msg.runtime_name != self._runtime_name:
+            return
+        self._runtime_status_snapshot = (msg, time.monotonic())
+        self._runtime_status_event.set()
+
+    def _runtime_status_for_admission(self):
+        snapshot = getattr(self, "_runtime_status_snapshot", None)
+        if snapshot is None:
+            return None, "runtime status has not been received"
+        status, received = snapshot
+        if status.runtime_name != self._runtime_name:
+            return None, "runtime status identity mismatch"
+        max_age = self._runtime_status_freshness_sec
+        receipt_age = time.monotonic() - received
+        stamp_ns = status.stamp.sec * 1_000_000_000 + status.stamp.nanosec
+        source_age = (self.get_clock().now().nanoseconds - stamp_ns) / 1_000_000_000
+        if not 0 <= receipt_age <= max_age or not 0 <= source_age <= max_age:
+            return None, "runtime status is stale or its clock is unsynchronized"
+        if status.stop_latched:
+            return None, "runtime stop is latched; explicit idle rearm is required"
+        # DEGRADED can mean unavailable controllers or failed hardware reads.
+        if status.lifecycle != RUNTIME.LIFECYCLE_ACTIVE:
+            return None, f"runtime lifecycle is {status.lifecycle!r}; ACTIVE is required"
+        if status.faults:
+            return None, f"runtime has active faults: {', '.join(status.faults)}"
+        return status, ""
+
+    def _ensure_skill_capabilities(self, skill_name: str) -> tuple[bool, str]:
+        """Require current evidence for migrated consumers, including unannotated skills."""
+        if not getattr(self, "_runtime_enabled", False):
+            return True, ""
+        status, reason = self._runtime_status_for_admission()
+        if status is None:
+            return False, reason
+        required = self._required_capabilities_for_skill(skill_name)
+        missing = [cap for cap in required if cap not in status.capabilities]
+        if missing:
+            return False, (f"skill requires capabilities not provided by the runtime: {', '.join(sorted(missing))}")
+        return True, ""
+
+    def _runtime_mode_for(self, control_mode: str) -> str:
+        """Map the skill control-mode vocabulary onto runtime mode names (config-overridable)."""
+        mapping = getattr(self, "_runtime_mode_map", None) or {}
+        return str(mapping.get(control_mode, control_mode)).strip()
+
+    def _request_runtime_mode(self, mode: str, goal_handle=None) -> tuple[bool, str]:
+        """A successful RPC is not evidence of a fresh, healthy active mode."""
+        client = getattr(self, "_runtime_mode_client", None)
+        if client is None:
+            return False, "runtime mode client unavailable"
+
+        def canceled():
+            return bool(goal_handle is not None and goal_handle.is_cancel_requested)
+
+        try:
+            if not client.wait_for_service(timeout_sec=self._rpc_timeout):
+                return False, f"runtime mode service {self._runtime_mode_service} unavailable"
+            if canceled():
+                return False, "skill canceled before runtime mode switch"
+            status, reason = self._runtime_status_for_admission()
+            if status is None:
+                return False, reason
+            request = SetRuntimeMode.Request()
+            request.mode = mode
+            requested_stamp_ns = self.get_clock().now().nanoseconds
+            self._runtime_status_snapshot = None
+            future = client.call_async(request)
+            if not self._wait_for_future(future, self._rpc_timeout, cancel_requested=canceled):
+                return False, f"runtime mode request {mode!r} timed out or was canceled"
+            response = future.result()
+        except Exception as exc:
+            return False, f"runtime mode request {mode!r} failed: {exc}"
+        if response is None or not response.success:
+            message = response.message if response is not None else "no response"
+            return False, f"runtime rejected mode {mode!r}: {message}"
+        deadline = time.monotonic() + self._rpc_timeout
+        while True:
+            self._runtime_status_event.clear()
+            if canceled():
+                return False, "skill canceled during runtime mode confirmation"
+            status, reason = self._runtime_status_for_admission()
+            if (
+                status is not None
+                and status.active_mode == mode
+                and mode in status.declared_modes
+                and status.stamp.sec * 1_000_000_000 + status.stamp.nanosec >= requested_stamp_ns
+            ):
+                return True, ""
+            if self._runtime_status_snapshot is not None and status is None:
+                return False, reason
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, f"runtime mode {mode!r} not confirmed by fresh status: {reason or 'wrong active mode'}"
+            self._runtime_status_event.wait(min(remaining, 0.05))
+
+    def _ensure_skill_control_mode(self, skill_name: str, goal_handle) -> tuple[bool, str]:
+        """Verify ownership before dispatch, using only the explicitly selected path."""
+        if getattr(self, "_runtime_enabled", False):
+            with self._motion_mode_switch_lock:
+                if goal_handle is not None and goal_handle.is_cancel_requested:
+                    return False, "skill canceled before runtime mode admission"
+                status, reason = self._runtime_status_for_admission()
+                if status is None:
+                    return False, reason
+                required_mode = self._required_control_mode_for_skill(skill_name)
+                if not required_mode:
+                    required_mode = str(getattr(self, "_skill_required_control_mode", "")).strip()
+                if not required_mode:
+                    return False, "skill control mode is not declared"
+                runtime_mode = self._runtime_mode_for(required_mode)
+                if runtime_mode not in status.declared_modes:
+                    return False, f"runtime mode {runtime_mode!r} is not declared"
+                ready, reason = self._ensure_skill_capabilities(skill_name)
+                if not ready:
+                    return False, reason
+                if status.active_mode != runtime_mode:
+                    if status.active_mode != "idle":
+                        return False, "another runtime producer is active; stop it and enter idle before skills"
+                    ready, reason = self._request_runtime_mode(runtime_mode, goal_handle)
+                    if not ready:
+                        return False, reason
+                status, reason = self._runtime_status_for_admission()
+                if status is None:
+                    return False, reason
+                if status.active_mode != runtime_mode:
+                    return False, f"runtime mode {runtime_mode!r} is no longer active"
+                return self._ensure_skill_capabilities(skill_name)
+
         # Keep object-level/unit-test fixtures that predate the motion-mode
         # client on the legacy unchecked path.
         if not hasattr(self, "_motion_mode_client") and not hasattr(self, "_supported_control_modes"):
@@ -4765,6 +4964,10 @@ class SkillExecutorNode(Node):
         control_mode_ready, control_mode_reason = self._ensure_skill_control_mode(goal.skill_name, goal_handle)
         if not control_mode_ready:
             return self._abort_skill(result, goal_handle, [], "CONTROL_MODE_MISMATCH", control_mode_reason)
+
+        capabilities_ready, capabilities_reason = self._ensure_skill_capabilities(goal.skill_name)
+        if not capabilities_ready:
+            return self._abort_skill(result, goal_handle, [], "CAPABILITY_MISSING", capabilities_reason)
 
         active_bundle = getattr(self, "_active_runtime_bundle", None)
         active_templates = (

@@ -704,11 +704,19 @@ class PipelinePolicyNode(Node):
         self._state_specs = [spec for spec in self._obs_specs if spec.key == "observation.state"]
         self._topic_to_qos = {observation.topic: observation.qos for observation in self._contract.observations}
 
-        calibration_sources = resolve_calibration_source_specs_from_config(robot_config)
-        joint_names = resolve_joint_names_from_config(robot_config)
-        gripper_joints = resolve_gripper_joints_from_config(robot_config) or ["6"]
         norm_mode = resolve_lerobot_norm_mode(robot_config)
-        if parse_bool(self._config.use_sim, default=False) and joint_names:
+        public_model = robot_config.get("robot_model")
+        if public_model:
+            from robot_runtime.model_metadata import build_joint_conversion_table_from_model, validate_model_metadata
+
+            validate_model_metadata(public_model)
+            joint_names = [str(name) for name in public_model["joint_groups"]["all"]]
+            self._joint_rad_limits = build_joint_conversion_table_from_model(public_model, joint_names, norm_mode)
+        else:
+            calibration_sources = resolve_calibration_source_specs_from_config(robot_config)
+            joint_names = resolve_joint_names_from_config(robot_config)
+            gripper_joints = resolve_gripper_joints_from_config(robot_config) or ["6"]
+        if not public_model and parse_bool(self._config.use_sim, default=False) and joint_names:
             from robot_config.launch_builders.description import generate_robot_description
 
             description = generate_robot_description(robot_config, True)
@@ -721,7 +729,7 @@ class PipelinePolicyNode(Node):
                 gripper_joints,
                 norm_mode=norm_mode,
             )
-        elif calibration_sources and joint_names:
+        elif not public_model and calibration_sources and joint_names:
             self._joint_rad_limits = build_joint_conversion_table(
                 calibration_sources,
                 joint_names,

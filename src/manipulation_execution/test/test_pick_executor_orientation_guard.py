@@ -4,6 +4,7 @@ import pytest
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
 
+from manipulation_execution import so101_kinematics_guard as wrist_guard
 from manipulation_execution.grasp_geometry import euler_xyz_matrix, quaternion_from_matrix
 from manipulation_execution.pick_executor_node import IKPayload, PickExecutorNode, PickFlowError
 
@@ -19,6 +20,7 @@ class _OrientationHarness:
     _load_json_object = staticmethod(PickExecutorNode._load_json_object)
     _load_home_joint_positions = classmethod(PickExecutorNode._load_home_joint_positions.__func__)
     _validate_home_joint_config = PickExecutorNode._validate_home_joint_config
+    _validate_provider_requirements = PickExecutorNode._validate_provider_requirements
     _orientation_guard = PickExecutorNode._orientation_guard
     _orientation_limits = PickExecutorNode._orientation_limits
     _joint5_home_constraints = PickExecutorNode._joint5_home_constraints
@@ -32,6 +34,9 @@ class _OrientationHarness:
 
     def __init__(self) -> None:
         self._home_joint_positions = {"5": 0.0}
+        self._wrist_guard = wrist_guard
+        self._grasp_geometry = None
+        self._target_geometry = {}
         self._config = {
             "target_gripper": {
                 "closing_axis_ee": [1.0, 0.0, 0.0],
@@ -100,6 +105,33 @@ def test_home_joint_positions_are_loaded_from_launch_json():
 def test_home_joint_positions_reject_non_finite_values():
     with pytest.raises(ValueError, match="joint 5 must be finite"):
         _OrientationHarness._load_home_joint_positions('{"5": NaN}')
+
+
+def test_orientation_guard_without_wrist_guard_provider_fails_fast():
+    harness = _OrientationHarness()
+    harness._wrist_guard = None
+    harness._config["target_gripper"]["ik_orientation_guard"]["joint5_constraints_enabled"] = True
+
+    with pytest.raises(ValueError, match="wrist_guard_provider is required"):
+        harness._validate_provider_requirements()
+
+
+def test_tabletop_filter_without_grasp_geometry_provider_fails_fast():
+    harness = _OrientationHarness()
+    harness._target_geometry = {"tabletop_filter": True}
+
+    with pytest.raises(ValueError, match="grasp_geometry_provider is required"):
+        harness._validate_provider_requirements()
+
+
+def test_disabled_features_do_not_require_providers():
+    harness = _OrientationHarness()
+    harness._wrist_guard = None
+    harness._grasp_geometry = None
+    harness._config["target_gripper"]["ik_orientation_guard"]["enabled"] = False
+    harness._target_geometry = {"tabletop_filter": False}
+
+    harness._validate_provider_requirements()
 
 
 def test_joint5_guard_requires_home_position_during_startup_validation():

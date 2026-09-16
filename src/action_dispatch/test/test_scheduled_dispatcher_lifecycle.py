@@ -15,6 +15,8 @@ import pytest
 from action_dispatch import scheduled_action_dispatcher_node as dispatcher_module
 from action_dispatch.active_plan import ActivePlan, PlanSource
 from action_dispatch.chunk_planning import ChunkPlan, create_chunk_planner
+from action_dispatch.executors.topic import TopicExecutor
+from action_dispatch.safe_stop import JointSnapshot, build_safe_stop_plan
 from action_dispatch.scheduled_action_dispatcher_node import (
     DispatcherState,
     ScheduledActionDispatcherNode,
@@ -149,6 +151,57 @@ def test_joint_snapshot_uses_local_monotonic_receive_time(monkeypatch):
     assert node._joint_snapshot.valid
     assert node._joint_snapshot.positions == [1.0, 2.0]
     assert node._joint_snapshot.received_monotonic_ns == 123456789
+
+
+@pytest.mark.parametrize("smoothing", [False, True])
+def test_safe_stop_zeros_twist_before_holding_arm(smoothing):
+    from geometry_msgs.msg import Twist
+    from std_msgs.msg import Float64MultiArray
+
+    node = _plan_node(smoothing=smoothing)
+    node._action_specs = [
+        SimpleNamespace(
+            topic="/unit/arm",
+            ros_type="std_msgs/msg/Float64MultiArray",
+            names=["action.0", "action.1"],
+            safety_behavior="hold",
+        ),
+        SimpleNamespace(
+            topic="/unit/velocity",
+            ros_type="geometry_msgs/msg/Twist",
+            names=["vx", "vy", "wz"],
+            safety_behavior="zeros",
+        ),
+    ]
+    node._safe_stop_plan = build_safe_stop_plan(action_specs=node._action_specs, joint_order=["joint1", "joint2"])
+    node._joint_snapshot = JointSnapshot(valid=False)
+    node._last_action = np.array([1.0, 2.0, 0.25, -0.5, 0.75])
+    node._active_plan.accept(ChunkPlan(np.tile(node._last_action, (2, 1))), _source(node))
+    publications = []
+
+    def create_publisher(message_type, topic, _qos):
+        def publish(message):
+            assert isinstance(message, message_type)
+            publications.append((topic, message))
+
+        return SimpleNamespace(publish=publish)
+
+    node.create_publisher = create_publisher
+    node._executor = TopicExecutor(node, {"action_specs": node._action_specs})
+    assert node._executor.initialize()
+
+    assert node._safe_stop()
+
+    assert [topic for topic, _message in publications] == ["/unit/velocity", "/unit/arm"]
+    velocity, arm = [message for _topic, message in publications]
+    assert isinstance(velocity, Twist)
+    assert [velocity.linear.x, velocity.linear.y, velocity.linear.z] == [0.0, 0.0, 0.0]
+    assert [velocity.angular.x, velocity.angular.y, velocity.angular.z] == [0.0, 0.0, 0.0]
+    assert isinstance(arm, Float64MultiArray)
+    assert list(arm.data) == [1.0, 2.0]
+    assert node._state is DispatcherState.CLOSING
+    assert node._last_action is None
+    assert node._active_plan.snapshot().remaining == 0
 
 
 def test_late_open_success_while_closing_triggers_compensating_close():
@@ -1193,9 +1246,11 @@ def test_production_failure_timer_closes_open_exception_with_frozen_ros_clock(mo
         if node._state is DispatcherState.FAILED:
             finished.set()
 
-    monkeypatch.setattr(
-        ScheduledActionDispatcherNode, "_load_contract_and_plan", lambda node: setattr(node, "_action_specs", [])
-    )
+    def load_contract(node):
+        node._action_specs = []
+        node._robot_config = SimpleNamespace(runtime={})
+
+    monkeypatch.setattr(ScheduledActionDispatcherNode, "_load_contract_and_plan", load_contract)
     monkeypatch.setattr(ScheduledActionDispatcherNode, "_fail_and_close", fail)
     monkeypatch.setattr(ScheduledActionDispatcherNode, "_drain_pending_failure", drain)
     monkeypatch.setattr(dispatcher_module, "TopicExecutor", Mock())

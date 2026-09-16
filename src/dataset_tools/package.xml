@@ -14,6 +14,7 @@
   <depend>ibrobot_msgs</depend>
   <depend>tensormsg</depend>
   <depend>robot_config</depend>
+  <depend>robot_runtime</depend>
 
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-av</exec_depend>

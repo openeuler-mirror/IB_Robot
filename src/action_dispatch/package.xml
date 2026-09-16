@@ -23,6 +23,7 @@
   <depend>tensormsg</depend>
   <depend>robot_config</depend>
   <depend>ibrobot_tracing</depend>
+  <exec_depend>robot_runtime</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -30,6 +30,7 @@
   <depend>observation_transport</depend>
   <depend>torch_models</depend>
   <depend>robot_config</depend>
+  <depend>robot_runtime</depend>
   <depend>dataset_tools</depend>
   <depend>ibrobot_tracing</depend>
 

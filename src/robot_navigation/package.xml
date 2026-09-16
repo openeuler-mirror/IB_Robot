@@ -35,7 +35,6 @@
   <exec_depend>nav2_mppi_controller</exec_depend>
   <exec_depend>nav2_rviz_plugins</exec_depend>
   <exec_depend>ibrobot_msgs</exec_depend>
-  <exec_depend>robot_description</exec_depend>
   <exec_depend>robot_localization</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>

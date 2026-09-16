@@ -46,6 +46,11 @@ def test_send_goal_does_not_start_recording_after_session_restart_failure():
     node._episode_finished_evt = threading.Event()
     node._last_result_success = True
     node._last_result_message = "old"
+    node._goal_lock = threading.RLock()
+    node._closing = False
+    node._owned_goal = None
+    node._goal_pending = False
+    node._mode_client = None
     node._should_reset_before_episode = lambda: True
     node.prepare_new_episode = lambda: False
     node._action_client = SimpleNamespace(

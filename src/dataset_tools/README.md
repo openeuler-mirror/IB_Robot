@@ -90,6 +90,58 @@ ros2 launch robot_config robot.launch.py \
 ros2 run dataset_tools record_cli
 ```
 
+#### Managed Teleop 逐 Episode 准入与录制完整性
+
+录制服务显式配置 `runtime_set_mode_service` 且 `control_mode=teleop` 时，
+`record_episode/get_info` 会公布 `teleop_admission` 配置，默认启动的 CLI 自动发现。
+CLI 显式传入的 runtime endpoint 优先。仅为可主动 rearm 的 managed leader 配置此功能；
+legacy teleop、phone/VR deadman 和 `model_inference` 不自动启用。
+
+每次提交 Prompt 都依次执行：请求 `idle`、等待新发布的 `ACTIVE / idle / stop_latched=false` 状态、
+调用 rearm 并等待最终 enable 结果、等待新发布的 `ACTIVE / stream / stop_latched=false` 状态，
+最后才发送录制 goal。状态必须在该请求完成后收到，时间戳不能早于等待起点或晚于当前 ROS 时间。
+每个 Prompt 最多尝试三次；失败回到 Prompt，不发送 goal。模式切换/rearm 超时后，
+在该请求完成前，即使提交新 Prompt 也不会再发送切换请求；晚到的响应不会自动重试。
+
+| 参数 | 使用方 | 默认值 |
+|---|---|---|
+| `runtime_set_mode_service` | recorder 公布、CLI 使用 | 空，关闭 managed admission |
+| `teleop_rearm_service` | recorder 公布、CLI 使用 | `/robot_teleop_node/rearm` |
+| `teleop_stop_service` | recorder 公布、CLI 使用 | 空；managed leader 由 launch 绑定 public stop endpoint |
+| `runtime_status_topic` | recorder 公布、CLI 使用 | `/runtime_status` |
+| `admission_timeout_sec` | recorder 公布、CLI 使用 | `5.0`，每次服务调用/状态等待上限 |
+| `admission_attempts` | recorder 公布、CLI 使用 | `3`，限制在 1 到 3 |
+| `shutdown_timeout_sec` | CLI | `15.0`，退出时等待自身 goal 或准入清理的总上限 |
+| `require_action_stream` | recorder | `false`，连续动作流校验开关 |
+| `action_stream_start_timeout_sec` | recorder | `2.0`，首条动作宽限期 |
+| `action_stream_gap_timeout_sec` | recorder | `1.0`，逐动作 topic 最大接收间隔 |
+
+managed leader 的 launch 将 `admission_timeout_sec` 默认设为有效 `rearm_timeout_s + 1.0`，
+即默认 6 秒，为服务完成后的响应交付保留余量；显式覆盖也必须大于 rearm 期限。
+跨主机部署需要同步 ROS 时间对应的系统时钟，否则源时间戳校验会拒绝准入。
+
+`require_action_stream=true` 时，所有 `contract.actions[].publish_topic` 都必须持续发布，
+空 actions 契约会拒绝启动。关节位置保持不变但消息持续发布是有效录制；零动作、任一动作 topic
+中断、或中断后恢复但间隔超限，都会令整个当前 episode 失败并删除当前目录，保留此前 episode。
+即使在首条动作宽限期内立即结束，也不能保存零动作 episode。稀疏推理模式应保持此开关关闭。
+间隔按 recorder 回调接收时间检查；超过截止时间的磁盘或 executor 停顿也会保守地废弃 episode。
+
+Enter 停止只结束当前 episode，遥操作会话保留。CLI 退出（Ctrl+C、`q`、EOF）在取消自己的 goal 后，
+立即停止由本 CLI rearm 的 managed teleop 会话，不等待 bag 落盘：先确认 HOLD，再恢复到准入前观测到的
+`ACTIVE/idle/unlatched`；不是本 CLI 启用的会话不受影响。rearm 请求一旦发出即视为持有
+（服务请求无法撤回），显式拒绝会解除持有，超时未决则保持持有。
+Ctrl+C 会保留 ROS context 和 executor，处理尚未返回的 goal acceptance，然后有界等待 cancel/result
+及 writer 清理。HOLD 清理与录制收尾共用退出期限，但优先发起 HOLD，慢速落盘不会耗尽其请求机会。
+录制结果超时只表示 bag 完成状态未确认，recorder 仍可能在后台收尾；该超时与 HOLD 确认分别报告。
+准入期间退出则先等待远端 mode/rearm 请求完成：晚到的 rearm 成功会被停止，
+显式失败则直接恢复 idle。
+ROS service 无法撤销已在远端执行的请求；若清理超时，CLI 会明确报告 runtime 状态未知、需要操作员停止，
+不能把这种情况视作已确认安全停止。
+
+本机回归使用真实 DDS/action executor、mock runtime 服务和 SQLite bag writer，不连接机器人。
+部署环境仍需验收：停锁后新 Prompt 的 idle/reset/rearm 流程、逐次 episode 准入、录制中断流整段丢弃、
+Enter 保留有效录制、goal acceptance 前后 Ctrl+C 的清理，以及退出 CLI 后遥操作会话确认停止。板端 idle/reset 流程尚需单独实测。
+
 episodic 录制目录现在按 dataset 组织：
 
 ```text

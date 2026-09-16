@@ -24,8 +24,10 @@ Skill Gateway 以及可选感知和抓取执行服务。
   `manipulation_execution/pick_executor_node`。
 - 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为
   ROS 参数传给业务节点。
-- 当 `robot.grasp_execution.ik.worker_count>0` 时，自动包含 `robot_moveit/so101_ik_workers.launch.py`，
-  为 Hermes 启动与监督式抓取脚本相同的并行候选 IK/FK 池。
+- 无 `runtime.provider` 的旧式配置里，当 `robot.grasp_execution.ik.worker_count>0` 时，包含
+  `grasp_execution.ik.workers_launch` 指定的机器人套件 launch（如
+  `$(find so101_motion)/launch/ik_workers.launch.py`），为 Hermes 启动与监督式抓取脚本相同的并行候选
+  IK/FK 池；有 `runtime.provider` 时 IK/FK 由机器人运行时提供。
 - 保持具身业务运行时依赖集中在 bringup 层，避免 `robot_config` 反向依赖业务包。
 
 本包不负责：

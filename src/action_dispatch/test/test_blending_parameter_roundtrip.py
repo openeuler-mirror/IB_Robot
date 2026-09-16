@@ -1,6 +1,7 @@
 """Real rclpy parameter export/reload, with transport endpoints isolated."""
 
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
@@ -26,9 +27,12 @@ def node_type(request, monkeypatch):
     monkeypatch.setattr("action_dispatch.action_dispatcher_node.ActionServer", Mock())
     monkeypatch.setattr("action_dispatch.action_dispatcher_node.create_executor", lambda *args: Mock())
     monkeypatch.setattr("action_dispatch.scheduled_action_dispatcher_node.TopicExecutor", Mock())
-    monkeypatch.setattr(
-        ScheduledActionDispatcherNode, "_load_contract_and_plan", lambda self: setattr(self, "_action_specs", [])
-    )
+
+    def load_contract(node):
+        node._action_specs = []
+        node._robot_config = SimpleNamespace(runtime={})
+
+    monkeypatch.setattr(ScheduledActionDispatcherNode, "_load_contract_and_plan", load_contract)
     yield cls
 
 

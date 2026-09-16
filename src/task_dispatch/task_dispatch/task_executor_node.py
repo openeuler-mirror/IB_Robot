@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Task Executor Node — orchestrates sequential task plans via MoveIt gateway.
+"""Task Executor Node — orchestrates sequential task plans via bound motion services.
 
 Architecture Position:
     task_dispatch sits between task-level planners (visual_grasp, VoxPoser, etc.)
-    and the motion execution layer (moveit_gateway + ros2_control).
+    and the motion execution layer (runtime motion services).
 
     Planners produce a sequence of TaskSteps (waypoints, gripper commands, waits).
     This node executes them one by one:
-      - MOVE_TO_POSE  → calls /moveit_gateway/move_to_pose service
+      - MOVE_TO_POSE  → calls the public motion service, or the legacy gateway
       - GRIPPER       → sends FollowJointTrajectory goal to gripper controller
       - WAIT          → sleeps for the requested duration
 
@@ -15,7 +15,7 @@ ROS Interfaces:
     Action Server:
         ~/execute_task_plan (ibrobot_msgs/action/ExecuteTaskPlan)
     Service Client:
-        /moveit_gateway/move_to_pose (ibrobot_msgs/srv/MoveToPose)
+        Bound motion.move_to_pose or /motion/move_to_pose (ibrobot_msgs/srv/MoveToPose)
     Action Client:
         /{gripper_controller}/follow_joint_trajectory (control_msgs/action/FollowJointTrajectory)
     Subscribers:
@@ -42,17 +42,29 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from ibrobot_msgs.action import ExecuteTaskPlan
 from ibrobot_msgs.msg import TaskStep
 from ibrobot_msgs.srv import MoveToPose
+from robot_config.contract_utils import qos_profile_from_dict
+from robot_config.interface_binding import InterfaceBindingError, resolve_robot_interfaces
 from robot_config.loader import load_robot_section
+from robot_runtime import contract as RUNTIME
 
 
 def _load_robot_yaml(config_path: str) -> dict:
     """Load the resolved robot section through the robot_config SSOT loader."""
-    _, robot_config = load_robot_section(config_path)
+    resolved_path, robot_config = load_robot_section(config_path)
+    runtime = robot_config.get("runtime") or {}
+    if runtime.get("provider"):
+        robot_config = resolve_robot_interfaces(
+            {
+                **robot_config,
+                "_config_path": str(resolved_path),
+                "runtime": {**runtime, "require_model": True},
+            }
+        )
     return robot_config
 
 
 class TaskExecutorNode(Node):
-    """Executes sequential task plans by delegating to moveit_gateway and gripper controllers."""
+    """Delegate through public runtime interfaces, retaining provider-less legacy routing."""
 
     def __init__(self):
         super().__init__("task_executor")
@@ -81,14 +93,13 @@ class TaskExecutorNode(Node):
         self._gripper_position_tolerance = max(float(self.get_parameter("gripper_position_tolerance").value), 0.0)
         self._joint_state_max_age_s = max(float(self.get_parameter("joint_state_max_age_s").value), 0.0)
 
-        # Extract gripper joint name and controller action from robot_config
-        self._gripper_joint = self._resolve_gripper_joint()
-        self._gripper_action_name = self._resolve_gripper_action_name()
+        # Resolve every binding before creating any motion-capable ROS client.
+        self._configure_interfaces()
 
-        # ---- Service Client: MoveIt gateway ----
+        # ---- Service Client: Motion ----
         self._move_client = self.create_client(
             MoveToPose,
-            "/moveit_gateway/move_to_pose",
+            self._move_service_name,
             callback_group=self._cb_group,
         )
 
@@ -106,9 +117,9 @@ class TaskExecutorNode(Node):
         self._joint_state_lock = threading.Lock()
         self._joint_state_sub = self.create_subscription(
             JointState,
-            "/joint_states",
+            self._joint_state_topic,
             self._joint_state_cb,
-            10,
+            self._joint_state_qos,
             callback_group=self._cb_group,
         )
 
@@ -134,6 +145,62 @@ class TaskExecutorNode(Node):
     # ------------------------------------------------------------------ #
     #  Configuration helpers
     # ------------------------------------------------------------------ #
+
+    def _configure_interfaces(self) -> None:
+        runtime = self._robot_cfg.get("runtime") or {}
+        self._gripper_limits = None
+        if not runtime.get("provider"):
+            self._move_service_name = RUNTIME.MOVE_TO_POSE_SERVICE
+            self._joint_state_topic, self._joint_state_qos = "/joint_states", 10
+            self._gripper_joint = self._resolve_gripper_joint()
+            self._gripper_action_name = self._resolve_gripper_action_name()
+            return
+
+        model = self._robot_cfg.get("robot_model")
+        if not model:
+            raise InterfaceBindingError("model_required", "robot_model", "task execution requires public joint groups")
+        gripper_joints = model["joint_groups"]["gripper"]
+        if len(gripper_joints) != 1:
+            raise InterfaceBindingError(
+                "unsupported_group", "robot_model.joint_groups.gripper", "exactly one joint required"
+            )
+        self._gripper_joint = gripper_joints[0]
+        self._gripper_limits = model["joint_limits"][self._gripper_joint]
+        bindings = self._robot_cfg.get("task_dispatch") or {}
+        if not isinstance(bindings, dict):
+            raise InterfaceBindingError("invalid_binding", "task_dispatch", "must be a mapping")
+        resolved = {}
+        for name, default, kind, message_type in (
+            ("move_to_pose_interface", "motion.move_to_pose", "service", "ibrobot_msgs/srv/MoveToPose"),
+            ("gripper_trajectory_interface", "", "action", "control_msgs/action/FollowJointTrajectory"),
+            ("joint_state_interface", "joint.state", "topic", "sensor_msgs/msg/JointState"),
+        ):
+            interface_id = bindings.get(name, default)
+            path = f"task_dispatch.{name}"
+            if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+                raise InterfaceBindingError("interface_required", path, "select a public logical interface ID")
+            interface = runtime["interface_description"]["interfaces"].get(interface_id)
+            if interface is None:
+                raise InterfaceBindingError("unknown_interface", path, interface_id)
+            expected_direction = "publish" if kind == "topic" else "serve"
+            if (interface["kind"], interface["direction"], interface["message_type"]) != (
+                kind,
+                expected_direction,
+                message_type,
+            ):
+                raise InterfaceBindingError(
+                    "interface_mismatch", path, f"requires {kind} {message_type} {expected_direction}"
+                )
+            resolved[name] = interface
+        self._move_service_name = resolved["move_to_pose_interface"]["endpoint"]
+        self._gripper_action_name = resolved["gripper_trajectory_interface"]["endpoint"]
+        state = resolved["joint_state_interface"]
+        if self._gripper_joint not in state.get("joint_names", []):
+            raise InterfaceBindingError(
+                "joint_mismatch", "task_dispatch.joint_state_interface", "gripper feedback absent"
+            )
+        self._joint_state_topic = state["endpoint"]
+        self._joint_state_qos = qos_profile_from_dict(state["qos"])
 
     def _resolve_gripper_joint(self) -> str:
         """Get gripper joint name from robot_config."""
@@ -268,11 +335,11 @@ class TaskExecutorNode(Node):
     # ------------------------------------------------------------------ #
 
     def _exec_move_to_pose(self, step: TaskStep) -> tuple:
-        """Execute a MOVE_TO_POSE step via moveit_gateway service."""
+        """Execute a MOVE_TO_POSE step via the selected motion service."""
         if not self._move_client.service_is_ready():
-            self.get_logger().warn("Waiting for /moveit_gateway/move_to_pose service...")
+            self.get_logger().warn(f"Waiting for {self._move_service_name} service...")
             if not self._move_client.wait_for_service(timeout_sec=10.0):
-                return False, "moveit_gateway/move_to_pose service not available"
+                return False, f"{self._move_service_name} service not available"
 
         req = MoveToPose.Request()
         req.target_pose = step.target_pose
@@ -302,6 +369,11 @@ class TaskExecutorNode(Node):
     def _exec_gripper(self, step: TaskStep) -> tuple:
         """Execute a GRIPPER step via FollowJointTrajectory action."""
         target_position = step.gripper_position
+        limits = getattr(self, "_gripper_limits", None)
+        if limits is not None and (
+            not math.isfinite(target_position) or not limits["min"] <= target_position <= limits["max"]
+        ):
+            return False, "Gripper target is outside public joint limits"
 
         if self._is_redundant_gripper_open(target_position):
             self.get_logger().info(f"    Gripper already open at {target_position:.2f}; skipping trajectory")

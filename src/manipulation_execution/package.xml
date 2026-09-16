@@ -12,11 +12,11 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>moveit_msgs</depend>
+  <depend>robot_runtime</depend>
   <depend>tf2_ros</depend>
   <depend>ibrobot_msgs</depend>
   <depend>embodied_common</depend>
   <depend>skill_catalog</depend>
-  <exec_depend>robot_description</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
 

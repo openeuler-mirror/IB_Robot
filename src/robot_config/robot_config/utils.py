@@ -328,12 +328,20 @@ def uses_public_model(robot_config: dict[str, Any]) -> bool:
 def resolve_joint_names_from_config(robot_config: dict[str, Any]) -> list[str]:
     """Resolve ordered joint names from raw robot_config YAML content."""
     if uses_public_model(robot_config):
-        return [
-            str(name)
-            for observation in (robot_config.get("contract") or {}).get("observations", [])
-            if observation.get("key") == "observation.state"
-            for name in (observation.get("selector") or {}).get("names", [])
-        ]
+        # The observation.state selector names are message field selectors
+        # (``position.<joint>`` per the bag_to_lerobot contract); the joint
+        # name is the suffix. Returning the raw selectors as joint names made
+        # every public-model conversion lookup fail with "missing contract
+        # joints", so strip the ``<field>.`` prefix and pass bare names
+        # through unchanged.
+        names: list[str] = []
+        for observation in (robot_config.get("contract") or {}).get("observations", []):
+            if observation.get("key") != "observation.state":
+                continue
+            for name in (observation.get("selector") or {}).get("names", []):
+                text = str(name)
+                names.append(text.split(".", 1)[1] if "." in text else text)
+        return names
     ros2_control = robot_config.get("ros2_control", {}) or {}
     joints_cfg = robot_config.get("joints", {}) or {}
     joint_names = ros2_control.get("joint_names") or joints_cfg.get("all") or []

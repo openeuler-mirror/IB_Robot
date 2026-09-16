@@ -15,6 +15,7 @@ from sensor_msgs.msg import JointState
 from ibrobot_msgs.action import PickObject
 from ibrobot_msgs.msg import GraspCandidate
 from ibrobot_msgs.srv import VerifyGrasp
+from manipulation_execution.geometry import axis_error_deg, quaternion_error_deg
 from manipulation_execution.grasp_geometry import fixed_finger_robust_gap, xyz_within_workspace
 from manipulation_execution.pick_executor_models import (
     BaseSceneGeometry,
@@ -24,7 +25,6 @@ from manipulation_execution.pick_executor_models import (
     PickFlowError,
     PreparedCandidate,
 )
-from manipulation_execution.so101_geometry import axis_error_deg, quaternion_error_deg
 
 
 class ExecutionPhase:

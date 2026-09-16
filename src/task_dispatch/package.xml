@@ -6,7 +6,7 @@
   <description>
     Task-level execution framework for IB-Robot.
     Orchestrates sequential task plans (waypoints + gripper + waits)
-    by delegating arm motion to moveit_gateway and gripper control
+    by delegating arm motion to public runtime services (or the legacy moveit_gateway) and gripper control
     to ros2_control trajectory controllers.
 
     Planners (visual_grasp, VoxPoser, etc.) are action clients that

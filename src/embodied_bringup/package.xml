@@ -19,7 +19,7 @@
   <exec_depend>perception_service</exec_depend>
   <exec_depend>manipulation_service</exec_depend>
   <exec_depend>manipulation_execution</exec_depend>
-  <exec_depend>robot_moveit</exec_depend>
+  <exec_depend>robot_runtime</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

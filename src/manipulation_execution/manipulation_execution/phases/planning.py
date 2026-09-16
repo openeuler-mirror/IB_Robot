@@ -27,7 +27,6 @@ from manipulation_execution.pick_executor_models import (
     PlannerSceneGeometry,
     RankedCandidate,
 )
-from manipulation_execution.so101_geometry import gripper_geometry_metrics_batch
 
 
 class PlanningPhase:
@@ -392,7 +391,7 @@ class PlanningPhase:
                 )
             minimum_clearance = float(self._target_geometry.get("tabletop_clearance_m", 0.0))
             try:
-                geometry_metrics = gripper_geometry_metrics_batch(
+                geometry_metrics = self._grasp_geometry.gripper_geometry_metrics_batch(
                     self._mesh_directory,
                     [
                         (

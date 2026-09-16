@@ -117,6 +117,7 @@ from robot_config.utils import (
     resolve_joint_names_from_config,
     resolve_lerobot_norm_mode,
 )
+from robot_runtime.model_metadata import build_joint_conversion_table_from_model, validate_public_conversion_metadata
 
 # ---------------------------------------------------------------------------
 
@@ -340,11 +341,11 @@ def _lerobot_metadata_entry(
     if not fingerprint:
         fingerprint = str(lerobot_meta.get("default_conversion_fingerprint", "") or "")
     if not fingerprint:
-        return "", {}
+        raise ValueError("new-format recording is missing its conversion fingerprint")
 
     conversion_meta = conversions.get(fingerprint)
     if not isinstance(conversion_meta, dict):
-        return fingerprint, {}
+        raise ValueError(f"recorded conversion fingerprint is not present: {fingerprint}")
     return fingerprint, conversion_meta
 
 
@@ -441,6 +442,23 @@ def _build_feature_conversion_table(
         return [(0.0, 1.0, 1.0, 0.0) if name is None else next(rows) for name in resolved_names]
 
     if conversion_meta:
+        if "description" in conversion_meta:
+            validate_public_conversion_metadata(conversion_meta)
+            feature_map = conversion_meta["feature_names"]
+            # The recorded order is joint names; the requested order is message
+            # field selectors. Compare through the selector -> joint mapping so
+            # both a raw-selector passthrough (missing contract joints) and a
+            # false order conflict are impossible.
+            if feature_names and feature_kind == "state":
+                recorded = list(feature_map.get("observation.state") or [])
+                requested = [name for name in resolved_names if name is not None]
+                if recorded and requested != recorded:
+                    raise ValueError("recorded public conversion feature order conflicts with requested feature order")
+            return build_in_feature_order(
+                lambda names: build_joint_conversion_table_from_model(
+                    conversion_meta["description"]["model"], names, conversion_meta["norm_mode"]
+                )
+            )
         norm_mode = normalize_lerobot_norm_mode(str(conversion_meta.get("norm_mode", "")))
         if norm_mode == "none":
             return []
@@ -456,6 +474,8 @@ def _build_feature_conversion_table(
             )
         raise ValueError("Dataset conversion metadata is missing calibration snapshot")
 
+    if fallback_config.get("new_format"):
+        raise ValueError("new-format recording is missing validated public conversion metadata")
     calibration_source_specs = fallback_config.get("calibration_source_specs") or []
     if calibration_source_specs:
         return build_in_feature_order(
@@ -970,6 +990,8 @@ def export_bags_to_lerobot(
             storage = info.get("storage_identifier") or "mcap"
             meta_dur_ns = int((info.get("duration") or {}).get("nanoseconds") or 0)
             conversion_fp, conversion_meta = _lerobot_metadata_entry(dataset_meta, info)
+            if isinstance(dataset_meta.get("lerobot"), dict):
+                fallback_conversion_config["new_format"] = True
 
             # Operator prompt (if present). Accept either old/new keys gracefully.
             prompt = ""

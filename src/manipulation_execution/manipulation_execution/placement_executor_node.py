@@ -325,7 +325,7 @@ class PlacementExecutorNode(Node):
         self.declare_parameter("action_name", "/manipulation/execute_place")
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("placement_execution_json", "{}")
-        self.declare_parameter("gripper_joint_name", "6")
+        self.declare_parameter("gripper_joint_name", "")
         self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_closed_position", 0.0)
         self.declare_parameter("gripper_position_tolerance", 0.05)
@@ -340,7 +340,12 @@ class PlacementExecutorNode(Node):
             configuration=self._config,
         )
         self._dispatch_binding = None
-        self._gripper_joint_name = str(self.get_parameter("gripper_joint_name").value)
+        self._gripper_joint_name = str(self.get_parameter("gripper_joint_name").value).strip()
+        if not self._gripper_joint_name:
+            raise RuntimeError(
+                "gripper_joint_name parameter is required: the SO-101 '6' default "
+                "was removed; declare the gripper joint explicitly"
+            )
         self._gripper_open = float(self.get_parameter("gripper_open_position").value)
         self._gripper_closed = float(self.get_parameter("gripper_closed_position").value)
         self._gripper_tolerance = float(self.get_parameter("gripper_position_tolerance").value)
