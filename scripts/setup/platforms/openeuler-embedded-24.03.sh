@@ -32,6 +32,7 @@ platform_prepare_host() {
         libvpx \
         libvpx-devel \
         nlohmann-json-devel \
+        "opencv >= 4.13" \
         yaml-cpp \
         yaml-cpp-devel
 
