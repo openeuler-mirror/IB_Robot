@@ -95,6 +95,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── rosclaw/                    # [子模块] OpenClaw 社交控制集成
 │   ├── sim_models/                 # 仿真场景模型 (Gazebo/MuJoCo)
 │   ├── model_utils/                # 模型工具库
+│   ├── torch_models/               # 自研 PyTorch 模型源码，每个模型独立目录
 │   ├── attention_viz/              # 注意力可视化工具
 │   ├── voice_asr_service/          # 语音识别服务
 │   ├── workflows/                  # CI/CD 配置

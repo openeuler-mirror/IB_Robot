@@ -96,6 +96,7 @@ IB_Robot/                           # Main Workspace
 │   ├── rosclaw/                    # [Submodule] OpenClaw social control integration
 │   ├── sim_models/                 # Simulation scene models (Gazebo/MuJoCo)
 │   ├── model_utils/                # Model utility library
+│   ├── torch_models/               # Self-developed PyTorch models, one directory per model
 │   ├── attention_viz/              # Attention visualization tool
 │   ├── voice_asr_service/          # Voice recognition service
 │   ├── workflows/                  # CI/CD configuration
