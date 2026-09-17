@@ -25,3 +25,4 @@ string workflow_digest
 uint32 workflow_step_index
 string root_lease_nonce
 string dispatch_nonce
+string trace_id

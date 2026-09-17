@@ -1,0 +1,16 @@
+# PrepareAgentPlan.srv - Capture and exact-snapshot validate a typed Agent plan.
+# The caller presents the returned immutable plan before confirmation.
+
+uint32 schema_version
+string request_id
+string raw_command
+WorkflowStep[] workflow_steps
+string execution_mode
+string trace_id
+---
+bool success
+bool allowed
+AgentPlan plan
+string error_code
+string message
+SkillDiagnostic[] diagnostics

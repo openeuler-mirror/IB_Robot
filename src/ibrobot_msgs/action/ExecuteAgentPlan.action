@@ -29,6 +29,7 @@ string plan_token
 string confirmation_token
 string task_id
 float32 timeout_sec
+string trace_id
 ---
 # --- Result ---
 bool success

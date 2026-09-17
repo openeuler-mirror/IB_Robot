@@ -98,6 +98,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/BeginWorkflowExecution.srv"
   "srv/FinalizeWorkflowExecution.srv"
   "srv/PlanAgentCommand.srv"
+  "srv/PrepareAgentPlan.srv"
   "srv/ValidateAgentPlan.srv"
   "srv/ConfirmAgentPlan.srv"
   "srv/StartVisualGame.srv"
