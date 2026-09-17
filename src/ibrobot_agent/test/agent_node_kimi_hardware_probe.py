@@ -7,6 +7,7 @@ import time
 import uuid
 
 import rclpy
+from presentation_probe import display_probe_plan
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -61,6 +62,7 @@ def main() -> None:
         start = time.monotonic()
         publisher.publish(message)
         _spin_until(node, lambda: any(item.get("request_id") == request_id for item in responses), 10.0)
+        display_probe_plan(node, events, request_id, "nod_yes", _spin_until, 150.0)
         _spin_until(
             node,
             lambda: any(

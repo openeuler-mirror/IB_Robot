@@ -8,6 +8,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from embodied_common.skill_request import validate_request_schema_version
+from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from ibrobot_msgs.msg import SkillRegistryEvent
 from ibrobot_msgs.srv import GetSkillGatewayStatus, GetSkillSnapshot, ValidatePrimitive, ValidateSkill
@@ -17,6 +18,8 @@ from safety_guard.rules import (
     validate_skill_request,
 )
 from safety_guard.snapshot_cache import SafetySnapshotCache, SnapshotCacheError, SnapshotIdentity
+
+_trace = create_trace_logger("ib_trace.safety")
 
 
 class SafetyGuardNode(Node):
@@ -268,6 +271,19 @@ class SafetyGuardNode(Node):
         response.actual_registry_digest = identity.registry_digest if identity else ""
 
     def _handle_validate_skill(self, request, response):
+        task_id = str(request.dispatch_binding.task_id)
+        with (
+            trace_scope(str(getattr(request.dispatch_binding, "trace_id", "") or task_id)),
+            trace_stage(
+                _trace,
+                "safety.skill",
+                task_id=task_id,
+                skill=str(request.skill_name),
+            ),
+        ):
+            return self._handle_validate_skill_traced(request, response)
+
+    def _handle_validate_skill_traced(self, request, response):
         expected = SnapshotIdentity(
             request.dispatch_binding.expected_registry_epoch,
             int(request.dispatch_binding.expected_registry_generation),
@@ -349,6 +365,19 @@ class SafetyGuardNode(Node):
         return response
 
     def _handle_validate_primitive(self, request, response):
+        task_id = str(request.dispatch_binding.task_id)
+        with (
+            trace_scope(str(getattr(request.dispatch_binding, "trace_id", "") or task_id)),
+            trace_stage(
+                _trace,
+                "safety.primitive",
+                task_id=task_id,
+                primitive=str(request.primitive_name),
+            ),
+        ):
+            return self._handle_validate_primitive_traced(request, response)
+
+    def _handle_validate_primitive_traced(self, request, response):
         expected = SnapshotIdentity(
             request.dispatch_binding.expected_registry_epoch,
             int(request.dispatch_binding.expected_registry_generation),

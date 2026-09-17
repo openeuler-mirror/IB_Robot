@@ -26,9 +26,6 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from std_srvs.srv import SetBool
 from tf2_ros import Buffer, TransformException, TransformListener
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
@@ -44,8 +41,14 @@ from embodied_common.dispatch_binding import (
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_V1, primitive_contract_for_version
 from embodied_common.skill_request import derive_skill_task_id, validate_request_schema_version
+from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
-from embodied_common.workflow_contracts import CanonicalWorkflowStep, compute_workflow_digest, normalize_workflow_steps
+from embodied_common.workflow_contracts import (
+    CanonicalWorkflowStep,
+    compute_workflow_digest,
+    normalize_workflow_steps,
+    validate_workflow_steps,
+)
 from ibrobot_msgs.action import (
     ExecuteNavigation,
     ExecuteTaskPlan,
@@ -69,6 +72,9 @@ from ibrobot_msgs.srv import (
     ValidateSkill,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -87,6 +93,7 @@ from skill_library.runtime_coordinator import SkillRegistryOwner
 EE_POSITION_TOLERANCE_M = 0.02
 SKILL_CANCEL_TIMEOUT = "SKILL_CANCEL_TIMEOUT"
 PRIMITIVE_CANCEL_CLEANUP_TIMEOUT = "CANCEL_CLEANUP_TIMEOUT"
+_trace = create_trace_logger("ib_trace.skill")
 WORKFLOW_STEP_PENDING = "pending"
 WORKFLOW_STEP_ACTIVE = "active"
 WORKFLOW_STEP_SUCCEEDED = "succeeded"
@@ -815,6 +822,8 @@ class SkillExecutorNode(Node):
             profile_name=self._skill_catalog_profile,
             context=context,
         )
+        # The snapshot dataclass always carries enabled_skill_names; keeping
+        # the consistency check unconditional preserves the startup invariant.
         self._validate_hri_runtime_catalog_consistency(snapshot)
         return snapshot
 
@@ -1501,6 +1510,7 @@ class SkillExecutorNode(Node):
         binding = request.dispatch_binding
         root_task_id = str(binding.root_task_id).strip()
         try:
+            validate_workflow_steps(request.workflow_steps)
             steps = normalize_workflow_steps(request.workflow_steps)
             duration_sec = self._task_budget_duration_sec(binding)
         except (TypeError, ValueError) as exc:
@@ -2747,6 +2757,20 @@ class SkillExecutorNode(Node):
             return error_code, token, None, False
 
     def _execute_primitive(self, goal_handle):
+        goal = goal_handle.request
+        task_id = _binding_task_id(goal)
+        with (
+            trace_scope(str(getattr(goal.dispatch_binding, "trace_id", "") or task_id)),
+            trace_stage(
+                _trace,
+                "skill.primitive",
+                task_id=task_id,
+                primitive=str(goal.primitive_name),
+            ),
+        ):
+            return self._execute_primitive_traced(goal_handle)
+
+    def _execute_primitive_traced(self, goal_handle):
         # See _execute_skill for the rationale of this test-fixture fallback.
         if not hasattr(self, "_gateway_policy"):
             return self._execute_primitive_unchecked(goal_handle)
@@ -4310,6 +4334,21 @@ class SkillExecutorNode(Node):
                 self._skill_goal_active = False
 
     def _execute_skill_gateway(self, goal_handle):
+        goal = goal_handle.request
+        task_id = _binding_task_id(goal)
+        trace_id = str(getattr(goal, "trace_id", "") or getattr(goal.dispatch_binding, "trace_id", "") or task_id)
+        with (
+            trace_scope(trace_id),
+            trace_stage(
+                _trace,
+                "skill.gateway",
+                task_id=task_id,
+                skill=str(goal.skill_name).strip(),
+            ),
+        ):
+            return self._execute_skill_gateway_traced(goal_handle)
+
+    def _execute_skill_gateway_traced(self, goal_handle):
         # _gateway_policy is always assigned in __init__ on the production path;
         # this branch only triggers for unit-test fixtures built via object.__new__
         # that bypass __init__. A node with a half-initialized __init__ would have

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_agent.contracts import (
+    MAX_REQUEST_TEXT_LENGTH,
     AgentEvent,
     AgentRequest,
     ExecutionResult,
@@ -58,6 +60,14 @@ def test_request_key_and_request_hash_are_canonical() -> None:
     assert request.to_key() == RequestKey("robot-a", "channel-1", "principal-1", "request-1")
     assert request_hash_preimage(request)["reply_to_request_id"] is None
     assert request_hash_text(request) == sha256_text(to_canonical_json(request_hash_preimage(request)))
+
+
+@pytest.mark.parametrize("character", ["x", "挥"])
+def test_request_text_limit_rejects_without_truncation(character):
+    text = character * MAX_REQUEST_TEXT_LENGTH
+    assert replace(_request(), text=text).text == text
+    with pytest.raises(ValueError, match="text must be at most"):
+        replace(_request(), text=text + character)
 
 
 def test_planner_outcome_rejects_invalid_skill_name_for_read_only() -> None:

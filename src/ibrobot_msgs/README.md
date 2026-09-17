@@ -140,9 +140,24 @@ plan/validate/confirm/execute 端点可达；且系统未处于初始编译、re
 `MOTION_NOT_AUTHORIZED`。状态服务永远不会暴露任一 nonce。
 
 Agent plan 的 `execution_mode` 是显式控制模式契约：`interactive_confirmation` 为旧分阶段入口默认值，
-`immediate_after_presentation` 仅由 `robot-skill run-workflow` 使用。模式在计划创建时捕获，写入
+`immediate_after_presentation` 由 `robot-skill run-workflow` 和 `ibrobot_agent` 孵化入口使用。模式在计划创建时捕获，写入
 `AgentPlan`，并由 `ConfirmAgentPlan` 精确匹配；它不授予或修改 `authorize_motion`。立即模式仍必须完成
 exact catalog、validation、计划展示并 flush、技术绑定、action admission、停止收敛和权威终态校验。
+
+CLI 在同步展示回调返回前完成 flush；孵化 Agent 则发布完整计划并等待客户端的 exact-plan 展示回执，
+收到有效回执后才调用 `ConfirmAgentPlan`。回执是展示传输屏障，不是运动授权或用户二次批准。
+没有客户端、展示失败或超时时不得自动跳过屏障。孵化 JSON 回执协议见 `ibrobot_agent/README.md`。
+
+### Agent plan 复合预检与 trace ID
+
+`PrepareAgentPlan.srv` 请求包含 schema_version=1、request_id、raw_command、typed workflow_steps、
+execution_mode 和 trace_id。响应包含 success、allowed、AgentPlan、error_code、message 和 diagnostics；
+只捕获 exact catalog plan 并做逐步只读 validation，不包含展示、确认、授权或执行。
+`PlanAgentCommand` / `ValidateAgentPlan` 仍保留用于分阶段诊断与兼容调用。
+
+`DispatchBinding.trace_id` 与 `ExecuteAgentPlan.Goal.trace_id` 为链路关联字段，不参与运动权限判断；
+空值按调用路径回退到 request/task ID。日志使用清洗后的副本，不改变业务幂等身份。
+新增同名 ROS 消息/action 字段改变 wire layout，生产者、消费者及生成接口须一致重建和部署。
 
 Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `ValidateSkill.srv`。状态服务不携带
 执行器依赖、ROS transport 名称、配置路径、primitive sequence、坐标或底层控制器状态；这些都不是

@@ -31,6 +31,48 @@ WORKFLOW_STEP_COMMON_FIELDS = _WORKFLOW_STEP_COMMON_FIELDS
 WORKFLOW_STEP_NAVIGATION_FIELDS = _WORKFLOW_STEP_NAVIGATION_FIELDS
 
 
+def validate_workflow_steps(steps: Sequence[Any], *, max_steps: int = 16) -> None:
+    """Validate raw workflow mappings before normalization can coerce values."""
+    if not isinstance(steps, Sequence) or isinstance(steps, str | bytes):
+        raise TypeError("steps must be a sequence")
+    if len(steps) > max_steps:
+        raise ValueError(f"steps cannot contain more than {max_steps} entries")
+    text_fields = {
+        "skill_name",
+        "target_name",
+        "container_name",
+        "place_name",
+        "motion_direction",
+        "arm_side",
+        "direction",
+    }
+    number_fields = {"motion_distance", "imitation_duration_sec", "timeout_sec", "distance", "degree", "x", "y", "yaw"}
+    for index, step in enumerate(steps):
+        if not isinstance(step, Mapping):
+            if not hasattr(step, "schema_version") or not hasattr(step, "skill_name"):
+                raise TypeError(f"steps[{index}] must be a mapping or typed WorkflowStep")
+            continue
+        schema_version = step.get("schema_version")
+        if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2}:
+            raise TypeError(f"steps[{index}].schema_version must be integer 1 or 2")
+        allowed_fields = _WORKFLOW_STEP_COMMON_FIELDS | (
+            _WORKFLOW_STEP_NAVIGATION_FIELDS if schema_version == 2 else set()
+        )
+        unknown_fields = sorted(set(step) - allowed_fields)
+        if unknown_fields:
+            raise ValueError(f"steps[{index}] contains unknown fields: {', '.join(unknown_fields)}")
+        for field_name in text_fields & set(step):
+            if not isinstance(step[field_name], str):
+                raise TypeError(f"steps[{index}].{field_name} must be a string")
+        for field_name in number_fields & set(step):
+            value = step[field_name]
+            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
+                raise TypeError(f"steps[{index}].{field_name} must be a finite number")
+        for field_name in {"has_x", "has_y", "has_yaw"} & set(step):
+            if not isinstance(step[field_name], bool):
+                raise TypeError(f"steps[{index}].{field_name} must be a boolean")
+
+
 @dataclass(frozen=True)
 class CanonicalWorkflowStep:
     schema_version: int
@@ -246,6 +288,7 @@ __all__ = [
     "compute_workflow_digest",
     "normalize_workflow_step",
     "normalize_workflow_steps",
+    "validate_workflow_steps",
     "workflow_digest_preimage",
 ]
 

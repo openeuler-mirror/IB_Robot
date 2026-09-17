@@ -1,21 +1,22 @@
 # embodied_agent 架构契约
 
-`embodied_agent` 是 Hermes-only 具身运行时中的 Agent plan 生命周期与 Workflow 编排包。
+`embodied_agent` 是具身运行时中的 Agent plan 生命周期与 Workflow 编排包，服务于 Hermes/CLI
+和 `ibrobot_agent` 孵化入口。
 它不拥有 Skill catalog、运动授权或物理执行权。
 
 ## 当前 ROS 节点
 
 | 节点 | 主要职责 |
 | --- | --- |
-| `agent_plan_node` | plan / validate / confirm / execute 生命周期，按顺序调用 Skill Gateway |
+| `agent_plan_node` | plan / prepare+validate / confirm / execute 生命周期，按顺序调用 Skill Gateway |
 | `sound_orientation_node` | 精确触发词或会话门控的周期声源转向；仅通过 Skill Gateway 调用 `nav_turn`，不经过 LLM/Agent plan |
 | `visual_game_gateway_node` | 非运动视觉游戏（分院帽等）的异步 start/query 控制平面，复用 `perception_service`，自带有界 ledger、结果校验和 `VisualGameEvent` 事件发布 |
 | `visual_game_announcer_node` | 视觉游戏终态的有界去重与 TTS 调用；不拥有声卡播放、不参与游戏准入或结果判定 |
 | `task_entry_node` | legacy ASR task adapter；不参与视觉游戏路由，当前不由 Hermes-only bringup 启动 |
 | `task_executor_node` | planned-task executor；当前不由 bringup 启动 |
 
-规则 `task_planner_node` 已删除；`vlm_task_planner` 也已删除。运行时唯一公开入口模式为
-`embodied.entry_mode: hermes`。
+规则 `task_planner_node` 已删除；`vlm_task_planner` 也已删除。运行时入口模式为
+`embodied.entry_mode: hermes` 或孵化模式 `agent`；自然语言理解属于上层 `ibrobot_agent`。
 
 ## 调用链
 
@@ -37,6 +38,11 @@ Hermes / robot-skill
         -> 本机临时 WAV -> /voice_tts/play -> 扬声器
 ```
 
+`/embodied/prepare_agent_plan` 是 Agent 生产路径使用的复合入口：它在同一个 exact catalog
+snapshot 上完成 plan capture 和逐步骤 read-only safety validation。旧的 `plan`/`validate`
+服务继续作为诊断和兼容入口；复合入口不包含 presentation、technical confirm、运动授权或
+execution admission。
+
 ## Agent plan 状态机
 
 ```text
@@ -46,11 +52,13 @@ PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
 - plan 捕获 exact catalog identity，并保存短时不可变 `AgentPlan`。
 - validate 对每个步骤执行只读 Safety 预检。
 - confirm 绑定 plan digest、task ID、registry identity 和绝对 task budget；这是内部技术绑定，不是用户二次确认门。
+- confirm 的调用方先完成 exact plan 展示：CLI 同步 flush；孵化 Agent 等待受信客户端的计划摘要/token 回执。
+  Gateway 不把展示回执视作运动授权，也不承担客户端渲染。
 - execute 复用确认时冻结的预算，通过 Gateway 执行 Skill 或 Workflow。
 - child 接受、取消或终态未知时保持 plan 为 `ACCEPTED`，不得自动重试或释放可能仍有效的 root lease。
 
-Agent 必须通过 `robot-skill run-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
-`raw_command` 只作为审计文本和幂等请求摘要的一部分。
+Hermes 通过 `robot-skill run-workflow` 提交结构化步骤；孵化 Agent 通过 `RosBridge` 调用同一组
+Gateway plan 接口。本包不解析自然语言，`raw_command` 只作为审计文本和幂等请求摘要的一部分。
 
 每个 `WorkflowStep` 必须显式携带 `schema_version`。非导航旧合同使用 v1，导航 typed step 使用 v2；CLI 拒绝缺少
 版本的导航步骤，不会从 `domain` 推导或重写版本。IDL/生成接口、wire preflight、执行器、CLI 和 Agent skill 文档

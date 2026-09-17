@@ -12,6 +12,7 @@ from ibrobot_agent.planner import (
     RulePlanner,
     build_planner_messages,
     parse_planner_outcome,
+    read_only_outcome,
 )
 
 
@@ -60,6 +61,22 @@ def test_rule_planner_asks_for_a_specific_skill():
 
     assert outcome.kind == "needs_clarification"
     assert outcome.missing_fields == ("skill_name",)
+
+
+@pytest.mark.parametrize(
+    "text, query_kind",
+    [("当前状态如何？", "status"), ("list skills", "list_skills"), ("有哪些姿态", "list_poses")],
+)
+def test_rule_planner_and_read_only_router_agree(text, query_kind):
+    outcome = read_only_outcome(text)
+    assert outcome.query_kind == query_kind
+    assert RulePlanner().plan(_request(text), {}, {}, threading.Event()) == outcome
+
+
+@pytest.mark.parametrize("text", ["不要查询当前状态", "如果查询当前状态会怎样？", "do not list skills"])
+def test_read_only_router_preserves_negation_and_hypothetical_guards(text):
+    assert read_only_outcome(text) is None
+    assert RulePlanner().plan(_request(text), {}, {}, threading.Event()).kind == "conversation"
 
 
 def test_parser_rejects_duplicate_json_keys():

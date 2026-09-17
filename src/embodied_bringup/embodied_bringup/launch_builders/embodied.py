@@ -389,6 +389,7 @@ def generate_embodied_nodes(
                     "finalize_workflow_service": common_params["finalize_workflow_service"],
                     "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                     "plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                    "prepare_plan_service": embodied_config.get("prepare_plan_service", "/embodied/prepare_agent_plan"),
                     "validate_plan_service": embodied_config.get(
                         "validate_plan_service", "/embodied/validate_agent_plan"
                     ),
@@ -424,6 +425,7 @@ def generate_embodied_nodes(
                         "max_session_turns": agent_config.get("max_session_turns", 12),
                         "clarification_ttl_sec": agent_config.get("clarification_ttl_sec", 300.0),
                         "event_queue_size": agent_config.get("event_queue_size", 128),
+                        "presentation_timeout_sec": float(agent_config.get("presentation_timeout_sec", 30.0)),
                         "allowed_skills_json": json.dumps(list(agent_config.get("test_allowlist", []))),
                         "simulation_mode": bool(use_sim),
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
@@ -433,6 +435,9 @@ def generate_embodied_nodes(
                         "gateway_validate_skill_service": common_params["validate_skill_service"],
                         "gateway_skill_action": common_params["skill_action_name"],
                         "gateway_plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                        "gateway_prepare_plan_service": embodied_config.get(
+                            "prepare_plan_service", "/embodied/prepare_agent_plan"
+                        ),
                         "gateway_validate_plan_service": embodied_config.get(
                             "validate_plan_service", "/embodied/validate_agent_plan"
                         ),

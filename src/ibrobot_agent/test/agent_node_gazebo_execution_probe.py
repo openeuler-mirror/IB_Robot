@@ -8,6 +8,7 @@ import time
 import uuid
 
 import rclpy
+from presentation_probe import display_probe_plan
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -62,6 +63,7 @@ def main() -> None:
         )
         publisher.publish(message)
         _spin_until(node, lambda: any(item.get("request_id") == request_id for item in responses), 10.0)
+        display_probe_plan(node, events, request_id, "nod_yes", _spin_until, 30.0)
         _spin_until(
             node,
             lambda: any(
@@ -114,6 +116,7 @@ def main() -> None:
             ensure_ascii=False,
         )
         publisher.publish(wave_message)
+        display_probe_plan(node, events, stop_request_id, "wave_hello", _spin_until, 30.0)
         _spin_until(
             node,
             lambda: any(

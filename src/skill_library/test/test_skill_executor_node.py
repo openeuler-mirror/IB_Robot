@@ -290,6 +290,8 @@ def test_runtime_snapshot_uses_configured_context_schema(monkeypatch, context_sc
     def compile_catalog(_compiler, _source, *, profile_name, context):
         captured["profile_name"] = profile_name
         captured["context"] = context
+        # Test double stands in for SkillCatalogSnapshot; enabled_skill_names
+        # keeps the runtime/catalog consistency validation meaningful.
         return snapshot
 
     monkeypatch.setattr(skill_executor_node.SkillCatalogCompiler, "compile", compile_catalog)

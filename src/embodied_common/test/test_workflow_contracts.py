@@ -4,6 +4,7 @@ from embodied_common.workflow_contracts import (
     CanonicalWorkflowStep,
     compute_workflow_digest,
     normalize_workflow_steps,
+    validate_workflow_steps,
     workflow_digest_preimage,
 )
 
@@ -123,3 +124,8 @@ def test_workflow_v1_rejects_navigation_parameters():
 def test_workflow_step_rejects_unknown_fields():
     with pytest.raises(ValueError, match="unknown fields.*unexpected"):
         normalize_workflow_steps([{"schema_version": 1, "skill_name": "open_gripper_skill", "unexpected": True}])
+
+
+def test_raw_workflow_validation_is_shared_before_normalization():
+    with pytest.raises(TypeError, match="skill_name must be a string"):
+        validate_workflow_steps([{"schema_version": 1, "skill_name": 1}])

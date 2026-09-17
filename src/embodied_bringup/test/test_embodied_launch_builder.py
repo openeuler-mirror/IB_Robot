@@ -444,6 +444,7 @@ def test_agent_entry_mode_adds_only_agent_entry_node():
     assert params["execution_enabled"] is False
     assert _decode_launch_json_string(_decode_launch_string(params["allowed_skills_json"])) == ["wave_hello"]
     assert params["simulation_mode"] is False
+    assert params["presentation_timeout_sec"] == 30.0
 
 
 def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
@@ -455,6 +456,7 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
         "ledger_path": "/tmp/ibrobot-agent-test.sqlite3",
         "conversation_path": "/tmp/ibrobot-agent-conversation-test.sqlite3",
         "deployment_lock_path": "/tmp/ibrobot-agent-test.lock",
+        "presentation_timeout_sec": 12.0,
     }
 
     nodes = generate_embodied_nodes(
@@ -469,6 +471,7 @@ def test_agent_entry_mode_receives_use_sim_as_simulation_mode():
     nodes_by_name = {vars(node)["_Node__node_name"]: node for node in nodes}
     params = _normalize_launch_param_mapping(vars(nodes_by_name["ibrobot_agent_node"])["_Node__parameters"][0])
     assert params["simulation_mode"] is True
+    assert params["presentation_timeout_sec"] == 12.0
 
 
 def test_non_moveit_game_launches_only_gateway_and_perception():

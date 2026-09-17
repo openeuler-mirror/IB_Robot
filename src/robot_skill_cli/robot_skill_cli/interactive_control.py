@@ -26,7 +26,10 @@ from embodied_common.agent_execution_contract import (
     validate_agent_execution_mode,
 )
 from embodied_common.agent_terminal_contract import GOAL_CANCELED, TERMINAL_GOAL_STATUSES, classify_agent_terminal
+from embodied_common.tracing import create_trace_logger, sanitize_trace_id, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
+
+_trace = create_trace_logger("ib_trace.agent_control")
 
 # Closed natural-language grammars. Motion-enabling intents require an exact match
 # after normalization; unknown text never acts.
@@ -180,6 +183,25 @@ class InteractiveController:
         self._result_future = None
         self._submission_started = False
 
+    def _prepare_plan(self, raw_command: str, normalized: list[dict[str, Any]], request_id: str) -> dict[str, Any]:
+        prepare = getattr(self._bridge, "prepare_agent_plan", None)
+        if prepare is None:
+            return self._bridge.plan_agent_command(
+                request_id=request_id,
+                raw_command=raw_command,
+                workflow_steps=normalized,
+                timeout_sec=self._rpc(),
+                execution_mode=self._execution_mode,
+            )
+        return prepare(
+            request_id=request_id,
+            raw_command=raw_command,
+            workflow_steps=normalized,
+            timeout_sec=self._rpc(),
+            execution_mode=self._execution_mode,
+            trace_id=request_id,
+        )
+
     @property
     def state(self) -> str:
         with self._state_lock:
@@ -275,14 +297,9 @@ class InteractiveController:
         if not request_id:
             raise InteractiveControlError("SKILL_SCHEMA_INVALID", "request_id must be non-empty")
         task_id = self._id_factory()
-        result = self._bridge.plan_agent_command(
-            request_id=request_id,
-            raw_command=raw_command,
-            workflow_steps=normalized,
-            timeout_sec=self._rpc(),
-            execution_mode=self._execution_mode,
-        )
-        if not result.get("success"):
+        with trace_scope(request_id), trace_stage(_trace, "agent_control.plan", task_id=task_id):
+            result = self._prepare_plan(raw_command, normalized, request_id)
+        if not result.get("success") or result.get("allowed") is False:
             raise InteractiveControlError(
                 str(result.get("error_code") or "SKILL_SCHEMA_INVALID"),
                 str(result.get("message") or "plan_agent_command failed"),
@@ -322,12 +339,20 @@ class InteractiveController:
             "registry_digest": plan_identity[2],
             "expected_step_count": len(plan_steps),
             "task_id": task_id,
+            "trace_id": request_id,
         }
         with self._state_lock:
             self._pending = pending
+            self._pending["validated"] = bool(result.get("allowed") is True)
             self._confirmed = None
             self._terminal = None
             self._state = STOPPING if self._stop_requested_now() else PREPARED
+        _trace.info(
+            "[bind] trace_id=%s task_id=%s plan_id=%s",
+            sanitize_trace_id(request_id),
+            sanitize_trace_id(task_id),
+            sanitize_trace_id(plan["plan_id"]),
+        )
         return self._presentation()
 
     @staticmethod
@@ -402,36 +427,37 @@ class InteractiveController:
                 "confirmation_token": "",
                 "stopped_before_execution": True,
             }
-        try:
-            validation = self._bridge.validate_agent_plan(
-                plan_token=self._pending["plan_token"],
-                timeout_sec=self._status_timeout_sec,
-            )
-        except Exception as exc:
-            with self._state_lock:
-                self._clear_operation()
-                self._state = FAILED
-            raise InteractiveControlError("SERVER_UNAVAILABLE", "plan validation response was unavailable") from exc
-        if not validation.get("allowed"):
-            raise InteractiveControlError(
-                str(validation.get("error_code") or "SKILL_VALIDATION_FAILED"),
-                str(validation.get("message") or "validate_agent_plan failed"),
-            )
-        if self._stop_requested_now():
-            self._state = STOPPING
-            return {
-                "state": self._state,
-                "task_id": self._pending["task_id"],
-                "confirmation_token": "",
-                "stopped_before_execution": True,
-            }
-        expected_plan = (self._pending["plan_id"], self._pending["plan_digest"])
-        actual_plan = (str(validation.get("plan_id", "")), str(validation.get("plan_digest", "")))
-        if actual_plan != expected_plan:
-            raise InteractiveControlError(
-                "SKILL_SNAPSHOT_DIGEST_MISMATCH",
-                "validate_agent_plan returned a different plan identity",
-            )
+        if not self._pending.get("validated", False):
+            try:
+                validation = self._bridge.validate_agent_plan(
+                    plan_token=self._pending["plan_token"],
+                    timeout_sec=self._status_timeout_sec,
+                )
+            except Exception as exc:
+                with self._state_lock:
+                    self._clear_operation()
+                    self._state = FAILED
+                raise InteractiveControlError("SERVER_UNAVAILABLE", "plan validation response was unavailable") from exc
+            if not validation.get("allowed"):
+                raise InteractiveControlError(
+                    str(validation.get("error_code") or "SKILL_VALIDATION_FAILED"),
+                    str(validation.get("message") or "validate_agent_plan failed"),
+                )
+            if self._stop_requested_now():
+                self._state = STOPPING
+                return {
+                    "state": self._state,
+                    "task_id": self._pending["task_id"],
+                    "confirmation_token": "",
+                    "stopped_before_execution": True,
+                }
+            expected_plan = (self._pending["plan_id"], self._pending["plan_digest"])
+            actual_plan = (str(validation.get("plan_id", "")), str(validation.get("plan_digest", "")))
+            if actual_plan != expected_plan:
+                raise InteractiveControlError(
+                    "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+                    "validate_agent_plan returned a different plan identity",
+                )
         task_budget_sec = float(self._fresh_status["task_budget_sec"])
         try:
             result = self._bridge.confirm_agent_plan(
@@ -644,6 +670,7 @@ class InteractiveController:
                 confirmation_token=confirmation_token,
                 task_id=task_id,
                 timeout_sec=timeout_sec,
+                trace_id=self._pending["trace_id"],
                 feedback_callback=guarded_feedback,
             )
         except Exception as exc:

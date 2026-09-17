@@ -173,6 +173,71 @@ class SQLiteRequestStore(RequestStore):
             ).fetchone()
             return row is not None
 
+    def recover_interrupted_requests(self, robot_scope: str) -> int:
+        """Converge abandoned requests before the deployment owner accepts work.
+
+        A submitted intent is not proof of either dispatch or terminal state.
+        Preserve its TaskRef and quarantine until an operator reconciles it with
+        the Gateway. Requests known not to have been submitted are never replayed.
+        """
+        with self._transaction():
+            rows = self._connection.execute(
+                """SELECT * FROM requests WHERE robot_scope = ?
+                AND state IN ('RECEIVED', 'PLANNING', 'PROPOSAL_READY', 'PREPARING', 'MAY_EXECUTE', 'RUNNING', 'STOPPING')
+                ORDER BY created_at, request_id""",
+                (robot_scope,),
+            ).fetchall()
+            recovered = 0
+            for row in rows:
+                if row["state"] not in _ACTIVE_STATES:
+                    continue
+                if row["terminal_json"]:
+                    raise RequestStoreError("STORAGE_UNAVAILABLE", "active request already has a terminal record")
+                record = self._row_to_record(row)
+                uncertain = record.may_have_submitted or record.state == "RUNNING"
+                if uncertain:
+                    state = "UNKNOWN"
+                    result = ExecutionResult(
+                        "unknown",
+                        record.task_ref,
+                        "ROBOT_QUARANTINED",
+                        "Agent restarted with an unfinished submission; reconcile the saved task with the Gateway",
+                        {"recovered_from": record.state, "may_have_submitted": True},
+                    )
+                elif record.stop_requested:
+                    state = "CANCELLED_BEFORE_EXECUTION"
+                    result = ExecutionResult(
+                        "cancelled",
+                        None,
+                        "CANCELLED_BEFORE_EXECUTION",
+                        "Agent restarted after a pre-submission stop",
+                        {"submitted": False},
+                    )
+                else:
+                    state = "FAILED"
+                    result = ExecutionResult(
+                        "failed",
+                        record.task_ref,
+                        "AGENT_RESTARTED_BEFORE_SUBMISSION",
+                        "Agent restarted before submission; the interrupted request was not replayed",
+                        {"submitted": False},
+                    )
+                self._connection.execute(
+                    """
+                    UPDATE requests SET state = ?, terminal_json = ?, updated_at = ?
+                    WHERE robot_scope = ? AND channel_id = ? AND principal_id = ? AND request_id = ?
+                    """,
+                    (state, _execution_result_to_json(result), self._clock(), *_request_key_tuple(record.key)),
+                )
+                self._append_event_locked(
+                    record.key,
+                    event_type="restart_recovery",
+                    state=state,
+                    detail={"previous_state": record.state, "result": result.to_dict()},
+                )
+                recovered += 1
+            return recovered
+
     def begin_planning(self, key: RequestKey, *, expected_generation: int) -> RequestRecord:
         with self._transaction():
             row = self._fetch_row(key)
@@ -271,7 +336,7 @@ class SQLiteRequestStore(RequestStore):
                 return self._row_to_record(row)
             if row["state"] not in _ACTIVE_STATES:
                 raise RequestStoreError("REQUEST_ID_CONFLICT", "request is no longer active")
-            new_state = "STOPPING" if row["state"] != "RECEIVED" else "STOPPING"
+            new_state = "STOPPING"
             now = self._clock()
             self._connection.execute(
                 """

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any
 
@@ -214,7 +215,9 @@ class FakeBridge:
     def wait_for_execute_plan_server(self, *, timeout_sec):
         return self.server_ready
 
-    def send_agent_plan_goal(self, *, plan_token, confirmation_token, task_id, timeout_sec, feedback_callback):
+    def send_agent_plan_goal(
+        self, *, plan_token, confirmation_token, task_id, timeout_sec, trace_id="", feedback_callback
+    ):
         self._record(
             "send_agent_plan_goal",
             {"plan_token": plan_token, "confirmation_token": confirmation_token, "task_id": task_id},
@@ -331,6 +334,20 @@ def test_prepare_then_confirm_presentation_and_nl_grammar(rig):
     assert confirm_call["plan_token"] == "ptok-id-1"
     assert confirm_call["plan_digest"] == "pdig"
     assert confirm_call["task_id"] == "id-2"
+
+
+def test_binding_log_sanitizes_ids_without_changing_request_identity(rig, caplog, monkeypatch):
+    controller, bridge = rig
+    controller.discover()
+    request_id = "Bearer synthetic-marker"
+    monkeypatch.setattr(ic._trace, "propagate", True)
+    with caplog.at_level(logging.INFO, logger=ic._trace.name):
+        presentation = controller.prepare_workflow("nod", [_step("nod_yes")], request_id=request_id)
+    plan_call = next(kwargs for method, kwargs in bridge.calls if method == "plan_agent_command")
+    assert plan_call["request_id"] == request_id
+    assert presentation["plan_id"] == "pid-" + request_id
+    assert "synthetic-marker" not in caplog.text
+    assert "[bind] trace_id=unknown" in caplog.text
 
 
 def test_execute_success_reaches_succeeded_terminal(rig):

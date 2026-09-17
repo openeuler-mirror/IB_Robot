@@ -14,6 +14,29 @@ from typing import Any
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_agent.contracts import PlannerIdentity, PlannerOutcome, planner_outcome_from_mapping
 
+_NEGATION_MARKERS = ("不要", "别", "不想", "do not", "don't")
+_HYPOTHETICAL_MARKERS = ("如果", "假如", "假设")
+_READ_ONLY_QUERIES = (
+    ("status", ("当前状态", "状态怎么样", "状态如何", "status"), "我来查看当前机器人状态。"),
+    (
+        "list_skills",
+        ("有什么能力", "哪些能力", "有哪些技能", "技能列表", "能力列表", "list skills"),
+        "我来查看当前机器人技能。",
+    ),
+    ("list_poses", ("有哪些姿态", "命名姿态", "姿态列表", "list poses"), "我来查看当前机器人姿态。"),
+)
+
+
+def read_only_outcome(text: str) -> PlannerOutcome | None:
+    """Recognize factual queries before planning, excluding negated or hypothetical requests."""
+    folded = text.casefold()
+    if any(token in folded for token in (*_NEGATION_MARKERS, *_HYPOTHETICAL_MARKERS)):
+        return None
+    for query_kind, tokens, message in _READ_ONLY_QUERIES:
+        if any(token in folded for token in tokens):
+            return PlannerOutcome(kind="read_only", user_message=message, query_kind=query_kind)
+    return None
+
 
 class PlannerParseError(ValueError):
     """Raised when a model response cannot be parsed into a planner outcome."""
@@ -188,20 +211,19 @@ class RulePlanner:
             raise PlannerParseError("planning cancelled")
         text = request.text.strip()
         folded = text.casefold()
-        if any(token in folded for token in ("不要", "别", "不想", "do not", "don't")):
+        if any(token in folded for token in _NEGATION_MARKERS):
             return PlannerOutcome(
                 kind="conversation",
                 user_message="我不会执行被明确否定的动作。请直接说明你希望机器人做什么。",
             )
-        if any(token in folded for token in ("吗", "能不能", "会不会", "如果", "假如", "假设", "?", "？")):
+        query = read_only_outcome(text)
+        if query is not None:
+            return query
+        if any(token in folded for token in ("吗", "能不能", "会不会", *_HYPOTHETICAL_MARKERS, "?", "？")):
             return PlannerOutcome(
                 kind="conversation",
                 user_message="这是能力询问或假设，不会触发机器人动作。",
             )
-        if any(token in folded for token in ("有哪些能力", "有哪些技能", "能力列表", "list skills")):
-            return PlannerOutcome(kind="read_only", user_message="我来查看当前机器人的能力。", query_kind="list_skills")
-        if any(token in folded for token in ("当前状态", "状态怎么样", "status")):
-            return PlannerOutcome(kind="read_only", user_message="我来查看当前机器人的状态。", query_kind="status")
         if any(token in folded for token in ("你好", "谢谢", "hello", "hi")) and not self._find_skills(folded):
             return PlannerOutcome(kind="conversation", user_message="你好，我可以帮助你控制 SO-101。")
         if any(token in folded for token in ("做一个动作", "做个动作", "动一下", "do something")):
@@ -244,4 +266,5 @@ __all__ = [
     "build_planner_messages",
     "parse_planner_outcome",
     "planner_outcome_from_payload",
+    "read_only_outcome",
 ]

@@ -1192,6 +1192,7 @@ robot:
       max_session_turns: 12       # 会话记忆滚动窗口
       clarification_ttl_sec: 300.0  # 一次性澄清上下文有效期
       event_queue_size: 128
+      presentation_timeout_sec: 30.0  # exact plan 展示完成回执等待上限
       planner:
         mode: vlm                 # rule（仅仿真执行）| vlm
         provider: kimicode        # kimicode | openai_compatible
@@ -1217,6 +1218,7 @@ robot:
 | `agent.ledger_path` / `conversation_path` / `deployment_lock_path` | 非空路径 |
 | `agent.max_session_turns` / `event_queue_size` | 正整数 |
 | `agent.clarification_ttl_sec` | 正数 |
+| `agent.presentation_timeout_sec` | 有限正数，默认 30 秒；未收到 exact plan 展示完成回执时禁止 confirm/execute |
 | `agent.planner.mode` | `rule` 或 `vlm` |
 | `agent.planner.provider` | vlm 模式下 `kimicode` 或 `openai_compatible` |
 | `agent.planner.base_url` / `model` | vlm 模式下必填非空 |

@@ -81,6 +81,12 @@ ibrobot_msgs / rclpy
 - `embodied_common.agent_execution_contract.INTERACTIVE_CONFIRMATION`
 - `embodied_common.agent_execution_contract.IMMEDIATE_AFTER_PRESENTATION`
 - `embodied_common.agent_execution_contract.validate_agent_execution_mode`
+- `embodied_common.workflow_contracts.validate_workflow_steps`：原始 typed workflow 的共享校验入口。
+- `embodied_common.tracing.trace_scope` / `trace_stage`：Agent 控制面的有界阶段耗时日志，主 trace ID
+  与附加字段共用清洗规则，拒绝常见凭据标记和控制字符；该规则不替代通用密钥检测，不修改业务幂等键。
+  边界：结构化 `IBTRACE1` 插桩与分析链路属于 `ibrobot_tracing` 包；本模块只产生 `[hop]` 阶段记录，
+  其进程内 ContextVar 为 `embodied_stage_trace_id`，与 `ibrobot_tracing` 的 `ibrobot_trace_id`
+  互不共享；跨子系统关联统一走 `DispatchBinding.trace_id` 消息字段。
 
 Agent execution mode is captured when an Agent plan is created and must match
 at confirmation. `immediate_after_presentation` only removes the second user

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from ibrobot_agent.chat_tui import ChatState, _build_key_bindings, _event_matches_session, parse_local_command
 
 
@@ -197,7 +199,10 @@ def test_chat_prompt_loop_uses_prompt_toolkit_stdout_patch():
 
     from ibrobot_agent import chat_tui
 
-    assert "with patch_stdout()" in inspect.getsource(chat_tui.run_chat)
+    source = inspect.getsource(chat_tui.run_chat)
+    assert "patch_stdout()" in source
+    assert "async with in_terminal()" in source
+    assert "session.app.output.flush()" in source
 
 
 def test_chat_output_formats_all_message_kinds_as_strings(monkeypatch):
@@ -223,3 +228,126 @@ def test_chat_startup_diagnostics_mentions_event_subscription():
     from ibrobot_agent import chat_tui
 
     assert "agent_event订阅已建立" in inspect.getsource(chat_tui._print_startup_diagnostics)
+
+
+@pytest.mark.parametrize("failure", [None, "writer", "digest", "identity"])
+def test_presentation_receipt_only_follows_exact_plan_flush(failure):
+    from types import SimpleNamespace
+
+    from ibrobot_agent.chat_tui import _render_output_item
+    from ibrobot_agent.presentation import presentation_digest
+
+    state = ChatState("session")
+    state.register("request")
+    plan = {
+        "steps": [{"schema_version": 1, "skill_name": "nod_yes"}],
+        "task_ref": {"task_id": "task", "plan_id": "plan", "registry_digest": "rdig"},
+    }
+    payload = {
+        "request_key": {
+            "request_id": "request",
+            "channel_id": state.channel_id,
+            "principal_id": state.principal_id,
+            "robot_scope": state.robot_scope,
+        },
+        "event_type": "presentation",
+        "detail": {
+            "presentation": plan,
+            "presentation_digest": presentation_digest(plan),
+            "receipt_token": "token",
+        },
+    }
+    calls = []
+    node = SimpleNamespace(state=state, acknowledge_presentation=lambda _: calls.append("receipt"))
+
+    def write_and_flush(line):
+        assert "nod_yes" in line and "task" in line and "rdig" in line
+        if failure == "writer":
+            raise OSError("output failed")
+        calls.append("flushed")
+
+    if failure == "digest":
+        payload["detail"]["presentation"]["steps"][0]["skill_name"] = "wave_hello"
+    if failure == "identity":
+        payload["request_key"]["principal_id"] = "other"
+    if failure in {"digest", "writer"}:
+        with pytest.raises((ValueError, OSError)):
+            _render_output_item(node, "event", payload, writer=write_and_flush)
+    else:
+        _render_output_item(node, "event", payload, writer=write_and_flush)
+    assert calls == ([] if failure else ["flushed", "receipt"])
+
+
+def test_async_chat_renderer_flushes_before_receipt(monkeypatch):
+    import asyncio
+
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.input import DummyInput
+    from prompt_toolkit.output import DummyOutput
+
+    from ibrobot_agent import chat_tui
+    from ibrobot_agent.presentation import presentation_digest
+
+    calls = []
+
+    class Output(DummyOutput):
+        def write(self, data):
+            if "[Exact plan]" in data:
+                calls.append("plan_written")
+
+        def flush(self):
+            if calls and calls[-1] == "plan_written":
+                calls.append("flushed")
+
+    class LocalChat(chat_tui.AgentChatNode):
+        def wait_ready(self, timeout_sec=60.0):
+            self.state.connected = True
+
+        def send(self, text):
+            self.state.register("render-test")
+            plan = {"steps": [{"schema_version": 1, "skill_name": "nod_yes"}]}
+            self._output.put(
+                (
+                    "event",
+                    {
+                        "event_type": "presentation",
+                        "request_key": {
+                            "request_id": "render-test",
+                            "channel_id": self.state.channel_id,
+                            "principal_id": self.state.principal_id,
+                            "robot_scope": self.state.robot_scope,
+                        },
+                        "detail": {
+                            "presentation": plan,
+                            "presentation_digest": presentation_digest(plan),
+                            "receipt_token": "token",
+                        },
+                    },
+                )
+            )
+            return "render-test"
+
+        def acknowledge_presentation(self, payload):
+            assert calls == ["plan_written", "flushed"]
+            calls.append("receipt")
+            self.state.finish("render-test")
+
+    session = PromptSession(input=DummyInput(), output=Output())
+    submitted = False
+
+    async def prompt(*args, **kwargs):
+        nonlocal submitted
+        if not submitted:
+            submitted = True
+            return "nod"
+        for _ in range(100):
+            if "receipt" in calls:
+                return "/quit"
+            await asyncio.sleep(0.01)
+        raise RuntimeError("renderer did not complete")
+
+    monkeypatch.setattr(session, "prompt_async", prompt)
+    monkeypatch.setattr(chat_tui, "PromptSession", lambda **kwargs: session)
+    monkeypatch.setattr(chat_tui, "AgentChatNode", LocalChat)
+    chat_tui.run_chat(session_id="render-test")
+    assert calls == ["plan_written", "flushed", "receipt"]

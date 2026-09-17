@@ -9,6 +9,7 @@ import pytest
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_agent.contracts import AgentRequest, ExecutionResult, PlannerIdentity, PlannerOutcome
 from ibrobot_agent.planner import RulePlanner
+from ibrobot_agent.presentation import PresentationGate
 from ibrobot_agent.request_store import SQLiteRequestStore
 from ibrobot_agent.service import AgentService
 
@@ -79,6 +80,21 @@ class FailingEvents(Events):
         raise RuntimeError("event transport unavailable")
 
 
+class RenderedEvents(Events):
+    def __init__(self):
+        super().__init__()
+        self.gate = PresentationGate(0.5)
+
+    def publish(self, event):
+        super().publish(event)
+        if event.event_type == "presentation":
+            assert self.gate.acknowledge(
+                event.request_key,
+                digest=event.detail["presentation_digest"],
+                token=event.detail["receipt_token"],
+            )
+
+
 class FailingFinishStore(SQLiteRequestStore):
     def finish(self, *args, **kwargs):
         raise RuntimeError("ledger unavailable")
@@ -89,6 +105,7 @@ class FakeExecution:
         self.status = status
         self.calls = 0
         self.stop_calls = 0
+        self.submitted = 0
 
     def execute(
         self,
@@ -114,6 +131,7 @@ class FakeExecution:
             )
         )
         submission_callback(task_ref, {"confirmed": True})
+        self.submitted += 1
         return ExecutionResult(self.status, task_ref, "" if self.status == "succeeded" else "FAILED", "done", {})
 
     def request_stop(self, request_key):
@@ -385,7 +403,7 @@ def test_skill_query_uses_deterministic_path_and_bounds_message(tmp_path):
 def test_execution_persists_presentation_submission_and_terminal(tmp_path):
     from ibrobot_agent.contracts import PlannerOutcome
 
-    events = Events()
+    events = RenderedEvents()
     execution = FakeExecution()
     service = AgentService(
         planner=FakePlanner(
@@ -400,6 +418,7 @@ def test_execution_persists_presentation_submission_and_terminal(tmp_path):
         store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
         execution=execution,
         event_sink=events,
+        presentation=events.gate,
         execution_enabled=True,
         allowed_skills={"wave_hello"},
     )
@@ -419,10 +438,40 @@ def test_execution_persists_presentation_submission_and_terminal(tmp_path):
         service.close()
 
 
+def test_natural_language_wave_routes_to_skill_execution(tmp_path):
+    execution = FakeExecution()
+    events = RenderedEvents()
+    service = AgentService(
+        planner=RulePlanner(),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
+        execution=execution,
+        event_sink=events,
+        presentation=events.gate,
+        execution_enabled=True,
+        allowed_skills={"wave_hello"},
+    )
+    try:
+        request = _request(text="请挥手")
+        assert service.send_message(request).accepted
+        for _ in range(200):
+            record = service.get_request(request.to_key())
+            if record.state == "SUCCEEDED":
+                break
+            time.sleep(0.01)
+        assert record.state == "SUCCEEDED"
+        assert execution.calls == 1
+        assert record.task_ref is not None
+        assert record.may_have_submitted
+    finally:
+        service.close()
+
+
 def test_unknown_execution_quarantines_robot_scope(tmp_path):
     from ibrobot_agent.contracts import PlannerOutcome
 
     execution = FakeExecution(status="unknown")
+    events = RenderedEvents()
     service = AgentService(
         planner=FakePlanner(
             PlannerOutcome(
@@ -435,6 +484,8 @@ def test_unknown_execution_quarantines_robot_scope(tmp_path):
         catalog=FakeCatalog(),
         store=SQLiteRequestStore(tmp_path / "request.sqlite3"),
         execution=execution,
+        event_sink=events,
+        presentation=events.gate,
         execution_enabled=True,
         allowed_skills={"wave_hello"},
     )
@@ -506,6 +557,104 @@ def test_terminal_persistence_failure_quarantines_service(tmp_path):
         rejected = service.send_message(_request("r2"))
         assert not rejected.accepted
         assert rejected.reason_code == "STORAGE_UNAVAILABLE"
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["before_write", "after_write", "storage_unavailable"])
+def test_submission_persistence_failure_uses_ledger_state(tmp_path, monkeypatch, failure_stage):
+    store = SQLiteRequestStore(tmp_path / "request.sqlite3")
+    execution = FakeExecution()
+    events = RenderedEvents()
+    mark_submitted = store.mark_submitted
+    get_request = store.get_request
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    def failing_submission(*args, **kwargs):
+        if failure_stage != "before_write":
+            mark_submitted(*args, **kwargs)
+        if failure_stage == "storage_unavailable":
+            monkeypatch.setattr(store, "get_request", unavailable)
+        raise RuntimeError("submission persistence interrupted")
+
+    monkeypatch.setattr(store, "mark_submitted", failing_submission)
+    service = AgentService(
+        planner=RulePlanner(),
+        catalog=FakeCatalog(),
+        store=store,
+        execution=execution,
+        event_sink=events,
+        presentation=events.gate,
+        execution_enabled=True,
+        allowed_skills={"wave_hello"},
+    )
+    request = _request(text="请挥手")
+    try:
+        assert service.send_message(request).accepted
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            record = get_request(request.to_key())
+            if (failure_stage == "before_write" and record.state == "FAILED") or not service.healthy:
+                break
+            time.sleep(0.01)
+        record = get_request(request.to_key())
+        assert execution.calls == 1
+        assert execution.submitted == 0
+        if failure_stage == "before_write":
+            assert record.state == "FAILED"
+            assert not record.may_have_submitted
+            assert service.healthy
+        else:
+            assert record.may_have_submitted
+            assert not service.healthy
+            if failure_stage == "after_write":
+                assert record.state == "UNKNOWN"
+                assert store.is_robot_quarantined(request.robot_scope)
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("broken_transport", [False, True])
+def test_no_display_receipt_or_failed_transport_prevents_submission(tmp_path, broken_transport):
+    execution = FakeExecution()
+    events = FailingEvents() if broken_transport else Events()
+    service = AgentService(
+        planner=RulePlanner(),
+        catalog=FakeCatalog(),
+        store=SQLiteRequestStore(tmp_path / "requests.sqlite3"),
+        execution=execution,
+        presentation=PresentationGate(0.05),
+        event_sink=events,
+        execution_enabled=True,
+        allowed_skills={"wave_hello"},
+    )
+    req = _request(text="请挥手")
+    try:
+        assert service.send_message(req).accepted
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and service.get_request(req.to_key()).state != "FAILED":
+            time.sleep(0.01)
+        record = service.get_request(req.to_key())
+        assert record.state == "FAILED"
+        assert not record.may_have_submitted
+        assert execution.submitted == 0
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("text", ["当前状态如何？", "list skills", "有哪些姿态"])
+def test_factual_queries_bypass_model_planning(tmp_path, text):
+    service, planner, events = _service(tmp_path, PlannerOutcome(kind="conversation", user_message="unused"))
+    request = _request(text=text)
+    try:
+        assert service.send_message(request).accepted
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and service.get_request(request.to_key()).state != "ANSWERED":
+            time.sleep(0.01)
+        assert service.get_request(request.to_key()).state == "ANSWERED"
+        assert planner.calls == 0
     finally:
         service.close()
 

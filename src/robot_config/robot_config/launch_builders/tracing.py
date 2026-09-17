@@ -182,7 +182,7 @@ def generate_tracing_actions(
     enable_tracing: bool,
     requested_session_name: str,
     trace_root: Path | None = None,
-) -> list[RegisterEventHandler]:
+) -> list[RegisterEventHandler | SetEnvironmentVariable]:
     """Start LTTng or raise on startup failure; metadata export is a separate CLI."""
     if not enable_tracing:
         return []
@@ -212,4 +212,7 @@ def generate_tracing_actions(
         except Exception as cleanup_error:
             logger.warning(f"[tracing] Failed to clean up session '{trace_session}': {cleanup_error}")
         raise
-    return [RegisterEventHandler(event_handler=OnShutdown(on_shutdown=_make_trace_shutdown_handler(trace_session)))]
+    return [
+        SetEnvironmentVariable("IB_TRACE_LOG_LEVEL", "INFO"),
+        RegisterEventHandler(event_handler=OnShutdown(on_shutdown=_make_trace_shutdown_handler(trace_session))),
+    ]

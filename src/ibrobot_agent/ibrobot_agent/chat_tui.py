@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import json
 import queue
 import threading
@@ -13,6 +15,8 @@ from typing import Any
 
 import rclpy
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import in_terminal
+from prompt_toolkit.application.current import set_app
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -25,6 +29,7 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
 from ibrobot_agent.contracts import TERMINAL_REQUEST_STATES as TERMINAL_STATES
+from ibrobot_agent.presentation import presentation_digest
 
 STOP_WORDS = {"停止", "别动", "停", "stop", "halt"}
 
@@ -136,6 +141,25 @@ class AgentChatNode(Node):
         self._output.put(("system", {"message": f"已发送停止请求：{request_id}"}))
         return True
 
+    def acknowledge_presentation(self, payload: dict[str, Any]) -> None:
+        if not _event_matches_session(payload, self.state):
+            raise ValueError("presentation identity does not match this session")
+        detail = payload["detail"]
+        self._control_publisher.publish(
+            String(
+                data=json.dumps(
+                    {
+                        "operation": "presentation_rendered",
+                        "request_id": payload["request_key"]["request_id"],
+                        "request_key": payload["request_key"],
+                        "presentation_digest": detail["presentation_digest"],
+                        "receipt_token": detail["receipt_token"],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+
     def _on_response(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
@@ -184,15 +208,30 @@ class AgentChatNode(Node):
         self._output.put(("event", payload))
 
 
-def _print_output(kind: str, payload: dict[str, Any]) -> None:
+def _print_output(kind: str, payload: dict[str, Any], *, writer=None) -> None:
     """Write asynchronous results through the prompt toolkit output proxy."""
     if kind == "system":
         line = f"[系统] {payload.get('message', '')}"
     elif kind == "response":
         line = f"[受理] {payload.get('request_id', '')} {payload.get('state', '')} {payload.get('message', '')}"
+    elif payload.get("event_type") == "presentation":
+        detail = payload["detail"]
+        value = detail["presentation"]
+        if not isinstance(value, dict) or presentation_digest(value) != detail.get("presentation_digest"):
+            raise ValueError("presentation digest does not match the exact plan")
+        line = "[Exact plan]\n" + json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
     else:
         line = f"[Agent] {payload.get('event_type', '')} {payload.get('state', '')}: {payload.get('user_message', '')}"
-    _write_terminal_line(line)
+    (writer or _write_terminal_line)(line)
+
+
+def _render_output_item(node: AgentChatNode, kind: str, payload: dict[str, Any], *, writer) -> None:
+    if kind == "event" and not _event_matches_session(payload, node.state):
+        return
+    _print_output(kind, payload, writer=writer)
+    if kind == "event" and payload.get("event_type") == "presentation":
+        # The writer must return only after the complete plan has been flushed.
+        node.acknowledge_presentation(payload)
 
 
 def _write_terminal_line(line: str) -> None:
@@ -289,19 +328,6 @@ def run_chat(
             except ExternalShutdownException:
                 return
 
-    output_stop = threading.Event()
-    output_thread: threading.Thread | None = None
-
-    def render_output() -> None:
-        while not output_stop.is_set() or not output.empty():
-            try:
-                kind, payload = output.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if kind == "event" and not _event_matches_session(payload, state):
-                continue
-            _print_output(kind, payload)
-
     spin_thread = threading.Thread(target=spin, name="agent-chat-ros", daemon=True)
     try:
         spin_thread.start()
@@ -309,12 +335,40 @@ def run_chat(
         session: PromptSession[str] = PromptSession(history=InMemoryHistory())
         _print_startup_diagnostics(node, state)
         print("输入自然语言；/stop 停止；/status 查询状态；/skills 查询技能；/help 帮助；/quit 退出。", flush=True)
-        output_thread = threading.Thread(target=render_output, name="agent-chat-output", daemon=True)
-        output_thread.start()
-        with patch_stdout():
+
+        async def chat_loop() -> None:
+            def write_and_flush(line: str) -> None:
+                session.app.output.write(line + "\n")
+                session.app.output.flush()
+
+            async def render_output() -> None:
+                while context.ok():
+                    try:
+                        kind, payload = output.get_nowait()
+                    except queue.Empty:
+                        await asyncio.sleep(0.05)
+                        continue
+                    try:
+                        # Run on the prompt's event loop; patch_stdout.flush only queues output.
+                        async with in_terminal():
+                            _render_output_item(node, kind, payload, writer=write_and_flush)
+                    except Exception as exc:
+                        node.stop()
+                        async with in_terminal():
+                            write_and_flush(f"presentation/output failed: {type(exc).__name__}")
+
+            renderer = asyncio.create_task(render_output())
+            try:
+                await prompt_loop()
+            finally:
+                renderer.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await renderer
+
+        async def prompt_loop() -> None:
             while context.ok():
                 try:
-                    text = session.prompt(
+                    text = await session.prompt_async(
                         HTML("<prompt>小智&gt; </prompt>"),
                         key_bindings=_build_key_bindings(node),
                         style=Style.from_dict({"prompt": "ansicyan bold"}),
@@ -343,14 +397,14 @@ def run_chat(
                 elif stripped:
                     request_id = node.send(stripped)
                     print(f"[{request_id}] 已提交，等待 Agent 处理。", flush=True)
+
+        with set_app(session.app), patch_stdout():
+            asyncio.run(chat_loop())
     finally:
-        output_stop.set()
         spin_stop.set()
         if context.ok():
             context.shutdown()
         spin_thread.join(timeout=2.0)
-        if output_thread is not None:
-            output_thread.join(timeout=2.0)
         executor.remove_node(node)
         executor.shutdown()
         node.destroy_node()

@@ -41,6 +41,7 @@ class RosBridge:
         plan_service: str = "/embodied/plan_agent_command",
         validate_plan_service: str = "/embodied/validate_agent_plan",
         confirm_plan_service: str = "/embodied/confirm_agent_plan",
+        prepare_plan_service: str = "/embodied/prepare_agent_plan",
         execute_plan_action: str = "/embodied/execute_agent_plan",
         start_visual_game_service: str = "/embodied/start_visual_game",
         get_visual_game_result_service: str = "/embodied/get_visual_game_result",
@@ -55,6 +56,7 @@ class RosBridge:
         self._plan_service = plan_service
         self._validate_plan_service = validate_plan_service
         self._confirm_plan_service = confirm_plan_service
+        self._prepare_plan_service = prepare_plan_service
         self._execute_plan_action = execute_plan_action.rstrip("/")
         self._start_visual_game_service = start_visual_game_service
         self._get_visual_game_result_service = get_visual_game_result_service
@@ -72,6 +74,7 @@ class RosBridge:
         self._plan_client = None
         self._validate_plan_client = None
         self._confirm_plan_client = None
+        self._prepare_plan_client = None
         self._execute_plan_client = None
         self._cancel_client = None
         self._cancel_plan_client = None
@@ -86,6 +89,7 @@ class RosBridge:
         self._PlanAgentCommand = None
         self._ValidateAgentPlan = None
         self._ConfirmAgentPlan = None
+        self._PrepareAgentPlan = None
         self._ExecuteAgentPlan = None
         self._CancelGoal = None
         self._WorkflowStep = None
@@ -111,6 +115,7 @@ class RosBridge:
                 GetSkillSnapshot,
                 GetVisualGameResult,
                 PlanAgentCommand,
+                PrepareAgentPlan,
                 ReloadSkillCatalog,
                 StartVisualGame,
                 ValidateAgentPlan,
@@ -175,6 +180,9 @@ class RosBridge:
             self._confirm_plan_client = self._node.create_client(
                 ConfirmAgentPlan, self._confirm_plan_service, callback_group=callback_group
             )
+            self._prepare_plan_client = self._node.create_client(
+                PrepareAgentPlan, self._prepare_plan_service, callback_group=callback_group
+            )
             self._execute_plan_client = ActionClient(
                 self._node,
                 ExecuteAgentPlan,
@@ -214,6 +222,7 @@ class RosBridge:
             self._PlanAgentCommand = PlanAgentCommand
             self._ValidateAgentPlan = ValidateAgentPlan
             self._ConfirmAgentPlan = ConfirmAgentPlan
+            self._PrepareAgentPlan = PrepareAgentPlan
             self._ExecuteAgentPlan = ExecuteAgentPlan
             self._CancelGoal = CancelGoal
             self._WorkflowStep = WorkflowStep
@@ -539,6 +548,40 @@ class RosBridge:
             "diagnostics": self._diagnostics(response.diagnostics),
         }
 
+    def prepare_agent_plan(
+        self,
+        *,
+        request_id: str,
+        raw_command: str,
+        workflow_steps: list[dict[str, Any]],
+        timeout_sec: float,
+        execution_mode: str = INTERACTIVE_CONFIRMATION,
+        trace_id: str = "",
+    ) -> dict[str, Any]:
+        if self._PrepareAgentPlan is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._PrepareAgentPlan.Request()
+        request.schema_version = 1
+        request.request_id = request_id
+        request.raw_command = raw_command
+        request.workflow_steps = [self._workflow_step_message(step) for step in workflow_steps]
+        request.execution_mode = execution_mode
+        request.trace_id = str(trace_id).strip()
+        response = self._call_service(
+            self._prepare_plan_client,
+            request,
+            service_name=self._prepare_plan_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "success": bool(response.success),
+            "allowed": bool(response.allowed),
+            "plan": self._agent_plan_dict(response.plan),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+            "diagnostics": self._diagnostics(response.diagnostics),
+        }
+
     def _workflow_step_message(self, step: dict[str, Any]):
         if self._WorkflowStep is None:
             raise BridgeError(
@@ -672,10 +715,13 @@ class RosBridge:
             return False
         return self._execute_plan_client.wait_for_server(timeout_sec=timeout_sec)
 
-    def wait_for_agent_plan_interfaces(self, *, timeout_sec: float) -> bool:
+    def wait_for_agent_plan_interfaces(self, *, timeout_sec: float, include_prepare: bool = False) -> bool:
         """Return whether every Hermes-facing plan service/action is discoverable."""
         deadline = time.monotonic() + timeout_sec
-        for client in (self._plan_client, self._validate_plan_client, self._confirm_plan_client):
+        clients = [self._plan_client, self._validate_plan_client, self._confirm_plan_client]
+        if include_prepare:
+            clients.insert(1, self._prepare_plan_client)
+        for client in clients:
             remaining = deadline - time.monotonic()
             if client is None or remaining <= 0.0 or not client.wait_for_service(timeout_sec=remaining):
                 return False
@@ -709,7 +755,14 @@ class RosBridge:
         return True
 
     def send_agent_plan_goal(
-        self, *, plan_token: str, confirmation_token: str, task_id: str, timeout_sec: float, feedback_callback=None
+        self,
+        *,
+        plan_token: str,
+        confirmation_token: str,
+        task_id: str,
+        timeout_sec: float,
+        trace_id: str = "",
+        feedback_callback=None,
     ):
         if self._ExecuteAgentPlan is None or self._execute_plan_client is None:
             raise BridgeError(
@@ -721,6 +774,7 @@ class RosBridge:
         goal.confirmation_token = confirmation_token
         goal.task_id = task_id
         goal.timeout_sec = float(timeout_sec)
+        goal.trace_id = str(trace_id).strip()
 
         def on_feedback(feedback) -> None:
             if feedback_callback is None:

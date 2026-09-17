@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 from launch import LaunchContext
-from launch.actions import ExecuteProcess, GroupAction, OpaqueFunction, RegisterEventHandler
+from launch.actions import ExecuteProcess, GroupAction, OpaqueFunction, RegisterEventHandler, SetEnvironmentVariable
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
@@ -574,6 +574,16 @@ def test_custom_trace_session_collision_fails(monkeypatch, tmp_path):
         raise AssertionError("Expected custom tracing session collision to raise RuntimeError")
 
 
+def test_generate_tracing_actions_enables_python_trace_logging(monkeypatch, tmp_path):
+    monkeypatch.setattr(tracing_builder, "_trace_session_exists", lambda _name: False)
+    monkeypatch.setattr(tracing_builder, "_run_trace_command", lambda _command, _reason: None)
+    monkeypatch.setattr(tracing_builder, "_start_trace_session", lambda _name, _path: None)
+
+    actions = tracing_builder.generate_tracing_actions(True, "test_trace", tmp_path)
+
+    assert any(action.__class__.__name__ == "SetEnvironmentVariable" for action in actions)
+
+
 def test_tracing_startup_does_not_import_or_write_topology(monkeypatch, tmp_path):
     monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
     monkeypatch.setattr(tracing_builder, "_trace_session_exists", lambda _name: False)
@@ -593,8 +603,12 @@ def test_tracing_startup_does_not_import_or_write_topology(monkeypatch, tmp_path
 
     actions = tracing_builder.generate_tracing_actions(True, "test_trace", tmp_path)
 
-    assert len(actions) == 1
-    assert isinstance(actions[0], RegisterEventHandler)
+    assert len(actions) == 2
+    assert isinstance(actions[0], SetEnvironmentVariable)
+    environment = LaunchContext()
+    actions[0].execute(environment)
+    assert environment.environment["IB_TRACE_LOG_LEVEL"] == "INFO"
+    assert isinstance(actions[1], RegisterEventHandler)
     assert [command[1] for command in commands] == ["create", "enable-event", "enable-event", "start"]
     assert not (tmp_path / "test_trace" / "ibrobot-topology.json").exists()
     assert "IB_TRACE_ENABLED" not in os.environ

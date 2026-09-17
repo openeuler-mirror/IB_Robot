@@ -14,7 +14,10 @@ from datetime import datetime
 from typing import Any, Literal, Protocol
 
 from embodied_common.canon import sha256_text, to_canonical_json
-from embodied_common.workflow_contracts import CanonicalWorkflowStep, normalize_workflow_steps
+from embodied_common.workflow_contracts import CanonicalWorkflowStep, normalize_workflow_steps, validate_workflow_steps
+
+MAX_REQUEST_TEXT_LENGTH = 4096
+MAX_REQUEST_JSON_BYTES = 64 * 1024
 
 QueryKind = Literal["status", "list_skills", "describe_skill", "list_poses"]
 PlanKind = Literal[1, 2]
@@ -92,38 +95,6 @@ _PLANNER_FIELDS = {
     "reason_code",
     "steps",
     "summary",
-}
-_WORKFLOW_COMMON_FIELDS = {
-    "schema_version",
-    "skill_name",
-    "target_name",
-    "container_name",
-    "place_name",
-    "motion_direction",
-    "motion_distance",
-    "arm_side",
-    "imitation_duration_sec",
-    "timeout_sec",
-}
-_WORKFLOW_NAVIGATION_FIELDS = {"direction", "distance", "degree", "has_x", "x", "has_y", "y", "has_yaw", "yaw"}
-_WORKFLOW_TEXT_FIELDS = {
-    "skill_name",
-    "target_name",
-    "container_name",
-    "place_name",
-    "motion_direction",
-    "arm_side",
-    "direction",
-}
-_WORKFLOW_NUMBER_FIELDS = {
-    "motion_distance",
-    "imitation_duration_sec",
-    "timeout_sec",
-    "distance",
-    "degree",
-    "x",
-    "y",
-    "yaw",
 }
 
 
@@ -257,7 +228,7 @@ class AgentRequest:
         object.__setattr__(self, "channel_id", _non_empty_text(self.channel_id, "channel_id"))
         object.__setattr__(self, "principal_id", _non_empty_text(self.principal_id, "principal_id"))
         object.__setattr__(self, "robot_scope", _non_empty_text(self.robot_scope, "robot_scope"))
-        object.__setattr__(self, "text", _non_empty_text(self.text, "text"))
+        object.__setattr__(self, "text", _non_empty_text(self.text, "text", max_length=MAX_REQUEST_TEXT_LENGTH))
         if self.reply_to_request_id is not None:
             object.__setattr__(
                 self, "reply_to_request_id", _non_empty_text(self.reply_to_request_id, "reply_to_request_id")
@@ -648,6 +619,17 @@ class EventSink(Protocol):
     def publish(self, event: AgentEvent) -> None: ...
 
 
+class PresentationPort(Protocol):
+    def present(
+        self,
+        key: RequestKey,
+        presentation: Presentation,
+        *,
+        publish: Callable[[Mapping[str, object]], None],
+        cancel_token: threading.Event,
+    ) -> None: ...
+
+
 class ConversationStore(Protocol):
     def append(self, request: AgentRequest, *, role: str = "user") -> None: ...
 
@@ -682,6 +664,8 @@ class RequestStore(Protocol):
     def get_request(self, key: RequestKey) -> RequestView: ...
 
     def is_robot_quarantined(self, robot_scope: str) -> bool: ...
+
+    def recover_interrupted_requests(self, robot_scope: str) -> int: ...
 
     def begin_planning(self, key: RequestKey, *, expected_generation: int) -> RequestRecord: ...
 
@@ -747,7 +731,7 @@ def planner_outcome_from_mapping(payload: Mapping[str, Any], *, steps: Sequence[
     if any(not isinstance(item, str) for item in missing_fields):
         raise TypeError("missing_fields items must be strings")
     workflow_steps = steps if steps is not None else payload.get("steps", ())
-    _validate_raw_workflow_steps(workflow_steps)
+    validate_workflow_steps(workflow_steps)
     normalized_steps = normalize_workflow_steps(workflow_steps) if workflow_steps else ()
     return PlannerOutcome(
         kind=payload["kind"],
@@ -759,33 +743,6 @@ def planner_outcome_from_mapping(payload: Mapping[str, Any], *, steps: Sequence[
         steps=normalized_steps,
         summary=payload.get("summary", ""),
     )
-
-
-def _validate_raw_workflow_steps(steps: Sequence[Any]) -> None:
-    if not isinstance(steps, Sequence) or isinstance(steps, str | bytes):
-        raise TypeError("steps must be a sequence")
-    if len(steps) > 16:
-        raise ValueError("steps cannot contain more than 16 entries")
-    for index, step in enumerate(steps):
-        if not isinstance(step, Mapping):
-            raise TypeError(f"steps[{index}] must be a mapping")
-        schema_version = step.get("schema_version")
-        if isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version not in {1, 2}:
-            raise TypeError(f"steps[{index}].schema_version must be integer 1 or 2")
-        allowed_fields = _WORKFLOW_COMMON_FIELDS | (_WORKFLOW_NAVIGATION_FIELDS if schema_version == 2 else set())
-        unknown_fields = sorted(set(step) - allowed_fields)
-        if unknown_fields:
-            raise ValueError(f"steps[{index}] contains unknown fields: {', '.join(unknown_fields)}")
-        for field_name in _WORKFLOW_TEXT_FIELDS & set(step):
-            if not isinstance(step[field_name], str):
-                raise TypeError(f"steps[{index}].{field_name} must be a string")
-        for field_name in _WORKFLOW_NUMBER_FIELDS & set(step):
-            value = step[field_name]
-            if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(float(value)):
-                raise TypeError(f"steps[{index}].{field_name} must be a finite number")
-        for field_name in {"has_x", "has_y", "has_yaw"} & set(step):
-            if not isinstance(step[field_name], bool):
-                raise TypeError(f"steps[{index}].{field_name} must be a boolean")
 
 
 def planner_outcome_to_mapping(outcome: PlannerOutcome) -> dict[str, Any]:
@@ -836,6 +793,7 @@ __all__ = [
     "RobotAdmissionState",
     "StopReceipt",
     "Presentation",
+    "PresentationPort",
     "TaskRef",
     "planner_outcome_from_mapping",
     "planner_outcome_to_mapping",

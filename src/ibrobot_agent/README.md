@@ -2,7 +2,7 @@
 
 `ibrobot_agent` 是 IB-Robot 自然语言 Agent 的孵化运行时包。它把用户的自然语言请求转成
 严格校验的 typed workflow，并把全部机器人执行委托给既有 Capability Gateway 链路
-（`InteractiveController` → `agent_plan_node` → Safety Guard → Skill Executor）。
+（Agent ExecutionPort → `agent_plan_node` → Safety Guard → Skill Executor）。
 本包不拥有 Skill catalog、运动授权或物理执行权，也不实现感知。
 
 本包与 `embodied_agent` 互补而非重复：`embodied_agent` 负责 Agent plan 的
@@ -25,12 +25,12 @@ Planner 适配、请求状态机与持久化 ledger。Planner 是本包进程内
   -> /agent/request (std_msgs/String, JSON)
   -> ibrobot_agent_node
      -> Planner（rule / vlm，严格 JSON 契约）
-     -> 复用 robot_skill_cli.InteractiveController
-        -> /embodied/plan_agent_command -> /embodied/validate_agent_plan
+     -> Agent ExecutionPort 复用 robot_skill_cli.RosBridge
+        -> /embodied/prepare_agent_plan（capture + read-only validate）
         -> /embodied/confirm_agent_plan -> /embodied/execute_agent_plan
         -> embodied_agent.agent_plan_node -> Safety Guard -> Skill Executor
   <- /agent/response（同步应答） /agent/event（有序事件）
-  -> /agent/control（request 粒度 stop）
+   -> /agent/control（request 粒度 stop / exact plan 展示完成回执）
 ```
 
 ## 请求状态机
@@ -58,6 +58,11 @@ tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py
 
 节点另提供 `~/health` 与 `~/ready`（`std_srvs/Trigger`）。
 
+`/agent/request` 的 JSON 在解析前限制为 64 KiB UTF-8 字节；`AgentRequest.text` 去除首尾空白后最多
+4096 个字符（中文字符按一个字符计数）。超限返回 `REQUEST_SCHEMA_INVALID`，不会截断指令或进入规划队列。
+限制由 `ibrobot_agent.contracts` 统一定义。状态、技能列表与姿态列表查询复用 Planner 层的
+确定性只读解析，否定或假设请求不走该快捷路径；普通只读问句直接读取 Gateway 事实，不依赖模型调用。
+
 ## 安全设计
 
 - 运动默认关闭：`execution_enabled=false` 时零 goal 提交，仅规划与应答。
@@ -66,7 +71,12 @@ tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py
 - 内置 RulePlanner 只允许在仿真模式执行；真机执行必须配置 vlm Planner。
 - Planner 输出只接受单一严格 JSON 对象；未知字段、未知 skill、编造参数一律拒绝。
 - 终态未知（UNKNOWN）进入 robot-scope quarantine，需人工介入。
+- 启动时在接受请求前执行单事务恢复：未完成且可能已提交的请求转为持久化 UNKNOWN，保留 TaskRef
+  供人工通过 Gateway 核实；确定未提交的中断请求转为 FAILED 或 CANCELLED_BEFORE_EXECUTION。
+  不重放旧请求，不以 Gateway 空闲推断成功；已有终态和其他 robot scope 的记录保持原样。
 - 部署锁（`deployment_lock_path`）防止双 Agent 实例并存。
+- 提交前持久化回调异常由 `AgentService` 根据 ledger 判定：未提交时失败；可能已提交时
+  UNKNOWN/quarantine；无法读取或写入 ledger 时保持隔离，不由 transport adapter 猜测终态。
 - Planner 凭据统一按 Kimi 模式提供：`base_url` + `api_key_env`（环境变量名）；
   `embodied.agent.planner.api_key` 字面密钥会被 robot_config 校验直接拒绝，
   也不会进入 `config_digest` 的 preimage。
@@ -75,7 +85,7 @@ tool call 的严格拒绝只作用于 Planner 响应（`ibrobot_agent/planner.py
 
 ```text
 ibrobot_agent
-    -> robot_skill_cli   # InteractiveController / RosBridge / catalog view（复用，不复制）
+    -> robot_skill_cli   # RosBridge / catalog view（复用，不复制）
     -> embodied_common   # canon / workflow_contracts / VLMAPIClient
     -> robot_config      # SSOT 配置与 launch 校验（经 embodied_bringup 注入参数）
     -> rclpy / std_msgs / std_srvs
@@ -92,11 +102,25 @@ ibrobot_agent
 `so101_agent_manual`（真机手动无运动）、`so101_single_arm_agent_test`（rule Planner 测试）、
 `so101_single_arm_agent_gazebo`（Gazebo 执行）、`so101_single_arm_agent_hardware*`（真机执行/停止）。
 
+## 展示完成协议
+
+`immediate_after_presentation` 仍要求完整 exact plan 展示并 flush 后才 technical confirm。
+`presentation` 事件的 `detail` 包含完整 `presentation`（task/plan/registry tuple、有序步骤、预算和摘要）、
+canonical `presentation_digest` 与一次性 `receipt_token`。TUI 在自己的事件循环中用底层 terminal output
+打印并 flush 整个计划，再发送：
+
+```json
+{"operation":"presentation_rendered","request_id":"...","request_key":{"robot_scope":"...","channel_id":"...","principal_id":"...","request_id":"..."},"presentation_digest":"...","receipt_token":"..."}
+```
+
+服务端仅接受当前待展示计划的精确身份、摘要、token 和有效期；回执不代表用户二次批准，不授予运动权限。
+`embodied.agent.presentation_timeout_sec` 默认 30 秒，必须为有限正数；无客户端、输出失败、事件传输失败、
+超时、错误回执或停止请求均不能进入 confirm/goal 发送。旧的只订阅事件而不返回展示回执的客户端必须升级。
+`/agent/control` 是受信本地客户端边界，回执是协议证据而非对任意恶意 ROS peer 的认证。
+
 ## 已知限制
 
 - 孵化期包（`incubation: true` 强制标记），String JSON topic 契约尚未类型化。
 - 会话记忆为有界滚动窗口，不做长期记忆检索。
 - `chat_tui` 为单操作员本地终端，不提供多通道并发接入。
-- `immediate_after_presentation` 模式下，`MAY_EXECUTE` 事件发布后即可提交执行 goal；本地 TUI 的渲染与
-  运动启动之间没有硬同步 flush 屏障，弱于 `robot-skill run-workflow` 的「展示并 flush 后再执行」语义，
-  依赖执行中停止词（别动/停止）与 `/agent/control` 取消兜底。
+- UNKNOWN 恢复采用保守隔离，不自动重放或推断旧任务终态；需操作员依据保留的 TaskRef 完成核实。

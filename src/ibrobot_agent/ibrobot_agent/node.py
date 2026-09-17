@@ -7,8 +7,11 @@ from an independent repository.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
+import time
+import uuid
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,9 +22,12 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
+from embodied_common.agent_terminal_contract import classify_agent_terminal, stable_agent_execution_error_code
 from embodied_common.canon import sha256_text, to_canonical_json
+from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.workflow_contracts import normalize_workflow_steps
 from ibrobot_agent.contracts import (
+    MAX_REQUEST_JSON_BYTES,
     AgentRequest,
     EventSink,
     ExecutionResult,
@@ -32,8 +38,11 @@ from ibrobot_agent.contracts import (
 from ibrobot_agent.conversation_store import SQLiteConversationStore
 from ibrobot_agent.deployment_lock import DeploymentLock
 from ibrobot_agent.planner import PlannerAdapter, RulePlanner, build_planner_messages
+from ibrobot_agent.presentation import PresentationGate
 from ibrobot_agent.request_store import SQLiteRequestStore
 from ibrobot_agent.service import AgentService
+
+_trace = create_trace_logger("ib_trace.agent")
 
 
 class _RosEventSink(EventSink):
@@ -85,53 +94,304 @@ class _RosBridgeCatalog:
 
 
 class _RosExecutionAdapter:
-    """Reuse the established InteractiveController lifecycle as the execution port."""
+    """Execute typed Agent plans without duplicating the CLI controller state machine."""
 
     def __init__(self, bridge, *, timeout_policy: dict[str, float]) -> None:
-        from robot_skill_cli.interactive_control import InteractiveController
-
-        self._submission_callback = None
-        self._controller = InteractiveController(
-            bridge,
-            timeout_policy=timeout_policy,
-            execution_mode="immediate_after_presentation",
-            submission_callback=lambda detail: self._submission_callback(detail),
-        )
+        self._bridge = bridge
+        self._rpc_timeout_sec = max(float(timeout_policy.get("rpc_timeout_sec", 5.0)), 0.1)
+        self._task_budget_sec = float(timeout_policy.get("task_budget_sec", 120.0))
+        self._active_lock = threading.Lock()
+        self._active_stop_event: threading.Event | None = None
+        self._active_task_id: str | None = None
 
     def execute(self, proposal, *, expected_registry_identity, presentation_callback, submission_callback, stop_event):
-        holder: dict[str, Presentation] = {}
-
-        def present(value: dict) -> None:
-            presentation = _presentation_from_mapping(value, proposal)
-            holder["presentation"] = presentation
-            presentation_callback(presentation)
-
-        def mark_submission(detail: dict) -> None:
-            presentation = holder.get("presentation")
-            if presentation is None:
-                raise RuntimeError("presentation must be persisted before plan confirmation")
-            submission_callback(presentation.task_ref, detail)
-
-        self._submission_callback = mark_submission
+        task_id = uuid.uuid4().hex
+        with self._active_lock:
+            self._active_stop_event = stop_event
+            self._active_task_id = task_id
         try:
-            terminal = self._controller.run(
-                proposal.request.text,
-                [step.to_dict() for step in proposal.outcome.steps],
-                request_id=proposal.request.request_id,
-                expected_registry_identity=(
-                    expected_registry_identity.epoch,
-                    expected_registry_identity.generation,
-                    expected_registry_identity.digest,
-                ),
-                presentation_callback=present,
+            return self._execute_direct(
+                proposal,
+                task_id=task_id,
+                expected_registry_identity=expected_registry_identity,
+                presentation_callback=presentation_callback,
+                submission_callback=submission_callback,
                 stop_event=stop_event,
             )
-            return _execution_result_from_controller(terminal, holder.get("presentation"))
         finally:
-            self._submission_callback = None
+            with self._active_lock:
+                self._active_stop_event = None
+                self._active_task_id = None
 
     def request_stop(self, request_key) -> None:
-        self._controller.request_stop()
+        with self._active_lock:
+            if self._active_stop_event is not None:
+                self._active_stop_event.set()
+
+    def _execute_direct(
+        self,
+        proposal,
+        *,
+        task_id: str,
+        expected_registry_identity,
+        presentation_callback,
+        submission_callback,
+        stop_event: threading.Event,
+    ) -> ExecutionResult:
+        expected_identity = (
+            expected_registry_identity.epoch,
+            expected_registry_identity.generation,
+            expected_registry_identity.digest,
+        )
+        if stop_event.is_set():
+            return ExecutionResult(
+                "cancelled", None, "SKILL_CANCELLED", "stopped before planning", {"submitted": False}
+            )
+
+        prepare_agent_plan = getattr(self._bridge, "prepare_agent_plan", None)
+        if prepare_agent_plan is None:
+            prepare_agent_plan = self._legacy_prepare_agent_plan
+        try:
+            plan_response = prepare_agent_plan(
+                request_id=proposal.request.request_id,
+                raw_command=proposal.request.text,
+                workflow_steps=[step.to_dict() for step in proposal.outcome.steps],
+                timeout_sec=self._rpc_timeout_sec,
+                execution_mode="immediate_after_presentation",
+                trace_id=proposal.request.request_id,
+            )
+        except Exception as exc:
+            return self._failed_result("CAPABILITY_NOT_READY", f"agent plan preparation failed: {exc}")
+        if not plan_response.get("success") or not plan_response.get("allowed", True):
+            return self._failed_result(
+                str(plan_response.get("error_code") or "SKILL_SCHEMA_INVALID"),
+                str(plan_response.get("message") or "agent plan preparation failed"),
+            )
+
+        plan = plan_response["plan"]
+        try:
+            planned_steps = tuple(normalize_workflow_steps(plan.get("workflow_steps", [])))
+        except (TypeError, ValueError) as exc:
+            return self._failed_result("SKILL_SCHEMA_INVALID", str(exc))
+        if planned_steps != tuple(proposal.outcome.steps):
+            return self._failed_result("SKILL_SNAPSHOT_DIGEST_MISMATCH", "planned workflow differs from proposal")
+        plan_identity = (
+            str(plan.get("registry_epoch", "")),
+            int(plan.get("registry_generation", 0)),
+            str(plan.get("registry_digest", "")),
+        )
+        if plan_identity != expected_identity:
+            return self._failed_result("SKILL_SNAPSHOT_DIGEST_MISMATCH", "planned workflow uses a different registry")
+
+        presentation = _presentation_from_mapping(
+            {
+                "task_id": task_id,
+                "plan_id": plan["plan_id"],
+                "plan_digest": plan["plan_digest"],
+                "plan_kind": int(plan.get("plan_kind", 0)),
+                "steps": [step.to_dict() for step in planned_steps],
+                "execution_mode": "immediate_after_presentation",
+                "proposed_task_budget_sec": self._task_budget_sec,
+                "summary": proposal.outcome.summary,
+            },
+            proposal,
+        )
+        try:
+            presentation_callback(presentation)
+        except Exception as exc:
+            if stop_event.is_set():
+                return ExecutionResult(
+                    "cancelled", None, "SKILL_CANCELLED", "stopped before presentation completed", {"submitted": False}
+                )
+            return self._failed_result("PRESENTATION_FAILED", f"plan presentation failed: {exc}", presentation)
+        if stop_event.is_set():
+            return ExecutionResult(
+                "cancelled", None, "SKILL_CANCELLED", "stopped after presentation", {"submitted": False}
+            )
+
+        try:
+            status = self._bridge.get_status(task_id="", payload_hash="", timeout_sec=self._rpc_timeout_sec)
+            if stop_event.is_set():
+                return ExecutionResult(
+                    "cancelled", None, "SKILL_CANCELLED", "stopped before confirmation", {"submitted": False}
+                )
+            task_budget_sec = min(float(status["task_budget_sec"]), self._task_budget_sec)
+            confirmation = self._bridge.confirm_agent_plan(
+                plan_token=plan["plan_token"],
+                plan_digest=plan["plan_digest"],
+                task_id=task_id,
+                status=status,
+                task_budget_sec=task_budget_sec,
+                timeout_sec=self._rpc_timeout_sec,
+                execution_mode="immediate_after_presentation",
+            )
+        except Exception:
+            return self._unknown_result("confirmation response was unavailable", presentation)
+        if not confirmation.get("confirmed"):
+            return self._failed_result(
+                str(confirmation.get("error_code") or "SKILL_REQUEST_ID_CONFLICT"),
+                str(confirmation.get("message") or "plan confirmation failed"),
+                presentation,
+            )
+        if stop_event.is_set():
+            return ExecutionResult(
+                "cancelled", None, "SKILL_CANCELLED", "stopped before goal submission", {"submitted": False}
+            )
+        if not self._bridge.wait_for_execute_plan_server(timeout_sec=self._rpc_timeout_sec):
+            return self._failed_result("CAPABILITY_NOT_READY", "agent plan action server unavailable", presentation)
+
+        if stop_event.is_set():
+            return ExecutionResult(
+                "cancelled", None, "SKILL_CANCELLED", "stopped before submission persistence", {"submitted": False}
+            )
+        # Let AgentService inspect durable submission state if persistence raises.
+        submission_callback(
+            presentation.task_ref,
+            {
+                "confirmed": True,
+                "task_id": task_id,
+                "plan_id": presentation.task_ref.plan_id,
+                "plan_digest": presentation.task_ref.plan_digest,
+                "registry_epoch": presentation.task_ref.registry_epoch,
+                "registry_generation": presentation.task_ref.registry_generation,
+                "registry_digest": presentation.task_ref.registry_digest,
+                "expected_step_count": presentation.task_ref.expected_step_count,
+            },
+        )
+        if stop_event.is_set():
+            return ExecutionResult(
+                "cancelled", None, "SKILL_CANCELLED", "stopped before goal submission", {"submitted": False}
+            )
+        try:
+            goal_future = self._bridge.send_agent_plan_goal(
+                plan_token=plan["plan_token"],
+                confirmation_token=confirmation["confirmation_token"],
+                task_id=task_id,
+                timeout_sec=float(confirmation.get("confirmed_task_budget_sec", task_budget_sec)),
+                trace_id=proposal.request.request_id,
+                feedback_callback=None,
+            )
+        except Exception as exc:
+            return self._converge_after_submission(task_id, presentation, f"goal submission failed: {exc}")
+
+        if not self._wait_future(goal_future, self._rpc_timeout_sec, stop_event):
+            return self._converge_after_submission(task_id, presentation, "goal acceptance was not confirmed")
+        try:
+            goal_handle = goal_future.result()
+        except Exception as exc:
+            return self._converge_after_submission(task_id, presentation, f"goal response unavailable: {exc}")
+        if goal_handle is None or not goal_handle.accepted:
+            if stop_event.is_set():
+                return self._converge_after_submission(task_id, presentation, "goal was rejected during stop")
+            return self._failed_result("GOAL_REJECTED", "agent plan goal was rejected", presentation)
+
+        try:
+            result_future = goal_handle.get_result_async()
+        except Exception as exc:
+            return self._converge_after_submission(task_id, presentation, f"result request unavailable: {exc}")
+        timeout_sec = float(confirmation.get("confirmed_task_budget_sec", task_budget_sec))
+        deadline = time.monotonic() + timeout_sec + self._rpc_timeout_sec
+        while not result_future.done() and time.monotonic() < deadline and not stop_event.is_set():
+            time.sleep(0.02)
+        if not result_future.done() or stop_event.is_set():
+            return self._converge_after_submission(
+                task_id,
+                presentation,
+                "execution was stopped" if stop_event.is_set() else "agent plan result timed out",
+            )
+        try:
+            wrapped_result = result_future.result()
+            terminal = {
+                "status": int(wrapped_result.status),
+                "result": _agent_plan_result_from_message(wrapped_result.result),
+            }
+        except Exception as exc:
+            return self._converge_after_submission(task_id, presentation, f"terminal result unavailable: {exc}")
+        return self._execution_result_from_terminal(terminal, presentation)
+
+    def _legacy_prepare_agent_plan(self, **kwargs):
+        """Compatibility path for test bridges and pre-prepare ROS bridges."""
+        response = self._bridge.plan_agent_command(
+            request_id=kwargs["request_id"],
+            raw_command=kwargs["raw_command"],
+            workflow_steps=kwargs["workflow_steps"],
+            timeout_sec=kwargs["timeout_sec"],
+            execution_mode=kwargs["execution_mode"],
+        )
+        if response.get("success"):
+            response["allowed"] = True
+        return response
+
+    @staticmethod
+    def _wait_future(future, timeout_sec: float, stop_event: threading.Event) -> bool:
+        deadline = time.monotonic() + timeout_sec
+        while not future.done() and time.monotonic() < deadline and not stop_event.is_set():
+            time.sleep(0.01)
+        return future.done()
+
+    def _converge_after_submission(self, task_id: str, presentation: Presentation, detail: str) -> ExecutionResult:
+        with contextlib.suppress(Exception):
+            self._bridge.cancel_agent_plan(task_id, timeout_sec=self._rpc_timeout_sec)
+        deadline = time.monotonic() + self._rpc_timeout_sec
+        while time.monotonic() < deadline:
+            try:
+                terminal = self._bridge.get_agent_plan_result(task_id, timeout_sec=self._rpc_timeout_sec)
+                if int(terminal.get("status", 0)) in {4, 5, 6}:
+                    return self._execution_result_from_terminal(terminal, presentation)
+            except Exception:
+                pass
+            time.sleep(0.02)
+        return self._unknown_result(detail, presentation)
+
+    @staticmethod
+    def _execution_result_from_terminal(terminal: dict, presentation: Presentation) -> ExecutionResult:
+        result = terminal.get("result", {}) or {}
+        expectation = {
+            "plan_id": presentation.task_ref.plan_id,
+            "plan_digest": presentation.task_ref.plan_digest,
+            "registry_epoch": presentation.task_ref.registry_epoch,
+            "registry_generation": presentation.task_ref.registry_generation,
+            "registry_digest": presentation.task_ref.registry_digest,
+            "step_count": presentation.task_ref.expected_step_count,
+        }
+        classification = classify_agent_terminal(terminal.get("status", 0), result, expectation)
+        if classification == "succeeded":
+            return ExecutionResult("succeeded", presentation.task_ref, "", str(result.get("message", "")), result)
+        if classification == "stopped":
+            return ExecutionResult(
+                "cancelled", presentation.task_ref, "SKILL_CANCELLED", str(result.get("message", "")), result
+            )
+        if classification == "failed":
+            return ExecutionResult(
+                "failed",
+                presentation.task_ref,
+                stable_agent_execution_error_code(str(result.get("error_code", ""))),
+                str(result.get("message", "")),
+                result,
+            )
+        return ExecutionResult(
+            "unknown",
+            presentation.task_ref,
+            str(result.get("error_code") or "SKILL_CANCEL_TIMEOUT"),
+            str(result.get("message") or "robot stop state is unknown"),
+            result,
+        )
+
+    @staticmethod
+    def _failed_result(error_code: str, message: str, presentation: Presentation | None = None) -> ExecutionResult:
+        return ExecutionResult(
+            "failed", presentation.task_ref if presentation else None, error_code[:64], message[:300], {}
+        )
+
+    @staticmethod
+    def _unknown_result(message: str, presentation: Presentation | None = None) -> ExecutionResult:
+        return ExecutionResult(
+            "unknown",
+            presentation.task_ref if presentation else None,
+            "SKILL_CANCEL_TIMEOUT",
+            message[:300],
+            {},
+        )
 
 
 def _presentation_from_mapping(value: dict, proposal) -> Presentation:
@@ -156,18 +416,19 @@ def _presentation_from_mapping(value: dict, proposal) -> Presentation:
     )
 
 
-def _execution_result_from_controller(value: dict, presentation: Presentation | None) -> ExecutionResult:
-    state = value.get("state", "unknown")
-    status = {"succeeded": "succeeded", "failed": "failed", "stopped": "cancelled"}.get(state, "unknown")
-    return ExecutionResult(
-        status=status,
-        task_ref=(
-            None if presentation is None or bool(value.get("stopped_before_execution")) else presentation.task_ref
-        ),
-        error_code=str(value.get("error_code", ""))[:64],
-        message=str(value.get("message", ""))[:300],
-        detail=value,
-    )
+def _agent_plan_result_from_message(result) -> dict:
+    return {
+        "success": bool(result.success),
+        "plan_id": str(result.plan_id),
+        "plan_digest": str(result.plan_digest),
+        "workflow_digest": str(result.workflow_digest),
+        "completed_step_count": int(result.completed_step_count),
+        "error_code": str(result.error_code),
+        "message": str(result.message),
+        "actual_registry_epoch": str(result.actual_registry_epoch),
+        "actual_registry_generation": int(result.actual_registry_generation),
+        "actual_registry_digest": str(result.actual_registry_digest),
+    }
 
 
 class IncubationAgentNode(Node):
@@ -195,6 +456,7 @@ class IncubationAgentNode(Node):
         self.declare_parameter("max_session_turns", 12)
         self.declare_parameter("clarification_ttl_sec", 300.0)
         self.declare_parameter("event_queue_size", 128)
+        self.declare_parameter("presentation_timeout_sec", 30.0)
         self.declare_parameter("robot_scope", "so101_single_arm")
         self.declare_parameter("channel_id", "agent_incubation")
         self.declare_parameter("principal_id", "local_operator")
@@ -207,6 +469,7 @@ class IncubationAgentNode(Node):
         self.declare_parameter("gateway_validate_skill_service", "/embodied/validate_skill")
         self.declare_parameter("gateway_skill_action", "/embodied/execute_skill")
         self.declare_parameter("gateway_plan_service", "/embodied/plan_agent_command")
+        self.declare_parameter("gateway_prepare_plan_service", "/embodied/prepare_agent_plan")
         self.declare_parameter("gateway_validate_plan_service", "/embodied/validate_agent_plan")
         self.declare_parameter("gateway_confirm_plan_service", "/embodied/confirm_agent_plan")
         self.declare_parameter("gateway_execute_plan_action", "/embodied/execute_agent_plan")
@@ -226,6 +489,7 @@ class IncubationAgentNode(Node):
             String, str(self.get_parameter("response_topic").value), event_queue_size
         )
         self._store = SQLiteRequestStore(ledger_path)
+        self._presentation_gate = PresentationGate(float(self.get_parameter("presentation_timeout_sec").value))
         self._bridge = None
         catalog = catalog_port or _UnavailableCatalog()
         execution = execution_port
@@ -244,6 +508,7 @@ class IncubationAgentNode(Node):
                     validate_skill_service=str(self.get_parameter("gateway_validate_skill_service").value),
                     skill_action=str(self.get_parameter("gateway_skill_action").value),
                     plan_service=str(self.get_parameter("gateway_plan_service").value),
+                    prepare_plan_service=str(self.get_parameter("gateway_prepare_plan_service").value),
                     validate_plan_service=str(self.get_parameter("gateway_validate_plan_service").value),
                     confirm_plan_service=str(self.get_parameter("gateway_confirm_plan_service").value),
                     execute_plan_action=str(self.get_parameter("gateway_execute_plan_action").value),
@@ -283,6 +548,7 @@ class IncubationAgentNode(Node):
             catalog=catalog,
             store=self._store,
             execution=execution,
+            presentation=self._presentation_gate,
             event_sink=_RosEventSink(event_publisher),
             execution_enabled=bool(self.get_parameter("execution_enabled").value),
             allowed_skills=allowed_skills,
@@ -320,6 +586,8 @@ class IncubationAgentNode(Node):
     def _request_callback(self, message: String) -> None:
         request_id = ""
         try:
+            if len(message.data) > MAX_REQUEST_JSON_BYTES or len(message.data.encode("utf-8")) > MAX_REQUEST_JSON_BYTES:
+                raise ValueError(f"request JSON must be at most {MAX_REQUEST_JSON_BYTES} UTF-8 bytes")
             payload = json.loads(message.data)
             if not isinstance(payload, dict):
                 raise ValueError("request must be a JSON object")
@@ -335,7 +603,8 @@ class IncubationAgentNode(Node):
                 received_at=datetime.now(timezone.utc),
                 reply_to_request_id=payload.get("reply_to_request_id"),
             )
-            response = self._service.send_message(request)
+            with trace_scope(request.request_id), trace_stage(_trace, "agent.admit", request_id=request.request_id):
+                response = self._service.send_message(request)
             self._publish_response(response.__dict__)
             self.get_logger().info(json.dumps(response.__dict__, sort_keys=True))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -353,14 +622,24 @@ class IncubationAgentNode(Node):
     def _control_callback(self, message: String) -> None:
         try:
             payload = json.loads(message.data)
-            if not isinstance(payload, dict) or payload.get("operation") != "stop":
-                raise ValueError("control request must be a stop operation")
+            if not isinstance(payload, dict) or payload.get("operation") not in {"stop", "presentation_rendered"}:
+                raise ValueError("control request must be stop or presentation_rendered")
             key = RequestKey(
                 robot_scope=str(self.get_parameter("robot_scope").value),
                 channel_id=str(self.get_parameter("channel_id").value),
                 principal_id=str(self.get_parameter("principal_id").value),
                 request_id=payload["request_id"],
             )
+            if payload["operation"] == "presentation_rendered":
+                if payload.get("request_key") != key.to_dict():
+                    raise ValueError("presentation receipt identity does not match this Agent")
+                accepted = self._presentation_gate.acknowledge(
+                    key,
+                    digest=payload["presentation_digest"],
+                    token=payload["receipt_token"],
+                )
+                self._publish_response({"request_id": key.request_id, "presentation_received": accepted})
+                return
             receipt = self._service.stop_request(key)
             self._publish_response(
                 {
@@ -409,7 +688,7 @@ class IncubationAgentNode(Node):
             self._gateway_ready = False
             return
         try:
-            if not self._bridge.wait_for_agent_plan_interfaces(timeout_sec=0.1):
+            if not self._bridge.wait_for_agent_plan_interfaces(timeout_sec=0.1, include_prepare=True):
                 self._gateway_ready = False
                 return
             status = self._bridge.get_status(task_id="", payload_hash="", timeout_sec=0.2)

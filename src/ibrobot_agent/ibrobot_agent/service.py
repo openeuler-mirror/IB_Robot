@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from ibrobot_agent.contracts import (
     AgentEvent,
     AgentRequest,
@@ -23,6 +24,7 @@ from ibrobot_agent.contracts import (
     Planner,
     PlannerOutcome,
     PlanProposal,
+    PresentationPort,
     RegistryIdentity,
     RequestKey,
     RequestStore,
@@ -30,9 +32,10 @@ from ibrobot_agent.contracts import (
     planner_outcome_to_mapping,
     request_hash_text,
 )
-from ibrobot_agent.planner import RulePlanner
+from ibrobot_agent.planner import RulePlanner, read_only_outcome
 
 _LOGGER = logging.getLogger(__name__)
+_trace = create_trace_logger("ib_trace.agent")
 
 
 def _safe_error_message(exc: Exception) -> str:
@@ -125,6 +128,7 @@ class AgentService:
         catalog: CatalogPort,
         store: RequestStore,
         execution: ExecutionPort | None = None,
+        presentation: PresentationPort | None = None,
         event_sink: EventSink | None = None,
         conversation: ConversationStore | None = None,
         execution_enabled: bool = False,
@@ -138,18 +142,22 @@ class AgentService:
         self._catalog = catalog
         self._store = store
         self._execution = execution
+        self._presentation = presentation
         self._events = event_sink
         self._conversation = conversation or InMemoryConversationStore()
         self._execution_enabled = execution_enabled
         self._allowed_skills = frozenset(allowed_skills or ())
         self._robot_scope = robot_scope
-        self._quarantined = store.is_robot_quarantined(robot_scope)
         if execution_enabled and not self._allowed_skills:
             raise ValueError("execution-enabled AgentService requires a non-empty incubation allowlist")
         if execution_enabled and execution is None:
             raise ValueError("execution-enabled AgentService requires an execution port")
+        if execution_enabled and presentation is None:
+            raise ValueError("execution-enabled AgentService requires a presentation port")
         if getattr(planner, "identity", None) is None:
             raise ValueError("planner must provide a PlannerIdentity")
+        store.recover_interrupted_requests(robot_scope)
+        self._quarantined = store.is_robot_quarantined(robot_scope)
         self._worker = threading.Thread(target=self._planning_loop, name="agent-planner", daemon=True)
         self._queue: list[AgentRequest] = []
         self._queued_or_active: set[RequestKey] = set()
@@ -294,6 +302,10 @@ class AgentService:
             _LOGGER.exception("Could not persist planner worker failure for request %s", request.request_id)
 
     def _plan_one(self, request: AgentRequest) -> None:
+        with trace_scope(request.request_id):
+            self._plan_one_traced(request)
+
+    def _plan_one_traced(self, request: AgentRequest) -> None:
         key = request.to_key()
         try:
             record = self._store.begin_planning(key, expected_generation=0)
@@ -302,8 +314,9 @@ class AgentService:
                 self._active[key] = cancel_token
             gateway_error = None
             try:
-                status = self._catalog.get_status()
-                catalog = self._catalog.get_catalog(status)
+                with trace_stage(_trace, "agent.catalog", request_id=request.request_id):
+                    status = self._catalog.get_status()
+                    catalog = self._catalog.get_catalog(status)
             except Exception as exc:
                 status = {}
                 catalog = {}
@@ -329,16 +342,17 @@ class AgentService:
                     event_type="needs_clarification",
                 )
                 return
-            read_only_outcome = self._deterministic_read_only_outcome(request.text)
-            if read_only_outcome is not None:
-                outcome = read_only_outcome
+            query = read_only_outcome(request.text)
+            if query is not None:
+                outcome = query
             else:
-                outcome = self._planner.plan(
-                    request,
-                    {"messages": self._conversation.context(request), "clarification": clarification},
-                    catalog,
-                    cancel_token,
-                )
+                with trace_stage(_trace, "agent.planner", request_id=request.request_id):
+                    outcome = self._planner.plan(
+                        request,
+                        {"messages": self._conversation.context(request), "clarification": clarification},
+                        catalog,
+                        cancel_token,
+                    )
             if cancel_token.is_set():
                 self._finish_cancel_before_execution(key, record.planning_generation)
                 return
@@ -388,17 +402,18 @@ class AgentService:
                 self._finish_plan_without_execution(key, record.planning_generation, outcome.user_message)
                 return
             record = self._store.mark_preparing(key, expected_generation=record.planning_generation)
-            execution_result = self._execution.execute(
-                proposal,
-                expected_registry_identity=identity,
-                presentation_callback=lambda presentation: self._present(
-                    key, record.planning_generation, proposal, presentation
-                ),
-                submission_callback=lambda task_ref, detail: self._mark_may_submit(
-                    key, record.planning_generation, task_ref, detail
-                ),
-                stop_event=cancel_token,
-            )
+            with trace_stage(_trace, "agent.execution", request_id=request.request_id):
+                execution_result = self._execution.execute(
+                    proposal,
+                    expected_registry_identity=identity,
+                    presentation_callback=lambda presentation: self._present(
+                        key, record.planning_generation, proposal, presentation, cancel_token
+                    ),
+                    submission_callback=lambda task_ref, detail: self._mark_may_submit(
+                        key, record.planning_generation, task_ref, detail
+                    ),
+                    stop_event=cancel_token,
+                )
             if execution_result.status == "unknown":
                 current = self._store.get_request(key)
                 self._finish_unknown(key, current, execution_result.message or execution_result.error_code)
@@ -409,6 +424,8 @@ class AgentService:
         except Exception as exc:
             try:
                 record = self._store.get_request(key)
+                # Submission callbacks may fail after a durable write. The ledger,
+                # not the adapter's exception type, decides whether quarantine is required.
                 if record.may_have_submitted:
                     self._finish_unknown(key, record, str(exc))
                 elif record.stop_requested:
@@ -454,17 +471,6 @@ class AgentService:
             error_code=error_code,
         )
         self._emit(key, event_type, "ANSWERED", message)
-
-    @staticmethod
-    def _deterministic_read_only_outcome(text: str) -> PlannerOutcome | None:
-        folded = text.casefold()
-        if any(token in folded for token in ("当前状态", "状态怎么样", "状态如何", "status")):
-            return PlannerOutcome(kind="read_only", user_message="我来查看当前机器人状态。", query_kind="status")
-        if any(token in folded for token in ("有什么能力", "哪些能力", "有哪些技能", "技能列表", "能力列表")):
-            return PlannerOutcome(kind="read_only", user_message="我来查看当前机器人技能。", query_kind="list_skills")
-        if any(token in folded for token in ("有哪些姿态", "命名姿态", "姿态列表")):
-            return PlannerOutcome(kind="read_only", user_message="我来查看当前机器人姿态。", query_kind="list_poses")
-        return None
 
     @staticmethod
     def _resolve_non_workflow_message(
@@ -535,15 +541,44 @@ class AgentService:
             if self._allowed_skills and step.skill_name not in self._allowed_skills:
                 raise RuntimeError(f"skill is outside the incubation allowlist: {step.skill_name}")
 
-    def _present(self, key: RequestKey, generation: int, proposal: PlanProposal, presentation: Any) -> None:
-        self._store.bind_task(
-            key,
-            expected_generation=generation,
-            task_ref=presentation.task_ref,
-            presentation=presentation,
-            proposal_json=json.dumps(proposal.to_dict(), ensure_ascii=False, sort_keys=True),
-        )
-        self._emit(key, "presentation", "MAY_EXECUTE", presentation.summary)
+    def _present(
+        self,
+        key: RequestKey,
+        generation: int,
+        proposal: PlanProposal,
+        presentation: Any,
+        cancel_token: threading.Event,
+    ) -> None:
+        with trace_stage(
+            _trace,
+            "agent.presentation",
+            request_id=key.request_id,
+            task_id=presentation.task_ref.task_id,
+            plan_id=presentation.task_ref.plan_id,
+        ):
+            self._store.bind_task(
+                key,
+                expected_generation=generation,
+                task_ref=presentation.task_ref,
+                presentation=presentation,
+                proposal_json=json.dumps(proposal.to_dict(), ensure_ascii=False, sort_keys=True),
+            )
+            if self._presentation is None or self._events is None:
+                raise RuntimeError("presentation transport is unavailable")
+            self._presentation.present(
+                key,
+                presentation,
+                cancel_token=cancel_token,
+                publish=lambda detail: self._emit(
+                    key,
+                    "presentation",
+                    "MAY_EXECUTE",
+                    presentation.summary,
+                    detail=detail,
+                    required=True,
+                ),
+            )
+            self._emit(key, "presentation_rendered", "MAY_EXECUTE", "exact plan presentation completed")
 
     def _mark_may_submit(
         self,
@@ -552,8 +587,15 @@ class AgentService:
         task_ref: Any,
         detail: Mapping[str, object],
     ) -> None:
-        self._store.record_confirmation(key, expected_generation=generation, detail=detail)
-        self._store.mark_submitted(key, expected_generation=generation, task_ref=task_ref)
+        with trace_stage(
+            _trace,
+            "agent.submission",
+            request_id=key.request_id,
+            task_id=task_ref.task_id,
+            plan_id=task_ref.plan_id,
+        ):
+            self._store.record_confirmation(key, expected_generation=generation, detail=detail)
+            self._store.mark_submitted(key, expected_generation=generation, task_ref=task_ref)
 
     def _finish_failure(self, key: RequestKey, record: Any, message: str) -> None:
         self._store.finish(
@@ -591,14 +633,26 @@ class AgentService:
         )
         self._emit(key, "dry_run_complete", "ANSWERED", message)
 
-    def _emit(self, key: RequestKey, event_type: str, state: str, message: str) -> None:
+    def _emit(
+        self,
+        key: RequestKey,
+        event_type: str,
+        state: str,
+        message: str,
+        *,
+        detail: Mapping[str, object] | None = None,
+        required: bool = False,
+    ) -> None:
         if self._events is None:
+            if required:
+                raise RuntimeError("required event transport is unavailable")
             return
+        detail = dict(detail or {})
         sequence = self._store.record_event(
             key,
             event_type=event_type,
             state=state,
-            detail_json=json.dumps({"message": message}, ensure_ascii=False, sort_keys=True),
+            detail_json=json.dumps({"message": message, "detail": detail}, ensure_ascii=False, sort_keys=True),
         )
         try:
             self._events.publish(
@@ -609,10 +663,13 @@ class AgentService:
                     event_type=event_type,
                     state=state,
                     user_message=message,
+                    detail=detail,
                     created_at=datetime.now(timezone.utc).isoformat(),
                 )
             )
         except Exception:
+            if required:
+                raise
             # The ledger is authoritative; a broken transport must not reopen
             # the request through the outer failure handler.
             _LOGGER.exception("Could not publish Agent event for %s", key.request_id)

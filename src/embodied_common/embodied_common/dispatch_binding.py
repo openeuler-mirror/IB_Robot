@@ -11,12 +11,13 @@ from embodied_common.canon import sha256_text, to_canonical_json
 from ibrobot_msgs.msg import DelegatedExecutorIdentity, DispatchBinding, WorkflowStep
 
 
-def new_binding(*, task_id: str = "", root_task_id: str = "") -> DispatchBinding:
+def new_binding(*, task_id: str = "", root_task_id: str = "", trace_id: str = "") -> DispatchBinding:
     binding = DispatchBinding()
     binding.schema_version = 1
     binding.task_id = task_id
     binding.root_task_id = root_task_id or task_id
     binding.workflow_step_index = 0
+    binding.trace_id = trace_id
     return binding
 
 
@@ -33,6 +34,7 @@ def copy_binding(source: DispatchBinding) -> DispatchBinding:
     target.workflow_step_index = source.workflow_step_index
     target.root_lease_nonce = source.root_lease_nonce
     target.dispatch_nonce = source.dispatch_nonce
+    target.trace_id = source.trace_id
     return target
 
 

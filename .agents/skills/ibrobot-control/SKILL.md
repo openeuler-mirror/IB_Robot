@@ -202,6 +202,9 @@ ibrobot-perceive --source arm_joint_position --field position [--config-name NAM
 - `ros2 topic echo --once` returns the *next* published message, a single point-in-time sample, not a
   persistent snapshot. For volatile event sources such as `voice_direction` (published only on
   voice activity) the value may be absent within the timeout or already stale when consumed.
+  When reading `voice_direction`, set the tool-call timeout to at least 70 seconds (the wrapper
+  waits up to 60 seconds for the next voice event) and prompt the user to speak toward the robot
+  within that window before or while the call runs.
 - The wrapper prints the value on stdout (e.g., `0.5236`) and errors on stderr. On any error,
   timeout, or missing field, report "无法感知" to the user and stop; do not fabricate a value.
 - For requests asking for current motor or joint angles, run

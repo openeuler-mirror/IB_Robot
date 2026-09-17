@@ -7,6 +7,7 @@ from robot_config.loader import (
     _validate_sound_orientation_config,
     load_robot_config,
     load_robot_config_dict,
+    validate_agent_entry_config,
     validate_config,
     validate_embodied_launch_dict,
 )
@@ -14,6 +15,17 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_skill_cli.catalog import compile_local_snapshot
 
 GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
+
+
+@pytest.mark.parametrize("timeout", [0, -1, True, "30", float("inf"), float("nan")])
+def test_agent_presentation_timeout_is_bounded(timeout):
+    errors = validate_agent_entry_config(
+        {
+            "entry_mode": "agent",
+            "agent": {"incubation": True, "presentation_timeout_sec": timeout},
+        }
+    )
+    assert any("presentation_timeout_sec" in error for error in errors)
 
 
 def _snapshot(config_path: Path):

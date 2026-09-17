@@ -23,11 +23,13 @@ from embodied_common.agent_execution_contract import validate_agent_execution_mo
 from embodied_common.agent_terminal_contract import stable_agent_execution_error_code
 from embodied_common.dispatch_binding import new_binding, workflow_step
 from embodied_common.skill_request import derive_skill_task_id
+from embodied_common.tracing import create_trace_logger, trace_scope, trace_stage
 from embodied_common.wire_contracts import validate_public_request_wire_contracts
 from embodied_common.workflow_contracts import (
     CanonicalWorkflowStep,
     compute_workflow_digest,
     normalize_workflow_steps,
+    validate_workflow_steps,
 )
 from embodied_common.workflow_lifecycle import WorkflowLifecycleClient, WorkflowLifecycleError
 from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
@@ -40,10 +42,13 @@ from ibrobot_msgs.srv import (
     GetSkillGatewayStatus,
     GetSkillSnapshot,
     PlanAgentCommand,
+    PrepareAgentPlan,
     ValidateAgentPlan,
     ValidateSkill,
 )
 from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
+
+_trace = create_trace_logger("ib_trace.agent_plan")
 
 
 class _ChildStateUnknown(AgentPlanError):
@@ -70,6 +75,7 @@ class AgentPlanNode(Node):
         self.declare_parameter("begin_workflow_service", "/embodied/begin_workflow_execution")
         self.declare_parameter("finalize_workflow_service", "/embodied/finalize_workflow_execution")
         self.declare_parameter("plan_service", "/embodied/plan_agent_command")
+        self.declare_parameter("prepare_plan_service", "/embodied/prepare_agent_plan")
         self.declare_parameter("validate_plan_service", "/embodied/validate_agent_plan")
         self.declare_parameter("confirm_plan_service", "/embodied/confirm_agent_plan")
         self.declare_parameter("execute_plan_action", "/embodied/execute_agent_plan")
@@ -122,6 +128,12 @@ class AgentPlanNode(Node):
             PlanAgentCommand,
             self._string_parameter("plan_service"),
             self._plan_command,
+            callback_group=callback_group,
+        )
+        self._prepare_plan_server = self.create_service(
+            PrepareAgentPlan,
+            self._string_parameter("prepare_plan_service"),
+            self._prepare_plan,
             callback_group=callback_group,
         )
         self._validate_plan_server = self.create_service(
@@ -298,6 +310,7 @@ class AgentPlanNode(Node):
 
     def _normalize_steps(self, workflow_steps, status, catalog) -> tuple[CanonicalWorkflowStep, ...]:
         try:
+            validate_workflow_steps(workflow_steps)
             requested_steps = normalize_workflow_steps(workflow_steps)
             steps = []
             for step in requested_steps:
@@ -342,6 +355,10 @@ class AgentPlanNode(Node):
         return steps
 
     def _plan_command(self, request, response):
+        with trace_scope(request.request_id), trace_stage(_trace, "agent_plan.prepare", request_id=request.request_id):
+            return self._plan_command_traced(request, response)
+
+    def _plan_command_traced(self, request, response):
         try:
             if request.schema_version != 1:
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
@@ -378,10 +395,80 @@ class AgentPlanNode(Node):
             response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
-    def _validate_step(self, plan: AgentPlan, step: CanonicalWorkflowStep):
+    def _prepare_plan(self, request, response):
+        """Capture and validate a plan in one exact-snapshot read-only transaction."""
+        with (
+            trace_scope(request.trace_id or request.request_id),
+            trace_stage(_trace, "agent_plan.prepare_validate", request_id=request.request_id),
+        ):
+            try:
+                if request.schema_version != 1:
+                    raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
+                try:
+                    execution_mode = validate_agent_execution_mode(request.execution_mode)
+                except ValueError as exc:
+                    raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
+                status = self._gateway_status()
+                catalog = self._catalog_view(status)
+                steps = self._normalize_steps(request.workflow_steps, status, catalog)
+                epoch, generation, digest = self._identity(status)
+                with self._store_lock:
+                    plan = self._store.create_plan(
+                        request_id=request.request_id,
+                        raw_command=request.raw_command,
+                        workflow_steps=steps,
+                        registry_epoch=epoch,
+                        registry_generation=generation,
+                        registry_digest=digest,
+                        execution_mode=execution_mode,
+                    )
+                response.plan = self._to_plan_message(plan)
+                first_error_code = ""
+                first_error_message = ""
+                for step in plan.workflow_steps:
+                    validation = self._validate_step(plan, step, request.trace_id)
+                    response.diagnostics.extend(self._copy_diagnostics(validation.diagnostics))
+                    actual_identity = (
+                        validation.actual_registry_epoch,
+                        int(validation.actual_registry_generation),
+                        validation.actual_registry_digest,
+                    )
+                    expected_identity = (plan.registry_epoch, plan.registry_generation, plan.registry_digest)
+                    if actual_identity != expected_identity and not first_error_code:
+                        first_error_code = "SKILL_REGISTRY_VERSION_MISMATCH"
+                        first_error_message = "validation used a different registry identity"
+                    elif not validation.allowed and not first_error_code:
+                        first_error_code = validation.error_code or "CAPABILITY_NOT_READY"
+                        first_error_message = validation.reason or first_error_code
+                if first_error_code:
+                    response.error_code = first_error_code
+                    response.message = first_error_message
+                    return response
+                with self._store_lock:
+                    self._store.mark_validated(
+                        plan_token=plan.plan_token,
+                        registry_epoch=plan.registry_epoch,
+                        registry_generation=plan.registry_generation,
+                        registry_digest=plan.registry_digest,
+                    )
+                response.success = True
+                response.allowed = True
+                response.message = "allowed"
+            except AgentPlanError as exc:
+                response.error_code = exc.code
+                response.message = str(exc)
+                response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+            except Exception as exc:
+                self._log_unexpected_service_error("prepare and validation", exc)
+                response.error_code = "CAPABILITY_NOT_READY"
+                response.message = "agent plan preparation is temporarily unavailable"
+                response.diagnostics = [self._diagnostic(response.error_code, response.message)]
+            return response
+
+    def _validate_step(self, plan: AgentPlan, step: CanonicalWorkflowStep, trace_id: str = ""):
         request = ValidateSkill.Request()
         request.schema_version = step.schema_version
-        request.dispatch_binding = new_binding(task_id=plan.plan_id)
+        request.dispatch_binding = new_binding(task_id=plan.plan_id, trace_id=trace_id)
         request.dispatch_binding.expected_registry_epoch = plan.registry_epoch
         request.dispatch_binding.expected_registry_generation = plan.registry_generation
         request.dispatch_binding.expected_registry_digest = plan.registry_digest
@@ -423,7 +510,7 @@ class AgentPlanNode(Node):
             first_error_code = ""
             first_error_message = ""
             for step in plan.workflow_steps:
-                validation = self._validate_step(plan, step)
+                validation = self._validate_step(plan, step, getattr(request, "trace_id", ""))
                 response.diagnostics.extend(self._copy_diagnostics(validation.diagnostics))
                 actual_identity = (
                     validation.actual_registry_epoch,
@@ -465,6 +552,10 @@ class AgentPlanNode(Node):
         return response
 
     def _confirm_plan(self, request, response):
+        with trace_scope(request.task_id), trace_stage(_trace, "agent_plan.confirm", task_id=request.task_id):
+            return self._confirm_plan_traced(request, response)
+
+    def _confirm_plan_traced(self, request, response):
         try:
             if request.schema_version != 1:
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
@@ -513,8 +604,9 @@ class AgentPlanNode(Node):
             response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
-    def _root_binding(self, plan: AgentPlan, task_id: str, execution):
+    def _root_binding(self, plan: AgentPlan, task_id: str, execution, trace_id: str = ""):
         binding = new_binding(task_id=task_id)
+        binding.trace_id = str(trace_id).strip()
         binding.expected_registry_epoch = plan.registry_epoch
         binding.expected_registry_generation = plan.registry_generation
         binding.expected_registry_digest = plan.registry_digest
@@ -664,6 +756,11 @@ class AgentPlanNode(Node):
             raise AgentPlanError(exc.code, str(exc)) from exc
 
     def _execute_plan(self, goal_handle):
+        task_id = str(goal_handle.request.task_id)
+        with trace_scope(task_id), trace_stage(_trace, "agent_plan.execute", task_id=task_id):
+            return self._execute_plan_traced(goal_handle)
+
+    def _execute_plan_traced(self, goal_handle):
         request = goal_handle.request
         result = ExecuteAgentPlan.Result()
         completed = 0
@@ -714,7 +811,7 @@ class AgentPlanNode(Node):
             if remaining_timeout <= 0.0:
                 raise AgentPlanError("SKILL_TASK_DEADLINE_EXPIRED", "confirmed task budget expired before execution")
             execution_deadline = time.monotonic() + remaining_timeout
-            binding = self._root_binding(plan, request.task_id, execution)
+            binding = self._root_binding(plan, request.task_id, execution, getattr(request, "trace_id", ""))
             if len(steps) > 1:
                 binding.root_lease_nonce = self._begin_workflow(plan, binding, steps)
                 workflow_started = True
@@ -724,7 +821,9 @@ class AgentPlanNode(Node):
                 child_binding = binding
                 if workflow_started:
                     child_binding = new_binding(
-                        task_id=derive_skill_task_id(request.task_id, index), root_task_id=request.task_id
+                        task_id=derive_skill_task_id(request.task_id, index),
+                        root_task_id=request.task_id,
+                        trace_id=binding.trace_id,
                     )
                     child_binding.task_budget = binding.task_budget
                     child_binding.expected_registry_epoch = plan.registry_epoch

@@ -2325,6 +2325,14 @@ def validate_agent_entry_config(embodied: dict[str, Any]) -> list[str]:
     if isinstance(event_queue_size, bool) or not isinstance(event_queue_size, int) or event_queue_size <= 0:
         errors.append("embodied.agent.event_queue_size must be a positive integer")
     clarification_ttl_sec = agent.get("clarification_ttl_sec", 300.0)
+    presentation_timeout_sec = agent.get("presentation_timeout_sec", 30.0)
+    if (
+        isinstance(presentation_timeout_sec, bool)
+        or not isinstance(presentation_timeout_sec, int | float)
+        or not math.isfinite(presentation_timeout_sec)
+        or presentation_timeout_sec <= 0
+    ):
+        errors.append("embodied.agent.presentation_timeout_sec must be finite and positive")
     if (
         isinstance(clarification_ttl_sec, bool)
         or not isinstance(clarification_ttl_sec, int | float)
