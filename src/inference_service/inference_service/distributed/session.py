@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -233,6 +233,8 @@ class EdgeSession:
         target_request_id: str = "",
         observation_timestamp_ns: int = 0,
         stream_references: tuple[StreamReference, ...] = (),
+        aligned_timestamps_ns: tuple[int, ...] = (),
+        aligned_tensors: tuple[Mapping[str, object], ...] = (),
     ) -> DistributedRequest:
         """Register and transmit one request without an invalidation window."""
 
@@ -246,6 +248,8 @@ class EdgeSession:
                 target_request_id=target_request_id,
                 observation_timestamp_ns=observation_timestamp_ns,
                 stream_references=stream_references,
+                aligned_timestamps_ns=aligned_timestamps_ns,
+                aligned_tensors=aligned_tensors,
             )
             try:
                 sender(request)
@@ -265,6 +269,8 @@ class EdgeSession:
         target_request_id: str,
         observation_timestamp_ns: int,
         stream_references: tuple[StreamReference, ...],
+        aligned_timestamps_ns: tuple[int, ...] = (),
+        aligned_tensors: tuple[Mapping[str, object], ...] = (),
     ) -> DistributedRequest:
         if self._state.state is not PipelineState.READY or not self._session_id:
             raise DistributedProtocolError(
@@ -323,6 +329,8 @@ class EdgeSession:
             target_request_id=target_request_id,
             observation_timestamp_ns=observation_timestamp_ns,
             stream_references=stream_references,
+            aligned_timestamps_ns=aligned_timestamps_ns,
+            aligned_tensors=aligned_tensors,
         )
         self._pending[request_id] = (operation, target_request_id)
         return request

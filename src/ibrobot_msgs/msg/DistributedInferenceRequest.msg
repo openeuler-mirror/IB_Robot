@@ -20,3 +20,8 @@ string[] stream_observation_keys
 string[] stream_ids
 # Non-streamed observations, including explicit DDS image mode, remain in tensors.
 VariantsList tensors
+# Timestamped history of non-streamed observations for post-hoc alignment
+# with the cloud-selected video capture. Empty when no RTP stream is
+# referenced (pure DDS mode stays on the request tick anchor).
+uint64[] aligned_timestamps_ns
+VariantsList[] aligned_tensors

@@ -733,9 +733,79 @@ class PipelinePolicyNode(Node):
                 (-float(base_velocity_max), float(base_velocity_max), 200.0, -100.0) for _ in velocity_joints
             )
 
+    _state_alignment_window_ns = 0
+
+    def _resolve_state_alignment_window_ns(self) -> int:
+        """Alignment window from the first RTP stream's readiness settings."""
+        from robot_config.observation_transport import effective_observation_transport
+
+        for spec in self._obs_specs:
+            transport = effective_observation_transport(spec.transport)
+            if transport.mode == "rtp" and transport.readiness is not None:
+                return max(0, int(transport.readiness.state_alignment_window_ms)) * 1_000_000
+        return 0
+
+    def _build_aligned_history(
+        self, observations: dict[str, object], sample_time: int
+    ) -> tuple[tuple[int, ...], tuple[dict[str, object], ...]]:
+        """Collect timestamped history of small non-streamed observations.
+
+        The cloud can only select video frames that are already decoded, so
+        the selected capture lags the request tick by the video pipeline
+        latency and the single tick-anchored state sample cannot represent
+        that offset. The cloud matches this history against the selected
+        capture timestamp instead. DDS-transported images stay anchored at
+        the request tick: they are too large to window and mixing transports
+        in one pipeline cannot be aligned anyway.
+        """
+        window_ns = self._state_alignment_window_ns
+        if window_ns <= 0:
+            return (), ()
+        keys: list[str] = []
+        for key in observations:
+            state = self._subs.get(key)
+            if state is None:
+                continue
+            if state.spec.image_resize is not None:
+                self.get_logger().warning(
+                    f"observation {key} is a DDS-transported image alongside RTP streams; it stays"
+                    " anchored at the request tick and cannot align with the cloud-selected capture",
+                    throttle_duration_sec=10.0,
+                )
+                continue
+            keys.append(key)
+        if not keys:
+            return (), ()
+        anchor_state = self._subs[keys[0]]
+        anchor_entries = [
+            timestamp_ns
+            for timestamp_ns, _receive_ts, _value in anchor_state.buffer.entries()
+            if sample_time - window_ns <= timestamp_ns <= sample_time
+        ]
+        if not anchor_entries:
+            return (), ()
+        timestamps: list[int] = []
+        tensors: list[dict[str, object]] = []
+        for timestamp_ns in anchor_entries:
+            entry: dict[str, object] = {}
+            for key in keys:
+                value, issue = self._subs[key].buffer.select(timestamp_ns)
+                if value is None:
+                    del issue
+                    entry = {}
+                    break
+                if key == "observation.state":
+                    value = self._rad_to_lerobot(value)
+                entry[key] = value
+            if entry:
+                timestamps.append(timestamp_ns)
+                tensors.append(entry)
+        return tuple(timestamps), tuple(tensors)
+
     def _setup_observation_subscriptions(self) -> None:
         from rosidl_runtime_py.utilities import get_message
 
+        self._state_alignment_window_ns = self._resolve_state_alignment_window_ns()
         for spec in self._obs_specs:
             key = self._subscription_key(spec)
             max_age_ms = int(spec.max_age_ms)
@@ -744,6 +814,10 @@ class PipelinePolicyNode(Node):
             policy = str(getattr(spec, "resample_policy", "hold")).lower()
             alignment_window_ns = asof_tolerance_ns if policy == "asof" else step_ns if policy == "drop" else 0
             observation_history_ns = (self._n_obs_steps - 1) * step_ns
+            # Small non-image observations retain an alignment window so the
+            # timestamped history sent with each request can cover the video
+            # pipeline latency; image entries are far too large to retain.
+            state_alignment_ns = self._state_alignment_window_ns if spec.image_resize is None else 0
             self._subs[key] = _SubState(
                 spec=spec,
                 max_age_ns=max_age_ms * 1_000_000,
@@ -753,6 +827,7 @@ class PipelinePolicyNode(Node):
                         step_ns * 2,
                         max_age_ms * 1_000_000 + step_ns,
                         alignment_window_ns + step_ns,
+                        state_alignment_ns + step_ns,
                     )
                     + observation_history_ns
                 ),
@@ -1458,6 +1533,12 @@ class PipelinePolicyNode(Node):
                         for key, value in canonical_inputs.items()
                         if key not in video_manager.observation_keys
                     }
+                aligned_timestamps_ns: tuple[int, ...] = ()
+                aligned_tensors: tuple[dict[str, object], ...] = ()
+                if stream_references:
+                    aligned_timestamps_ns, aligned_tensors = self._build_aligned_history(observations, sample_time)
+                    if aligned_timestamps_ns:
+                        aligned_tensors = tuple(dict(edge_runtime.preprocess(entry)) for entry in aligned_tensors)
                 self._raise_if_deadline_expired(deadline, request_id)
                 distributed_result = self._round_trip(
                     Operation.INFER,
@@ -1468,6 +1549,8 @@ class PipelinePolicyNode(Node):
                     goal_handle=goal_handle,
                     observation_timestamp_ns=sample_time if stream_references else 0,
                     stream_references=stream_references,
+                    aligned_timestamps_ns=aligned_timestamps_ns,
+                    aligned_tensors=aligned_tensors,
                 )
                 self._raise_if_deadline_expired(deadline, request_id)
                 if self._goal_cancel_requested(goal_handle):
@@ -2689,6 +2772,8 @@ class PipelinePolicyNode(Node):
         progress: _RoundTripProgress | None = None,
         observation_timestamp_ns: int = 0,
         stream_references: tuple[StreamReference, ...] = (),
+        aligned_timestamps_ns: tuple[int, ...] = (),
+        aligned_tensors: tuple[dict[str, object], ...] = (),
     ) -> DistributedResult:
         pending = _PendingOperation(event=threading.Event(), operation=operation)
         with self._pending_lock:
@@ -2718,6 +2803,8 @@ class PipelinePolicyNode(Node):
                 target_request_id=target_request_id,
                 observation_timestamp_ns=observation_timestamp_ns,
                 stream_references=stream_references,
+                aligned_timestamps_ns=aligned_timestamps_ns,
+                aligned_tensors=aligned_tensors,
             )
             while not pending.event.wait(timeout=0.05):
                 if request.deadline is not None and datetime.now(timezone.utc) >= request.deadline:

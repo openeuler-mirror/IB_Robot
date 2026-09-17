@@ -31,7 +31,55 @@ class _StreamManager:
 
     def statuses(self) -> tuple[object, ...]: ...
 
+    def selection_anchor_ns(self) -> int: ...
+
+    def state_alignment_tolerance_ns(self) -> int: ...
+
+    def record_state_alignment(self, delta_ns: int) -> None: ...
+
     def close(self) -> None: ...
+
+
+def align_inputs_to_selection(
+    inputs: dict[str, object],
+    *,
+    aligned_timestamps_ns: tuple[int, ...],
+    aligned_tensors: tuple[Mapping[str, object], ...],
+    selected_capture_ns: int,
+    tolerance_ns: int,
+) -> tuple[dict[str, object], int]:
+    """Replace tick-anchored inputs with the history entry matching the capture.
+
+    The cloud can only select video frames that are already decoded, so the
+    selected capture lags the request tick. The request carries a timestamped
+    history of the small observations; the entry closest to the selected
+    capture replaces the tick-anchored samples so the policy consumes one
+    consistent instant. No entry within tolerance is a hard failure: the
+    dispatcher retries instead of silently pairing mismatched instants.
+    """
+    if not aligned_timestamps_ns or selected_capture_ns <= 0:
+        return inputs, 0
+    best_index = min(
+        range(len(aligned_timestamps_ns)),
+        key=lambda index: abs(aligned_timestamps_ns[index] - selected_capture_ns),
+    )
+    delta_ns = abs(aligned_timestamps_ns[best_index] - selected_capture_ns)
+    if tolerance_ns > 0 and delta_ns > tolerance_ns:
+        raise DistributedProtocolError(
+            StructuredError(
+                code="state_alignment_unavailable",
+                message=(
+                    "no aligned observation history within "
+                    f"{tolerance_ns / 1e6:.0f}ms of the selected capture "
+                    f"(delta {delta_ns / 1e6:.1f}ms)"
+                ),
+                stage="backend",
+                recoverable=True,
+            )
+        )
+    aligned = dict(inputs)
+    aligned.update(aligned_tensors[best_index])
+    return aligned, delta_ns
 
 
 class DistributedCloudService:
@@ -151,6 +199,15 @@ class DistributedCloudService:
                                 now_ns=time.time_ns(),
                             )
                         )
+                        if request.aligned_timestamps_ns:
+                            inputs, alignment_delta_ns = align_inputs_to_selection(
+                                inputs,
+                                aligned_timestamps_ns=request.aligned_timestamps_ns,
+                                aligned_tensors=request.aligned_tensors,
+                                selected_capture_ns=self.stream_manager.selection_anchor_ns(),
+                                tolerance_ns=self.stream_manager.state_alignment_tolerance_ns(),
+                            )
+                            self.stream_manager.record_state_alignment(alignment_delta_ns)
                     stream_assembly_end_monotonic_ns = time.monotonic_ns()
                     inference_start_monotonic_ns = time.monotonic_ns()
                     pipeline_result = self.runtime.infer(

@@ -86,6 +86,7 @@ class ComputeVideoStreamManager:
         self._recorders: dict[str, H264StreamRecorder] = {}
         self._lock = threading.RLock()
         self._selection_diagnostics: tuple[tuple[str, int, float, float], ...] = ()
+        self._last_state_alignment_delta_ns: int | None = None
         self._receiver_start_lock = threading.Lock()
         self._specs: dict[str, tuple[SpecView, ObservationTransportSpec]] = {}
         for spec in observation_specs:
@@ -241,6 +242,26 @@ class ComputeVideoStreamManager:
         with self._lock:
             streams = tuple(sorted(self._streams.values(), key=lambda item: item.spec.key))
         return tuple((stream.spec.key, stream.receiver.decoder.metrics) for stream in streams)
+
+    def selection_anchor_ns(self) -> int:
+        """Capture timestamp of the newest common selection, 0 when none."""
+        with self._lock:
+            captures = [item[1] for item in self._selection_diagnostics]
+        return min(captures) if captures else 0
+
+    def state_alignment_tolerance_ns(self) -> int:
+        for _spec, transport in self._specs.values():
+            if transport.readiness is not None:
+                return max(0, int(transport.readiness.state_alignment_tolerance_ms)) * 1_000_000
+        return 0
+
+    def record_state_alignment(self, delta_ns: int) -> None:
+        with self._lock:
+            self._last_state_alignment_delta_ns = delta_ns
+
+    def state_alignment_delta_ns(self) -> int | None:
+        with self._lock:
+            return self._last_state_alignment_delta_ns
 
     def selection_diagnostics(self) -> tuple[tuple[str, int, float, float], ...]:
         with self._lock:

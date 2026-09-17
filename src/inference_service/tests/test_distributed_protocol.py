@@ -35,6 +35,7 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
 )
+from inference_service.distributed.service import align_inputs_to_selection
 from inference_service.distributed.types import PROTOCOL_VERSION, structured_error_from_exception
 from inference_service.pipeline import PipelineState
 from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
@@ -875,6 +876,97 @@ def test_stream_reference_cannot_collide_with_tensor_semantic(tmp_path):
             observation_timestamp_ns=1,
             stream_references=(StreamReference("observation.images.top", "top"),),
         )
+
+
+def test_aligned_history_round_trips_through_the_request_message(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    request = DistributedRequest(
+        operation=Operation.INFER,
+        pipeline_id=identity.pipeline_id,
+        request_id="request",
+        session_id="session",
+        session_generation=1,
+        deployment_fingerprint=identity.deployment_fingerprint,
+        observation_timestamp_ns=1,
+        stream_references=(StreamReference("observation.images.top", "top"),),
+        aligned_timestamps_ns=(1_000, 1_050, 1_100),
+        aligned_tensors=(
+            {"observation.state": np.array([0.0, 1.0])},
+            {"observation.state": np.array([0.5, 1.5])},
+            {"observation.state": np.array([1.0, 2.0])},
+        ),
+    )
+
+    decoded = request_from_message(request_to_message(request))
+
+    assert decoded.aligned_timestamps_ns == (1_000, 1_050, 1_100)
+    assert len(decoded.aligned_tensors) == 3
+    np.testing.assert_allclose(decoded.aligned_tensors[1]["observation.state"], np.array([0.5, 1.5]))
+
+
+def test_aligned_history_requires_stream_references_and_equal_arrays(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    base = dict(
+        operation=Operation.INFER,
+        pipeline_id=identity.pipeline_id,
+        request_id="request",
+        session_id="session",
+        session_generation=1,
+        deployment_fingerprint=identity.deployment_fingerprint,
+    )
+    with pytest.raises(ValueError, match="equal length"):
+        DistributedRequest(
+            **base,
+            stream_references=(StreamReference("observation.images.top", "top"),),
+            aligned_timestamps_ns=(1_000,),
+            aligned_tensors=(),
+        )
+    with pytest.raises(ValueError, match="requires stream references"):
+        DistributedRequest(**base, aligned_timestamps_ns=(1_000,), aligned_tensors=({"k": 1},))
+
+
+def test_align_inputs_to_selection_matches_the_nearest_history_entry():
+    inputs = {"observation.state": [9.0, 9.0]}
+    aligned, delta = align_inputs_to_selection(
+        inputs,
+        aligned_timestamps_ns=(1_000, 1_050, 1_100),
+        aligned_tensors=(
+            {"observation.state": [0.0, 0.0]},
+            {"observation.state": [0.5, 0.5]},
+            {"observation.state": [1.0, 1.0]},
+        ),
+        selected_capture_ns=1_060,
+        tolerance_ns=25_000_000,
+    )
+
+    assert aligned["observation.state"] == [0.5, 0.5]
+    assert delta == 10
+
+
+def test_align_inputs_to_selection_fails_beyond_tolerance():
+    with pytest.raises(DistributedProtocolError) as error:
+        align_inputs_to_selection(
+            {"observation.state": [9.0]},
+            aligned_timestamps_ns=(1_000,),
+            aligned_tensors=({"observation.state": [0.0]},),
+            selected_capture_ns=1_000_000_000,
+            tolerance_ns=25_000_000,
+        )
+    assert error.value.error.code == "state_alignment_unavailable"
+    assert error.value.error.recoverable is True
+
+
+def test_align_inputs_to_selection_skips_when_history_absent():
+    inputs = {"observation.state": [9.0]}
+    aligned, delta = align_inputs_to_selection(
+        inputs,
+        aligned_timestamps_ns=(),
+        aligned_tensors=(),
+        selected_capture_ns=1_000,
+        tolerance_ns=25_000_000,
+    )
+    assert aligned is inputs
+    assert delta == 0
 
 
 def test_request_decoder_rejects_old_protocol_and_malformed_stream_arrays(tmp_path):

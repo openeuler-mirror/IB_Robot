@@ -61,6 +61,8 @@ class VideoReadinessSpec:
     keyframe_timeout_ms: int = 3000
     timestamp_mapping_max_age_ms: int = 1000
     max_inter_camera_skew_ms: int = 50
+    state_alignment_window_ms: int = 2000
+    state_alignment_tolerance_ms: int = 25
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,13 +175,21 @@ def parse_observation_transport(value: Any) -> ObservationTransportSpec | None:
         item = _mapping(data["readiness"], "transport.readiness")
         _check_fields(
             item,
-            {"keyframe_timeout_ms", "timestamp_mapping_max_age_ms", "max_inter_camera_skew_ms"},
+            {
+                "keyframe_timeout_ms",
+                "timestamp_mapping_max_age_ms",
+                "max_inter_camera_skew_ms",
+                "state_alignment_window_ms",
+                "state_alignment_tolerance_ms",
+            },
             "transport.readiness",
         )
         readiness = VideoReadinessSpec(
             keyframe_timeout_ms=int(item.get("keyframe_timeout_ms", 3000)),
             timestamp_mapping_max_age_ms=int(item.get("timestamp_mapping_max_age_ms", 1000)),
             max_inter_camera_skew_ms=int(item.get("max_inter_camera_skew_ms", 50)),
+            state_alignment_window_ms=int(item.get("state_alignment_window_ms", 2000)),
+            state_alignment_tolerance_ms=int(item.get("state_alignment_tolerance_ms", 25)),
         )
     recording = None
     if data.get("recording") is not None:

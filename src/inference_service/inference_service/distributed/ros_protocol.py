@@ -114,6 +114,8 @@ def request_to_message(request: DistributedRequest) -> DistributedInferenceReque
     message.stream_observation_keys = [reference.observation_key for reference in request.stream_references]
     message.stream_ids = [reference.stream_id for reference in request.stream_references]
     message.tensors = TensorMsgConverter.to_variant(dict(request.inputs))
+    message.aligned_timestamps_ns = list(request.aligned_timestamps_ns)
+    message.aligned_tensors = [TensorMsgConverter.to_variant(dict(entry)) for entry in request.aligned_tensors]
     return message
 
 
@@ -134,6 +136,8 @@ def request_from_message(message: DistributedInferenceRequest) -> DistributedReq
         session_generation=message.session_generation,
         deployment_fingerprint=message.deployment_fingerprint,
         inputs=TensorMsgConverter.from_variant(message.tensors),
+        aligned_timestamps_ns=tuple(message.aligned_timestamps_ns),
+        aligned_tensors=tuple(TensorMsgConverter.from_variant(entry) for entry in message.aligned_tensors),
         prompt=message.prompt or None,
         deadline=deadline,
         observation_timestamp_ns=_time_to_nanoseconds(message.observation_timestamp),

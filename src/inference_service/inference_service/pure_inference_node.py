@@ -248,6 +248,12 @@ class PureInferenceNode(Node):
                 f"dropped_stale={metrics.dropped_stale_decoder_frames}, metadata_depth={metrics.metadata_fifo_depth}",
                 throttle_duration_sec=2.0,
             )
+        alignment_delta_ns = self._stream_manager.state_alignment_delta_ns()
+        if alignment_delta_ns is not None:
+            self.get_logger().info(
+                f"State alignment: delta_ms={alignment_delta_ns / 1e6:.1f}",
+                throttle_duration_sec=2.0,
+            )
         for observation_key, capture_ns, capture_age_ms, live_age_ms in self._stream_manager.selection_diagnostics():
             self.get_logger().info(
                 f"Video selection: observation={observation_key}, "

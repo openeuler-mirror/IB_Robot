@@ -180,6 +180,8 @@ class DistributedRequest:
     target_request_id: str = ""
     observation_timestamp_ns: int = 0
     stream_references: tuple[StreamReference, ...] = ()
+    aligned_timestamps_ns: tuple[int, ...] = ()
+    aligned_tensors: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("pipeline_id", "request_id", "session_id", "deployment_fingerprint"):
@@ -193,6 +195,12 @@ class DistributedRequest:
             raise ValueError("cancel requests require target_request_id")
         if self.operation is not Operation.CANCEL and self.target_request_id:
             raise ValueError("target_request_id is valid only for cancel requests")
+        if len(self.aligned_timestamps_ns) != len(self.aligned_tensors):
+            raise ValueError("aligned timestamp and tensor arrays must have equal length")
+        if self.aligned_timestamps_ns and not self.stream_references:
+            raise ValueError("aligned history requires stream references")
+        if any(ts < 0 for ts in self.aligned_timestamps_ns):
+            raise ValueError("aligned timestamps must be non-negative")
         if self.observation_timestamp_ns < 0:
             raise ValueError("observation_timestamp_ns cannot be negative")
         if self.operation is not Operation.INFER and (self.observation_timestamp_ns or self.stream_references):
