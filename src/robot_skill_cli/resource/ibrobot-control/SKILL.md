@@ -51,10 +51,10 @@ For every normal natural-language motion request, use the deterministic composit
 robot-skill run-workflow [--request-id REQUEST_ID] --text TEXT --workflow-json JSON
 ```
 
-Hermes produces the complete typed workflow once. `run-workflow` then performs discovery, catalog
-visibility checks, planning, validation, presentation, confirmation, execution, and terminal-result
-collection internally in one controlled call. Do not call the lifecycle commands separately for the
-same normal request. They remain available for diagnostics and protocol tests.
+Hermes produces the complete typed workflow once. `run-workflow` then performs discovery, catalog visibility checks,
+planning, validation, presentation, confirmation, execution, and terminal-result collection internally in one controlled
+call. Do not call the lifecycle commands separately for the same normal request. They remain available only for
+diagnostics, protocol tests, and explicit low-level integration debugging.
 
 For a single-step request, use one flat typed step, for example:
 
@@ -99,9 +99,12 @@ Construct request IDs and task IDs directly in the conversation and `robot-skill
 approval, authorizes only that command and is not motion authorization. The displayed plan/task tuple is bound internally
 by `confirm-plan` immediately after the presentation flush.
 
-Natural-language single-Skill and Workflow requests both use `run-workflow` through the composite entry. The internal `confirm-plan` call is
-the Gateway's technical binding for the exact plan/task tuple, not a second user confirmation gate. For an explicitly
-selected single skill, the direct `describe -> validate -> execute` path remains valid.
+The internal `confirm-plan` call is the Gateway's technical binding for the exact plan/task tuple, rather than a user
+confirmation gate. For an explicitly selected single skill, the direct `describe -> validate -> execute` path remains
+valid.
+
+Natural-language single-Skill and Workflow requests both use `run-workflow` through the composite entry. The internal
+binding remains separate from the user confirmation gate.
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, or rejected validation.
 Do not invent parameters absent from `describe`.
@@ -257,8 +260,8 @@ capacity failure instead of retrying with a new request ID.
 
 ## Hard Boundaries
 
-- The Agent **must not launch or restart the pipeline**.
-- The Agent **must not enable motion authorization**; only the operator may set `authorize_motion`.
+- The Agent **must not launch or restart the pipeline** unless the user explicitly confirms in the current conversation that it is safe to do so. When confirmed, the Agent may launch `ros2 launch embodied_bringup embodied_pipeline.launch.py ...` and wait for the Gateway to become ready before proceeding.
+- The Agent **must not enable motion authorization** unless the user explicitly confirms in the current conversation that motion is authorized. When confirmed, the Agent may call `ros2 service call /embodied/authorize_motion std_srvs/srv/SetBool "{data: true}"`. Without such confirmation, only the operator may set `authorize_motion`.
 - The Agent **must not modify ROS parameters**.
 - The Agent **must not source environment scripts, select a ROS domain, or discover another repository/config**.
 - The Agent **must not call Python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task IDs**.
@@ -271,7 +274,7 @@ capacity failure instead of retrying with a new request ID.
 | Situation | Response |
 |---|---|
 | Catalog-only request | Use catalog commands; no motion confirmation is needed. |
-| Runtime unavailable/unauthorized | Report the CLI error; do not start or alter infrastructure. |
+| Runtime unavailable/unauthorized | Report the CLI error; with explicit user confirmation the Agent may launch the pipeline and enable motion authorization, then retry. Without confirmation, do not start or alter infrastructure. |
 | Visual-game perception unavailable | Report `PERCEPTION_UNAVAILABLE`; do not launch or restart perception. |
 | Visual-game result ledger full | Report `GAME_CAPACITY_EXHAUSTED`; retained terminal results are not evicted early. |
 | No clearly visible person | Report `NO_PERSON`; do not announce or invent a game result. |
@@ -296,7 +299,7 @@ required workflow.
 | Mistake | Correction |
 |---|---|
 | Treating accepted cancellation as physical stop | Wait for a terminal result or task ledger terminal state. |
-| Treating command approval as motion authorization | Command approval authorizes only that command; motion still requires operator `authorize_motion` and a flushed plan presentation. |
+| Treating command approval as motion authorization | Command approval authorizes only that command; motion still requires `authorize_motion` (set by the operator, or by the Agent after explicit user confirmation in the current conversation) and a flushed plan presentation. |
 | Retrying after checking idle | Require a new user request and repeat the entire workflow; never retry automatically. |
 | Continuing after an unknown stop | `继续` needs a definite canceled terminal (5 + `SKILL_CANCELLED`). Otherwise refuse continuation and send no motion. |
 | Slicing completed steps on `继续` | Reject breakpoint resume until the Gateway provides server-owned continuation admission. |
