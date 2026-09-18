@@ -44,6 +44,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
+            "ibrobot-trace-topology = robot_config.tracing_topology:main",
             "wait_for_clock = robot_config.wait_for_clock:main",
             "wait_for_controllers = robot_config.wait_for_controllers:main",
             "controller_spawner = robot_config.controller_spawner:main",

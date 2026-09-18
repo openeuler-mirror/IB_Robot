@@ -10,14 +10,64 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
-from launch.actions import RegisterEventHandler
+from launch.action import Action
+from launch.actions import (
+    ExecuteProcess,
+    GroupAction,
+    OpaqueFunction,
+    RegisterEventHandler,
+    SetEnvironmentVariable,
+    UnregisterEventHandler,
+    UnsetEnvironmentVariable,
+)
 from launch.event_handlers import OnShutdown
+from launch.substitutions import TextSubstitution
 
 from robot_config.logger_utils import get_colored_logger
 
 logger = get_colored_logger("robot_config.tracing")
 
 DEFAULT_TRACE_SESSION_NAME = "ib_robot_trace"
+
+
+def scope_tracing_environment(actions: list[Action]) -> GroupAction:
+    """Enable direct child processes within a restoring launch scope.
+
+    Dynamically included/deferred actions must apply this helper at their actual
+    execution boundary (as controller-readiness launch does). Do not evaluate
+    IncludeLaunchDescription/OpaqueFunction early just to inspect its processes.
+    """
+    for action in actions:
+        if not isinstance(action, ExecuteProcess):
+            continue
+        # Explicit process environments bypass the launch context (e.g. LeRobot nodes).
+        environment = action.additional_env if action.additional_env is not None else action.env
+        if environment is not None:
+            environment.append(([TextSubstitution(text="IB_TRACE_ENABLED")], [TextSubstitution(text="1")]))
+
+    previous_flag = None
+
+    def remember_environment(context):
+        nonlocal previous_flag
+        previous_flag = context.environment.get("IB_TRACE_ENABLED")
+
+    def restore_environment(_event, _context):
+        if previous_flag is None:
+            return [UnsetEnvironmentVariable("IB_TRACE_ENABLED")]
+        return [SetEnvironmentVariable("IB_TRACE_ENABLED", previous_flag)]
+
+    # Humble may skip GroupAction's PopEnvironment when a child raises.
+    restore_handler = OnShutdown(on_shutdown=restore_environment)
+    return GroupAction(
+        actions=[
+            OpaqueFunction(function=remember_environment),
+            RegisterEventHandler(restore_handler),
+            SetEnvironmentVariable("IB_TRACE_ENABLED", "1"),
+            *actions,
+            UnregisterEventHandler(restore_handler),
+        ],
+        scoped=True,
+    )
 
 
 def _run_trace_command(command: list[str], failure_reason: str) -> None:
@@ -89,12 +139,7 @@ def _resolve_trace_session(session_name: str, trace_root: Path) -> tuple[str, Pa
 
 
 def _start_trace_session(session_name: str, trace_dir: Path) -> None:
-    """Create and start a mixed ROS UST + Python logging LTTng session."""
-    trace_dir.parent.mkdir(parents=True, exist_ok=True)
-    _run_trace_command(
-        ["lttng", "create", session_name, "--output", str(trace_dir)],
-        "failed to create tracing session",
-    )
+    """Enable ROS UST + Python logging and start an already owned LTTng session."""
     _run_trace_command(
         ["lttng", "enable-event", "--session", session_name, "--userspace", "ros2:*"],
         "failed to enable ROS 2 UST tracepoints",
@@ -138,7 +183,7 @@ def generate_tracing_actions(
     requested_session_name: str,
     trace_root: Path | None = None,
 ) -> list[RegisterEventHandler]:
-    """Start the tracing session when requested and return launch shutdown actions."""
+    """Start LTTng or raise on startup failure; metadata export is a separate CLI."""
     if not enable_tracing:
         return []
 
@@ -150,5 +195,21 @@ def generate_tracing_actions(
             f"'{trace_session}' instead"
         )
     logger.info(f"[tracing] Enabling ros2_tracing session: {trace_session}")
-    _start_trace_session(trace_session, trace_dir)
+    session_created = False
+    try:
+        trace_dir.parent.mkdir(parents=True, exist_ok=True)
+        _run_trace_command(
+            ["lttng", "create", trace_session, "--output", str(trace_dir)],
+            "failed to create tracing session",
+        )
+        # A successful create, not the earlier name check, establishes ownership.
+        session_created = True
+        _start_trace_session(trace_session, trace_dir)
+    except Exception:
+        try:
+            if session_created:
+                _make_trace_shutdown_handler(trace_session)(None, None)
+        except Exception as cleanup_error:
+            logger.warning(f"[tracing] Failed to clean up session '{trace_session}': {cleanup_error}")
+        raise
     return [RegisterEventHandler(event_handler=OnShutdown(on_shutdown=_make_trace_shutdown_handler(trace_session)))]

@@ -137,6 +137,7 @@ from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.launch_builders.tracing import (
     DEFAULT_TRACE_SESSION_NAME,
     generate_tracing_actions,
+    scope_tracing_environment,
 )
 from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
@@ -1036,7 +1037,11 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"setting up rerun visualizer: {e}")
         logger.info("Continuing without recording visualizer...")
 
+    enable_tracing = parse_bool(context.launch_configurations.get("enable_tracing", "false"), default=False)
     if controller_dependent_actions:
+        if enable_tracing:
+            # Readiness callbacks run after the outer launch environment scope has closed.
+            controller_dependent_actions = [scope_tracing_environment(controller_dependent_actions)]
         if controller_ready_barrier is not None:
             logger.info(
                 f"Controller readiness barrier armed for "
@@ -1059,14 +1064,13 @@ def launch_setup(context, *args, **kwargs):
             actions.extend(controller_dependent_actions)
 
     # ========== N. Tracing (optional, ros2_tracing + LTTng) ==========
-    enable_tracing = parse_bool(context.launch_configurations.get("enable_tracing", "false"), default=False)
     if enable_tracing:
         requested_trace_session = context.launch_configurations.get("trace_session_name", DEFAULT_TRACE_SESSION_NAME)
         actions[:0] = generate_tracing_actions(enable_tracing=True, requested_session_name=requested_trace_session)
 
     logger.info(f"========== Total nodes to launch: {len(actions)} ==========")
 
-    return actions
+    return [scope_tracing_environment(actions)] if enable_tracing else actions
 
 
 def generate_launch_description():

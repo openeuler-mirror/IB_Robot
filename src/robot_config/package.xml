@@ -18,6 +18,7 @@
   <depend>embodied_common</depend>
   <depend>inference_manifest</depend>
   <depend>ament_index_python</depend>
+  <depend>ibrobot_tracing</depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ros2bag</exec_depend>

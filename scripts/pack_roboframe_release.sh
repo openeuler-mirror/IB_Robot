@@ -247,6 +247,7 @@ PY_PATH=/data/roboframe/pysite:\
 /data/roboframe/install/tensormsg/lib/python3.12/site-packages:\
 /data/roboframe/install/embodied_common/lib/python3.12/site-packages:\
 /data/roboframe/install/inference_manifest/lib/python3.12/site-packages:\
+/data/roboframe/install/ibrobot_tracing/lib/python3.12/site-packages:\
 /data/roboframe/install/robot_config/lib/python3.12/site-packages:\
 /data/roboframe/install/inference_service/lib/python3.12/site-packages:\
 /data/roboframe/install/hardware_mock/lib/python3.12/site-packages:\

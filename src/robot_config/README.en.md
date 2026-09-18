@@ -744,6 +744,42 @@ Relative `model_path` values resolve only against an absolute `WORKSPACE` enviro
 derives default action, reset, health, and distributed topics. With multiple pipelines,
 `executor.inference_pipeline` must select one explicitly.
 
+### Tracing And Topology
+
+`enable_tracing:=true` starts LTTng through `robot_config.launch_builders.tracing`;
+`trace_session_name` defaults to `ib_robot_trace`. Default-name collisions get a
+unique suffix; explicit name collisions fail without overwriting an existing session.
+The builder stops/destroys its session on shutdown. `IB_TRACE_ENABLED=1` is scoped
+to this launch's child processes, including explicit inference environments and
+processes deferred until controller readiness. There is no early assignment to
+the parent's `os.environ`; launch restores the environment on leaving the scope
+so later launches do not inherit the flag. Control modes, node parameters and
+model-loading behavior are unchanged.
+
+The existing LTTng startup failure contract is retained: session inspection,
+creation, event enablement or start failures abort launch. Failure cleanup only
+owns sessions successfully created by this invocation. There is no new strict option.
+
+Startup neither exports a topology sidecar nor imports the topology module.
+Ordinary trace analysis requires no robot YAML or topology metadata. For an optional
+configuration declaration, use the existing `load_robot_section` path, including
+sibling `base_config` overlays, without the full business loader's model checks:
+
+```bash
+source .shrc_local
+ros2 run robot_config ibrobot-trace-topology \
+    src/robot_config/config/robots/so101_arm_aero_hand.yaml \
+    --control-mode model_inference > /tmp/ibrobot-topology.json
+```
+
+This command neither starts the robot nor loads models or weakens business-loader
+validation. Its metadata is marked `provenance=declared`, `runtime_verified=false`:
+it is not an inventory of started nodes. It does not apply launch CLI overrides
+(except the explicit `--control-mode`), nav stages or runtime-derived configuration.
+Independent export failure cannot reject robot startup or stop/destroy a successful
+LTTng recording. The tracing Core consumes configuration mappings or topology
+manifests, not raw robot YAML.
+
 ### Validating Configuration
 
 ```bash

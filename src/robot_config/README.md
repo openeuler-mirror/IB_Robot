@@ -976,6 +976,30 @@ ros2 topic pub /arm_position_controller/commands std_msgs/msg/Float64MultiArray 
 以及 shutdown 时的 stop/destroy 生命周期都由
 `robot_config/launch_builders/tracing.py` 统一管理。
 
+`enable_tracing:=true` 仅为本次 launch 的业务子进程设置 `IB_TRACE_ENABLED=1`，
+包括带独立环境的推理进程和 controller readiness 后启动的进程。移除提前对父进程
+`os.environ` 的赋值，使用退出时恢复的 launch scope，避免污染同进程后续 launch。
+不改变 control mode、节点参数或模型加载策略。
+保留既有失败契约：LTTng 会话检查、创建、事件启用或 start 失败仍中止 launch；
+失败清理只针对本次成功 create 的会话，不销毁同名已有会话。不新增 strict 配置。
+
+启动不再自动导出 topology sidecar，也不依赖 topology 模块。普通 trace 分析无需机器人
+YAML 或 topology 元数据。需要配置声明图时，可独立使用已有 `load_robot_section`
+展开 sibling `base_config`，不经过包含模型可用性检查的完整业务 loader：
+
+```bash
+source .shrc_local
+ros2 run robot_config ibrobot-trace-topology \
+    src/robot_config/config/robots/so101_arm_aero_hand.yaml \
+    --control-mode model_inference > /tmp/ibrobot-topology.json
+```
+
+该命令只生成可选元数据，不启动机器人、不加载模型、不放宽业务 loader 的校验。
+输出标注 `metadata.provenance=declared`、`runtime_verified=false`，不是实际
+started nodes 清单；不应用 launch CLI 覆盖（除显式 `--control-mode`）、nav stage 或
+运行时派生配置。独立导出失败不会拒绝机器人启动，也不会停止或销毁已成功录制的 LTTng 会话。
+`ibrobot_tracing` Core 不直接读取机器人 YAML。
+
 ### Voice ASR（语音识别）
 
 `robot_config` 通过 `robot.voice_asr` 作为语音识别节点的机器人级单一配置来源，并由

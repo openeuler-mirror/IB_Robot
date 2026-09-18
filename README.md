@@ -61,6 +61,9 @@ IB-Robot 构建了一个从感知、决策到执行的端到端闭环体系，�
 
 ## 仓库结构
 
+追踪功能见 [Core 使用说明](src/ibrobot_tracing/README.md)；可选性能工作台见
+[Web 工具说明](tools/ibrobot_tracing_web/README.md)，需显式准备依赖和构建，不进入默认业务安装。
+
 ```text
 IB_Robot/                           # 主工作空间 (本仓库)
 ├── .gitmodules                     # Git 子模块配置
@@ -80,6 +83,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── task_dispatch/              # 任务调度与分发服务
 │   ├── tensormsg/                  # LeRobot ↔ ROS 2 协议转换枢纽
 │   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action/Service)
+│   ├── ibrobot_tracing/            # 非侵入埋点与离线 trace 分析
 │   ├── dataset_tools/              # 数据集采集与转换工具 (Episode Recorder)
 │   ├── robot_teleop/               # 遥操作控制 (Leader Arm/Xbox 手柄)
 │   ├── robot_description/          # 统一机器人 URDF/SRDF/MJCF 模型描述
@@ -105,6 +109,8 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── skill_library/              # 技能执行层 (skill → primitive → MoveIt)
 │   └── safety_guard/               # 显式安全校验层 (白名单 + 工作空间边界)
 │
+├── tools/ibrobot_tracing_web/       # 显式启用的 Web API 工具包
+├── web/ibrobot_tracing_ui/          # Vue trace 性能工作台
 ├── docs/                           # 深度架构文档与开发指南
 │   ├── pictures/                   # 架构图与演示 GIF
 │   └── videos/                     # 演示视频 (源文件)
