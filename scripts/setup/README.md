@@ -35,7 +35,7 @@
 - **submodules**：只初始化 `libs/lerobot`（跳过 LiDAR / bringup 子模块与 ROS 第三方 patch 栈）。
 - **rosdep**：范围收窄到 `ibrobot_msgs`、`tensormsg`、`inference_manifest`、`torch_models`、`inference_service`、`model_utils`、`dataset_tools`；`robot_config` 仍需构建（SSOT YAML）但不参与 rosdep 解析，避免拉入 nav2 / slam_toolbox / gz / 相机 / 雷达等 bringup 依赖。
 - **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍安装完整的平台依赖与 CANN 匹配的 `torch_npu`；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
-- **CANN 8.1 ABI**：使用 `requirements/lerobot-v0.6-cann-8.1.txt` 安装 LeRobot 的非 Torch 运行时依赖；full profile 追加 `lerobot-v0.6-cann-8.1-full.txt` 的 dataset/kinematics 与 Transformers 5.5 依赖，local-only inference profile 则通过 `lerobot-v0.6-cann-8.1-inference.txt` 固定 `transformers==5.3.0` 维持 PI0.5 冻结精度基线（不启用 remote code、不调用 `save_pretrained`）；最后以 `--no-deps` 安装 editable LeRobot，并固定验证 `torch==2.5.1`、`torch_npu==2.5.1`、`torchvision==0.20.1`。
+- **CANN 8.1 ABI**：`full` 和 `inference` 共用 `lerobot-v0.6-cann-8.1-compat.txt`，包含已验证的 Transformers 5.3.0。`full` 仅追加 `lerobot-v0.6-cann-8.1-extras.txt` 的 dataset/kinematics 功能依赖，不切换推理版本。LeRobot 以 `--no-deps` 安装；`openeuler-24.03-cann-8.1.txt` 负责平台包和 Torch ABI。
 - **OpenCV / cv_bridge ABI**：openEuler aarch64 同时安装 `opencv>=4.13.0` 与 `ros-humble-cv-bridge>=3.2.1-2.oe2403`；后者是针对 OpenCV 4.13 重新构建的 RPM。环境校验在工作区 Python 中执行 BGR/RGB 转换、非连续数组及 mono8/mono16/32FC1 往返，不要求将 NumPy 1.x 兼容的 `cv2` wheel 升到 4.13，也不拒绝后续兼容的 RPM 修订。
 - **验证**：跳过 tracing 校验（lttng / tracetools 属于全工作区诊断能力），并跳过 Ubuntu 平台的 tracing 工具安装钩子（`platform_post_install_rosdeps`）。
 
@@ -44,6 +44,21 @@
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
 ```
+
+## CANN 8.1 依赖文件分工
+
+| 文件（`requirements/` 下） | 使用方式 |
+| --- | --- |
+| `lerobot-v0.6-cann-8.1-compat.txt` | 两种 profile 都安装，公共 LeRobot/PI05 兼容运行时。 |
+| `lerobot-v0.6-cann-8.1-extras.txt` | full 在 compat 之上追加数据集和运动学依赖。 |
+| `openeuler-24.03-cann-8.1.txt` | openEuler+CANN 8.1 的平台包及 Torch 2.5.1/Torch-NPU 2.5.1/TorchVision 0.20.1。 |
+| `constraints-cann-8.1.txt` | 版本约束，不是功能安装清单；通过函数局部的 `PIP_CONSTRAINT` 保护每次 pip 安装及子进程，安装结束后核验全部受保护版本。 |
+
+`full = compat + extras + 平台依赖`，`inference = compat + 平台依赖`。
+Torch ABI、Transformers、tokenizers、safetensors、Pillow 和 OpenCV wheel 的版本约束与 profile 无关。
+外部已有的 pip constraints 会保留并共同生效；这些运行库的冲突明确报错，不先升级后降级。
+NumPy 沿用仓库既有的最终 ROS ABI 恢复步骤，安装结束后固定并核验为 1.26.4；full 的 Rerun 元数据要求 NumPy 2，因此不将 NumPy 加入全过程约束。
+Transformers 5.3.0 是当前冻结精度的兼容选择，本轮不解决其已知安全公告；模型升级和其他模型兼容性验证另行安排。
 
 ## LeRobot 补丁分发
 

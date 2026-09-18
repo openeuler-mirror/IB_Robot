@@ -29,7 +29,7 @@ Differences of `inference` vs. `full`:
 - **Submodules**: only `libs/lerobot` is initialized (LiDAR / bringup submodules and the ROS third-party patch stacks are skipped).
 - **rosdep**: scope narrowed to `ibrobot_msgs`, `tensormsg`, `inference_manifest`, `torch_models`, `inference_service`, `model_utils`, `dataset_tools`; `robot_config` is still built (SSOT YAML) but excluded from rosdep resolution so nav2 / slam_toolbox / gz / camera / LiDAR bringup dependencies are not pulled in.
 - **Python venv**: skips `hardware.txt`, WebPhone, `dev-tools.txt`, voice-tts, perception (SAM2 / Grounding-DINO / RAM++ / SigLIP2 and the audited wheels), FullSubNet, GraspGen, and the pre-commit / gitlint hooks; Ubuntu installs only `requirements/inference.txt` (ONNX toolchain), while openEuler keeps its complete platform dependencies and a CANN-matched `torch_npu`; the lerobot editable install drops the teleop-only `kinematics` extra.
-- **CANN 8.1 ABI**: installs LeRobot's non-Torch runtime dependencies from `requirements/lerobot-v0.6-cann-8.1.txt`; the full profile adds dataset/kinematics and Transformers 5.5 from `lerobot-v0.6-cann-8.1-full.txt`, while the local-only inference profile pins `transformers==5.3.0` through `lerobot-v0.6-cann-8.1-inference.txt` to preserve frozen PI0.5 accuracy (remote code and `save_pretrained` are not used); editable LeRobot is installed with `--no-deps`, and setup pins and verifies `torch==2.5.1`, `torch_npu==2.5.1`, and `torchvision==0.20.1`.
+- **CANN 8.1 ABI**: both profiles install `lerobot-v0.6-cann-8.1-compat.txt`, including validated Transformers 5.3.0. Full only adds dataset/kinematics from `lerobot-v0.6-cann-8.1-extras.txt`, without switching inference versions. LeRobot is installed with `--no-deps`; `openeuler-24.03-cann-8.1.txt` supplies platform packages and the Torch ABI.
 - **OpenCV / cv_bridge ABI**: openEuler aarch64 installs `opencv>=4.13.0` together with `ros-humble-cv-bridge>=3.2.1-2.oe2403`, the RPM rebuilt for OpenCV 4.13. Verification exercises BGR/RGB conversion, non-contiguous arrays, and mono8/mono16/32FC1 round trips in the workspace interpreter; it accepts later compatible RPM revisions and keeps the NumPy 1.x-compatible Python `cv2` wheel.
 - **Verification**: tracing checks are skipped (lttng / tracetools are full-workspace diagnostics), and so is the Ubuntu tracing-tools post-install hook (`platform_post_install_rosdeps`).
 
@@ -38,6 +38,21 @@ Differences of `inference` vs. `full`:
 ./scripts/setup.sh --yes --profile inference
 ./scripts/build.sh --packages-up-to inference_service
 ```
+
+## CANN 8.1 dependency layers
+
+| File under `requirements/` | Usage |
+| --- | --- |
+| `lerobot-v0.6-cann-8.1-compat.txt` | Shared LeRobot/PI05 compatibility runtime for both profiles. |
+| `lerobot-v0.6-cann-8.1-extras.txt` | Additive dataset and kinematics dependencies for full. |
+| `openeuler-24.03-cann-8.1.txt` | openEuler+CANN 8.1 platform packages and Torch 2.5.1/Torch-NPU 2.5.1/TorchVision 0.20.1. |
+| `constraints-cann-8.1.txt` | Version constraints, not an install list. A function-local `PIP_CONSTRAINT` protects every pip invocation and subprocess; all protected versions are checked after the final install. |
+
+Full installs compat + extras + platform packages; inference installs compat + platform packages.
+The Torch ABI, Transformers, tokenizers, safetensors, Pillow and OpenCV wheel constraints are independent of profile.
+Existing caller constraints remain active; conflicts fail explicitly rather than upgrading and later downgrading the runtime.
+NumPy retains the repository's existing final ROS ABI restoration step and is verified as 1.26.4 after installation. Full's Rerun metadata requires NumPy 2, so NumPy is not included in the all-install constraint.
+Transformers 5.3.0 preserves the frozen accuracy baseline. Its known security advisories, model upgrades, and other-model compatibility remain separate work.
 
 ## LeRobot patch dispatch
 

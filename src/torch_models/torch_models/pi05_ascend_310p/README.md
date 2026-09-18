@@ -30,11 +30,13 @@ native `(pi05, torch, npu)` identity resolves this provider.
 
 ## Environment and Execution
 
-On CANN 8.1, run `./scripts/setup.sh --profile inference` in the workspace.
-The tested combination is LeRobot 0.6.0, Torch/Torch-NPU 2.5.1,
-TorchVision 0.20.1, and Transformers 5.3.0. A full setup profile uses a newer
-Transformers release and cannot run this model until its accuracy has been
-validated; this provider reports that mismatch before loading weights.
+On CANN 8.1, both `./scripts/setup.sh --profile full` and
+`./scripts/setup.sh --profile inference` select the same compatibility runtime:
+LeRobot 0.6.0, Torch/Torch-NPU 2.5.1, TorchVision 0.20.1, and Transformers
+5.3.0. Full adds functionality without selecting a different Transformers.
+The shared `requirements/lerobot-v0.6-cann-8.1-compat.txt` and CANN constraints
+preserve this combination; the model provider still validates it before loading
+weights. Newer Transformers compatibility is separate model-adaptation work.
 
 Set the robot's inference pipeline to the normal bundle and deployment:
 

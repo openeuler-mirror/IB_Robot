@@ -1,10 +1,13 @@
-# LeRobot v0.6 runtime dependencies for CANN 8.1 hosts.
+# Shared LeRobot v0.6 compatibility dependencies for CANN 8.1.
+# Both full and inference profiles install this same runtime. Full only adds
+# lerobot-v0.6-cann-8.1-extras.txt; it does not select a different Transformers.
 #
 # LeRobot declares torch>=2.7 and torchvision>=0.22, while CANN 8.1 on
 # Ascend310P requires the 2.5 ABI. setup installs LeRobot editable with
 # --no-deps and uses this list for the non-Torch runtime dependencies. The
 # exact Torch/Torch-NPU/TorchVision set is installed separately from
 # openeuler-24.03-cann-8.1.txt.
+-c constraints-cann-8.1.txt
 numpy==1.26.4
 opencv-python-headless<4.12
 Pillow>=10,<13
@@ -24,3 +27,6 @@ num2words>=0.5.14,<0.6
 accelerate>=1.14,<2
 deepdiff>=7,<9
 jsonlines>=4,<5
+# Preserve the validated PI0.5 behavior. Upgrading Transformers and resolving
+# its known advisories is separate model-compatibility work, not a profile switch.
+transformers==5.3.0

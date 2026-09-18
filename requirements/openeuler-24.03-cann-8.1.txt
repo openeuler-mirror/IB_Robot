@@ -1,5 +1,6 @@
 # Keep the non-Torch packages aligned with openeuler-24.03.txt. This variant
 # pins the ABI set supported by CANN 8.1 instead of the default Torch 2.10 set.
+-c constraints-cann-8.1.txt
 aiortc
 av>=15,<16
 onnx

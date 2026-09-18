@@ -188,6 +188,40 @@ print(f"CANN 8.1 Torch ABI verified: {actual}")
 PY
 }
 
+verify_cann_runtime_versions() {
+    local python_path="$1"
+    local cann_version=""
+    cann_version="$(detect_cann_version 2>/dev/null || true)"
+    [[ "${cann_version}" =~ ^8[.]1([.]|$) ]] || return 0
+    verify_cann_torch_abi "${python_path}" || return 1
+    "${python_path}" - "${WORKSPACE}/requirements/constraints-cann-8.1.txt" <<'PY'
+import importlib.metadata
+import sys
+from pathlib import Path
+
+from packaging.requirements import Requirement
+
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    requirement = Requirement(line)
+    try:
+        installed = importlib.metadata.version(requirement.name)
+    except importlib.metadata.PackageNotFoundError:
+        # The GUI wheel is optional; the headless wheel is installed by compat.
+        if requirement.name == "opencv-python":
+            continue
+        raise
+    if installed not in requirement.specifier:
+        raise SystemExit(f"CANN 8.1 requires {requirement}, got {installed}")
+    print(f"CANN 8.1 runtime verified: {requirement.name}=={installed}")
+numpy_version = importlib.metadata.version("numpy")
+if numpy_version != "1.26.4":
+    raise SystemExit(f"CANN 8.1 final ROS ABI requires numpy==1.26.4, got {numpy_version}")
+PY
+}
+
 install_lerobot_editable() {
     local pip_runner=("$@")
     local cann_version=""
@@ -203,17 +237,13 @@ install_lerobot_editable() {
 
     cann_version="$(detect_cann_version 2>/dev/null || true)"
     if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
-        log_info "Installing the CANN 8.1-compatible LeRobot v0.6 runtime dependency set..."
+        log_info "Installing the shared CANN 8.1-compatible LeRobot v0.6 runtime..."
         run_cmd "${pip_runner[@]}" install \
-            -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1.txt" --quiet
+            -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-compat.txt" --quiet
         if [[ "${SETUP_PROFILE:-full}" == "full" ]]; then
             log_info "Installing the CANN 8.1-compatible full-workspace LeRobot dependencies..."
             run_cmd "${pip_runner[@]}" install \
-                -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-full.txt" --quiet
-        else
-            log_info "Installing the frozen PI0.5 inference compatibility dependencies..."
-            run_cmd "${pip_runner[@]}" install \
-                -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-inference.txt" --quiet
+                -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-extras.txt" --quiet
         fi
         log_info "Installing LeRobot editable without its incompatible upstream Torch constraints..."
         run_cmd "${pip_runner[@]}" install --no-deps -e "${WORKSPACE}/libs/lerobot"
@@ -359,6 +389,16 @@ setup_python_venv() {
         fi
     fi
 
+    # A function-local exported constraint applies to all pip invocations and
+    # build subprocesses, and is restored on return. Do not wait until the
+    # platform requirements step: extras can otherwise pull a newer Torch first.
+    local cann_version=""
+    local -x PIP_CONSTRAINT="${PIP_CONSTRAINT:-}"
+    cann_version="$(detect_cann_version 2>/dev/null || true)"
+    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
+        PIP_CONSTRAINT="${WORKSPACE}/requirements/constraints-cann-8.1.txt${PIP_CONSTRAINT:+ ${PIP_CONSTRAINT}}"
+        log_info "Protecting the validated CANN 8.1 runtime during every dependency install."
+    fi
     local pip_install=("${VENV_PYTHON}" -m pip install)
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
     local ros_abi_pin_packages=("numpy==1.26.4" "opencv-python-headless<4.12")
@@ -478,7 +518,6 @@ setup_python_venv() {
             # path), torch_npu (Ascend NPU inference), and pygraphviz (required
             # by verify_env on this platform) are all inference-relevant.
             install_openeuler_python_dependencies "${pip_install[@]}"
-            verify_cann_torch_abi "${VENV_PYTHON}"
             ;;
     esac
 
@@ -733,6 +772,11 @@ PY
         log_warn "    rm -rf ${user_site}/colcon* ${user_site%/lib/*}/bin/colcon*"
     fi
 
+    # Optional full-profile installs run after the platform dependencies.
+    # Validate at the very end so no later pip transaction can invalidate it.
+    if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        verify_cann_runtime_versions "${VENV_PYTHON}" || return 1
+    fi
     PYTHON_ENV_STATUS="done"
 
 }

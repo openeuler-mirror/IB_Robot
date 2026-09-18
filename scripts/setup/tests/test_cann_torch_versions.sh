@@ -86,7 +86,7 @@ assert_eq "missing CANN preserves the current openEuler requirements" \
 requirements_packages() {
     local line
     while IFS= read -r line || [[ -n "${line}" ]]; do
-        [[ -z "${line}" || "${line}" == \#* ]] || printf '%s\n' "${line}"
+        [[ -z "${line}" || "${line}" == \#* || "${line}" == -c\ * ]] || printf '%s\n' "${line}"
     done < "$1"
 }
 assert_eq "CANN 8.1 requirements pin the complete Torch ABI" \
@@ -94,7 +94,7 @@ assert_eq "CANN 8.1 requirements pin the complete Torch ABI" \
     "$(requirements_packages "${REPO_ROOT}/requirements/openeuler-24.03-cann-8.1.txt" | paste -sd, -)"
 assert_eq "CANN 8.1 LeRobot runtime pins the PI05-compatible Transformers version" \
     "transformers==5.3.0" \
-    "$(grep -E '^transformers==' "${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-inference.txt")"
+    "$(grep -E '^transformers==' "${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-compat.txt")"
 
 # Exercise the setup integration without invoking pip. The fake CANN root is
 # selected through the same environment variable honored by a sourced CANN
@@ -144,8 +144,7 @@ CAPTURED_COMMANDS=""
 run_cmd() { CAPTURED_COMMANDS+="$(printf '%q ' "$@")"$'\n'; }
 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" SETUP_PROFILE=inference \
     install_lerobot_editable fake-python -m pip
-expected_lerobot_commands="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1.txt --quiet "$'\n'
-expected_lerobot_commands+="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-inference.txt --quiet "$'\n'
+expected_lerobot_commands="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-compat.txt --quiet "$'\n'
 expected_lerobot_commands+="fake-python -m pip install --no-deps -e ${REPO_ROOT}/libs/lerobot "
 assert_eq "CANN 8.1 editable LeRobot install bypasses incompatible Torch constraints" \
     "${expected_lerobot_commands}" "${CAPTURED_COMMANDS%$'\n'}"
@@ -153,11 +152,52 @@ assert_eq "CANN 8.1 editable LeRobot install bypasses incompatible Torch constra
 CAPTURED_COMMANDS=""
 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" SETUP_PROFILE=full \
     install_lerobot_editable fake-python -m pip
-expected_lerobot_commands="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1.txt --quiet "$'\n'
-expected_lerobot_commands+="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-full.txt --quiet "$'\n'
+expected_lerobot_commands="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-compat.txt --quiet "$'\n'
+expected_lerobot_commands+="fake-python -m pip install -r ${REPO_ROOT}/requirements/lerobot-v0.6-cann-8.1-extras.txt --quiet "$'\n'
 expected_lerobot_commands+="fake-python -m pip install --no-deps -e ${REPO_ROOT}/libs/lerobot "
 assert_eq "CANN 8.1 full setup retains dataset and kinematics dependencies" \
     "${expected_lerobot_commands}" "${CAPTURED_COMMANDS%$'\n'}"
+
+# Simulate transitive version drift after optional full-profile installs. The
+# final check must catch it even if all three Torch imports still match.
+printf '__version__ = "2.5.1"\n' > "${ABI_STUBS}/torch/__init__.py"
+cat > "${ABI_STUBS}/sitecustomize.py" <<'PY'
+import importlib.metadata
+import os
+
+versions = {
+    "torch": "2.5.1", "torch_npu": "2.5.1", "torchvision": "0.20.1",
+    "transformers": os.environ.get("TEST_TRANSFORMERS_VERSION", "5.3.0"),
+    "numpy": os.environ.get("TEST_NUMPY_VERSION", "1.26.4"),
+    "opencv-python-headless": "4.11.0.86", "opencv-python": "4.11.0.86",
+    "tokenizers": "0.22.2", "safetensors": "0.8.0", "pillow": "10.3.0",
+}
+importlib.metadata.version = versions.__getitem__
+PY
+if IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" PYTHONPATH="${ABI_STUBS}" \
+    verify_cann_runtime_versions python3 >/dev/null; then
+    PASS=$((PASS + 1))
+    printf '  PASS  final runtime check accepts the preserved baseline\n'
+else
+    FAIL=$((FAIL + 1))
+    printf '  FAIL  final runtime check accepts the preserved baseline\n' >&2
+fi
+if TEST_TRANSFORMERS_VERSION=5.5.4 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" PYTHONPATH="${ABI_STUBS}" \
+    verify_cann_runtime_versions python3 >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    printf '  FAIL  final runtime check rejects Transformers drift with matching Torch ABI\n' >&2
+else
+    PASS=$((PASS + 1))
+    printf '  PASS  final runtime check rejects Transformers drift with matching Torch ABI\n'
+fi
+if TEST_NUMPY_VERSION=2.3.0 IBR_CANN_TOOLKIT_ROOT="${LATEST_ROOT}" PYTHONPATH="${ABI_STUBS}" \
+    verify_cann_runtime_versions python3 >/dev/null 2>&1; then
+    FAIL=$((FAIL + 1))
+    printf '  FAIL  final runtime check rejects an incomplete ROS NumPy restoration\n' >&2
+else
+    PASS=$((PASS + 1))
+    printf '  PASS  final runtime check rejects an incomplete ROS NumPy restoration\n'
+fi
 
 echo
 echo "== summary: ${PASS} passed, ${FAIL} failed =="

@@ -32,7 +32,7 @@ repos:
         pass_filenames: false
         files: |
           (?x)^(
-            requirements/(openeuler-24\.03(-cann-8\.1)?|lerobot-v0\.6-cann-8\.1(-(full|inference))?)\.txt |
+            requirements/(openeuler-24\.03(-cann-8\.1)?|lerobot-v0\.6-cann-8\.1-(compat|extras)|constraints-cann-8\.1)\.txt |
             scripts/setup/python_venv\.sh |
             scripts/setup/tests/test_cann_torch_versions\.sh
           )$

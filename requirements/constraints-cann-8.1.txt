@@ -1,0 +1,18 @@
+# Version constraints, not an install list. Apply to every pip transaction on
+# CANN 8.1, including full-profile optional dependencies and their build hooks.
+# Hardware ABI supported by the validated Ascend310P1 environment:
+torch==2.5.1
+torch_npu==2.5.1
+torchvision==0.20.1
+# Keep the existing PI0.5 runtime and image wheel in both setup profiles.
+transformers==5.3.0
+# NumPy is restored to 1.26.4 by the existing final ROS ABI step. Do not put
+# it in this all-install constraint: full's existing Rerun dependency requires
+# NumPy 2 in its metadata, which setup already handles with that final pin.
+opencv-python-headless==4.11.0.86
+opencv-python<4.12
+# Preserve the tokenizer, weight-reader and image-library versions measured
+# with the frozen PI0.5 baseline; extras must not silently upgrade these.
+tokenizers==0.22.2
+safetensors==0.8.0
+pillow==10.3.0

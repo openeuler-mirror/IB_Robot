@@ -1,7 +1,0 @@
-# PI0.5 Gemma/PaliGemma inference drifts materially with Transformers 5.4+
-# on this CANN/Torch stack. The frozen 310P baseline is reproduced by 5.3.0.
-#
-# This compatibility pin is limited to the local-only inference profile. The
-# runtime never enables remote code and never calls save_pretrained, excluding
-# the vulnerable LightGlue remote-load and chat-template save paths in 5.3.0.
-transformers==5.3.0
