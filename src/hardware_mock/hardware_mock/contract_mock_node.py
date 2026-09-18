@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
+import numpy as np  # noqa: F401  # cv_bridge runtime dependency
 import rclpy
+from cv_bridge import CvBridge
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -58,22 +59,6 @@ def _qos_from_dict(d: dict) -> QoSProfile:
     )
 
 
-def _array_to_image(frame: np.ndarray, *, encoding: str) -> Image:
-    """Create a packed ROS image without depending on the cv_bridge/OpenCV ABI."""
-
-    array = np.ascontiguousarray(frame)
-    if array.dtype != np.uint8 or array.ndim not in {2, 3}:
-        raise ValueError(f"hardware_mock images must be uint8 HW or HWC arrays, got {array.shape} {array.dtype}")
-    msg = Image()
-    msg.height = int(array.shape[0])
-    msg.width = int(array.shape[1])
-    msg.encoding = encoding
-    msg.is_bigendian = False
-    msg.step = int(array.strides[0])
-    msg.data = array.tobytes()
-    return msg
-
-
 class ContractMockNode(Node):
     """rclpy node implementing the contract-driven mock."""
 
@@ -98,6 +83,7 @@ class ContractMockNode(Node):
         robot = load_robot_config_dict(path)
         self._plan: MockPlan = build_plan(robot)
         self._joints = JointModel(self._plan.joint_ids, self._plan.initial_positions)
+        self._bridge = CvBridge()
 
         self._image_publishers: list = []
         self._joint_state_publishers: list = []
@@ -205,7 +191,7 @@ class ContractMockNode(Node):
     def _publish_image_with_stamp(self, obs: ObservationSpec, pub, gen, stamp) -> None:
         frame = gen()
         assert obs.image is not None
-        msg = _array_to_image(frame, encoding=obs.image.encoding)
+        msg: Image = self._bridge.cv2_to_imgmsg(frame, encoding=obs.image.encoding)
         msg.header.stamp = stamp
         msg.header.frame_id = obs.frame_id
         pub.publish(msg)

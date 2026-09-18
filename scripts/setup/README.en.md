@@ -12,6 +12,7 @@ This directory hosts the modular pieces sourced by `scripts/setup.sh`:
 | `lerobot_filter_series.py` | Reads `manifest.yaml` + host facts, prints the patch series that actually applies. |
 | `tests/test_lerobot_filter.sh` | Regression fixtures pinned to the canonical 3-platform matrix + tag-binding cases. |
 | `tests/test_cann_torch_versions.sh` | Tests CANN detection and openEuler Torch ABI selection without a CANN installation. |
+| `tests/test_openeuler_cv_bridge_abi.sh` | Tests installation of the OpenCV 4.13-compatible openEuler `cv_bridge` RPM. |
 
 ## Setup profiles (dependency-scope parameterization)
 
@@ -29,6 +30,7 @@ Differences of `inference` vs. `full`:
 - **rosdep**: scope narrowed to `ibrobot_msgs`, `tensormsg`, `inference_manifest`, `torch_models`, `inference_service`, `model_utils`, `dataset_tools`; `robot_config` is still built (SSOT YAML) but excluded from rosdep resolution so nav2 / slam_toolbox / gz / camera / LiDAR bringup dependencies are not pulled in.
 - **Python venv**: skips `hardware.txt`, WebPhone, `dev-tools.txt`, voice-tts, perception (SAM2 / Grounding-DINO / RAM++ / SigLIP2 and the audited wheels), FullSubNet, GraspGen, and the pre-commit / gitlint hooks; Ubuntu installs only `requirements/inference.txt` (ONNX toolchain), while openEuler keeps its complete platform dependencies and a CANN-matched `torch_npu`; the lerobot editable install drops the teleop-only `kinematics` extra.
 - **CANN 8.1 ABI**: installs LeRobot's non-Torch runtime dependencies from `requirements/lerobot-v0.6-cann-8.1.txt`; the full profile adds dataset/kinematics and Transformers 5.5 from `lerobot-v0.6-cann-8.1-full.txt`, while the local-only inference profile pins `transformers==5.3.0` through `lerobot-v0.6-cann-8.1-inference.txt` to preserve frozen PI0.5 accuracy (remote code and `save_pretrained` are not used); editable LeRobot is installed with `--no-deps`, and setup pins and verifies `torch==2.5.1`, `torch_npu==2.5.1`, and `torchvision==0.20.1`.
+- **OpenCV / cv_bridge ABI**: openEuler aarch64 installs `opencv>=4.13.0` together with `ros-humble-cv-bridge>=3.2.1-2.oe2403`, the RPM rebuilt for OpenCV 4.13. Verification exercises BGR/RGB conversion, non-contiguous arrays, and mono8/mono16/32FC1 round trips in the workspace interpreter; it accepts later compatible RPM revisions and keeps the NumPy 1.x-compatible Python `cv2` wheel.
 - **Verification**: tracing checks are skipped (lttng / tracetools are full-workspace diagnostics), and so is the Ubuntu tracing-tools post-install hook (`platform_post_install_rosdeps`).
 
 ```bash

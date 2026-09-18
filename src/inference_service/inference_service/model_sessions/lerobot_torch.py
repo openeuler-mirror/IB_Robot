@@ -8,11 +8,7 @@ import inspect
 import math
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext, suppress
-from importlib.metadata import PackageNotFoundError
-from importlib.metadata import version as package_version
 from typing import Any
-
-from packaging.version import Version
 
 from inference_manifest import TorchRuntimeProfile
 from inference_service.auto_horizon_runtime import build_action_attention_collector
@@ -68,6 +64,7 @@ class LeRobotTorchModelSession(ModelSession):
         self._device: Any | None = None
         self._policy: Any | None = None
         self._policy_config: Any | None = None
+        self._policy_provider = None
         self._preprocessor: Any | None = None
         self._postprocessor: Any | None = None
         self._model_dtype = "native"
@@ -141,55 +138,25 @@ class LeRobotTorchModelSession(ModelSession):
         make_processors = self._require_attribute(factory, "make_pre_post_processors", "LeRobot processor factory")
         bundle_path = str(context.validated_manifest.bundle_root)
         policy_config = config_type.from_pretrained(bundle_path, local_files_only=True)
-        architecture_class = context.model.architecture_class
+        provider_module = self._import_required("torch_models.policy_provider", "torch_models policy provider")
+        resolve_provider = self._require_attribute(
+            provider_module,
+            "resolve_policy_provider",
+            "torch_models policy provider",
+        )
         try:
-            provider_module = self._import_required("torch_models.policy_provider", "torch_models policy provider")
-            resolve_provider = self._require_attribute(
-                provider_module,
-                "resolve_policy_provider",
-                "torch_models policy provider",
-            )
-            provider = resolve_provider(architecture_class)
+            provider = resolve_provider(context.model_type, context.backend, profile.device)
         except (AttributeError, ImportError, ValueError) as exc:
             raise BackendLoadError(
-                f"unable to resolve custom Torch architecture {architecture_class!r}: {exc}",
-                code="unsupported_architecture_class",
+                f"unable to resolve Torch policy provider for {context.model_type}/{context.backend}/{profile.device}: {exc}",
+                code="unsupported_policy_provider",
             ) from exc
-        try:
-            transformers_version = Version(package_version("transformers"))
-        except (PackageNotFoundError, ValueError) as exc:
-            raise BackendLoadError(f"unable to identify Transformers: {exc}", code="missing_dependency") from exc
-        if provider is not None and transformers_version.base_version != "5.3.0":
-            raise BackendLoadError(
-                f"custom Torch policy {architecture_class!r} requires Transformers 5.3.0; got {transformers_version}",
-                code="incompatible_dependency",
-            )
-        if provider is None and transformers_version.base_version == "5.3.0":
-            raise BackendLoadError(
-                "Transformers 5.3 is restricted to the local-only PI05 Ascend310P architecture",
-                code="incompatible_dependency",
-            )
         if provider is not None:
-            if context.model_type != "pi05":
-                raise BackendLoadError(
-                    f"custom Torch policy {architecture_class!r} requires model_type 'pi05'",
-                    code="invalid_deployment",
-                )
-            if profile.device != "npu" or torch_npu_module is None:
-                raise BackendLoadError(
-                    f"custom Torch policy {architecture_class!r} requires an NPU deployment",
-                    code="invalid_deployment",
-                )
-            if "Ascend310P" not in device_name:
-                raise BackendLoadError(
-                    f"custom Torch policy {architecture_class!r} requires Ascend310P, got {device_name!r}",
-                    code="invalid_deployment",
-                )
             try:
                 policy_config = provider.configure_config(policy_config, model_dtype=model_dtype)
             except (AttributeError, TypeError, ValueError) as exc:
                 raise BackendLoadError(
-                    f"unable to configure custom Torch policy {architecture_class!r}: {exc}",
+                    f"unable to configure repository-owned Torch policy: {exc}",
                     code="incompatible_policy_config",
                 ) from exc
         try:
@@ -217,11 +184,18 @@ class LeRobotTorchModelSession(ModelSession):
             )
         except ValueError as exc:
             raise BackendLoadError(str(exc), code="invalid_policy_assets") from exc
-        if provider is not None and tokenizer_path is None:
-            raise BackendLoadError(
-                f"custom Torch policy {architecture_class!r} requires bundled tokenizer assets",
-                code="invalid_policy_assets",
-            )
+        if provider is not None:
+            try:
+                provider.validate(
+                    config=policy_config,
+                    bundle_root=context.validated_manifest.bundle_root,
+                    tokenizer_path=tokenizer_path,
+                    device_name=device_name,
+                )
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise BackendLoadError(
+                    f"repository-owned Torch policy validation failed: {exc}", code="invalid_deployment"
+                ) from exc
         if local_vlm_path is not None:
             policy_config.vlm_model_name = local_vlm_path
         policy_class = provider.policy_class if provider is not None else get_policy_class(context.model_type)
@@ -231,7 +205,7 @@ class LeRobotTorchModelSession(ModelSession):
             "strict": True,
         }
         if provider is not None:
-            policy_load_options["skip_weight_init"] = True
+            policy_load_options.update(provider.load_options)
         policy = policy_class.from_pretrained(
             bundle_path,
             **policy_load_options,
@@ -246,20 +220,16 @@ class LeRobotTorchModelSession(ModelSession):
         self._device = device
         self._policy = policy
         self._policy_config = policy_config
+        self._policy_provider = provider
         rollback.defer(self._release)
         moved = policy.to(device)
         if moved is not None:
             self._policy = policy = moved
         self._cast_model(policy, model_dtype)
         if provider is not None:
-            prepare = getattr(policy, "prepare_for_inference", None)
-            if not callable(prepare):
-                raise BackendLoadError(
-                    f"custom Torch policy {architecture_class!r} does not expose prepare_for_inference",
-                    code="incompatible_policy_runtime",
-                )
             try:
-                prepare(
+                provider.prepare(
+                    policy=policy,
                     deployment_fingerprint=context.deployment_fingerprint,
                     torch_module=torch_module,
                     torch_npu_module=torch_npu_module,
@@ -267,7 +237,7 @@ class LeRobotTorchModelSession(ModelSession):
                 )
             except (AttributeError, ImportError, RuntimeError, TypeError, ValueError) as exc:
                 raise BackendLoadError(
-                    f"custom Torch policy {architecture_class!r} setup failed: {exc}",
+                    f"repository-owned Torch policy setup failed: {exc}",
                     code="incompatible_policy_runtime",
                 ) from exc
         evaluated = policy.eval()
@@ -339,13 +309,12 @@ class LeRobotTorchModelSession(ModelSession):
             action = callback(batch, **kwargs)
         action = self._remove_batch_dimension(action)
         attention_metadata = self._attention_collector.estimate() if self._attention_collector is not None else {}
-        policy_model = getattr(policy, "model", None)
-        stage_records = getattr(policy_model, "get_action_fused_stage_timing_records", None)
-        pi05_stage_metadata = {}
-        if callable(stage_records):
-            records = stage_records()
-            if records:
-                pi05_stage_metadata["pi05_stage_timing"] = records[-1]
+        provider = self._policy_provider
+        model_metadata = (
+            provider.execution_metadata(policy)
+            if provider is not None and provider.execution_metadata is not None
+            else {}
+        )
         self._last_metadata = {
             "request_id": context.request_id,
             "policy_type": self._require_context().model_type,
@@ -354,7 +323,7 @@ class LeRobotTorchModelSession(ModelSession):
             "external_noise": noise is not None and "noise" in kwargs,
             "model_dtype": self._model_dtype,
             **attention_metadata,
-            **pi05_stage_metadata,
+            **model_metadata,
         }
         return {"action": action}
 
@@ -381,6 +350,7 @@ class LeRobotTorchModelSession(ModelSession):
             self._attention_collector.close()
         self._policy = None
         self._policy_config = None
+        self._policy_provider = None
         self._preprocessor = None
         self._postprocessor = None
         self._device = None

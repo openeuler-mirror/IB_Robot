@@ -38,7 +38,6 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _create_bundle(root: Path, policy_type: str = "act") -> None:
-    pi05_fields = {"num_inference_steps": 10} if policy_type == "pi05" else {}
     _write_json(
         root / "config.json",
         {
@@ -48,7 +47,6 @@ def _create_bundle(root: Path, policy_type: str = "act") -> None:
                 "observation.images.top": {"type": "VISUAL", "shape": [3, 16, 24]},
             },
             "output_features": {"action": {"type": "ACTION", "shape": [6]}},
-            **pi05_fields,
         },
     )
     _write_json(root / "policy_preprocessor.json", {"name": "pre", "steps": []})
@@ -188,84 +186,16 @@ def test_package_torch_deployments_supports_device_selection_and_prefix(tmp_path
     assert validated[0].deployment.device == "cpu"
 
 
-def test_package_torch_deployment_records_custom_architecture_class(tmp_path):
-    _create_bundle(tmp_path, policy_type="pi05")
+@pytest.mark.parametrize("policy_type", ["act", "pi05"])
+def test_native_devices_share_one_model_descriptor_without_selector(tmp_path, policy_type):
+    _create_bundle(tmp_path, policy_type=policy_type)
     (tmp_path / "model.safetensors").write_bytes(b"weights")
+    package_torch_deployments(tmp_path, devices=("cpu", "cuda"))
+    result = package_torch_deployments(tmp_path, devices=("npu",))[0]
 
-    validated = package_torch_deployments(
-        tmp_path,
-        devices=("npu",),
-        architecture_class="pi05-ascend-310p",
-    )
-
-    assert validated[0].deployment_name == "torch-npu"
-    assert validated[0].manifest.model.model_type == "pi05"
-    assert validated[0].manifest.model.architecture_class == "pi05-ascend-310p"
-
-
-def test_pi05_ascend_architecture_rejects_non_npu_devices(tmp_path):
-    _create_bundle(tmp_path, policy_type="pi05")
-    (tmp_path / "model.safetensors").write_bytes(b"weights")
-
-    with pytest.raises(ValueError, match="requires exactly --devices npu"):
-        package_torch_deployments(
-            tmp_path,
-            devices=("cpu",),
-            architecture_class="pi05-ascend-310p",
-        )
-
-
-def test_torch_packager_rejects_unknown_architecture_class(tmp_path):
-    _create_bundle(tmp_path, policy_type="pi05")
-    (tmp_path / "model.safetensors").write_bytes(b"weights")
-
-    with pytest.raises(ValueError, match="unsupported repository-owned architecture_class"):
-        package_torch_deployments(
-            tmp_path,
-            devices=("npu",),
-            architecture_class="pi05-ascend-301p",
-        )
-
-
-def test_pi05_ascend_architecture_rejects_non_pi05_bundle(tmp_path):
-    _create_bundle(tmp_path, policy_type="act")
-    (tmp_path / "model.safetensors").write_bytes(b"weights")
-
-    with pytest.raises(ValueError, match="requires model_type 'pi05'.*'act'"):
-        package_torch_deployments(
-            tmp_path,
-            devices=("npu",),
-            architecture_class="pi05-ascend-310p",
-        )
-
-
-def test_pi05_ascend_architecture_requires_fixed_ten_steps(tmp_path):
-    _create_bundle(tmp_path, policy_type="pi05")
-    config_path = tmp_path / "config.json"
-    config = json.loads(config_path.read_text(encoding="utf-8"))
-    config["num_inference_steps"] = 5
-    _write_json(config_path, config)
-    (tmp_path / "model.safetensors").write_bytes(b"weights")
-
-    with pytest.raises(ValueError, match="requires num_inference_steps=10.*5"):
-        package_torch_deployments(
-            tmp_path,
-            devices=("npu",),
-            architecture_class="pi05-ascend-310p",
-        )
-
-
-def test_pi05_ascend_architecture_rejects_existing_cpu_deployment(tmp_path):
-    _create_bundle(tmp_path, policy_type="pi05")
-    (tmp_path / "model.safetensors").write_bytes(b"weights")
-    package_torch_deployments(tmp_path, devices=("cpu",))
-
-    with pytest.raises(ValueError, match="incompatible deployments.*torch-cpu"):
-        package_torch_deployments(
-            tmp_path,
-            devices=("npu",),
-            architecture_class="pi05-ascend-310p",
-        )
+    assert set(result.manifest.deployments) == {"torch-cpu", "torch-cuda", "torch-npu"}
+    assert result.manifest.model.model_type == policy_type
+    assert result.manifest.model.architecture_class is None
 
 
 def test_package_deployment_artifact_reuses_identical_immutable_generation(tmp_path):

@@ -38,7 +38,7 @@ source .shrc_local && ./scripts/build.sh -- --packages-select torch_models
 source .shrc_local
 ```
 
-其他模块可以直接导入。以 `inference_service` 中未来的模型 session 为例：
+其他模块可以直接导入。以轻量模型为例：
 
 ```python
 import torch
@@ -59,51 +59,40 @@ assert torch.isfinite(output).all()
 ```
 
 Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install_requires`。
-这样 colcon 能按依赖顺序构建，Python 打包元数据也保持一致。本次仅提供引用示例，
-没有修改 `inference_service` 的依赖或注册新推理模型；导入成功不等于已接入服务。
-实际服务接入应复用现有 `ModelSession` 和统一推理运行时。
+这样 colcon 能按依赖顺序构建，Python 打包元数据也保持一致。模型 provider 通过稳定的
+`(model_type, backend, device)` 组合注册，实际服务接入复用现有 `ModelSession` 和统一
+推理运行时。
 
-## PI0.5 Ascend310P
+## 模型索引
 
-`torch_models.pi05_ascend_310p` owns the native Torch implementation used on
-Ascend310P. It contains the NPU-safe PI0.5 model, local SigLIP tower, fixed
-10-step prefix/denoise TorchAir graphs, internal-format preparation, persistent
-graph cache, and strict no-initialization checkpoint loading. These changes are
-kept out of the managed LeRobot patch stack.
+| 模型 | 目录 | 运行入口 |
+|---|---|---|
+| DemoTorchModel | `torch_models/demo_torch_model` | CPU smoke example |
+| [PI0.5 Ascend310P](torch_models/pi05_ascend_310p/README.md) | `torch_models/pi05_ascend_310p` | `model_type=pi05` + `backend=torch` + `device=npu` |
 
-The Python package directory uses underscores, while the public manifest token
-uses the requested product spelling:
+每个模型目录负责自己的配置校验、运行时准备和平台约束。统一推理服务只按稳定的
+`model_type/backend/device` 组合解析 provider，不在通用 manifest exporter 中维护模型特判。
 
-```text
-Python import:       torch_models.pi05_ascend_310p
-architecture_class: pi05-ascend-310p
-model_type:          pi05
-```
+## Provider 扩展
 
-Package a standard local PI0.5 bundle for this implementation with:
+1. 在模型目录新增 `provider.py`，导出 `create_provider() -> PolicyProvider`。
+2. 在 `torch_models/policy_provider.py` 的 `_PROVIDERS` 中增加一条
+   `(model_type, backend, device): "torch_models.<model_name>.provider"` 映射。
+   模块仅在匹配该组合时导入；不匹配时继续使用 LeRobot factory，匹配后加载失败不会静默回退。
+3. 通过 `PolicyProvider` 的 hooks 提供模型行为，不修改通用 session 或 manifest exporter：
 
-```bash
-source .shrc_local
-ros2 run model_utils package-torch-deployment \
-  --bundle-root /path/to/pi05-bundle \
-  --devices npu \
-  --architecture-class pi05-ascend-310p
-```
+| 字段 | 职责 |
+|---|---|
+| `policy_class` | 实现 LeRobot policy 接口的本地模型类 |
+| `configure_config(config, model_dtype=...)` | 加载权重前配置模型并检查固定契约 |
+| `validate(config=..., bundle_root=..., tokenizer_path=..., device_name=...)` | 模型内部的平台与依赖兼容检查 |
+| `load_options` | 该模型特有的 `from_pretrained` 参数 |
+| `prepare(policy=..., deployment_fingerprint=..., torch_module=..., torch_npu_module=..., device_name=...)` | 模型放置设备并转换 dtype 后准备推理优化 |
+| `execution_metadata(policy)` | 可选的模型诊断 metadata，默认无 |
 
-The resulting deployment is `torch-npu`. The stable `model_type` remains
-`pi05`, so existing PI0.5 processors, codecs, and action contracts are reused.
-Only the named architecture changes the native Torch model implementation.
-LeRobot, Transformers, and Torch-NPU remain platform-managed optional runtime
-dependencies installed by `scripts/setup.sh`; importing the base
-`torch_models` package or its demo model does not eagerly require them.
-
-On Ascend310P the model defaults to separately compiled vision and prefix
-prefill graphs plus one fixed ten-step denoise graph. Set
-`LEROBOT_PI05_COMPILE_VISION_EMBED=0` only for eager-vision diagnostics. The
-rollback switches `IBROBOT_PI05_GRAPH_COMPILE=0` and
-`IBROBOT_PI05_NPU_FUSED_OPS=0` are intended for accuracy isolation, not normal
-deployment. `IBROBOT_PI05_STAGE_TIMING=1` adds synchronized prefix/denoise
-timings to result metadata and therefore must not be used for formal latency.
+`ModelSession` 继续管理权重加载、设备放置、processor、取消和资源释放。Provider 不依赖
+ROS，也不导入 `inference_service`。模型源码、兼容矩阵和使用说明归属模型目录。
+新增模型时应覆盖 lazy 解析、未匹配路由、加载失败和模型特有约束，并在相应设备上验证。
 
 ## 轻量验证
 

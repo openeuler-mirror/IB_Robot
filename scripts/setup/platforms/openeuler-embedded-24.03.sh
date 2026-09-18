@@ -23,6 +23,7 @@ platform_prepare_host() {
     ensure_openeuler_extras_repo
     warn_openeuler_duplicate_ros_repos
     ensure_openeuler_gpg_key
+    ensure_openeuler_ros_cv_bridge_abi
 
     log_info "Installing openEuler host packages required by the workspace..."
     run_sudo dnf install -y --nogpgcheck \
@@ -36,6 +37,17 @@ platform_prepare_host() {
         yaml-cpp \
         yaml-cpp-devel
 
+}
+
+ensure_openeuler_ros_cv_bridge_abi() {
+    if [[ "$(uname -m)" != "aarch64" ]]; then
+        log_warn "Skipping the openEuler ROS cv_bridge ABI pair outside aarch64."
+        return 0
+    fi
+    log_info "Installing the OpenCV 4.13 and matching ROS cv_bridge ABI pair..."
+    run_sudo dnf install --refresh -y --nogpgcheck \
+        "opencv >= 4.13.0" \
+        "ros-humble-cv-bridge >= 3.2.1-2.oe2403"
 }
 
 ensure_openeuler_ca_certificates() {

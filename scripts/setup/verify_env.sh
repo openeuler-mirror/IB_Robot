@@ -158,6 +158,38 @@ verify_openeuler_yaml_cpp_abi() {
     return 0
 }
 
+verify_openeuler_cv_bridge_abi() {
+    [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]] || return 0
+    [[ "$(uname -m)" == "aarch64" ]] || return 0
+    log_info "Verifying openEuler OpenCV/cv_bridge ABI pair..."
+    rpm -q opencv ros-humble-cv-bridge || return 1
+    # Match the workspace interpreter and ROS overlay used by runtime nodes.
+    (set +u; source "${SETUP_ROS_SETUP_PATH}" && set -u && "${VENV_PYTHON}" - <<'PY'
+import cv2
+import numpy as np
+from cv_bridge import CvBridge
+
+bridge = CvBridge()
+bgr = np.arange(4 * 5 * 3, dtype=np.uint8).reshape(4, 5, 3)
+fixtures = (
+    (bgr, "bgr8"),
+    (bgr[:, ::-1], "bgr8"),
+    (np.arange(20, dtype=np.uint8).reshape(4, 5), "mono8"),
+    (np.arange(20, dtype=np.uint16).reshape(4, 5), "mono16"),
+    (np.arange(20, dtype=np.float32).reshape(4, 5), "32FC1"),
+)
+for frame, encoding in fixtures:
+    message = bridge.cv2_to_imgmsg(frame, encoding=encoding)
+    restored = bridge.imgmsg_to_cv2(message, desired_encoding=encoding)
+    assert (message.height, message.width, message.encoding) == (4, 5, encoding)
+    np.testing.assert_array_equal(frame, restored)
+message = bridge.cv2_to_imgmsg(bgr, encoding="bgr8")
+np.testing.assert_array_equal(bridge.imgmsg_to_cv2(message, desired_encoding="rgb8"), bgr[..., ::-1])
+print(f"cv_bridge round-trip and BGR/RGB conversion verified; cv2={cv2.__version__} ({cv2.__file__})")
+PY
+    )
+}
+
 verify_tracing() {
     local venv_python="${VENV_PYTHON}"
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
@@ -463,6 +495,7 @@ verify_env() {
     verify_lerobot || return 1
     verify_pygraphviz || return 1
     verify_openeuler_yaml_cpp_abi || return 1
+    verify_openeuler_cv_bridge_abi || return 1
     verify_tracing || return 1
 
     if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "ubuntu-22.04" ]]; then

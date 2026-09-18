@@ -36,3 +36,13 @@ repos:
             scripts/setup/python_venv\.sh |
             scripts/setup/tests/test_cann_torch_versions\.sh
           )$
+      - id: openeuler-cv-bridge-abi-fixtures
+        name: openEuler cv_bridge ABI selection fixtures
+        entry: bash scripts/setup/tests/test_openeuler_cv_bridge_abi.sh
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            scripts/setup/platforms/openeuler-embedded-24\.03\.sh |
+            scripts/setup/tests/test_openeuler_cv_bridge_abi\.sh
+          )$

@@ -305,7 +305,7 @@ def _default_runtime_profile(backend: str, target_soc: str) -> BackendRuntimePro
     raise ValueError(f"unsupported compiled deployment backend {backend!r}")
 
 
-def _policy_model_descriptor(policy, *, architecture_class: str | None = None) -> ModelDescriptor:
+def _policy_model_descriptor(policy) -> ModelDescriptor:
     def tensor(semantic: str, feature) -> SemanticTensor:
         feature_type = feature.type.upper()
         dtype = "int64" if feature_type in {"LANGUAGE", "TEXT", "TOKEN", "TOKENS"} else "float32"
@@ -317,7 +317,6 @@ def _policy_model_descriptor(policy, *, architecture_class: str | None = None) -
         operation="predict",
         inputs=tuple(tensor(name, feature) for name, feature in policy.input_features.items()),
         outputs=tuple(tensor(name, feature) for name, feature in policy.output_features.items()),
-        architecture_class=architecture_class,
     )
 
 
@@ -327,19 +326,12 @@ def upsert_deployment(
     deployment: Deployment,
     *,
     bundle_name: str | None = None,
-    architecture_class: str | None = None,
 ) -> ValidatedManifest:
     """Atomically update one deployment under a bundle-local writer lock."""
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
     with _manifest_lock(root):
-        return _upsert_deployment_unlocked(
-            root,
-            deployment_name,
-            deployment,
-            bundle_name=bundle_name,
-            architecture_class=architecture_class,
-        )
+        return _upsert_deployment_unlocked(root, deployment_name, deployment, bundle_name=bundle_name)
 
 
 def update_deployment(
@@ -372,7 +364,6 @@ def _upsert_deployment_unlocked(
     deployment: Deployment,
     *,
     bundle_name: str | None = None,
-    architecture_class: str | None = None,
 ) -> ValidatedManifest:
     """Write one deployment and prove the production strict loader accepts it."""
 
@@ -411,35 +402,6 @@ def _upsert_deployment_unlocked(
         previous_structure = (existing.bundle.name, tuple(entry.path for entry in existing.bundle.files))
         candidate_structure = (name, tuple(entry.path for entry in bundle_files))
         bundle_revision = existing.bundle.revision + (candidate_structure != previous_structure)
-    model = (
-        existing.model
-        if existing is not None
-        else _policy_model_descriptor(
-            policy,
-            architecture_class=architecture_class,
-        )
-    )
-    if existing is not None and architecture_class is not None:
-        model = model.model_copy(update={"architecture_class": architecture_class})
-    if model.architecture_class == "pi05-ascend-310p":
-        if model.model_type != "pi05":
-            raise ValueError(
-                f"architecture_class 'pi05-ascend-310p' requires model_type 'pi05'; got {model.model_type!r}"
-            )
-        config = load_json_strict(root / "config.json")
-        inference_steps = config.get("num_inference_steps") if isinstance(config, dict) else None
-        if inference_steps != 10:
-            raise ValueError(
-                f"architecture_class 'pi05-ascend-310p' requires num_inference_steps=10; got {inference_steps!r}"
-            )
-        incompatible = sorted(
-            name for name, candidate in deployments.items() if candidate.backend != "torch" or candidate.device != "npu"
-        )
-        if incompatible:
-            raise ValueError(
-                "architecture_class 'pi05-ascend-310p' requires NPU-only Torch deployments; "
-                f"incompatible deployments: {incompatible}"
-            )
     manifest = InferenceManifest(
         schema_version=3,
         bundle=ManifestBundle(
@@ -453,7 +415,7 @@ def _upsert_deployment_unlocked(
                 value=canonical_bundle_digest(bundle_uuid, bundle_revision, name, bundle_files),
             ),
         ),
-        model=model,
+        model=existing.model if existing is not None else _policy_model_descriptor(policy),
         deployments=deployments,
     )
     if existing is not None and manifest == existing:

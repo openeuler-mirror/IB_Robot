@@ -39,4 +39,4 @@ def test_pi05_ascend_310p_mock_pipeline(monkeypatch) -> None:
     assert pipeline.execution_mode == "monolithic"
     assert pipeline.runtime_options == {"model_dtype": "fp16"}
     assert pipeline.request_timeout == 1800.0
-    assert pipeline.validated_manifest.manifest.model.architecture_class == "pi05-ascend-310p"
+    assert pipeline.validated_manifest.manifest.model.model_type == "pi05"

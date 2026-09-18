@@ -607,10 +607,10 @@ Canonical backend 只有以下五个：
 | `rknn` | RKNNLite 执行 RKNN artifact |
 | `hmm` | Houmo TCIM 执行 HMM 多模块 artifact |
 
-原生 Torch policy 默认由 LeRobot factory 构造。schema v3 `model.architecture_class`
-可以显式选择 `torch_models` 中的仓库自研实现；例如 PI0.5 在 Ascend310P 上使用
-`architecture_class: pi05-ascend-310p`。该字段不改变稳定调度身份，`model_type`
-仍为 `pi05`。未知 architecture 会在模型加载前 fail-closed，runtime 不按 device 名称猜测实现。
+原生 Torch policy 默认由 LeRobot factory 构造。仓库自研模型可以在 `torch_models` 注册
+稳定的 `(model_type, backend, device)` provider；例如 PI0.5 Ascend310P 使用
+`(pi05, torch, npu)`。通用 runtime 不按模型名称维护平台分支，provider 自己负责模型
+配置、平台校验和运行时准备。
 
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
 Ascend native runtime 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
