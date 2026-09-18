@@ -1,0 +1,4 @@
+# Optional environment checklist; match tools/ibrobot_tracing_web/setup.py.
+fastapi>=0.100,<1
+pydantic>=2,<3
+uvicorn>=0.23,<1

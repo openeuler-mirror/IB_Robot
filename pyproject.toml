@@ -67,6 +67,8 @@ known-first-party = [
     "robot_calibration",
     "benchmark_runtime",
     "benchmark_libero",
+    "ibrobot_tracing",
+    "ibrobot_tracing_web",
 ]
 
 [tool.ruff.format]
