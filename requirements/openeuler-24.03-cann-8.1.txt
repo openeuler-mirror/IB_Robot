@@ -1,0 +1,14 @@
+# Keep the non-Torch packages aligned with openeuler-24.03.txt. This variant
+# pins the ABI set supported by CANN 8.1 instead of the default Torch 2.10 set.
+aiortc
+av>=15,<16
+onnx
+onnxruntime
+pygraphviz
+atomgit_sdk
+# Required by the CANN 8.1 TBE Python adapter; torch_npu 2.5.1 does not
+# declare it even though graph compilation imports it in a child interpreter.
+decorator
+torch==2.5.1
+torch_npu==2.5.1
+torchvision==0.20.1

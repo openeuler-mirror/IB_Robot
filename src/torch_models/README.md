@@ -63,6 +63,48 @@ Python 消费者还应将 `torch_models` 加入自己的 `setup.py` 的 `install
 没有修改 `inference_service` 的依赖或注册新推理模型；导入成功不等于已接入服务。
 实际服务接入应复用现有 `ModelSession` 和统一推理运行时。
 
+## PI0.5 Ascend310P
+
+`torch_models.pi05_ascend_310p` owns the native Torch implementation used on
+Ascend310P. It contains the NPU-safe PI0.5 model, local SigLIP tower, fixed
+10-step prefix/denoise TorchAir graphs, internal-format preparation, persistent
+graph cache, and strict no-initialization checkpoint loading. These changes are
+kept out of the managed LeRobot patch stack.
+
+The Python package directory uses underscores, while the public manifest token
+uses the requested product spelling:
+
+```text
+Python import:       torch_models.pi05_ascend_310p
+architecture_class: pi05-ascend-310p
+model_type:          pi05
+```
+
+Package a standard local PI0.5 bundle for this implementation with:
+
+```bash
+source .shrc_local
+ros2 run model_utils package-torch-deployment \
+  --bundle-root /path/to/pi05-bundle \
+  --devices npu \
+  --architecture-class pi05-ascend-310p
+```
+
+The resulting deployment is `torch-npu`. The stable `model_type` remains
+`pi05`, so existing PI0.5 processors, codecs, and action contracts are reused.
+Only the named architecture changes the native Torch model implementation.
+LeRobot, Transformers, and Torch-NPU remain platform-managed optional runtime
+dependencies installed by `scripts/setup.sh`; importing the base
+`torch_models` package or its demo model does not eagerly require them.
+
+On Ascend310P the model defaults to separately compiled vision and prefix
+prefill graphs plus one fixed ten-step denoise graph. Set
+`LEROBOT_PI05_COMPILE_VISION_EMBED=0` only for eager-vision diagnostics. The
+rollback switches `IBROBOT_PI05_GRAPH_COMPILE=0` and
+`IBROBOT_PI05_NPU_FUSED_OPS=0` are intended for accuracy isolation, not normal
+deployment. `IBROBOT_PI05_STAGE_TIMING=1` adds synchronized prefix/denoise
+timings to result metadata and therefore must not be used for formal latency.
+
 ## 轻量验证
 
 `DemoTorchModel` 仅包含一层 `nn.Linear(4, 2)`，使用随机初始化参数，无需权重文件、

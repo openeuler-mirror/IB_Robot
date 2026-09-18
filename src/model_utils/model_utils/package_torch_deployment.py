@@ -24,6 +24,7 @@ def package_torch_deployments(
     *,
     devices: Sequence[str] = ("cpu", "cuda"),
     deployment_prefix: str = "torch",
+    architecture_class: str | None = None,
 ) -> tuple[ValidatedManifest, ...]:
     """Add one named native Torch deployment for each requested device."""
 
@@ -35,6 +36,10 @@ def package_torch_deployments(
     unsupported = sorted(set(selected_devices) - set(_TORCH_DEVICES))
     if unsupported:
         raise ValueError(f"unsupported Torch devices: {unsupported}")
+    if architecture_class not in {None, "pi05-ascend-310p"}:
+        raise ValueError(f"unsupported repository-owned architecture_class: {architecture_class!r}")
+    if architecture_class == "pi05-ascend-310p" and selected_devices != ("npu",):
+        raise ValueError("architecture_class 'pi05-ascend-310p' requires exactly --devices npu")
     if not deployment_prefix:
         raise ValueError("deployment prefix must not be empty")
 
@@ -54,6 +59,7 @@ def package_torch_deployments(
                     profile=TorchRuntimeProfile(device=device),
                 ),
             ),
+            architecture_class=architecture_class,
         )
         for device in selected_devices
     )
@@ -74,12 +80,18 @@ def main() -> int:
         default="torch",
         help="Deployment name prefix (default: torch)",
     )
+    parser.add_argument(
+        "--architecture-class",
+        default=None,
+        help="Optional repository-owned Torch model selector stored in the schema-v3 model descriptor",
+    )
     args = parser.parse_args()
 
     validated = package_torch_deployments(
         args.bundle_root,
         devices=args.devices,
         deployment_prefix=args.deployment_prefix,
+        architecture_class=args.architecture_class,
     )
     print(validated[-1].manifest_path)
     for item in validated:

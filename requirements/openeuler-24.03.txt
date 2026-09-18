@@ -8,4 +8,5 @@ atomgit_sdk
 # libs/lerobot/requirements-ubuntu.txt). Without this pin pip backtracks
 # through torch_npu 2.12.0/2.11.0 (which require torch>=2.11, outside the
 # lerobot range) and wastes minutes resolving on aarch64 OEE Docker.
+# CANN 8.1 setup selects openeuler-24.03-cann-8.1.txt instead.
 torch_npu==2.10.0.post4

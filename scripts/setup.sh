@@ -316,7 +316,7 @@ validate_setup_profile() {
 # inference runtime; its Python-level needs are covered by the venv install.
 setup_profile_rosdep_paths() {
     if [[ "${SETUP_PROFILE}" == "inference" ]]; then
-        echo "src/ibrobot_msgs src/tensormsg src/inference_manifest src/inference_service src/model_utils src/dataset_tools"
+        echo "src/ibrobot_msgs src/tensormsg src/inference_manifest src/torch_models src/inference_service src/model_utils src/dataset_tools"
     else
         echo "src"
     fi

@@ -469,6 +469,13 @@ The only canonical backend names are:
 | `rknn` | RKNNLite execution of RKNN artifacts |
 | `hmm` | Houmo TCIM execution of HMM multi-module artifacts |
 
+Native Torch policies use the LeRobot factory by default. A schema-v3
+`model.architecture_class` may explicitly select a repository-owned
+implementation from `torch_models`; PI0.5 on Ascend310P uses
+`architecture_class: pi05-ascend-310p`. The stable dispatch `model_type`
+remains `pi05`. Unknown architecture values fail closed before model loading;
+the runtime never infers a custom implementation from the device name.
+
 Compiled PI0.5 and SmolVLA loops are owned by shared executor stages, not model-session resources. They execute through
 `InferencePipeline -> ModelRuntimeHandle -> SequentialModelExecutor -> InferenceStage -> ModelSession resource`.
 The handle owns control-plane state, while each session owns only its vendor runtime and model resources. The

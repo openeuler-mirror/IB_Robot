@@ -16,6 +16,7 @@
 | `lerobot_resolve_active.py` | 从 `INDEX.yaml` 解析当前生效的 lerobot tag；并交叉校验对应 `manifest.yaml`。 |
 | `lerobot_filter_series.py` | 读取 `manifest.yaml` + 主机事实，输出真正适用的补丁序列。 |
 | `tests/test_lerobot_filter.sh` | 锁定 3 平台基准矩阵 + tag 绑定用例的回归 fixture。 |
+| `tests/test_cann_torch_versions.sh` | 无需安装 CANN，验证 CANN 版本探测与 openEuler Torch ABI 选择。 |
 
 > 英文原版见 [`README.en.md`](./README.en.md)。
 
@@ -31,8 +32,9 @@
 `inference` profile 相对 `full` 的差异：
 
 - **submodules**：只初始化 `libs/lerobot`（跳过 LiDAR / bringup 子模块与 ROS 第三方 patch 栈）。
-- **rosdep**：范围收窄到 `ibrobot_msgs`、`tensormsg`、`inference_manifest`、`inference_service`、`model_utils`、`dataset_tools`；`robot_config` 仍需构建（SSOT YAML）但不参与 rosdep 解析，避免拉入 nav2 / slam_toolbox / gz / 相机 / 雷达等 bringup 依赖。
-- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍整装 `openeuler-24.03.txt`（含推理必需的 `onnx` / `torch_npu` / `pygraphviz`）；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
+- **rosdep**：范围收窄到 `ibrobot_msgs`、`tensormsg`、`inference_manifest`、`torch_models`、`inference_service`、`model_utils`、`dataset_tools`；`robot_config` 仍需构建（SSOT YAML）但不参与 rosdep 解析，避免拉入 nav2 / slam_toolbox / gz / 相机 / 雷达等 bringup 依赖。
+- **Python venv**：跳过 `hardware.txt`、WebPhone、`dev-tools.txt`、voice-tts、perception（SAM2 / Grounding-DINO / RAM++ / SigLIP2 与审计 wheel）、FullSubNet、GraspGen、pre-commit / gitlint 钩子；Ubuntu 侧只安装 `requirements/inference.txt`（ONNX 工具链），openEuler 侧仍安装完整的平台依赖与 CANN 匹配的 `torch_npu`；lerobot editable 安装去掉仅服务于遥操作的 `kinematics` extra。
+- **CANN 8.1 ABI**：使用 `requirements/lerobot-v0.6-cann-8.1.txt` 安装 LeRobot 的非 Torch 运行时依赖；full profile 追加 `lerobot-v0.6-cann-8.1-full.txt` 的 dataset/kinematics 与 Transformers 5.5 依赖，local-only inference profile 则通过 `lerobot-v0.6-cann-8.1-inference.txt` 固定 `transformers==5.3.0` 维持 PI0.5 冻结精度基线（不启用 remote code、不调用 `save_pretrained`）；最后以 `--no-deps` 安装 editable LeRobot，并固定验证 `torch==2.5.1`、`torch_npu==2.5.1`、`torchvision==0.20.1`。
 - **验证**：跳过 tracing 校验（lttng / tracetools 属于全工作区诊断能力），并跳过 Ubuntu 平台的 tracing 工具安装钩子（`platform_post_install_rosdeps`）。
 
 ```bash

@@ -60,6 +60,7 @@ known-first-party = [
     "so101_hardware",
     "sim_models",
     "tensormsg",
+    "torch_models",
     "model_utils",
     "ibrobot_msgs",
     "semantic_mapping",

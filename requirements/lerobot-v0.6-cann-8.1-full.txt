@@ -1,0 +1,13 @@
+# Additional LeRobot dependencies for a full CANN 8.1 workspace.
+# torchcodec is intentionally omitted on aarch64 because its available wheel
+# requires Torch >=2.11; LeRobot falls back to the PyAV decoder installed by
+# lerobot-v0.6-cann-8.1.txt.
+datasets>=4.7,<5
+pandas>=2,<3
+pyarrow>=21,<30
+placo>=0.9.6,<0.9.16
+cmeel-urdfdom>=4,<5
+cmeel-tinyxml2<11
+# Full workspaces retain LeRobot v0.6's supported Transformers range while
+# avoiding the LightGlue issue fixed in 5.5.0.
+transformers>=5.5,<5.6

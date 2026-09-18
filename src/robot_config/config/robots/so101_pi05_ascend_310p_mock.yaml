@@ -1,0 +1,136 @@
+# SO-101 PI0.5 Ascend310P contract-mock validation profile.
+robot:
+  name: so101_pi05_ascend_310p_mock
+  type: so101
+  robot_type: so_101
+
+  joints:
+    arm: ["1", "2", "3", "4", "5"]
+    gripper: ["6"]
+    all: ["1", "2", "3", "4", "5", "6"]
+
+  default_control_mode: model_inference
+
+  control_modes:
+    model_inference:
+      description: "PI0.5 Ascend310P native Torch inference with contract mock hardware"
+      inference:
+        enabled: true
+        pipelines:
+          policy:
+            model_path: models/pi05/pi05-doublecam-fp32/019200-torch-npu
+            deployment: torch-npu
+            execution_mode: monolithic
+            # A first CANN 8.1 cache miss can spend more than 20 minutes compiling.
+            request_timeout: 1800.0
+            default_task: "pick up the banana"
+            runtime_options:
+              model_dtype: fp16
+      executor:
+        type: topic
+        mode: model_inference
+        inference_pipeline: policy
+        queue_size: 100
+        watermark_threshold: 20
+        control_frequency: 20.0
+
+  ros2_control:
+    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
+
+  peripherals:
+    - type: camera
+      name: top
+      driver: mock
+      width: 640
+      height: 480
+      fps: 20
+      frame_id: camera_top_frame
+      optical_frame_id: camera_top_optical_frame
+
+    - type: camera
+      name: wrist
+      driver: mock
+      width: 640
+      height: 480
+      fps: 20
+      frame_id: camera_wrist_frame
+      optical_frame_id: camera_wrist_optical_frame
+
+  simulation:
+    platform: mock
+    scene: null
+
+  hardware_mock:
+    joint_state_rate_hz: 20
+    image_sources:
+      top:
+        kind: checkerboard
+        tile: 32
+      wrist:
+        kind: gradient
+
+  contract:
+    rate_hz: 20
+    max_duration_s: 90.0
+
+    observations:
+      - key: observation.images.top
+        topic: /camera/top/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: top
+        image:
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+
+      - key: observation.images.wrist
+        topic: /camera/wrist/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: wrist
+        image:
+          resize: [480, 640]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+
+      - key: observation.state
+        topic: /joint_states
+        type: sensor_msgs/msg/JointState
+        selector:
+          names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"]
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+
+    actions:
+      - key: action
+        selector:
+          names: ["action.0", "action.1", "action.2", "action.3", "action.4", "action.5"]
+        publish:
+          topic: /joint_commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+          strategy:
+            mode: nearest
+            tolerance_ms: 500
+        safety_behavior: hold

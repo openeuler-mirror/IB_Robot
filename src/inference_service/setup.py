@@ -24,6 +24,7 @@ setup(
         "std_msgs",
         "inference_manifest",
         "observation_transport",
+        "torch_models",
     ],
     zip_safe=True,
     maintainer="xqw",

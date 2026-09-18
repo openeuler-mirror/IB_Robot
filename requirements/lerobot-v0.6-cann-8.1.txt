@@ -1,0 +1,26 @@
+# LeRobot v0.6 runtime dependencies for CANN 8.1 hosts.
+#
+# LeRobot declares torch>=2.7 and torchvision>=0.22, while CANN 8.1 on
+# Ascend310P requires the 2.5 ABI. setup installs LeRobot editable with
+# --no-deps and uses this list for the non-Torch runtime dependencies. The
+# exact Torch/Torch-NPU/TorchVision set is installed separately from
+# openeuler-24.03-cann-8.1.txt.
+numpy==1.26.4
+opencv-python-headless<4.12
+Pillow>=10,<13
+einops>=0.8,<0.9
+draccus==0.10.0
+huggingface-hub>=1,<2
+requests>=2.32,<3
+gymnasium>=1.1.1,<2
+safetensors>=0.4.3,<1
+packaging>=24.2,<26
+termcolor>=2.4,<4
+tqdm>=4.66,<5
+cmake>=3.29.0.1,<4.2
+scipy>=1.14,<2
+diffusers>=0.27.2,<0.36
+num2words>=0.5.14,<0.6
+accelerate>=1.14,<2
+deepdiff>=7,<9
+jsonlines>=4,<5

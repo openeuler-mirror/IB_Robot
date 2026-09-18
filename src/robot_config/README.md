@@ -1439,6 +1439,9 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:
 # 契约级 mock 仿真
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true sim_platform:=mock control_mode:=model_inference
 
+# Ascend310P PI0.5 native Torch end-to-end validation with hardware_mock
+ros2 launch robot_config robot.launch.py robot_config:=so101_pi05_ascend_310p_mock use_sim:=true control_mode:=model_inference
+
 # MoveIt 规划模式（带 RViz）
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true
 

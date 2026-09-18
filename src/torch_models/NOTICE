@@ -1,0 +1,13 @@
+torch_models includes modified source derived from these Apache-2.0 projects:
+
+- LeRobot v0.5.1 PI0.5 policy implementation, Copyright 2025 Physical
+  Intelligence and The Hugging Face Inc. team.
+  Source: https://github.com/huggingface/lerobot/tree/v0.5.1
+- OpenPI PI0.5 implementation, Copyright 2025 Physical Intelligence.
+  Source: https://github.com/Physical-Intelligence/openpi
+- Transformers v5.3.0 SigLIP implementation, Copyright 2024 Google AI and
+  The Hugging Face Team.
+  Source: https://github.com/huggingface/transformers/tree/v5.3.0
+
+The derived files were modified for Ascend310P graph-safe inference, explicit
+runtime ownership, no-initialization checkpoint loading, and TorchAir caching.

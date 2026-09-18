@@ -8,9 +8,9 @@ setup(
     packages=find_packages(include=[package_name, f"{package_name}.*"]),
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
-        ("share/" + package_name, ["package.xml", "README.md"]),
+        ("share/" + package_name, ["package.xml", "README.md", "LICENSE", "NOTICE"]),
     ],
-    install_requires=["setuptools", "torch"],
+    install_requires=["setuptools", "torch", "typing_extensions"],
     zip_safe=True,
     maintainer="yidahao",
     maintainer_email="haoyida@huawei.com",

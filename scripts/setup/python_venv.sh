@@ -73,8 +73,124 @@ if version not in spec:
     return 0
 }
 
+_cann_version_from_file() {
+    local version_file="$1"
+    local line version
+
+    [[ -r "${version_file}" ]] || return 1
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            version=*)
+                version="${line#version=}"
+                ;;
+            version_dir=*)
+                version="${line#version_dir=}"
+                ;;
+            *_running_version=\[*:*\])
+                version="${line#*:}"
+                version="${version%%]*}"
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        version="${version%$'\r'}"
+        if [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][A-Za-z0-9]+)*$ ]]; then
+            printf '%s\n' "${version}"
+            return 0
+        fi
+    done < "${version_file}"
+    return 1
+}
+
+detect_cann_version() {
+    # CANN's "latest" path can be a merged directory of component symlinks,
+    # not a symlink to the release directory. Prefer its public version.cfg,
+    # then cover versioned toolkit roots and component metadata.
+    local toolkit_root="${IBR_CANN_TOOLKIT_ROOT:-${ASCEND_TOOLKIT_HOME:-${ASCEND_HOME_PATH:-/usr/local/Ascend/ascend-toolkit/latest}}}"
+    local version_file version resolved_root
+    local version_files=(
+        "${toolkit_root}/version.cfg"
+        "${toolkit_root}/ascend_toolkit_install.info"
+        "${toolkit_root}/aarch64-linux/ascend_toolkit_install.info"
+        "${toolkit_root}/arm64-linux/ascend_toolkit_install.info"
+        "${toolkit_root}/x86_64-linux/ascend_toolkit_install.info"
+        "${toolkit_root}/runtime/version.info"
+        "${toolkit_root}/toolkit/version.info"
+    )
+
+    for version_file in "${version_files[@]}"; do
+        if version="$(_cann_version_from_file "${version_file}")"; then
+            printf '%s\n' "${version}"
+            return 0
+        fi
+    done
+
+    resolved_root="$(readlink -f "${toolkit_root}" 2>/dev/null || true)"
+    version="${resolved_root##*/}"
+    if [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][A-Za-z0-9]+)*$ ]]; then
+        printf '%s\n' "${version}"
+        return 0
+    fi
+    return 1
+}
+
+openeuler_requirements_for_cann() {
+    local cann_version="${1:-}"
+
+    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
+        printf '%s\n' "openeuler-24.03-cann-8.1.txt"
+    else
+        printf '%s\n' "openeuler-24.03.txt"
+    fi
+}
+
+install_openeuler_python_dependencies() {
+    local pip_runner=("$@")
+    local cann_version=""
+    local requirements_file
+
+    if cann_version="$(detect_cann_version)"; then
+        log_info "Detected CANN ${cann_version}."
+    else
+        log_info "No active CANN installation detected."
+    fi
+    requirements_file="$(openeuler_requirements_for_cann "${cann_version}")"
+
+    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
+        log_info "Using the CANN 8.1 Torch ABI requirements."
+    else
+        log_info "Using the default openEuler requirements."
+    fi
+    run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/${requirements_file}" --quiet
+}
+
+verify_cann_torch_abi() {
+    local python_path="$1"
+    local cann_version=""
+
+    cann_version="$(detect_cann_version 2>/dev/null || true)"
+    [[ "${cann_version}" =~ ^8[.]1([.]|$) ]] || return 0
+    "${python_path}" - <<'PY'
+import torch
+import torch_npu
+import torchvision
+
+expected = {"torch": "2.5.1", "torch_npu": "2.5.1", "torchvision": "0.20.1"}
+actual = {
+    "torch": torch.__version__.split("+", maxsplit=1)[0],
+    "torch_npu": torch_npu.__version__.split("+", maxsplit=1)[0],
+    "torchvision": torchvision.__version__.split("+", maxsplit=1)[0],
+}
+if actual != expected:
+    raise SystemExit(f"CANN 8.1 requires the exact Torch ABI {expected}, got {actual}")
+print(f"CANN 8.1 Torch ABI verified: {actual}")
+PY
+}
+
 install_lerobot_editable() {
     local pip_runner=("$@")
+    local cann_version=""
 
     if ! check_lerobot_python_compat; then
         log_error "Cannot install lerobot: Python version is incompatible."
@@ -84,6 +200,25 @@ install_lerobot_editable() {
     fi
 
     check_lerobot_ros_numpy_compat
+
+    cann_version="$(detect_cann_version 2>/dev/null || true)"
+    if [[ "${cann_version}" =~ ^8[.]1([.]|$) ]]; then
+        log_info "Installing the CANN 8.1-compatible LeRobot v0.6 runtime dependency set..."
+        run_cmd "${pip_runner[@]}" install \
+            -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1.txt" --quiet
+        if [[ "${SETUP_PROFILE:-full}" == "full" ]]; then
+            log_info "Installing the CANN 8.1-compatible full-workspace LeRobot dependencies..."
+            run_cmd "${pip_runner[@]}" install \
+                -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-full.txt" --quiet
+        else
+            log_info "Installing the frozen PI0.5 inference compatibility dependencies..."
+            run_cmd "${pip_runner[@]}" install \
+                -r "${WORKSPACE}/requirements/lerobot-v0.6-cann-8.1-inference.txt" --quiet
+        fi
+        log_info "Installing LeRobot editable without its incompatible upstream Torch constraints..."
+        run_cmd "${pip_runner[@]}" install --no-deps -e "${WORKSPACE}/libs/lerobot"
+        return 0
+    fi
 
     # [smolvla,pi] extras pull in policy-specific deps; kinematics pulls in
     # placo for SO-101 Placo Cartesian teleop; diffusion pulls in diffusers
@@ -115,7 +250,8 @@ install_lerobot_editable() {
     if [[ "${INSTALL_BENCHMARK_DEPS:-false}" == true && -n "${BENCHMARK_PIP_CONSTRAINTS:-}" ]]; then
         constraint_args+=(--constraint "${BENCHMARK_PIP_CONSTRAINTS}")
     fi
-    "${pip_runner[@]}" install "${constraint_args[@]}" -e "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
+    run_cmd "${pip_runner[@]}" install "${constraint_args[@]}" -e \
+        "${WORKSPACE}/libs/lerobot[${lerobot_extras_csv}]"
 }
 
 install_graspgen_torch_abi() {
@@ -341,7 +477,8 @@ setup_python_venv() {
             # Installed whole in both profiles: onnx/onnxruntime (ONNX policy
             # path), torch_npu (Ascend NPU inference), and pygraphviz (required
             # by verify_env on this platform) are all inference-relevant.
-            run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/openeuler-24.03.txt" --quiet
+            install_openeuler_python_dependencies "${pip_install[@]}"
+            verify_cann_torch_abi "${VENV_PYTHON}"
             ;;
     esac
 

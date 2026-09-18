@@ -82,6 +82,19 @@ ros2 run model_utils package-torch-deployment \
 上述命令生成 `native-cpu`。`--devices` 也支持 `cuda`、`mps` 和 `npu`；生成 manifest
 不要求当前主机具备对应设备，实际加载 deployment 时 runtime 才检查设备可用性。
 
+Repository-owned native Torch policies are selected explicitly through the
+schema-v3 model descriptor. For the Ascend310P PI0.5 implementation:
+
+```bash
+ros2 run model_utils package-torch-deployment \
+    --bundle-root /path/to/pi05_bundle \
+    --devices npu \
+    --architecture-class pi05-ascend-310p
+```
+
+This keeps `model_type: pi05` and records `architecture_class:
+pi05-ascend-310p`; runtime never infers a custom model from the device name.
+
 ## ACT Ascend Export
 
 `export_onnx_atc.py` 导出 ACT ONNX、调用 ATC 生成 OM，并将 OM 打包为 `ascend`

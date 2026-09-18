@@ -25,3 +25,14 @@ repos:
             scripts/setup/lerobot_resolve_active\.py |
             scripts/setup/tests/test_lerobot_filter\.sh
           )$
+      - id: cann-torch-version-fixtures
+        name: CANN Torch version selection fixtures
+        entry: bash scripts/setup/tests/test_cann_torch_versions.sh
+        language: system
+        pass_filenames: false
+        files: |
+          (?x)^(
+            requirements/(openeuler-24\.03(-cann-8\.1)?|lerobot-v0\.6-cann-8\.1(-(full|inference))?)\.txt |
+            scripts/setup/python_venv\.sh |
+            scripts/setup/tests/test_cann_torch_versions\.sh
+          )$

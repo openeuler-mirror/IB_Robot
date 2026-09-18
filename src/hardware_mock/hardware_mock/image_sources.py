@@ -112,7 +112,7 @@ def make_generator(spec: ImageSourceSpec) -> ImageGenerator:
         frame[~mask] = (32, 32, 32)
 
     def _gen() -> np.ndarray:
-        # Return a view; downstream cv_bridge copies into the message.
+        # Return a view; the publisher packs it into the ROS Image message.
         return frame
 
     return _gen
