@@ -284,6 +284,73 @@ def _scheduler_stub(**overrides):
     return SimpleNamespace(**values)
 
 
+@pytest.mark.parametrize("tracing", [False, True])
+def test_private_dispatch_trace_uses_existing_operation_and_preserves_callbacks(monkeypatch, tracing):
+    import json
+    import logging
+
+    from ibrobot_tracing import TraceEmitter
+    from inference_service import global_inference_scheduler_node as module
+
+    records = []
+    logger = logging.Logger("binding-trace", logging.INFO)
+    handler = logging.Handler()
+    handler.emit = lambda record: records.append(json.loads(record.getMessage().split(" ", 1)[1]))
+    logger.addHandler(handler)
+    monkeypatch.setattr(module, "trace", TraceEmitter(logger, enabled=tracing))
+    goal = DispatchPipelineBinding.Goal()
+    goal.session_id, goal.request_id = SESSION_ID, REQUEST_ID
+    goal.logical_generation, goal.binding_incarnation = 1, 1
+    goal.binding_id, goal.expected_boot_id, goal.operation_id = BINDING_ID, BOOT_ID, NEW_BOOT_ID
+    goal.expected_pipeline_generation = 1
+    result = DispatchPipelineBinding.Result()
+    result.pipeline_id, result.success = "policy", True
+    result.outcome.value = InferenceOutcome.COMPLETED
+    counts = []
+
+    class Future:
+        def __init__(self, value, kind):
+            self.value, self.kind = value, kind
+
+        def result(self):
+            return self.value
+
+        def add_done_callback(self, callback):
+            counts.append(self.kind)
+            callback(self)
+
+    def result_future():
+        counts.append("get_result")
+        return Future(SimpleNamespace(result=result), "result_callback")
+
+    gh = SimpleNamespace(accepted=True, get_result_async=result_future)
+
+    def send(sent_goal):
+        assert sent_goal is goal and goal.operation_id == NEW_BOOT_ID
+        counts.append("send")
+        return Future(gh, "accepted_callback")
+
+    node = _scheduler_stub(_operation_result=GlobalInferenceSchedulerNode._operation_result)
+    call = GlobalInferenceSchedulerNode._call_downstream(
+        node,
+        SimpleNamespace(wait_for_server=lambda **kwargs: True, send_goal_async=send),
+        goal,
+        operation_kind=OperationKind.DISPATCH,
+        deadline_monotonic_ns=time.monotonic_ns() + 10**9,
+    )
+    assert call.certainty == "completed" and call.result is result
+    assert counts == ["send", "accepted_callback", "get_result", "result_callback"]
+    assert len(node._downstream_operations) == 0
+    if tracing:
+        assert {(r["event"], r["fields"]["edge_id"]) for r in records} == {
+            ("flow_send", "scheduler_to_pipeline_dispatch"),
+            ("flow_receive", "pipeline_result_to_scheduler"),
+        }
+        assert all(r["fields"]["flow_id"] == NEW_BOOT_ID and r["fields"]["trace_id"] == REQUEST_ID for r in records)
+    else:
+        assert not records
+
+
 def test_pipeline_binding_guard_rejects_wrong_boot_and_stale_binding():
     node = object.__new__(PipelinePolicyNode)
     node._boot_id = BOOT_ID

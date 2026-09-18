@@ -40,16 +40,20 @@ def test_selected_interval_ownership_and_clear(smoothing):
     assert snapshot.watermark == 0
     assert snapshot.source == source
     assert snapshot.next_position == (None if smoothing else 2)
+    assert snapshot.consumed == 0
     with pytest.raises(FrozenInstanceError):
         snapshot.remaining = 9
+    with pytest.raises(FrozenInstanceError):
+        snapshot.consumed = 9
     with pytest.raises(FrozenInstanceError):
         snapshot.source.request_id = "other"
     data[:] = -1
     reservation, action = owner.reserve()
     action[:] = -2
     assert owner.snapshot() == snapshot
-    for expected in chunk()[2:5]:
+    for consumed, expected in enumerate(chunk()[2:5], start=1):
         np.testing.assert_array_equal(owner.take_action().action, expected)
+        assert owner.snapshot().consumed == consumed
     assert not owner.commit(reservation)
     exhausted = owner.snapshot()
     assert owner.take_action(last_action=action).source == "hold"
@@ -59,6 +63,7 @@ def test_selected_interval_ownership_and_clear(smoothing):
     cleared = owner.snapshot()
     assert cleared.source is None and cleared.next_position is None
     assert cleared.watermark == 2 and cleared.remaining == 0
+    assert cleared.consumed == 0
     assert cleared.revision > exhausted.revision
 
 
@@ -66,8 +71,10 @@ def test_capacity_clipping_includes_discarded_prefix():
     owner = ActivePlan(capacity=30, watermark=4)
     owner.accept(FullChunkPlanner().plan(chunk(50), actions_executed=5), PlanSource("r"))
     assert owner.snapshot().next_position == 20
+    assert owner.snapshot().consumed == 0
     np.testing.assert_array_equal(owner.take_action().action, chunk(50)[20])
     assert owner.snapshot().next_position == 21
+    assert owner.snapshot().consumed == 1
 
 
 @pytest.mark.parametrize(
@@ -93,8 +100,10 @@ def test_reservations_commit_once_and_never_consume_replacement():
     assert owner.commit(reservation)
     assert not owner.commit(reservation)
     assert owner.snapshot().next_position == 1
+    assert owner.snapshot().consumed == 1
     stale, _ = owner.reserve()
     owner.accept(ChunkPlan(chunk()), PlanSource("r", 2))
+    assert owner.snapshot().consumed == 0
     assert not owner.commit(stale)
     current, _ = owner.reserve()
     owner.clear()
@@ -110,6 +119,7 @@ def test_empty_selected_interval_clears_executable_plan(smoothing, start, stop):
     stale, _ = owner.reserve()
     owner.accept(ChunkPlan(chunk(), start, stop, 0), PlanSource("expired"))
     assert owner.snapshot().remaining == 0
+    assert owner.snapshot().consumed == 0
     assert owner.snapshot().source.request_id == "expired"
     assert not owner.commit(stale)
 

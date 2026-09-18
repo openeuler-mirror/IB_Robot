@@ -17,6 +17,17 @@ Dispatch 重叠执行，统一 diagnostics 的活动计数包含两者。
 中的资源，只负责加载、执行和释放 vendor 模型对象、设备 lease、buffer 或 worker。
 模型家族的预处理、后处理和 ROS service 形状不属于 backend runtime，由调用方 adapter/plugin 持有。
 
+`IB_TRACE_ENABLED=1` 仅增加 span/flow 观测，不改变 stage 遍历、输入校验位置、取消/超时检查、
+异常证据或健康状态。`model_call` 仅在 policy 原有 model request/result stage 边界记录一个聚合
+span，不对每个 role/迭代单独埋点。未到达 result stage 的 span 标为 `incomplete`，提前拒绝允许
+缺失 span；trace token 仅保存在请求上下文中，不写入业务 frame 或 metadata。
+
+Tracing 不增加设备同步或 tensor/device 遍历。span 是主机调用耗时，不保证 GPU/NPU kernel
+已经完成。`backend_latency_ms` 保留原有 request/result stage 间的业务计算，不从 trace 数据派生。
+
+分布式 policy 的实际 LeRobot processors 位于云端，预处理/模型/后处理埋点跟随其真实位置；
+edge 的 identity 适配不计作模型预处理。正常与失败结果都在返回边界发送结果 Flow。
+
 manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。常规 loader
 不会为了生成诊断身份扫描大型权重文件；启用推理 scheduler 时，本地 compiled artifact 还必须声明内容
 `sha256`，`robot_config` 会在构造 scheduled launch 前流式校验文件内容。

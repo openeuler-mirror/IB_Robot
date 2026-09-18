@@ -26,6 +26,7 @@ from ibrobot_msgs.action import (
     ScheduledDispatchInfer,
 )
 from ibrobot_msgs.msg import InferenceOutcome, InferenceServingStatus
+from ibrobot_tracing import get_trace_emitter
 from inference_service.runtime_composition import (
     build_model_service_runtime_dependencies,
     require_runtime_dependencies,
@@ -72,6 +73,16 @@ from inference_service.unified_runtime import RegistrySet, RuntimeProviders
 
 _SESSION_OPEN_CLOSURE = "session_open"
 _FULL_INFER_CLOSURE = "full_infer"
+
+trace = get_trace_emitter("ib_trace.scheduler", component_id="global_scheduler")
+
+
+def _goal_flow_id(goal_handle, fallback: str) -> str:
+    try:
+        goal_id = bytes(goal_handle.goal_id.uuid)
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+    return f"{fallback}:{goal_id.hex()}" if any(goal_id) else fallback
 
 
 @dataclass
@@ -672,6 +683,19 @@ class GlobalInferenceSchedulerNode(Node):
                 )
             result_done.set()
 
+            if trace_dispatch and "result" in holder:
+                trace.flow_receive(
+                    "pipeline_result_to_scheduler",
+                    goal.operation_id,
+                    trace_id=goal.request_id,
+                    component_id="global_scheduler",
+                    pipeline_id=holder["result"].pipeline_id,
+                    session_id=goal.session_id,
+                    logical_generation=goal.logical_generation,
+                    binding_id=goal.binding_id,
+                    binding_incarnation=goal.binding_incarnation,
+                )
+
         def _run_late_cleanup() -> None:
             nonlocal late_cleanup_sent
             with acceptance_state_lock:
@@ -712,6 +736,21 @@ class GlobalInferenceSchedulerNode(Node):
                     result_done.set()
             send_done.set()
 
+            if trace_dispatch:
+                trace.flow_send(
+                    "scheduler_to_pipeline_dispatch",
+                    goal.operation_id,
+                    timestamp_ns=send_timestamp_ns,
+                    trace_id=goal.request_id,
+                    component_id="global_scheduler",
+                    session_id=goal.session_id,
+                    logical_generation=goal.logical_generation,
+                    binding_id=goal.binding_id,
+                    binding_incarnation=goal.binding_incarnation,
+                )
+
+        trace_dispatch = trace.enabled and isinstance(goal, DispatchPipelineBinding.Goal)
+        send_timestamp_ns = time.time_ns() if trace_dispatch else None
         try:
             client.send_goal_async(goal).add_done_callback(_sent)
         except Exception as exc:  # noqa: BLE001
@@ -887,16 +926,53 @@ class GlobalInferenceSchedulerNode(Node):
         if goal.priority == 0:
             payload["fallback_chain"] = list(goal.fallback_chain)
             payload["deadline"] = goal.deadline
-        return self._execute_idempotent(
-            goal_handle=goal_handle,
-            action=LedgerAction.DISPATCH,
-            key=dispatch_key(goal.session_id, goal.session_generation, goal.request_id),
-            payload=payload,
-            deadline=goal.deadline,
-            is_open=False,
-            execute=self._dispatch_once,
-            request_id=goal.request_id,
-        )
+        if not trace.enabled:
+            return self._execute_idempotent(
+                goal_handle=goal_handle,
+                action=LedgerAction.DISPATCH,
+                key=dispatch_key(goal.session_id, goal.session_generation, goal.request_id),
+                payload=payload,
+                deadline=goal.deadline,
+                is_open=False,
+                execute=self._dispatch_once,
+                request_id=goal.request_id,
+            )
+        dispatch_flow_id = _goal_flow_id(goal_handle, goal.request_id)
+
+        def execute_once(execution_goal_handle, ledger_entry):
+            with trace.span(
+                "scheduler_dispatch",
+                component_id="global_scheduler",
+                origin="built-in",
+                target_pipeline_id=goal.target_pipeline_id,
+                priority=goal.priority,
+            ):
+                return self._dispatch_once(execution_goal_handle, ledger_entry)
+
+        with trace.trace_context(goal.request_id, component_id="global_scheduler"):
+            trace.flow_receive(
+                "scheduled_dispatch_to_scheduler",
+                dispatch_flow_id,
+                component_id="global_scheduler",
+                target_pipeline_id=goal.target_pipeline_id,
+            )
+            result = self._execute_idempotent(
+                goal_handle=goal_handle,
+                action=LedgerAction.DISPATCH,
+                key=dispatch_key(goal.session_id, goal.session_generation, goal.request_id),
+                payload=payload,
+                deadline=goal.deadline,
+                is_open=False,
+                execute=execute_once,
+                request_id=goal.request_id,
+            )
+            trace.flow_send(
+                "scheduler_result_to_dispatcher",
+                dispatch_flow_id,
+                component_id="global_scheduler",
+                pipeline_id=result.pipeline_id,
+            )
+            return result
 
     def _close_endpoint(self, goal_handle) -> CloseInferenceSession.Result:
         goal = goal_handle.request

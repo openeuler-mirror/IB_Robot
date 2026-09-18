@@ -15,12 +15,14 @@
   <depend>diagnostic_msgs</depend>
   <depend>builtin_interfaces</depend>
   <depend>std_srvs</depend>
+  <depend>unique_identifier_msgs</depend>
 
   <exec_depend>python3-numpy</exec_depend>
 
   <depend>ibrobot_msgs</depend>
   <depend>tensormsg</depend>
   <depend>robot_config</depend>
+  <depend>ibrobot_tracing</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

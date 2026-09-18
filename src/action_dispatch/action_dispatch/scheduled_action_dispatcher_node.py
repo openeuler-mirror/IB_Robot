@@ -20,6 +20,7 @@ entrypoint and does not own model execution.
 from __future__ import annotations
 
 import json
+import os
 import signal
 import threading
 import time
@@ -42,6 +43,7 @@ from std_srvs.srv import Empty, Trigger
 from action_dispatch.action_chunk import validate_action_chunk, validate_execution_horizon
 from action_dispatch.active_plan import ActivePlan, PlanSource
 from action_dispatch.chunk_planning import create_chunk_planner
+from action_dispatch.executors.topic import capture_event, capture_time, capture_traces, execution_trace
 from action_dispatch.safe_stop import (
     JointSnapshot,
     SafeStopError,
@@ -57,10 +59,21 @@ from ibrobot_msgs.action import (
     OpenInferenceSession,
     ScheduledDispatchInfer,
 )
+from ibrobot_tracing import get_trace_emitter
 from robot_config.dispatch_strategies import (
     DispatchStrategyError,
     resolve_dispatch_strategies,
 )
+
+trace = get_trace_emitter("ib_trace.dispatch", component_id="action_dispatcher")
+
+
+def _goal_flow_id(goal_handle, fallback: str) -> str:
+    try:
+        goal_id = bytes(goal_handle.goal_id.uuid)
+    except (AttributeError, TypeError, ValueError):
+        return fallback
+    return f"{fallback}:{goal_id.hex()}" if any(goal_id) else fallback
 
 
 class DispatcherState(str, Enum):
@@ -95,6 +108,7 @@ class ScheduledActionDispatcherNode(Node):
         self._inflight_observation_time_ns = 0
         self._inflight_goal_handle = None
         self._plan_length_at_inference_start = 0
+        self._trace_action_steps = os.environ.get("IB_TRACE_ACTION_STEPS", "first").lower()
         self._startup_started_ns = time.monotonic_ns()
         self._failure_handling = False
         self._pending_failure: tuple[str | None, str, int, str] | None = None
@@ -470,14 +484,15 @@ class ScheduledActionDispatcherNode(Node):
 
     def _run_lifecycle_service(self, callback, request, response: Trigger.Response) -> Trigger.Response:
         # A contending service must leave a worker available for Open/Close.
-        if not self._lifecycle_lock.acquire(blocking=False):
-            response.success = False
-            response.message = "lifecycle operation in progress"
-            return response
-        try:
-            return callback(request, response)
-        finally:
-            self._lifecycle_lock.release()
+        with capture_traces(trace.enabled):
+            if not self._lifecycle_lock.acquire(blocking=False):
+                response.success = False
+                response.message = "lifecycle operation in progress"
+                return response
+            try:
+                return callback(request, response)
+            finally:
+                self._lifecycle_lock.release()
 
     def _start_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
         with self._state_lock:
@@ -659,6 +674,8 @@ class ScheduledActionDispatcherNode(Node):
                     self._plan_length_at_inference_start = self._current_plan_length_locked()
             sid = self._session_id
             gen = self._session_generation
+            if trace.enabled:
+                snapshot = self._active_plan.snapshot()
         if expired:
             self._fail_current_request(request_id, sid, gen, "scheduled dispatch deadline expired before retry")
             return
@@ -672,14 +689,44 @@ class ScheduledActionDispatcherNode(Node):
         goal.prompt = self._inference_prompt
         goal.obs_timestamp.sec, goal.obs_timestamp.nanosec = divmod(observation_time_ns, 1_000_000_000)
         goal.deadline.sec, goal.deadline.nanosec = divmod(deadline_utc_ns, 1_000_000_000)
+        if trace.enabled:
+            trace.event(
+                "dispatch_request",
+                origin="built-in",
+                trace_id=request_id,
+                component_id="action_dispatcher.request",
+                queue_size=snapshot.remaining,
+                watermark=snapshot.watermark,
+                pipeline_id=self._inference_pipeline,
+                priority=self._inference_priority,
+                attempt=attempt + 1,
+            )
         if not self._dispatch_client.wait_for_server(timeout_sec=0.1):
             self._retry_dispatch_not_started(request_id, attempt)
             return
+        send_timestamp_ns = time.time_ns() if trace.enabled else None
         send_future = self._dispatch_client.send_goal_async(goal)
 
         def _goal_response_cb(result_future) -> None:
             try:
                 gh = result_future.result()
+            except Exception:  # noqa: BLE001
+                self._on_dispatch_unknown(request_id, sid, gen)
+                return
+            if trace.enabled:
+                trace.flow_send(
+                    "scheduled_dispatch_to_scheduler",
+                    _goal_flow_id(gh, request_id),
+                    timestamp_ns=send_timestamp_ns,
+                    trace_id=request_id,
+                    component_id="action_dispatcher.request",
+                    pipeline_id=self._inference_pipeline,
+                    session_id=sid,
+                    session_generation=gen,
+                    priority=self._inference_priority,
+                    attempt=attempt + 1,
+                )
+            try:
                 if gh is None or not gh.accepted:
                     self.get_logger().error("scheduled dispatch goal rejected; endpoint goal slots are full")
                     self._dispatch_rejected(request_id)
@@ -708,6 +755,7 @@ class ScheduledActionDispatcherNode(Node):
         self, future, request_id: str, session_id: str, session_generation: int, attempt: int
     ) -> None:
         with self._state_lock:
+            goal_handle = self._inflight_goal_handle if trace.enabled else None
             if self._inflight_request_id == request_id:
                 self._inflight_goal_handle = None
         try:
@@ -724,6 +772,17 @@ class ScheduledActionDispatcherNode(Node):
         ):
             self._fail_current_request(request_id, session_id, session_generation, "scheduled result identity mismatch")
             return
+        if trace.enabled:
+            trace.flow_receive(
+                "scheduler_result_to_dispatcher",
+                _goal_flow_id(goal_handle, request_id),
+                trace_id=request_id,
+                component_id="action_dispatcher.decode",
+                pipeline_id=result.pipeline_id,
+                session_id=session_id,
+                session_generation=session_generation,
+                priority=self._inference_priority,
+            )
         if not result.success and result.outcome.value == 1 and result.error.recoverable:
             self._retry_dispatch_not_started(request_id, attempt, result.error.code)
             return
@@ -775,6 +834,10 @@ class ScheduledActionDispatcherNode(Node):
         timer = self.create_timer(max(0.001, delay_ms / 1000.0), _retry, callback_group=ReentrantCallbackGroup())
 
     def _on_dispatch_result(self, result) -> None:
+        with capture_traces(trace.enabled):
+            return self._on_dispatch_result_observed(result)
+
+    def _on_dispatch_result_observed(self, result) -> None:
         source = PlanSource(
             result.request_id, session_id=result.session_id, session_generation=int(result.session_generation)
         )
@@ -784,18 +847,34 @@ class ScheduledActionDispatcherNode(Node):
                 source.request_id, source.session_id, source.session_generation
             ):
                 return
+            result_timestamp_ns = time.time_ns() if trace.enabled else None
+        if trace.enabled:
+            trace.event(
+                "dispatch_result",
+                timestamp_ns=result_timestamp_ns,
+                origin="built-in",
+                trace_id=source.request_id,
+                component_id="action_dispatcher.decode",
+                success=result.success,
+                pipeline_id=result.pipeline_id,
+                policy_total_ms=result.inference_latency_ms,
+                chunk_size=result.chunk_size,
+            )
         failure_reason = ""
         if result.success:
-            try:
-                self._enqueue_chunk(
-                    result.action_chunk,
-                    reported_chunk_size=int(result.chunk_size),
-                    source=source,
-                    execution_horizon=int(result.execution_horizon),
-                )
-            except (TypeError, ValueError, RuntimeError, MemoryError) as exc:
-                self.get_logger().error(f"invalid scheduled action chunk: {exc}")
-                failure_reason = "invalid scheduled action chunk"
+            # Observation context construction and teardown cannot be classified
+            # as an invalid business chunk by the existing error handler.
+            with trace.trace_context(source.request_id, component_id="action_dispatcher.decode"):
+                try:
+                    self._enqueue_chunk(
+                        result.action_chunk,
+                        reported_chunk_size=int(result.chunk_size),
+                        source=source,
+                        execution_horizon=int(result.execution_horizon),
+                    )
+                except (TypeError, ValueError, RuntimeError, MemoryError) as exc:
+                    self.get_logger().error(f"invalid scheduled action chunk: {exc}")
+                    failure_reason = "invalid scheduled action chunk"
         else:
             failure_reason = result.error.code or "scheduled dispatch failed"
         if failure_reason:
@@ -816,23 +895,26 @@ class ScheduledActionDispatcherNode(Node):
 
     def _try_failure(self, request_id, session_id, session_generation, reason):
         # Never wait for a lifecycle owner that may need this worker for Close.
-        acquired = self._lifecycle_lock.acquire(blocking=False)
-        try:
-            with self._state_lock:
-                if (self._session_id, self._session_generation) != (session_id, session_generation):
-                    return
-                if request_id is not None and not self._request_is_current(request_id, session_id, session_generation):
-                    return
-                if not acquired:
-                    # Only the current identity can occupy this bounded mailbox.
-                    self._pending_failure = (request_id, session_id, session_generation, reason)
-                    return
-                if request_id is not None:
-                    self._state = DispatcherState.CLOSING
-            self._fail_and_close_locked(reason)
-        finally:
-            if acquired:
-                self._lifecycle_lock.release()
+        with capture_traces(trace.enabled):
+            acquired = self._lifecycle_lock.acquire(blocking=False)
+            try:
+                with self._state_lock:
+                    if (self._session_id, self._session_generation) != (session_id, session_generation):
+                        return
+                    if request_id is not None and not self._request_is_current(
+                        request_id, session_id, session_generation
+                    ):
+                        return
+                    if not acquired:
+                        # Only the current identity can occupy this bounded mailbox.
+                        self._pending_failure = (request_id, session_id, session_generation, reason)
+                        return
+                    if request_id is not None:
+                        self._state = DispatcherState.CLOSING
+                self._fail_and_close_locked(reason)
+            finally:
+                if acquired:
+                    self._lifecycle_lock.release()
 
     def _drain_pending_failure(self):
         with self._state_lock:
@@ -867,21 +949,41 @@ class ScheduledActionDispatcherNode(Node):
     ) -> None:
         from tensormsg.converter import TensorMsgConverter
 
-        decoded = TensorMsgConverter.from_variant(action_chunk_msg)
-        action = decoded.get("action") if isinstance(decoded, dict) else None
-        if action is None:
-            raise ValueError("scheduled action chunk is missing 'action'")
-        action_np = validate_action_chunk(
-            action,
-            expected_action_dimension=self._safe_stop_plan.total_positions,
-            reported_chunk_size=reported_chunk_size,
-        ).array
+        decode_start = capture_time(monotonic=True) if trace.enabled else None
+        decoded_ok = False
+        try:
+            decoded = TensorMsgConverter.from_variant(action_chunk_msg)
+            action = decoded.get("action") if isinstance(decoded, dict) else None
+            if action is None:
+                raise ValueError("scheduled action chunk is missing 'action'")
+            action_np = validate_action_chunk(
+                action,
+                expected_action_dimension=self._safe_stop_plan.total_positions,
+                reported_chunk_size=reported_chunk_size,
+            ).array
+            decoded_ok = True
+        finally:
+            if trace.enabled:
+                decode_stop = capture_time(monotonic=True)
+                capture_event(
+                    trace,
+                    "dispatch_decode",
+                    origin="built-in",
+                    trace_id=source.request_id,
+                    component_id="action_dispatcher.decode",
+                    status="ok" if decoded_ok else "error",
+                    decode_ms=(decode_stop - decode_start) * 1000
+                    if decode_stop is not None and decode_start is not None
+                    else None,
+                )
+        decode_end_ns = capture_time() if trace.enabled else None
         with self._state_lock:
             key = (source.session_id, source.session_generation, source.request_id)
             if key in self._received_results or not self._request_is_current(
                 source.request_id, source.session_id, source.session_generation
             ):
                 return
+            refill_start_ns = capture_time() if trace.enabled else None
             actions_executed = max(0, self._plan_length_at_inference_start - self._current_plan_length_locked())
             # The result-level execution prefix is chunk-planning input: the
             # auto_horizon strategy truncates the executable plan and switches
@@ -893,9 +995,54 @@ class ScheduledActionDispatcherNode(Node):
                 actions_executed=actions_executed,
                 execution_horizon=validate_execution_horizon(execution_horizon, len(action_np)),
             )
-            self._active_plan.accept(chunk_plan, source, action_dimension=self._safe_stop_plan.total_positions)
+            snapshot = self._active_plan.accept(
+                chunk_plan, source, action_dimension=self._safe_stop_plan.total_positions
+            )
             self._received_results.add(key)
             self._clear_inflight_locked()
+            refill_end_ns = capture_time() if trace.enabled else None
+        if trace.enabled:
+            with capture_traces(trace.enabled):
+                capture_event(
+                    trace,
+                    "flow_send",
+                    edge_id="decode_to_queue",
+                    flow_id=source.request_id,
+                    timestamp_ns=decode_end_ns,
+                    trace_id=source.request_id,
+                    component_id="action_dispatcher.decode",
+                )
+                capture_event(
+                    trace,
+                    "flow_receive",
+                    edge_id="decode_to_queue",
+                    flow_id=source.request_id,
+                    timestamp_ns=refill_start_ns,
+                    trace_id=source.request_id,
+                    component_id="action_dispatcher.queue",
+                )
+                capture_event(
+                    trace,
+                    "queue_refill",
+                    trace_id=source.request_id,
+                    component_id="action_dispatcher.queue",
+                    timestamp_ns=refill_end_ns,
+                    origin="built-in",
+                    new=chunk_plan.stop - chunk_plan.start,
+                    skipped=actions_executed,
+                    after=snapshot.remaining,
+                    watermark=snapshot.watermark,
+                )
+                if snapshot.remaining:
+                    capture_event(
+                        trace,
+                        "flow_send",
+                        edge_id="queue_to_execute",
+                        flow_id=source.request_id,
+                        trace_id=source.request_id,
+                        component_id="action_dispatcher.queue",
+                        timestamp_ns=refill_end_ns,
+                    )
 
     @property
     def _active_plan(self) -> ActivePlan:
@@ -915,17 +1062,66 @@ class ScheduledActionDispatcherNode(Node):
         self._inflight_goal_handle = None
 
     def _execute_next_action(self) -> None:
-        with self._state_lock:
+        sample_interval = 0
+        if trace.enabled and self._trace_action_steps.startswith("sample:"):
+            try:
+                sample_interval = max(1, int(self._trace_action_steps.partition(":")[2]))
+            except ValueError:
+                sample_interval = 0
+        with capture_traces(trace.enabled), self._state_lock:
             # One-way lifecycle gate: only an ACTIVE session permits submission.
             if self._state is not DispatcherState.ACTIVE:
                 return
+            if trace.enabled:
+                snapshot = self._active_plan.snapshot()
             blended = self._active_plan.take_action(last_action=self._last_action)
             action = blended.action
             if action is None:
                 return
             self._last_action = np.asarray(action, dtype=float).reshape(-1)
+            trace_step = trace.enabled and (
+                blended.source != "hold"
+                and snapshot.source is not None
+                and (
+                    snapshot.consumed == 0
+                    or self._trace_action_steps == "all"
+                    or (sample_interval > 0 and snapshot.consumed % sample_interval == 0)
+                )
+            )
+            if trace_step:
+                execute_timestamp_ns = time.time_ns()
+                execute_start = time.perf_counter()
             # Serialize publication with safe-stop's freeze and safety output.
-            self._executor.execute(self._last_action)
+            if trace_step:
+                with execution_trace(
+                    snapshot.source.request_id,
+                    snapshot.consumed,
+                    snapshot.next_position if snapshot.next_position is not None else -1,
+                    snapshot.remaining,
+                ):
+                    self._executor.execute(self._last_action)
+            else:
+                self._executor.execute(self._last_action)
+            if trace_step:
+                publish_ms = (time.perf_counter() - execute_start) * 1000.0
+                publish_end_ns = time.time_ns()
+        if trace_step:
+            with trace.trace_context(snapshot.source.request_id, component_id="action_dispatcher.execute"):
+                if snapshot.consumed == 0:
+                    trace.flow_receive(
+                        "queue_to_execute", snapshot.source.request_id, timestamp_ns=execute_timestamp_ns
+                    )
+                trace.event(
+                    "first_action_execute" if snapshot.consumed == 0 else "action_execute",
+                    timestamp_ns=execute_timestamp_ns,
+                    origin="built-in",
+                    consumed_index=snapshot.consumed,
+                    execute_index=snapshot.next_position if snapshot.next_position is not None else -1,
+                    source=blended.source,
+                    queue_before=snapshot.remaining,
+                    publish_ms=publish_ms,
+                    publish_end_ns=publish_end_ns,
+                )
 
     # ------------------------------------------------------------------
     # Contract-based safe-stop command construction.
@@ -1092,7 +1288,7 @@ class ScheduledActionDispatcherNode(Node):
             return self._close_success
 
     def shutdown_cleanup(self, *, spin_once=None) -> bool:
-        with self._lifecycle_lock:
+        with capture_traces(trace.enabled), self._lifecycle_lock:
             return self._shutdown_cleanup_locked(spin_once=spin_once)
 
     def _shutdown_cleanup_locked(self, *, spin_once=None) -> bool:

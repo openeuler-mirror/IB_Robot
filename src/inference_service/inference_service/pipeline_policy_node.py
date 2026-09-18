@@ -44,6 +44,7 @@ from ibrobot_msgs.msg import (
     VideoStreamDescriptor,
     VideoStreamStatus,
 )
+from ibrobot_tracing import get_trace_emitter
 from inference_manifest import (
     ValidatedManifest,
     is_image_semantic,
@@ -126,6 +127,8 @@ from tensormsg.converter import TensorMsgConverter
 
 _CLOUD_HANDSHAKE_WARNING_DELAY_S = 5.0
 _CLOUD_HANDSHAKE_WARNING_THROTTLE_S = 10.0
+
+trace = get_trace_emitter("ib_trace.policy", component_id="inference_policy")
 
 
 @dataclass(frozen=True)
@@ -898,6 +901,19 @@ class PipelinePolicyNode(Node):
             except Exception as exc:
                 self._last_error = f"video stream {spec.key} failed: {exc}"
                 self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
+        if stored and trace.enabled:
+            source_timestamp_ns = int(timestamp or receive_time)
+            trace.event(
+                "obs_receive",
+                origin="built-in",
+                component_id="policy.observation",
+                key=self._subscription_key(spec),
+                topic=spec.topic,
+                source="header" if timestamp is not None else "receive",
+                source_ts_ns=source_timestamp_ns,
+                recv_ts_ns=receive_time,
+                transport_ms=max(0.0, (receive_time - source_timestamp_ns) / 1_000_000),
+            )
         if stored and PipelinePolicyNode._should_trigger_visual(self, spec):
             PipelinePolicyNode._request_visual_frame(self, int(timestamp or receive_time))
 
@@ -1207,6 +1223,7 @@ class PipelinePolicyNode(Node):
         A fresh buffer with nothing on the wire correctly fails closed.
         """
         selected: dict[str, object] = {}
+        source_timestamps = {} if trace.enabled else None
         issues: list[dict[str, object]] = []
         now_ns = self.get_clock().now().nanoseconds if hasattr(self, "get_clock") else sample_time_ns
         step_ns = next(iter(self._subs.values())).step_ns if self._subs else int(1e9 / self._frequency)
@@ -1216,6 +1233,11 @@ class PipelinePolicyNode(Node):
                 if state.spec.key in rtp_video_keys:
                     selected[key] = None
                     issue = PipelinePolicyNode._rtp_video_send_issue(self, state, now_ns)
+                    if source_timestamps is not None:
+                        manager = getattr(self, "_video_stream_manager", None)
+                        sent_ns = manager.latest_sent_capture_ns(state.spec.key) if manager is not None else 0
+                        if sent_ns > 0:
+                            source_timestamps[key] = sent_ns
                     if issue is not None:
                         issues.append(issue)
                     continue
@@ -1226,8 +1248,25 @@ class PipelinePolicyNode(Node):
                 if issue is not None:
                     issues.append(issue)
                 selected[key] = value
+                if source_timestamps is not None:
+                    entry, _entry_issue = PipelinePolicyNode._buffer_for_state(state).select_entry(
+                        sample_time_ns,
+                        now_ns=now_ns,
+                    )
+                    if entry is not None:
+                        source_timestamps[key] = int(entry[0])
 
         if issues:
+            if trace.enabled:
+                trace.event(
+                    "obs_frame",
+                    origin="built-in",
+                    component_id="policy.observation",
+                    sample_ts_ns=sample_time_ns,
+                    ready=max(0, len(self._subs) - len(issues)),
+                    missing=len(issues),
+                    total=len(self._subs),
+                )
             raise ObservationNotReadyError(issues)
 
         sampled: dict[str, Any] = {}
@@ -1244,6 +1283,16 @@ class PipelinePolicyNode(Node):
             else:
                 sampled[key] = np.ascontiguousarray(np.stack(values)[None, ...]) if self._n_obs_steps > 1 else values[0]
         if decode_issues:
+            if trace.enabled:
+                trace.event(
+                    "obs_frame",
+                    origin="built-in",
+                    component_id="policy.observation",
+                    sample_ts_ns=sample_time_ns,
+                    ready=max(0, len(self._subs) - len(decode_issues)),
+                    missing=len(decode_issues),
+                    total=len(self._subs),
+                )
             raise ObservationNotReadyError(decode_issues)
 
         observations: dict[str, Any] = {}
@@ -1255,6 +1304,36 @@ class PipelinePolicyNode(Node):
             if key.startswith("observation.state_") and len(self._state_specs) > 1:
                 continue
             observations[key] = value
+        if source_timestamps is None:
+            return observations
+        for key, state in self._subs.items():
+            source_timestamp_ns = source_timestamps.get(key, 0)
+            # RTP only reports sender freshness here, not the frame selected by the cloud.
+            is_rtp = state.spec.key in rtp_video_keys
+            age_reference_ns = now_ns if is_rtp else sample_time_ns
+            trace.event(
+                "obs_sample",
+                origin="built-in",
+                component_id="policy.observation",
+                key=key,
+                topic=state.spec.topic,
+                source="rtp_sender_freshness" if is_rtp else "local_buffer",
+                ready=source_timestamp_ns > 0,
+                age_ms=(
+                    max(0.0, (age_reference_ns - source_timestamp_ns) / 1_000_000) if source_timestamp_ns else -1.0
+                ),
+                sample_ts_ns=sample_time_ns,
+                **{("sender_capture_ts_ns" if is_rtp else "source_ts_ns"): source_timestamp_ns},
+            )
+        trace.event(
+            "obs_frame",
+            origin="built-in",
+            component_id="policy.observation",
+            sample_ts_ns=sample_time_ns,
+            ready=len(self._subs),
+            missing=0,
+            total=len(self._subs),
+        )
         return observations
 
     def _clear_observation_buffers(self, reset_time_ns: int | None = None) -> None:
@@ -1323,14 +1402,24 @@ class PipelinePolicyNode(Node):
             try:
                 if self._goal_cancel_requested(goal_handle):
                     raise RequestCanceledError(f"inference request {request_id!r} was canceled before execution")
-                return self._execute_inference_request(
-                    goal_handle,
-                    request,
-                    request_id,
-                    sample_time,
-                    total_start,
-                    request_start_monotonic_ns,
-                )
+                with (
+                    trace.trace_context(request_id, component_id="policy"),
+                    trace.span(
+                        "policy_pipeline",
+                        component_id="policy",
+                        origin="built-in",
+                        execution_mode=self._config.execution_mode,
+                        pipeline_id=self._config.pipeline_id,
+                    ),
+                ):
+                    return self._execute_inference_request(
+                        goal_handle,
+                        request,
+                        request_id,
+                        sample_time,
+                        total_start,
+                        request_start_monotonic_ns,
+                    )
             finally:
                 self._operation_lock.release()
         except Exception as exc:
@@ -1378,8 +1467,24 @@ class PipelinePolicyNode(Node):
                 self._finish_canceled_goal(goal_handle)
             else:
                 goal_handle.abort()
+            trace.event(
+                "dispatch_result",
+                origin="built-in",
+                trace_id=request_id,
+                component_id="policy",
+                success=False,
+                error_type=type(exc).__name__,
+                pipeline_id=self._config.pipeline_id,
+            )
             return response
         finally:
+            trace.flow_send(
+                "result_to_decode",
+                request_id,
+                trace_id=request_id,
+                component_id="policy.postprocess",
+                pipeline_id=self._config.pipeline_id,
+            )
             with self._goal_state_lock:
                 self._cancel_requested_goals.discard(id(goal_handle))
                 self._cancel_confirmed_goals.discard(id(goal_handle))
@@ -1480,99 +1585,116 @@ class PipelinePolicyNode(Node):
         if deadline is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
         self._raise_if_deadline_expired(deadline, request_id)
-        video_keys = (
-            self._video_stream_manager.observation_keys
-            if self._config.execution_mode == "distributed" and self._video_stream_manager is not None
-            else frozenset()
+        trace.flow_receive(
+            "dispatch_to_observation",
+            request_id,
+            component_id="policy.observation",
+            pipeline_id=self._config.pipeline_id,
         )
-        observations = self._sample_observations(sample_time, rtp_video_keys=video_keys)
-        self._raise_if_deadline_expired(deadline, request_id)
-        if "observation.state" in observations:
-            observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
-        service_performance: dict[str, object]
-        if self._config.execution_mode == "monolithic":
-            observations = self._to_policy_inputs(observations)
-            inference_start_monotonic_ns = time.monotonic_ns()
-            result = self._require_manager().infer(
-                self._config.pipeline_id,
-                InferenceRequest(
-                    request_id=request_id,
-                    inputs=observations,
-                    prompt=request.prompt if request.prompt else None,
-                    deadline=deadline,
-                    priority=0,
-                ),
+        with trace.span("observation_sampling", component_id="policy.observation", origin="built-in"):
+            video_keys = (
+                self._video_stream_manager.observation_keys
+                if self._config.execution_mode == "distributed" and self._video_stream_manager is not None
+                else frozenset()
             )
-            raw_action = result.action
-            chunk_size = result.actual_chunk_size
-            inference_end_monotonic_ns = time.monotonic_ns()
-            execution_horizon = _execution_horizon_from_metadata(result.metadata, chunk_size)
-            backend_latency_ms = result.backend_latency_ms
-            total_latency_ms = result.total_latency_ms
-            service_performance = {
-                "clock_domain": "monotonic",
-                "execution_mode": "monolithic",
-                "request_start_monotonic_ns": request_start_monotonic_ns,
-                "inference_start_monotonic_ns": inference_start_monotonic_ns,
-                "inference_end_monotonic_ns": inference_end_monotonic_ns,
-                "transport": {"mode": "dds", "streams": []},
-            }
-        else:
-            edge_runtime = self._require_edge_runtime()
-            try:
-                canonical_inputs = edge_runtime.preprocess(
-                    observations,
-                    prompt=request.prompt if request.prompt else None,
+            observations = self._sample_observations(sample_time, rtp_video_keys=video_keys)
+            self._raise_if_deadline_expired(deadline, request_id)
+            if "observation.state" in observations:
+                observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
+        trace.flow_send(
+            "observation_to_preprocess",
+            request_id,
+            component_id="policy.observation",
+            pipeline_id=self._config.pipeline_id,
+        )
+        service_performance: dict[str, object]
+        with trace.span("policy_total", component_id="policy", origin="built-in"):
+            if self._config.execution_mode == "monolithic":
+                observations = self._to_policy_inputs(observations)
+                inference_start_monotonic_ns = time.monotonic_ns()
+                result = self._require_manager().infer(
+                    self._config.pipeline_id,
+                    InferenceRequest(
+                        request_id=request_id,
+                        inputs=observations,
+                        prompt=request.prompt if request.prompt else None,
+                        deadline=deadline,
+                        priority=0,
+                    ),
                 )
-                video_manager = self._video_stream_manager
-                stream_references: tuple[StreamReference, ...] = ()
-                if video_manager is not None:
-                    stream_references = video_manager.stream_references
-                    canonical_inputs = {
-                        key: value
-                        for key, value in canonical_inputs.items()
-                        if key not in video_manager.observation_keys
-                    }
-                aligned_timestamps_ns: tuple[int, ...] = ()
-                aligned_tensors: tuple[dict[str, object], ...] = ()
-                if stream_references:
-                    aligned_timestamps_ns, aligned_tensors = self._build_aligned_history(observations, sample_time)
-                    if aligned_timestamps_ns:
-                        aligned_tensors = tuple(dict(edge_runtime.preprocess(entry)) for entry in aligned_tensors)
-                self._raise_if_deadline_expired(deadline, request_id)
-                distributed_result = self._round_trip(
-                    Operation.INFER,
-                    request_id,
-                    inputs=dict(canonical_inputs),
-                    prompt=request.prompt if request.prompt else None,
-                    deadline=deadline,
-                    goal_handle=goal_handle,
-                    observation_timestamp_ns=sample_time if stream_references else 0,
-                    stream_references=stream_references,
-                    aligned_timestamps_ns=aligned_timestamps_ns,
-                    aligned_tensors=aligned_tensors,
-                )
-                self._raise_if_deadline_expired(deadline, request_id)
-                if self._goal_cancel_requested(goal_handle):
-                    self._fail_distributed_after_late_cancel(request_id)
-                    raise RequestCanceledError(f"inference request {request_id!r} was canceled before postprocessing")
-                raw_action = edge_runtime.postprocess(
-                    distributed_result.action,
-                    actual_chunk_size=distributed_result.actual_chunk_size,
-                )
-                self._raise_if_deadline_expired(deadline, request_id)
-                chunk_size = distributed_result.actual_chunk_size
-                execution_horizon = int(distributed_result.execution_horizon)
-                backend_latency_ms = distributed_result.backend_latency_ms
-                total_latency_ms = (time.perf_counter() - total_start) * 1000.0
-                service_performance = dict(distributed_result.performance)
-                service_performance["execution_mode"] = "distributed"
-            except Exception as exc:
-                self._fail_distributed_after_deadline(request_id, exc)
-                raise
+                raw_action = result.action
+                chunk_size = result.actual_chunk_size
+                inference_end_monotonic_ns = time.monotonic_ns()
+                execution_horizon = _execution_horizon_from_metadata(result.metadata, chunk_size)
+                backend_latency_ms = result.backend_latency_ms
+                total_latency_ms = result.total_latency_ms
+                service_performance = {
+                    "clock_domain": "monotonic",
+                    "execution_mode": "monolithic",
+                    "request_start_monotonic_ns": request_start_monotonic_ns,
+                    "inference_start_monotonic_ns": inference_start_monotonic_ns,
+                    "inference_end_monotonic_ns": inference_end_monotonic_ns,
+                    "transport": {"mode": "dds", "streams": []},
+                }
+            else:
+                edge_runtime = self._require_edge_runtime()
+                try:
+                    canonical_inputs = edge_runtime.preprocess(
+                        observations,
+                        prompt=request.prompt if request.prompt else None,
+                    )
+                    video_manager = self._video_stream_manager
+                    stream_references: tuple[StreamReference, ...] = ()
+                    if video_manager is not None:
+                        stream_references = video_manager.stream_references
+                        canonical_inputs = {
+                            key: value
+                            for key, value in canonical_inputs.items()
+                            if key not in video_manager.observation_keys
+                        }
+                    aligned_timestamps_ns: tuple[int, ...] = ()
+                    aligned_tensors: tuple[dict[str, object], ...] = ()
+                    if stream_references:
+                        aligned_timestamps_ns, aligned_tensors = self._build_aligned_history(observations, sample_time)
+                        if aligned_timestamps_ns:
+                            aligned_tensors = tuple(dict(edge_runtime.preprocess(entry)) for entry in aligned_tensors)
+                    self._raise_if_deadline_expired(deadline, request_id)
+                    distributed_result = self._round_trip(
+                        Operation.INFER,
+                        request_id,
+                        inputs=dict(canonical_inputs),
+                        prompt=request.prompt if request.prompt else None,
+                        deadline=deadline,
+                        goal_handle=goal_handle,
+                        observation_timestamp_ns=sample_time if stream_references else 0,
+                        stream_references=stream_references,
+                        aligned_timestamps_ns=aligned_timestamps_ns,
+                        aligned_tensors=aligned_tensors,
+                    )
+                    self._raise_if_deadline_expired(deadline, request_id)
+                    if self._goal_cancel_requested(goal_handle):
+                        self._fail_distributed_after_late_cancel(request_id)
+                        raise RequestCanceledError(
+                            f"inference request {request_id!r} was canceled before postprocessing"
+                        )
+                    raw_action = edge_runtime.postprocess(
+                        distributed_result.action,
+                        actual_chunk_size=distributed_result.actual_chunk_size,
+                    )
+                    self._raise_if_deadline_expired(deadline, request_id)
+                    chunk_size = distributed_result.actual_chunk_size
+                    execution_horizon = int(distributed_result.execution_horizon)
+                    backend_latency_ms = distributed_result.backend_latency_ms
+                    total_latency_ms = (time.perf_counter() - total_start) * 1000.0
+                    service_performance = dict(distributed_result.performance)
+                    service_performance["execution_mode"] = "distributed"
+                except Exception as exc:
+                    self._fail_distributed_after_deadline(request_id, exc)
+                    raise
 
         try:
-            action_message = self._commit_action(goal_handle, request_id, raw_action, deadline)
+            with trace.span("action_chunk_publish", component_id="policy.postprocess", origin="built-in"):
+                action_message = self._commit_action(goal_handle, request_id, raw_action, deadline)
         except Exception as exc:
             self._fail_distributed_after_deadline(request_id, exc)
             raise
@@ -1591,6 +1713,15 @@ class PipelinePolicyNode(Node):
         service_performance["pipeline_result_monotonic_ns"] = time.monotonic_ns()
         response.performance_json = json.dumps(service_performance, sort_keys=True, separators=(",", ":"))
         response.error = error_to_message(None)
+        trace.event(
+            "dispatch_result",
+            origin="built-in",
+            component_id="policy",
+            success=True,
+            policy_total_ms=total_latency_ms,
+            backend_latency_ms=backend_latency_ms,
+            pipeline_id=self._config.pipeline_id,
+        )
         self._last_inference_time = time.time()
         self._inference_count += 1
         self._last_error = ""
@@ -2002,6 +2133,26 @@ class PipelinePolicyNode(Node):
         )
 
     def _scheduled_dispatch_callback(self, goal_handle) -> DispatchPipelineBinding.Result:
+        if not trace.enabled:
+            return PipelinePolicyNode._scheduled_dispatch_callback_observed(self, goal_handle)
+        goal = goal_handle.request
+        with trace.trace_context(goal.request_id, component_id="policy"):
+            trace.flow_receive(
+                "scheduler_to_pipeline_dispatch",
+                goal.operation_id,
+                component_id="policy.observation",
+                pipeline_id=self._config.pipeline_id,
+            )
+            result = PipelinePolicyNode._scheduled_dispatch_callback_observed(self, goal_handle)
+            trace.flow_send(
+                "pipeline_result_to_scheduler",
+                goal.operation_id,
+                component_id="policy.postprocess",
+                pipeline_id=self._config.pipeline_id,
+            )
+            return result
+
+    def _scheduled_dispatch_callback_observed(self, goal_handle) -> DispatchPipelineBinding.Result:
         goal = goal_handle.request
         return self._execute_pipeline_idempotent(
             goal_handle=goal_handle,
@@ -2020,9 +2171,24 @@ class PipelinePolicyNode(Node):
                 "deadline": goal.deadline,
             },
             deadline=goal.deadline,
-            execute=self._scheduled_dispatch_once,
+            execute=self._scheduled_dispatch_once_observed if trace.enabled else self._scheduled_dispatch_once,
             request_id=goal.request_id,
         )
+
+    def _scheduled_dispatch_once_observed(self, goal_handle):
+        result = self._scheduled_dispatch_once(goal_handle)
+        trace.event(
+            "dispatch_result",
+            origin="built-in",
+            component_id="policy",
+            success=bool(result.success),
+            outcome=int(result.outcome.value),
+            error_code=result.error.code,
+            policy_total_ms=result.inference_latency_ms,
+            backend_latency_ms=result.backend_latency_ms,
+            pipeline_id=self._config.pipeline_id,
+        )
+        return result
 
     def _scheduled_close_callback(self, goal_handle) -> ClosePipelineBinding.Result:
         goal = goal_handle.request
@@ -2334,7 +2500,13 @@ class PipelinePolicyNode(Node):
             sample_time = goal.obs_timestamp.sec * 1_000_000_000 + goal.obs_timestamp.nanosec
             if sample_time <= 0:
                 sample_time = self.get_clock().now().nanoseconds
-            observations = self._sample_observations(sample_time)
+            with trace.span(
+                "observation_sampling",
+                component_id="policy.observation",
+                origin="built-in",
+                pipeline_id=self._config.pipeline_id,
+            ):
+                observations = self._sample_observations(sample_time)
             if self._goal_cancel_requested(goal_handle):
                 raise RequestCanceledError(f"scheduled dispatch {goal.request_id!r} was canceled before execution")
             ctrl.record_product_activity()
@@ -2353,6 +2525,13 @@ class PipelinePolicyNode(Node):
                     **self._observation_time_metadata(sample_time),
                 },
             )
+            if getattr(self._config, "pipeline_stage_policy", "sequential") == "sequential":
+                trace.flow_send(
+                    "observation_to_preprocess",
+                    goal.request_id,
+                    component_id="policy.observation",
+                    pipeline_id=self._config.pipeline_id,
+                )
             backend_result = self._require_manager().infer(
                 self._config.pipeline_id,
                 request,
@@ -2369,10 +2548,16 @@ class PipelinePolicyNode(Node):
                 )
             if ctrl.is_stale_generation(int(goal.expected_pipeline_generation)):
                 raise RuntimeError("dispatch completion crossed a session generation fence")
-            action = self._lerobot_to_rad(raw_action)
-            result.action_chunk = TensorMsgConverter.to_variant({"action": action})
-            result.chunk_size = chunk_size
-            result.execution_horizon = _execution_horizon_from_metadata(backend_result.metadata, chunk_size)
+            with trace.span(
+                "result_encoding",
+                component_id="policy.postprocess",
+                origin="built-in",
+                pipeline_id=self._config.pipeline_id,
+            ):
+                action = self._lerobot_to_rad(raw_action)
+                result.action_chunk = TensorMsgConverter.to_variant({"action": action})
+                result.chunk_size = chunk_size
+                result.execution_horizon = _execution_horizon_from_metadata(backend_result.metadata, chunk_size)
             result.success = True
             result.inference_latency_ms = total_latency_ms
             result.backend_latency_ms = backend_latency_ms

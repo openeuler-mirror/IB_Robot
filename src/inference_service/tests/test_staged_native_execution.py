@@ -1,3 +1,5 @@
+import json
+import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -7,13 +9,102 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from ibrobot_tracing import TraceEmitter
 from inference_manifest import ArtifactBindings, TensorBinding
 from inference_service.backends.types import BackendCapabilities, BackendPriorityMapping
 from inference_service.codecs import build_execution_plan
+from inference_service.pipeline import runtime as runtime_module
+from inference_service.pipeline import staged_executor as staged_module
 from inference_service.pipeline.staged_executor import StagedModelExecutor, StagedScheduling
 from inference_service.pipeline.stages import HostComputeStage, ModelStage
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
 from inference_service.unified_runtime.errors import CancellationRequested
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["trace-off", "trace-on"])
+def staged_tracing_mode(request, monkeypatch):
+    records = []
+    logger = logging.Logger("staged-test", logging.INFO)
+    handler = logging.Handler()
+    handler.emit = lambda record: records.append(json.loads(record.getMessage().split(" ", 1)[1]))
+    logger.addHandler(handler)
+    emitter = TraceEmitter(logger, enabled=request.param)
+    monkeypatch.setattr(staged_module, "trace", emitter)
+    monkeypatch.setattr(runtime_module, "trace", emitter)
+    return emitter, records
+
+
+def test_worker_identity_and_reused_snapshot_are_observed_without_extra_execution(staged_tracing_mode):
+    emitter, records = staged_tracing_mode
+    calls = []
+
+    class Session:
+        def execute_role(self, role, inputs, request, context, **kwargs):
+            calls.append((role, context.request_id))
+            assert not any("trace" in key for key in request.metadata)
+            if role == "encoder":
+                return {"internal.features": np.array([3], dtype=np.float32)}
+            return {"action": inputs["internal.features"] + inputs["state"]}
+
+    executor = _executor(Session())
+    try:
+        with emitter.trace_context("caller"):
+            assert executor.submit_frame(_request("producer", 1, 0)).result(timeout=2) == 1
+            for request_id, state in [("first", 10), ("second", 20)]:
+                result = executor.execute(
+                    _request(request_id, 9, state), ExecutionContext.create(request_id, timeout=2)
+                )
+                np.testing.assert_array_equal(result, [state + 3])
+            emitter.event("caller_after")
+        assert calls == [("encoder", "producer"), ("decoder", "first"), ("decoder", "second")]
+        if emitter.enabled:
+            starts = {r["fields"]["span_id"]: r for r in records if r["event"] == "span_begin"}
+            ends = {r["fields"]["span_id"]: r for r in records if r["event"] == "span_end"}
+            assert starts.keys() == ends.keys() and len(starts) == 3
+            assert {(r["fields"]["span_name"], r["fields"]["trace_id"]) for r in starts.values()} == {
+                ("visual_stage", "producer"),
+                ("action_stage", "first"),
+                ("action_stage", "second"),
+            }
+            selected = [r["fields"] for r in records if r["event"] == "visual_snapshot_selected"]
+            assert [(r["trace_id"], r["version"]) for r in selected] == [("first", 1), ("second", 1)]
+            assert records[-1]["fields"]["trace_id"] == "caller"
+        else:
+            assert not records
+    finally:
+        executor.close()
+
+
+@pytest.mark.parametrize("role", ["encoder", "decoder"])
+def test_worker_failure_keeps_original_error_and_closes_trace(staged_tracing_mode, role):
+    emitter, records = staged_tracing_mode
+    fault = RuntimeError("vendor failure")
+
+    class Session:
+        def execute_role(self, current, inputs, request, context, **kwargs):
+            if current == role:
+                raise fault
+            return {"internal.features": np.array([3], dtype=np.float32)}
+
+    executor = _executor(Session())
+    try:
+        if role == "encoder":
+            with pytest.raises(RuntimeError) as error:
+                executor.submit_frame(_request("producer", 1, 0)).result(timeout=2)
+        else:
+            executor.submit_frame(_request("producer", 1, 0)).result(timeout=2)
+            with pytest.raises(RuntimeError) as error:
+                executor.execute(_request("consumer", 1, 0), ExecutionContext.create("consumer", timeout=2))
+        assert error.value is fault
+        if emitter.enabled:
+            starts = [r for r in records if r["event"] == "span_begin"]
+            ends = [r for r in records if r["event"] == "span_end"]
+            assert len(starts) == len(ends)
+            assert ends[-1]["fields"]["status"] == "error"
+        else:
+            assert not records
+    finally:
+        executor.close()
 
 
 def _handle(executor):
@@ -460,7 +551,7 @@ def test_frame_request_id_collision_is_rejected_without_losing_active_owner(coll
         handle.close()
 
 
-def test_policy_facade_assembles_and_submits_to_staged_executor_with_device_links():
+def test_policy_facade_assembles_and_submits_to_staged_executor_with_device_links(staged_tracing_mode):
     from inference_manifest import CompiledDeployment
     from inference_service.backends import BackendCapabilities, InferenceRequest
     from inference_service.codecs.policies import PI05PolicyCodec
@@ -543,6 +634,14 @@ def test_policy_facade_assembles_and_submits_to_staged_executor_with_device_link
             assert future.result(timeout=2) == 1
             assert calls == ["encoder"]
             assert "internal.features" in pipeline._session_executor._snapshot.execution.host_tensors
+            emitter, records = staged_tracing_mode
+            if emitter.enabled:
+                starts = [record["fields"] for record in records if record["event"] == "span_begin"]
+                ends = [record["fields"] for record in records if record["event"] == "span_end"]
+                assert {record["span_id"] for record in starts} == {record["span_id"] for record in ends}
+                assert {record["span_name"] for record in starts} == {"visual_stage", "preprocess"}
+                assert all(record["trace_id"] == "frame" for record in starts)
+                assert not any(record["event"].startswith("flow_") for record in records)
         finally:
             pipeline._session_executor.close()
     finally:

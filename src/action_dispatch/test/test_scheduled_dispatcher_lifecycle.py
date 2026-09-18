@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -33,6 +35,8 @@ def _plan_node(*, smoothing=False, capacity=4):
     node._inflight_request_id = "request"
     node._inflight_goal_handle = None
     node._plan_length_at_inference_start = 0
+    node._trace_action_steps = "first"
+    node._inference_priority = 0
     node._smoothing_enabled = smoothing
     node._strategy_selection = resolve_dispatch_strategies(
         blending="temporal_ensemble" if smoothing else "none", entrypoint="scheduled"
@@ -66,6 +70,8 @@ def _result(node, actions):
         session_id=node._session_id,
         session_generation=node._session_generation,
         success=True,
+        pipeline_id="policy",
+        inference_latency_ms=12.5,
         chunk_size=len(actions),
         action_chunk=TensorMsgConverter.to_variant({"action": actions}),
         execution_horizon=0,
@@ -83,6 +89,47 @@ class _Future:
 class _PendingFuture:
     def add_done_callback(self, callback) -> None:
         self.callback = callback
+
+
+class _RecordingTrace:
+    def __init__(self, *, enabled=True) -> None:
+        self.enabled = enabled
+        self.events: list[tuple[str, dict]] = []
+        self.flows: list[tuple[str, str, str, dict]] = []
+        self.spans: list[tuple[str, dict]] = []
+        self._context = ContextVar("trace_context", default=None)
+
+    @contextmanager
+    def trace_context(self, trace_id: str, *, component_id: str = ""):
+        if not self.enabled:
+            yield
+            return
+        token = self._context.set({"trace_id": trace_id, "component_id": component_id})
+        try:
+            yield
+        finally:
+            self._context.reset(token)
+
+    @contextmanager
+    def span(self, name: str, **fields):
+        if self.enabled:
+            self.spans.append((name, {**(self._context.get() or {}), **fields}))
+        yield
+
+    def event(self, name: str, **fields) -> None:
+        if self.enabled:
+            if name in ("flow_send", "flow_receive"):
+                callback = self.flow_send if name == "flow_send" else self.flow_receive
+                callback(fields.pop("edge_id"), fields.pop("flow_id"), **fields)
+            self.events.append((name, {**(self._context.get() or {}), **fields}))
+
+    def flow_send(self, edge_id: str, flow_id: str, **fields) -> None:
+        if self.enabled:
+            self.flows.append(("send", edge_id, flow_id, {**(self._context.get() or {}), **fields}))
+
+    def flow_receive(self, edge_id: str, flow_id: str, **fields) -> None:
+        if self.enabled:
+            self.flows.append(("receive", edge_id, flow_id, {**(self._context.get() or {}), **fields}))
 
 
 def test_joint_snapshot_uses_local_monotonic_receive_time(monkeypatch):
@@ -371,10 +418,9 @@ def test_not_started_retry_limit_counts_retries_after_initial_request():
     assert failures == ["scheduled dispatch retries exhausted"]
 
 
-def test_dispatch_retry_reuses_one_observation_snapshot():
-    node = object.__new__(ScheduledActionDispatcherNode)
-    node._state_lock = threading.RLock()
-    node._state = DispatcherState.ACTIVE
+@pytest.mark.parametrize("tracing", [False, True])
+def test_dispatch_retry_reuses_one_observation_snapshot(monkeypatch, tracing):
+    node = _plan_node()
     node._session_id = "00112233-4455-4677-8899-aabbccddeeff"
     node._session_generation = 3
     node._inflight_request_id = ""
@@ -386,19 +432,31 @@ def test_dispatch_retry_reuses_one_observation_snapshot():
     node._inference_fallback_chain = ["fallback"]
     node._inference_priority = 0
     node._inference_prompt = ""
-    node._current_plan_length_locked = lambda: 0
     observation_time_ns = 123_456_789_012
     node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=observation_time_ns))
     goals = []
+    sent_futures = []
+
+    def send_goal(goal):
+        goals.append(goal)
+        sent_futures.append(_PendingFuture())
+        return sent_futures[-1]
+
     node._dispatch_client = SimpleNamespace(
         wait_for_server=lambda **_kwargs: True,
-        send_goal_async=lambda goal: goals.append(goal) or _PendingFuture(),
+        send_goal_async=send_goal,
     )
+    recording_trace = _RecordingTrace(enabled=tracing)
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
 
     ScheduledActionDispatcherNode._request_dispatch(node)
+    first_handle = Mock(accepted=True, goal_id=SimpleNamespace(uuid=[1] * 16))
+    sent_futures[0].callback(_Future(first_handle))
     first_request_id = node._inflight_request_id
     observation_time_ns += 99_000_000
     ScheduledActionDispatcherNode._request_dispatch(node, attempt=1, replace_request_id=first_request_id)
+    second_handle = Mock(accepted=True, goal_id=SimpleNamespace(uuid=[2] * 16))
+    sent_futures[1].callback(_Future(second_handle))
 
     assert len(goals) == 2
     first_stamp = goals[0].obs_timestamp.sec * 1_000_000_000 + goals[0].obs_timestamp.nanosec
@@ -407,6 +465,27 @@ def test_dispatch_retry_reuses_one_observation_snapshot():
     assert goals[0].fallback_chain == goals[1].fallback_chain == ["fallback"]
     assert goals[1].deadline == goals[0].deadline
     assert goals[1].request_id != goals[0].request_id
+    dispatch_events = [fields for name, fields in recording_trace.events if name == "dispatch_request"]
+    assert [fields["trace_id"] for fields in dispatch_events] == (
+        [goal.request_id for goal in goals] if tracing else []
+    )
+    assert [fields["attempt"] for fields in dispatch_events] == ([1, 2] if tracing else [])
+    assert all(fields["pipeline_id"] == "policy" and fields["priority"] == 0 for fields in dispatch_events)
+    scheduler_flows = [
+        flow for flow in recording_trace.flows if flow[:2] == ("send", "scheduled_dispatch_to_scheduler")
+    ]
+    assert [flow[2] for flow in scheduler_flows] == (
+        [f"{goals[0].request_id}:{'01' * 16}", f"{goals[1].request_id}:{'02' * 16}"] if tracing else []
+    )
+
+    unavailable_retries = []
+    node._dispatch_client.wait_for_server = lambda **_kwargs: False
+    node._retry_dispatch_not_started = lambda *args: unavailable_retries.append(args)
+    node._request_dispatch(attempt=2, replace_request_id=node._inflight_request_id)
+    assert unavailable_retries == [(node._inflight_request_id, 2)]
+    assert len([flow for flow in recording_trace.flows if flow[:2] == ("send", "scheduled_dispatch_to_scheduler")]) == (
+        2 if tracing else 0
+    )
 
 
 @pytest.mark.parametrize("smoothing", [False, True])
@@ -610,9 +689,11 @@ def test_stale_failure_leaves_two_worker_executor_free_for_close(monkeypatch, fa
 
 
 @pytest.mark.parametrize("smoothing", [False, True])
-def test_selected_interval_and_zero_watermark_drive_consumption(smoothing):
+def test_selected_interval_and_zero_watermark_drive_consumption(monkeypatch, smoothing):
     node = _plan_node(smoothing=smoothing)
     node._plan_length_at_inference_start = 2
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
 
     def plan(actions, *, actions_executed, execution_horizon=None):
         assert node._state_lock._is_owned()
@@ -625,6 +706,9 @@ def test_selected_interval_and_zero_watermark_drive_consumption(smoothing):
     snapshot = node._active_plan.snapshot()
     assert (snapshot.remaining, snapshot.watermark, snapshot.source) == (3, 0, source)
     assert snapshot.next_position == (None if smoothing else 2)
+    refill = [fields for name, fields in recording_trace.events if name == "queue_refill"]
+    assert len(refill) == 1
+    assert (refill[0]["new"], refill[0]["skipped"], refill[0]["after"], refill[0]["watermark"]) == (3, 2, 3, 0)
     node._request_dispatch = Mock()
     for _ in range(3):
         node._control_loop()
@@ -730,18 +814,22 @@ def test_invalid_result_safe_stops_then_closes_without_candidate_metadata(monkey
 
 
 @pytest.mark.parametrize("smoothing", [False, True])
-def test_duplicate_and_stale_result_leave_plan_and_new_request_untouched(smoothing):
+def test_duplicate_and_stale_result_leave_plan_and_new_request_untouched(monkeypatch, smoothing):
     node = _plan_node(smoothing=smoothing)
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
     result = _result(node, np.ones((2, 2)))
     node._on_dispatch_result(result)
     node._execute_next_action()
     before = node._active_plan.snapshot()
+    traces = (list(recording_trace.events), list(recording_trace.spans), list(recording_trace.flows))
     node._inflight_request_id = "next"
     node._on_dispatch_result(result)
     result.request_id = "stale"
     node._on_dispatch_result(result)
     assert node._active_plan.snapshot() == before
     assert node._inflight_request_id == "next"
+    assert (recording_trace.events, recording_trace.spans, recording_trace.flows) == traces
 
 
 @pytest.mark.parametrize("smoothing", [False, True])
@@ -750,6 +838,8 @@ def test_decoded_result_cannot_restore_plan_after_lifecycle_change(monkeypatch, 
     from tensormsg.converter import TensorMsgConverter
 
     node = _plan_node(smoothing=smoothing)
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
     result = _result(node, np.ones((2, 2)))
     reservations = []
     for owner in (node._queue_plan, node._smoothed_plan):
@@ -798,6 +888,9 @@ def test_decoded_result_cannot_restore_plan_after_lifecycle_change(monkeypatch, 
     assert all(snapshot.source is None and snapshot.remaining == 0 for snapshot in cleared)
     assert all(snapshot.watermark == 2 and snapshot.next_position is None for snapshot in cleared)
     assert not node._received_results
+    assert not [fields for name, fields in recording_trace.events if name == "queue_refill"]
+    assert not [flow for flow in recording_trace.flows if flow[1] == "queue_to_execute"]
+    assert not [flow for flow in recording_trace.flows if flow[:2] == ("receive", "decode_to_queue")]
     for owner, reservation in zip((node._queue_plan, node._smoothed_plan), reservations, strict=True):
         assert not owner.is_current(reservation)
 
@@ -1265,3 +1358,417 @@ def test_stale_mailbox_retry_cannot_overwrite_new_valid_failure(request_id):
     node._drain_pending_failure()
     node._fail_and_close_locked.assert_called_once_with("new failure")
     assert node._pending_failure is None
+
+
+def test_recoverable_result_completes_scheduler_flow_before_retry(monkeypatch):
+    node = _plan_node()
+    source = _source(node)
+    node._inflight_goal_handle = object()
+    result = _result(node, np.ones((2, 2)))
+    result.success = False
+    result.outcome = SimpleNamespace(value=1)
+    result.error = SimpleNamespace(recoverable=True, code="temporary")
+    flow_id = source.request_id
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+
+    def retry(*args):
+        assert args == (source.request_id, 0, "temporary")
+        assert [flow[:3] for flow in recording_trace.flows] == [("receive", "scheduler_result_to_dispatcher", flow_id)]
+
+    node._retry_dispatch_not_started = Mock(side_effect=retry)
+    node._on_dispatch_result = Mock()
+    node._dispatch_result_callback(
+        _Future(SimpleNamespace(result=result)),
+        source.request_id,
+        source.session_id,
+        source.session_generation,
+        0,
+    )
+    node._retry_dispatch_not_started.assert_called_once()
+    node._on_dispatch_result.assert_not_called()
+    assert node._inflight_goal_handle is None
+    assert recording_trace.flows[0][3]["trace_id"] == source.request_id
+    assert not recording_trace.spans
+
+
+@pytest.mark.parametrize("smoothing", [False, True])
+def test_successful_result_transfers_source_and_observes_existing_goal_id(monkeypatch, smoothing):
+    node = _plan_node(smoothing=smoothing)
+    node._active_plan.accept(ChunkPlan(np.tile([1.0, 2.0], (3, 1))), PlanSource("old"))
+    node._execute_next_action()
+    node._execute_next_action()
+    node._executor.reset_mock()
+    node._inflight_request_id = ""
+    node._default_request_timeout_ns = 10_000_000_000
+    node._inference_pipeline = "policy"
+    node._inference_fallback_chain = []
+    node._inference_prompt = ""
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=123))
+    goal_future, result_future = _PendingFuture(), _PendingFuture()
+    node._dispatch_client = Mock()
+    node._dispatch_client.send_goal_async.return_value = goal_future
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+
+    node._request_dispatch()
+    source = _source(node)
+    assert node._dispatch_client.send_goal_async.call_args.kwargs == {}
+    assert len(node._dispatch_client.send_goal_async.call_args.args) == 1
+    flow_id = f"{source.request_id}:{'01' * 16}"
+    goal_handle = Mock(accepted=True, goal_id=SimpleNamespace(uuid=[1] * 16))
+    goal_handle.get_result_async.return_value = result_future
+    goal_future.callback(_Future(goal_handle))
+    result = _result(node, np.array([[1.0, 2.0], [3.0, 4.0]]))
+    future = _Future(SimpleNamespace(result=result))
+    result_future.callback(future)
+
+    assert node._pending_failure is None
+    assert node._inflight_request_id == ""
+    snapshot = node._active_plan.snapshot()
+    assert (snapshot.source, snapshot.remaining, snapshot.consumed) == (source, 2, 0)
+    assert node._received_results == {(source.session_id, source.session_generation, source.request_id)}
+    assert [flow[:3] for flow in recording_trace.flows] == [
+        ("send", "scheduled_dispatch_to_scheduler", flow_id),
+        ("receive", "scheduler_result_to_dispatcher", flow_id),
+        ("send", "decode_to_queue", source.request_id),
+        ("receive", "decode_to_queue", source.request_id),
+        ("send", "queue_to_execute", source.request_id),
+    ]
+    decodes = [fields for name, fields in recording_trace.events if name == "dispatch_decode"]
+    assert len(decodes) == 1 and decodes[0]["trace_id"] == source.request_id
+    result_events = [fields for name, fields in recording_trace.events if name == "dispatch_result"]
+    assert len(result_events) == 1
+    assert result_events[0]["policy_total_ms"] == result.inference_latency_ms
+    assert result_events[0]["pipeline_id"] == "policy"
+    node._execute_next_action()
+    node._execute_next_action()
+    np.testing.assert_allclose([call.args[0] for call in node._executor.execute.call_args_list], [[1, 2], [3, 4]])
+    before = node._active_plan.snapshot()
+    traces = (list(recording_trace.events), list(recording_trace.spans), list(recording_trace.flows))
+    node._inflight_request_id = "next"
+    result_future.callback(future)
+    assert node._active_plan.snapshot() == before
+    assert node._inflight_request_id == "next"
+    assert (recording_trace.events, recording_trace.spans, recording_trace.flows) == traces
+
+
+@pytest.mark.parametrize("smoothing", [False, True])
+@pytest.mark.parametrize("chunking", ["full_chunk", "auto_horizon"])
+def test_fully_skipped_chunk_has_no_execution_flow_or_first_action(monkeypatch, smoothing, chunking):
+    node = _plan_node(smoothing=smoothing)
+    node._active_plan.accept(ChunkPlan(np.ones((1, 2))), PlanSource("old"))
+    node._execute_next_action()
+    node._executor.reset_mock()
+    node._chunk_planner = create_chunk_planner(chunking)
+    node._plan_length_at_inference_start = 3
+    source = _source(node)
+    result = _result(node, np.zeros((2 if chunking == "full_chunk" else 4, 2)))
+    result.execution_horizon = 2
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+
+    node._on_dispatch_result(result)
+    snapshot = node._active_plan.snapshot()
+    assert (snapshot.source, snapshot.remaining, snapshot.consumed) == (source, 0, 0)
+    node._execute_next_action()
+    node._execute_next_action()
+
+    assert node._active_plan.snapshot() == snapshot
+    refill = [fields for name, fields in recording_trace.events if name == "queue_refill"]
+    assert len(refill) == 1
+    assert (refill[0]["new"], refill[0]["after"]) == (0, 0)
+    assert not [flow for flow in recording_trace.flows if flow[1] == "queue_to_execute"]
+    assert not [fields for name, fields in recording_trace.events if name == "first_action_execute"]
+    assert not [fields for name, fields in recording_trace.spans if name == "first_action_execute"]
+    assert node._executor.execute.call_count == 2
+    assert all(len(call.args) == 1 and not call.kwargs for call in node._executor.execute.call_args_list)
+
+
+@pytest.mark.parametrize("smoothing", [False, True])
+@pytest.mark.parametrize("skipped", [0, 2])
+@pytest.mark.parametrize(
+    "sampling, indices", [("first", [0]), ("all", [0, 1, 2, 3]), ("sample:2", [0, 2]), ("sample:bad", [0])]
+)
+def test_action_sampling_uses_actual_consumption_and_never_traces_hold(
+    monkeypatch, smoothing, skipped, sampling, indices
+):
+    node = _plan_node(smoothing=smoothing, capacity=6)
+    node._trace_action_steps = sampling
+    node._plan_length_at_inference_start = skipped
+    source = _source(node)
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+    node._on_dispatch_result(_result(node, np.arange((skipped + 4) * 2).reshape(skipped + 4, 2)))
+    snapshot = node._active_plan.snapshot()
+    assert snapshot.next_position == (None if smoothing else skipped)
+    assert snapshot.consumed == 0
+
+    def execute(_action):
+        assert node._state_lock._is_owned()
+
+    node._executor.execute.side_effect = execute
+    for _ in range(6):
+        node._execute_next_action()
+
+    assert all(len(call.args) == 1 and not call.kwargs for call in node._executor.execute.call_args_list)
+    executions = [
+        (name, fields) for name, fields in recording_trace.events if name in {"first_action_execute", "action_execute"}
+    ]
+    assert [fields["consumed_index"] for _, fields in executions] == indices
+    assert [fields["execute_index"] for _, fields in executions] == (
+        [-1] * len(indices) if smoothing else [skipped + index for index in indices]
+    )
+    assert [name for name, _ in executions] == ["first_action_execute"] + ["action_execute"] * (len(indices) - 1)
+    assert all(fields["trace_id"] == source.request_id for _, fields in executions)
+    assert all(fields["source"] == ("smoother" if smoothing else "queue") for _, fields in executions)
+    receives = [flow[:3] for flow in recording_trace.flows if flow[:2] == ("receive", "queue_to_execute")]
+    assert receives == [("receive", "queue_to_execute", source.request_id)]
+    assert node._active_plan.snapshot().consumed == 4
+
+
+def test_toggle_tracing_uses_each_retained_store_consumption(monkeypatch):
+    node = _plan_node(capacity=5)
+    node._trace_action_steps = "all"
+    node._inflight_request_id = "queue"
+    node._plan_length_at_inference_start = 2
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+    node._on_dispatch_result(_result(node, np.ones((5, 2))))
+    node._execute_next_action()
+    queued = node._queue_plan.snapshot()
+    node._toggle_smoothing_cb(None, None)
+    node._execute_next_action()  # Empty smoother holds without receiving a flow.
+    node._inflight_request_id = "smooth"
+    node._plan_length_at_inference_start = 0
+    node._on_dispatch_result(_result(node, np.ones((2, 2))))
+    for _ in range(3):
+        node._execute_next_action()
+    node._toggle_smoothing_cb(None, None)
+    assert node._active_plan.snapshot() == queued
+    node._execute_next_action()
+    node._execute_next_action()
+    node._toggle_smoothing_cb(None, None)
+    node._execute_next_action()
+
+    assert all(len(call.args) == 1 and not call.kwargs for call in node._executor.execute.call_args_list)
+    traced = [
+        (fields["trace_id"], fields["consumed_index"])
+        for name, fields in recording_trace.events
+        if name in {"first_action_execute", "action_execute"}
+    ]
+    assert traced == [("queue", 0), ("smooth", 0), ("smooth", 1), ("queue", 1), ("queue", 2)]
+    assert [fields["trace_id"] for name, fields in recording_trace.events if name == "first_action_execute"] == [
+        "queue",
+        "smooth",
+    ]
+    receives = [flow[2] for flow in recording_trace.flows if flow[:2] == ("receive", "queue_to_execute")]
+    assert receives == ["queue", "smooth"]
+    assert node._queue_plan.snapshot().consumed == 3
+    assert node._smoothed_plan.snapshot().consumed == 0
+
+
+def test_action_waiting_on_state_lock_is_dropped_after_stop_state(monkeypatch):
+    node = _plan_node()
+    node._active_plan.accept(ChunkPlan(np.ones((1, 2))), _source(node))
+    entered = threading.Event()
+    recording_trace = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recording_trace)
+
+    def tick():
+        entered.set()
+        node._execute_next_action()
+
+    worker = threading.Thread(target=tick)
+    try:
+        with node._state_lock:
+            worker.start()
+            assert entered.wait(5)
+            node._state = DispatcherState.CLOSING
+            node._clear_plans_locked()
+            snapshot = node._active_plan.snapshot()
+    finally:
+        worker.join(5)
+    assert not worker.is_alive()
+    assert node._active_plan.snapshot() == snapshot
+    node._executor.execute.assert_not_called()
+    assert not recording_trace.events and not recording_trace.spans and not recording_trace.flows
+
+
+def test_safe_stop_waits_for_current_publish_and_is_last(monkeypatch):
+    node = _plan_node()
+    node._active_plan.accept(ChunkPlan(np.ones((1, 2))), _source(node))
+    node._joint_snapshot = SimpleNamespace(valid=False)
+    node._safe_stop_plan.channels = [
+        SimpleNamespace(topic="hold", safety_behavior="hold"),
+        SimpleNamespace(topic="zeros", safety_behavior="zeros"),
+    ]
+    normal_started, release_normal, stop_started, safe_ready = (threading.Event() for _ in range(4))
+    publications = []
+    safe_result = []
+
+    def execute(_action):
+        assert node._state_lock._is_owned()
+        publications.append("normal-start")
+        normal_started.set()
+        assert release_normal.wait(5)
+        publications.append("normal")
+
+    def safety_commands(**_kwargs):
+        assert node._state is DispatcherState.CLOSING
+        safe_ready.set()
+        return [np.asarray([0.0]), np.asarray([1.0])]
+
+    def stop():
+        stop_started.set()
+        safe_result.append(node._safe_stop())
+
+    monkeypatch.setattr(dispatcher_module, "construct_safety_command", safety_commands)
+    node._executor.execute.side_effect = execute
+    node._executor.execute_channel.side_effect = lambda topic, _action: publications.append(topic)
+    normal_worker = threading.Thread(target=node._execute_next_action)
+    safe_worker = threading.Thread(target=stop)
+    normal_worker.start()
+    try:
+        assert normal_started.wait(5)
+        safe_worker.start()
+        assert stop_started.wait(5)
+        assert not safe_ready.is_set()
+    finally:
+        release_normal.set()
+        normal_worker.join(5)
+        if safe_worker.ident is not None:
+            safe_worker.join(5)
+    assert not normal_worker.is_alive() and not safe_worker.is_alive()
+    assert safe_result == [True]
+    assert publications == ["normal-start", "normal", "zeros", "hold"]
+    node._execute_next_action()
+    assert node._executor.execute.call_count == 1
+
+
+@pytest.mark.parametrize("smoothing", [False, True])
+def test_trace_on_off_preserves_actions_and_lifecycle(monkeypatch, smoothing):
+    outcomes = []
+    for tracing in (False, True):
+        node = _plan_node(smoothing=smoothing)
+        node._trace_action_steps = "all"
+        recorder = _RecordingTrace(enabled=tracing)
+        monkeypatch.setattr(dispatcher_module, "trace", recorder)
+        node._on_dispatch_result(_result(node, np.arange(6).reshape(3, 2)))
+        for _ in range(5):
+            node._execute_next_action()
+        calls = [(call.args[0].tolist(), len(call.args), call.kwargs) for call in node._executor.execute.call_args_list]
+        outcomes.append((calls, node._active_plan.snapshot(), node._state, node._received_results))
+        if not tracing:
+            assert not recorder.events and not recorder.flows and not recorder.spans
+    assert outcomes[0] == outcomes[1]
+    assert [call[1:] for call in outcomes[0][0]] == [(1, {})] * 5
+
+
+def test_trace_off_has_only_original_uuid_and_snapshot_reads(monkeypatch):
+    node = _plan_node()
+    node._inflight_request_id = ""
+    node._default_request_timeout_ns = 10_000_000_000
+    node._inference_pipeline = "policy"
+    node._inference_fallback_chain = []
+    node._inference_prompt = ""
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=123))
+    node._dispatch_client = Mock()
+    node._dispatch_client.send_goal_async.return_value = _PendingFuture()
+    monkeypatch.setattr(dispatcher_module, "trace", _RecordingTrace(enabled=False))
+    uuid4 = Mock(wraps=dispatcher_module.uuid.uuid4)
+    monkeypatch.setattr(dispatcher_module.uuid, "uuid4", uuid4)
+    snapshot = Mock(wraps=node._active_plan.snapshot)
+    monkeypatch.setattr(node._active_plan, "snapshot", snapshot)
+    node._request_dispatch()
+    assert uuid4.call_count == 1
+    assert snapshot.call_count == 1
+    assert not node._dispatch_client.send_goal_async.call_args.kwargs
+    node._active_plan.accept(ChunkPlan(np.ones((1, 2))), PlanSource("accepted"))
+    snapshot.reset_mock()
+    node._execute_next_action()
+    assert snapshot.call_count == 1  # Existing reserve() read only.
+    assert len(node._executor.execute.call_args.args) == 1
+
+
+def test_trace_output_never_owns_state_lock(monkeypatch):
+    from action_dispatch.executors.topic import capture_event
+
+    node = _plan_node()
+    recorder = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recorder)
+    lock_observations = []
+    original_event = recorder.event
+
+    def event(name, **fields):
+        lock_observations.append(node._state_lock._is_owned())
+        original_event(name, **fields)
+
+    recorder.event = event
+    node._executor.execute.side_effect = lambda action: capture_event(recorder, "test_publish", values=len(action))
+    node._on_dispatch_result(_result(node, np.ones((2, 2))))
+    node._execute_next_action()
+    assert lock_observations and not any(lock_observations)
+
+
+@pytest.mark.parametrize("error_type", [MemoryError, SystemError])
+def test_observation_failure_is_not_classified_as_invalid_chunk(monkeypatch, error_type):
+    node = _plan_node()
+    recorder = _RecordingTrace()
+    original = error_type("trace write")
+
+    def fail(*_args, **_kwargs):
+        raise original
+
+    recorder.event = fail
+    # Initial result observation is outside the business handler; exercise the
+    # deferred decoder/refill records without failing that initial event.
+    first = True
+
+    def event(name, **fields):
+        nonlocal first
+        if first:
+            first = False
+            return
+        fail()
+
+    recorder.event = event
+    monkeypatch.setattr(dispatcher_module, "trace", recorder)
+    node._fail_current_request = Mock()
+    with pytest.raises(error_type) as caught:
+        node._on_dispatch_result(_result(node, np.ones((2, 2))))
+    assert caught.value is original
+    node._fail_current_request.assert_not_called()
+    assert node._active_plan.snapshot().remaining == 2
+
+
+def test_refill_trace_wait_does_not_block_action_or_force_flow_output_order(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    node = _plan_node()
+    recorder = _RecordingTrace()
+    monkeypatch.setattr(dispatcher_module, "trace", recorder)
+    entered, release = threading.Event(), threading.Event()
+    original_send = recorder.flow_send
+
+    def flow_send(edge_id, flow_id, **fields):
+        if edge_id == "queue_to_execute":
+            entered.set()
+            assert release.wait(5)
+        original_send(edge_id, flow_id, **fields)
+
+    recorder.flow_send = flow_send
+    result = _result(node, np.ones((2, 2)))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        refill = pool.submit(node._on_dispatch_result, result)
+        try:
+            assert entered.wait(5)
+            pool.submit(node._execute_next_action).result(timeout=2)
+            node._executor.execute.assert_called_once()
+            assert not [flow for flow in recorder.flows if flow[:2] == ("send", "queue_to_execute")]
+        finally:
+            release.set()
+        refill.result(timeout=5)
+    flows = [flow for flow in recorder.flows if flow[1] == "queue_to_execute"]
+    assert [flow[0] for flow in flows] == ["receive", "send"]
+    assert flows[1][3]["timestamp_ns"] <= flows[0][3]["timestamp_ns"]

@@ -9,10 +9,7 @@ Supports cross-frame temporal smoothing for action chunks.
 """
 
 import json
-
-# Business tracepoints via Python logging.
-# When lttngust is imported, these are auto-captured by LTTng as
-# python:logging events — no wrapper package needed.
+import os
 import threading
 import time
 import uuid
@@ -35,9 +32,9 @@ from std_srvs.srv import Empty, Trigger
 
 from ibrobot_msgs.action import DispatchInfer, RunPolicy
 from ibrobot_msgs.srv import PreparePolicyEpisode
+from ibrobot_tracing import get_trace_emitter
 from robot_config.contract_utils import iter_specs
 from robot_config.dispatch_strategies import resolve_dispatch_strategies
-from robot_config.tracing_utils import create_trace_logger
 from tensormsg.converter import TensorMsgConverter
 
 from .action_chunk import normalize_action_chunk, validate_execution_horizon
@@ -59,6 +56,7 @@ from .episode import (
 )
 from .executors.completion import ExecutionContext
 from .executors.registry import create_executor
+from .executors.topic import capture_event, capture_traces, execution_trace
 from .schedulers.base import (
     ActionDecision,
     CompletionDecision,
@@ -70,7 +68,7 @@ from .temporal_smoother import (
     TemporalSmootherManager,
 )
 
-_trace = create_trace_logger("ib_trace.dispatch")
+trace = get_trace_emitter("ib_trace.dispatch", component_id="action_dispatcher")
 
 
 @dataclass
@@ -117,7 +115,7 @@ def _dispatch_locked(method):
 
     @wraps(method)
     def locked(self, *args, **kwargs):
-        with self._dispatch_lock:
+        with capture_traces(trace.enabled), self._dispatch_lock:
             return method(self, *args, **kwargs)
 
     return locked
@@ -133,6 +131,8 @@ class ActionDispatcherNode(Node):
     Cross-frame smoothing can be enabled via parameters to ensure smooth
     transitions between consecutive action chunks.
     """
+
+    _trace_action_steps = "first"
 
     def __init__(self, **kwargs):
         super().__init__("action_dispatcher", **kwargs)
@@ -448,6 +448,7 @@ class ActionDispatcherNode(Node):
         self._hold_count = 0
         self._consecutive_failures = 0
         self._last_stats_dispatch_count = 0
+        self._trace_action_steps = os.environ.get("IB_TRACE_ACTION_STEPS", "first").lower()
         self._last_queue_refill_monotonic_ns = 0
         self._last_stall_log_ns = time.monotonic_ns()
         self._benchmark_inference_timings: dict[str, dict[str, object]] = {}
@@ -530,15 +531,43 @@ class ActionDispatcherNode(Node):
             execute_index = plan.next_position if plan.next_position is not None else -1
             request_id = plan.source.request_id if plan.source is not None else ""
             execute_start = time.perf_counter()
-            self._executor.execute(
-                action_np,
-                {
-                    "request_id": request_id,
-                    "execute_index": execute_index,
-                    "queue_size": q_size,
-                },
+            sample_interval = 0
+            if trace.enabled and self._trace_action_steps.startswith("sample:"):
+                try:
+                    sample_interval = max(1, int(self._trace_action_steps.partition(":")[2]))
+                except ValueError:
+                    sample_interval = 0
+            first_action = trace.enabled and action_source not in ("empty", "hold") and plan.consumed == 0
+            trace_step = (
+                trace.enabled
+                and action_source not in ("empty", "hold")
+                and (
+                    first_action
+                    or self._trace_action_steps == "all"
+                    or bool(sample_interval and plan.consumed % sample_interval == 0)
+                )
             )
+            metadata = {
+                "request_id": request_id,
+                "execute_index": execute_index,
+                "queue_size": q_size,
+            }
+            if trace_step:
+                with execution_trace(request_id, plan.consumed, execute_index, q_size):
+                    if first_action:
+                        capture_event(
+                            trace,
+                            "flow_receive",
+                            edge_id="queue_to_execute",
+                            flow_id=request_id,
+                            trace_id=request_id,
+                            component_id="action_dispatcher.execute",
+                        )
+                    self._executor.execute(action_np, metadata)
+            else:
+                self._executor.execute(action_np, metadata)
             publish_ms = (time.perf_counter() - execute_start) * 1000.0
+            publish_end_ns = time.time_ns() if trace_step else 0
             queue_after = self._get_plan_length()
             since_refill_ms = (
                 max(
@@ -548,17 +577,23 @@ class ActionDispatcherNode(Node):
                 if self._last_queue_refill_monotonic_ns
                 else -1.0
             )
-            _trace.info(
-                "[action_execute] request_id=%s index=%d source=%s "
-                "queue_before=%d queue_after=%d since_refill_ms=%.2f publish_ms=%.2f",
-                request_id,
-                execute_index,
-                action_source,
-                q_size,
-                queue_after,
-                since_refill_ms,
-                publish_ms,
-            )
+            if trace_step:
+                capture_event(
+                    trace,
+                    "first_action_execute" if first_action else "action_execute",
+                    origin="built-in",
+                    trace_id=request_id,
+                    component_id="action_dispatcher.execute",
+                    execute_index=execute_index,
+                    consumed_index=plan.consumed,
+                    chunk_position=plan.next_position,
+                    source=action_source,
+                    queue_before=q_size,
+                    queue_after=queue_after,
+                    since_refill_ms=since_refill_ms,
+                    publish_ms=publish_ms,
+                    publish_end_ns=publish_end_ns,
+                )
 
         # D. Periodic stats (only when new inferences arrived)
         now = time.monotonic()
@@ -612,18 +647,33 @@ class ActionDispatcherNode(Node):
             goal.prompt = self.get_parameter("inference_prompt").value
         goal.inference_id = self._current_request_id
 
-        _trace.info(
-            "[dispatch_request] request_id=%s queue_size=%d watermark=%d",
-            self._current_request_id,
-            self._plan_length_at_inference_start,
-            self._active_plan.snapshot().watermark,
-        )
+        if trace.enabled:
+            capture_event(
+                trace,
+                "dispatch_request",
+                origin="built-in",
+                trace_id=self._current_request_id,
+                component_id="action_dispatcher.request",
+                queue_size=self._plan_length_at_inference_start,
+                watermark=self._active_plan.snapshot().watermark,
+            )
         self.get_logger().debug(
             f"Requesting inference @ {goal.obs_timestamp.sec}, "
             f"plan_length_at_start: {self._plan_length_at_inference_start}"
         )
 
+        send_timestamp_ns = time.time_ns() if trace.enabled else None
         send_goal_future = self._infer_client.send_goal_async(goal)
+        if trace.enabled:
+            capture_event(
+                trace,
+                "flow_send",
+                timestamp_ns=send_timestamp_ns,
+                edge_id="dispatch_to_observation",
+                flow_id=self._current_request_id,
+                trace_id=self._current_request_id,
+                component_id="action_dispatcher.request",
+            )
         request_generation = self._request_generation
         # Canonical lock ordering: capture the episode goal generation at request time so the
         # result callback uses the generation that was active when this
@@ -882,13 +932,18 @@ class ActionDispatcherNode(Node):
                     # Queue/smoother non-emptiness verified above.
                     self._active_plan.commit_reserved()
                     queue_after = self._get_plan_length()
-                    _trace.info(
-                        "[action_execute] request_id=%s index=%d source=commit queue_before=%d queue_after=%d",
-                        self._reservation_context.metadata["request_id"],
-                        self._reservation_context.metadata["execute_index"],
-                        queue_before,
-                        queue_after,
-                    )
+                    if trace.enabled:
+                        capture_event(
+                            trace,
+                            "action_commit",
+                            origin="built-in",
+                            trace_id=self._reservation_context.metadata["request_id"],
+                            component_id="action_dispatcher.execute",
+                            execute_index=self._reservation_context.metadata["execute_index"],
+                            source="commit",
+                            queue_before=queue_before,
+                            queue_after=queue_after,
+                        )
                     self._last_action = self._reserved_action
                     self._reservation_context = None
                     self._plan_reservation = None
@@ -909,13 +964,18 @@ class ActionDispatcherNode(Node):
                 # No active goal (executor lifecycle isolation legacy path): pop as before.
                 self._active_plan.commit(self._plan_reservation)
                 queue_after = self._get_plan_length()
-                _trace.info(
-                    "[action_execute] request_id=%s index=%d source=commit queue_before=%d queue_after=%d",
-                    self._reservation_context.metadata["request_id"],
-                    self._reservation_context.metadata["execute_index"],
-                    queue_before,
-                    queue_after,
-                )
+                if trace.enabled:
+                    capture_event(
+                        trace,
+                        "action_commit",
+                        origin="built-in",
+                        trace_id=self._reservation_context.metadata["request_id"],
+                        component_id="action_dispatcher.execute",
+                        execute_index=self._reservation_context.metadata["execute_index"],
+                        source="commit",
+                        queue_before=queue_before,
+                        queue_after=queue_after,
+                    )
                 self._last_action = self._reserved_action
                 self._reservation_context = None
                 self._plan_reservation = None
@@ -962,6 +1022,12 @@ class ActionDispatcherNode(Node):
         )
 
     def _result_cb(self, future, request_id: str, request_generation: int, episode_goal_generation: int):
+        # Flush trace sinks (and propagate their fatal errors) outside business
+        # error classification and outside the original dispatch lock.
+        with capture_traces(trace.enabled):
+            return self._result_cb_observed(future, request_id, request_generation, episode_goal_generation)
+
+    def _result_cb_observed(self, future, request_id: str, request_generation: int, episode_goal_generation: int):
         with self._dispatch_lock:
             if request_generation != self._request_generation or request_id != self._inflight_request_id:
                 return
@@ -969,13 +1035,31 @@ class ActionDispatcherNode(Node):
         decode_start = time.perf_counter()
         try:
             result = future.result().result
+            if trace.enabled:
+                capture_event(
+                    trace,
+                    "flow_receive",
+                    edge_id="result_to_decode",
+                    flow_id=request_id,
+                    trace_id=request_id,
+                    component_id="action_dispatcher.decode",
+                )
             batch = TensorMsgConverter.from_variant(result.action_chunk) if result.success else None
             decoded = _normalize_action_chunk(batch["action"]) if result.success else None
+            if trace.enabled and result.success:
+                capture_event(
+                    trace,
+                    "flow_send",
+                    edge_id="decode_to_queue",
+                    flow_id=request_id,
+                    trace_id=request_id,
+                    component_id="action_dispatcher.decode",
+                )
             decode_error = None
         except (ValueError, TypeError, KeyError, AttributeError, RuntimeError, MemoryError) as exc:
             decoded = None
             decode_error = exc
-        with self._dispatch_lock:
+        with capture_traces(trace.enabled), self._dispatch_lock:
             if request_generation != self._request_generation or request_id != self._inflight_request_id:
                 return
             if self._is_benchmark and (
@@ -989,12 +1073,15 @@ class ActionDispatcherNode(Node):
             if decode_error is not None:
                 self._reject_action_chunk(request_id, decode_error)
                 return
-            if decoded is not None:
-                _trace.info(
-                    "[dispatch_decode] request_id=%s chunk_size=%d decode_ms=%.2f",
-                    request_id,
-                    decoded[1].shape[0] if decoded[1].ndim else 0,
-                    (time.perf_counter() - decode_start) * 1000.0,
+            if trace.enabled and decoded is not None:
+                capture_event(
+                    trace,
+                    "dispatch_decode",
+                    origin="built-in",
+                    trace_id=request_id,
+                    component_id="action_dispatcher.decode",
+                    chunk_size=decoded[1].shape[0] if decoded[1].ndim else 0,
+                    decode_ms=(time.perf_counter() - decode_start) * 1000.0,
                 )
             self._accept_result(result, request_id, request_generation, episode_goal_generation, decoded)
 
@@ -1071,10 +1158,16 @@ class ActionDispatcherNode(Node):
                 self._abort_episode(TERMINATION_INFERENCE_FAILED)
                 return
             self._consecutive_failures += 1
-            _trace.info(
-                "[dispatch_result] request_id=%s success=False",
-                req_id,
-            )
+            if trace.enabled:
+                capture_event(
+                    trace,
+                    "dispatch_result",
+                    origin="built-in",
+                    trace_id=req_id,
+                    component_id="action_dispatcher.decode",
+                    success=False,
+                    message=result.message,
+                )
             if self._consecutive_failures == 1:
                 self.get_logger().warn(f"Inference failed: {result.message}")
             else:
@@ -1099,6 +1192,15 @@ class ActionDispatcherNode(Node):
                 execution_horizon=validate_execution_horizon(int(result.execution_horizon), len(actions)),
             )
             dimension = sum(len(spec.names) for spec in self._action_specs) or None
+            if trace.enabled:
+                capture_event(
+                    trace,
+                    "flow_receive",
+                    edge_id="decode_to_queue",
+                    flow_id=req_id,
+                    trace_id=req_id,
+                    component_id="action_dispatcher.queue",
+                )
             plan = self._active_plan.accept(
                 candidate,
                 PlanSource(req_id, request_generation),
@@ -1120,15 +1222,37 @@ class ActionDispatcherNode(Node):
         self._dispatch_count += 1
         self._total_inference_latency_ms += result.inference_latency_ms
         self._last_queue_refill_monotonic_ns = time.monotonic_ns()
-        _trace.info(
-            "[dispatch_result] request_id=%s success=True latency_ms=%.2f chunk_size=%d",
-            req_id,
-            result.inference_latency_ms,
-            len(actions),
-        )
-        _trace.info(
-            "[queue_refill] request_id=%s new=%d skipped=%d after=%d", req_id, len(actions), executed, plan.remaining
-        )
+        if trace.enabled:
+            capture_event(
+                trace,
+                "dispatch_result",
+                origin="built-in",
+                trace_id=req_id,
+                component_id="action_dispatcher.decode",
+                success=True,
+                policy_total_ms=result.inference_latency_ms,
+                chunk_size=len(actions),
+            )
+            capture_event(
+                trace,
+                "queue_refill",
+                origin="built-in",
+                trace_id=req_id,
+                component_id="action_dispatcher.queue",
+                new=len(actions),
+                skipped=executed,
+                after=plan.remaining,
+            )
+        # Asynchronous benchmark steps are traced only at matching COMMIT.
+        if trace.enabled and not self._is_benchmark and plan.remaining:
+            capture_event(
+                trace,
+                "flow_send",
+                edge_id="queue_to_execute",
+                flow_id=req_id,
+                trace_id=req_id,
+                component_id="action_dispatcher.queue",
+            )
         if self._dispatch_count == 1:
             self.get_logger().info(
                 f"First inference received: chunk={len(actions)}, "

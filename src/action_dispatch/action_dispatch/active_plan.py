@@ -30,6 +30,7 @@ class PlanSnapshot:
     watermark: int
     source: PlanSource | None
     next_position: int | None
+    consumed: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +61,9 @@ class ActivePlan:
     def snapshot(self):
         with self._lock:
             remaining = self._smoother.plan_length if self._smoother is not None else len(self._queue)
-            return PlanSnapshot(self._revision, remaining, self._watermark, self._source, self._position)
+            return PlanSnapshot(
+                self._revision, remaining, self._watermark, self._source, self._position, self._consumed
+            )
 
     def accept(self, candidate, source: PlanSource, *, action_dimension=None, tensor_actions=None):
         with self._lock:

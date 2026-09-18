@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 import uuid
@@ -34,6 +35,8 @@ from ibrobot_msgs.action import (
     ScheduledDispatchInfer,
 )
 from ibrobot_msgs.msg import InferenceOutcome, InferenceServingStatus, InferenceWorkCapacity
+from ibrobot_tracing import TraceEmitter
+from inference_service import global_inference_scheduler_node as scheduler_module
 from inference_service import pipeline_policy_node as pipeline_policy_module
 from inference_service.backends import BackendCapabilities
 from inference_service.global_inference_scheduler_node import GlobalInferenceSchedulerNode
@@ -41,6 +44,21 @@ from inference_service.pipeline_policy_node import PipelineNodeConfig, PipelineP
 from inference_service.runtime_composition import build_policy_runtime_dependencies
 from robot_config.contract_utils import ActionSpec, Contract, ObservationSpec, iter_specs
 from robot_config.inference_runtime_options import effective_latency_runtime_options
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["trace-off", "trace-on"])
+def tracing_mode(request, monkeypatch):
+    # Run the actual public/private ROS protocol and lifecycle assertions in both
+    # modes. No synthetic goal fields or altered runtime dependencies are used.
+    records = []
+    logger = logging.Logger("scheduler-integration", logging.INFO)
+    handler = logging.Handler()
+    handler.emit = lambda record: records.append(json.loads(record.getMessage().split(" ", 1)[1]))
+    logger.addHandler(handler)
+    emitter = TraceEmitter(logger, enabled=request.param)
+    monkeypatch.setattr(scheduler_module, "trace", emitter)
+    monkeypatch.setattr(pipeline_policy_module, "trace", emitter)
+    return emitter, records
 
 
 @pytest.fixture
@@ -631,7 +649,9 @@ def test_disabled_pipeline_preserves_legacy_dispatch_action_closure(
         rclpy.shutdown()
 
 
-def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeypatch, runtime_dependencies) -> None:
+def test_real_pipeline_global_dispatcher_reaches_command_topic(
+    tmp_path, monkeypatch, runtime_dependencies, tracing_mode
+) -> None:
     suffix = uuid.uuid4().hex
     base = f"/scheduler_real/test_{suffix}"
     endpoints = {
@@ -887,6 +907,23 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(tmp_path, monkeyp
         stop_response = _wait_future(stop_client.call_async(Trigger.Request()))
         assert stop_response.success
         assert dispatcher._state == DispatcherState.STOPPED
+        emitter, records = tracing_mode
+        if emitter.enabled:
+            for edge in ("scheduler_to_pipeline_dispatch", "pipeline_result_to_scheduler"):
+                sends = {
+                    r["fields"]["flow_id"]
+                    for r in records
+                    if r["event"] == "flow_send" and r["fields"]["edge_id"] == edge
+                }
+                receives = {
+                    r["fields"]["flow_id"]
+                    for r in records
+                    if r["event"] == "flow_receive" and r["fields"]["edge_id"] == edge
+                }
+                assert sends and sends == receives
+                assert all(str(uuid.UUID(value)) == value for value in sends)
+        else:
+            assert records == []
     finally:
         executor.shutdown(timeout_sec=2.0)
         spin_thread.join(timeout=2.0)

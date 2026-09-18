@@ -15,12 +15,15 @@ from types import MappingProxyType
 
 import numpy as np
 
+from ibrobot_tracing import get_trace_emitter
 from inference_service.backends.types import BackendHealth, RuntimeContext
 from inference_service.pipeline.executor import ComponentModelExecutor
 from inference_service.pipeline.runtime_core import ExecutionControl, StageFrame
 from inference_service.pipeline.stages import InferenceStage, IterativeStage, ModelStage, ResultAdapter
 from inference_service.scheduler.operations import OperationIdentity, OperationKind, OperationRegistry
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
+
+trace = get_trace_emitter("ib_trace.policy.staged", component_id="policy.staged")
 
 
 @dataclass(frozen=True)
@@ -246,6 +249,20 @@ class StagedModelExecutor(ComponentModelExecutor):
             self._snapshot_condition.notify_all()
 
     def _run_visual(self, request: object, context: ExecutionContext, generation: int) -> int:
+        if not trace.enabled:
+            return self._run_visual_observed(request, context, generation)
+        # ThreadPoolExecutor does not inherit the caller's ContextVars. Only
+        # tracing state is scoped here; the request and snapshot stay untouched.
+        with (
+            trace.trace_context(context.request_id, component_id="policy.visual"),
+            trace.span("visual_stage", origin="built-in", generation=generation),
+        ):
+            version = self._run_visual_observed(request, context, generation)
+            if version:
+                trace.event("visual_snapshot_published", origin="built-in", generation=generation, version=version)
+            return version
+
+    def _run_visual_observed(self, request: object, context: ExecutionContext, generation: int) -> int:
         deadline = context.deadline.expires_at
         frame = self._new_frame(request, context, stage_id="visual")
         frame.values["_stage_base_priority"] = self._scheduling.frame_base_priority
@@ -285,6 +302,15 @@ class StagedModelExecutor(ComponentModelExecutor):
             frame.close()
 
     def _run_action(self, request: object, context: ExecutionContext) -> object:
+        if not trace.enabled:
+            return self._run_action_observed(request, context)
+        with (
+            trace.trace_context(context.request_id, component_id="policy.action"),
+            trace.span("action_stage", origin="built-in"),
+        ):
+            return self._run_action_observed(request, context)
+
+    def _run_action_observed(self, request: object, context: ExecutionContext) -> object:
         deadline = context.deadline.expires_at
         frame = self._new_frame(request, context, stage_id="action")
         try:
@@ -296,6 +322,9 @@ class StagedModelExecutor(ComponentModelExecutor):
                 stage.execute(frame, deadline=deadline)
             current_prompt = frame.values.get("_selected_prompt")
             snapshot = self._wait_matching_snapshot(frame.request, current_prompt, deadline, context=context)
+            trace.event(
+                "visual_snapshot_selected", origin="built-in", generation=snapshot.generation, version=snapshot.version
+            )
             current = dict(frame.values)
             frame.values.update(snapshot.values)
             frame.values.pop("_stage_base_priority", None)

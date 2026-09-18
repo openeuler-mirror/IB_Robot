@@ -84,7 +84,7 @@ class EdgeProcessorRuntime:
 
 
 class CloudBackendRuntime:
-    """Execute canonical preprocessed tensors without loading LeRobot processors."""
+    """Execute raw edge observations with cloud-owned model processors."""
 
     def __init__(
         self,
@@ -117,6 +117,8 @@ class CloudBackendRuntime:
             registry=registry,
             registry_set=registry_set,
             providers=providers,
+            instrument_processors=True,
+            model_component_id="cloud_inference",
         )
 
     @property
@@ -139,7 +141,12 @@ class CloudBackendRuntime:
         }
         return self._manager.infer(
             self.pipeline_id,
-            InferenceRequest(request_id=request_id, inputs=processor_inputs, prompt=prompt, deadline=deadline),
+            InferenceRequest(
+                request_id=request_id,
+                inputs=processor_inputs,
+                prompt=prompt,
+                deadline=deadline,
+            ),
         )
 
     def reset(self, deadline: datetime | None = None) -> None:
