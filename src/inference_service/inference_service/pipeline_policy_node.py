@@ -772,6 +772,13 @@ class PipelinePolicyNode(Node):
         window_ns = self._state_alignment_window_ns
         if window_ns <= 0:
             return (), ()
+        if len(self._state_specs) > 1:
+            self.get_logger().warning(
+                "multiple observation.state sources are not supported by the alignment history;"
+                " falling back to the tick-anchored sample",
+                throttle_duration_sec=30.0,
+            )
+            return (), ()
         keys: list[str] = []
         for key in observations:
             state = self._subs.get(key)
@@ -800,12 +807,16 @@ class PipelinePolicyNode(Node):
         for timestamp_ns in anchor_entries:
             entry: dict[str, object] = {}
             for key in keys:
-                value, issue = self._subs[key].buffer.select(timestamp_ns)
-                if value is None:
-                    del issue
+                state = self._subs[key]
+                message, _issue = state.buffer.select(timestamp_ns)
+                if message is None:
                     entry = {}
                     break
-                if key == "observation.state":
+                value = decode_value(state.spec.ros_type, message, state.spec)
+                if value is None:
+                    entry = {}
+                    break
+                if state.spec.key == "observation.state":
                     value = self._rad_to_lerobot(value)
                 entry[key] = value
             if entry:
