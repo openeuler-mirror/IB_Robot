@@ -257,6 +257,24 @@ class DeadlineExceededError(RuntimeError):
     stage = "deadline"
 
 
+class DistributedSessionNotReadyError(RuntimeError):
+    """Session-level failure raised while no distributed session exists.
+
+    After the cloud heartbeat expires (or before the first handshake) no
+    observation can reach the backend; reporting that through the per-
+    observation readiness path surfaces misleading "video_not_sent" noise
+    instead of the actual transport outage. The recoverable flag lets the
+    dispatcher retry once the session is re-established.
+    """
+
+    code = "not_ready"
+    recoverable = True
+    stage = "transport"
+
+    def __init__(self, state: str) -> None:
+        super().__init__(f"distributed pipeline is not ready ({state})")
+
+
 class _ExternalVideoProducerView:
     """Request-side session view for an out-of-process frame producer.
 
@@ -1590,6 +1608,22 @@ class PipelinePolicyNode(Node):
             "observation_monotonic_ns": now_mono_ns - age_ns,
         }
 
+    def _ensure_distributed_session_ready(self) -> None:
+        """Fail fast while the distributed session is not established.
+
+        A cleared session (cloud heartbeat expired, handshake recovery
+        pending) means no observation can reach the backend, so the request
+        fails with the session-level not_ready code before observation
+        sampling produces per-observation readiness noise.
+        """
+        if self._config.execution_mode != "distributed":
+            return
+        session = self._require_edge_session()
+        if session.ready:
+            return
+        state = getattr(session.state, "value", str(session.state))
+        raise DistributedSessionNotReadyError(state)
+
     def _execute_inference_request(
         self,
         goal_handle: object,
@@ -1603,6 +1637,7 @@ class PipelinePolicyNode(Node):
         if deadline is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
         self._raise_if_deadline_expired(deadline, request_id)
+        self._ensure_distributed_session_ready()
         trace.flow_receive(
             "dispatch_to_observation",
             request_id,

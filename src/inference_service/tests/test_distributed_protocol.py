@@ -1110,3 +1110,29 @@ def test_build_aligned_history_falls_back_with_multiple_state_sources():
 
     assert timestamps == ()
     assert tensors == ()
+
+
+def test_distributed_session_guard_fails_fast_when_session_is_down():
+    from inference_service.pipeline_policy_node import (
+        DistributedSessionNotReadyError,
+        PipelinePolicyNode,
+    )
+
+    degraded_session = SimpleNamespace(ready=False, state=SimpleNamespace(value="degraded"))
+    host = SimpleNamespace(
+        _config=SimpleNamespace(execution_mode="distributed"),
+        _require_edge_session=lambda: degraded_session,
+    )
+
+    with pytest.raises(DistributedSessionNotReadyError) as excinfo:
+        PipelinePolicyNode._ensure_distributed_session_ready(host)
+    assert excinfo.value.code == "not_ready"
+    assert excinfo.value.recoverable is True
+    assert str(excinfo.value) == "distributed pipeline is not ready (degraded)"
+
+    host._require_edge_session = lambda: SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+    PipelinePolicyNode._ensure_distributed_session_ready(host)
+
+    host._config = SimpleNamespace(execution_mode="monolithic")
+    host._require_edge_session = lambda: (_ for _ in ()).throw(AssertionError("session must not be touched"))
+    PipelinePolicyNode._ensure_distributed_session_ready(host)
