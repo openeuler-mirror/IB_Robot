@@ -1047,3 +1047,66 @@ def test_decode_failure_uses_cloud_identity_and_unknown_operation(tmp_path):
     assert result.pipeline_id == identity.pipeline_id
     assert result.error is not None
     assert result.error.code == "decode_failed"
+
+
+def test_build_aligned_history_decodes_raw_ros_messages():
+    from sensor_msgs.msg import JointState
+
+    from inference_service.pipeline_policy_node import PipelinePolicyNode
+    from robot_config.contract_utils import StreamBuffer
+
+    def joint_state(timestamp_ns, positions):
+        message = JointState()
+        message.header.stamp.sec = timestamp_ns // 1_000_000_000
+        message.header.stamp.nanosec = timestamp_ns % 1_000_000_000
+        message.name = [f"joint_{index}" for index in range(len(positions))]
+        message.position = list(positions)
+        return message
+
+    buffer = StreamBuffer("hold", 1)
+    base_ns = 1_000_000_000_000
+    for index in range(5):
+        timestamp_ns = base_ns + index * 20_000_000
+        buffer.push(timestamp_ns, joint_state(timestamp_ns, [float(index)] * 3), receive_time_ns=timestamp_ns)
+
+    spec = SimpleNamespace(key="observation.state", ros_type="sensor_msgs/msg/JointState", image_resize=None)
+    host = SimpleNamespace(
+        _state_alignment_window_ns=2_000_000_000,
+        _state_specs=[spec],
+        _subs={"observation.state": SimpleNamespace(spec=spec, buffer=buffer)},
+        _joint_rad_limits={},
+    )
+    host._rad_to_lerobot = PipelinePolicyNode._rad_to_lerobot.__get__(host)
+
+    timestamps, tensors = PipelinePolicyNode._build_aligned_history(
+        host, {"observation.state": object()}, base_ns + 100_000_000
+    )
+
+    assert len(timestamps) == 5
+    for index, entry in enumerate(tensors):
+        value = entry["observation.state"]
+        assert isinstance(value, np.ndarray)
+        assert value.dtype == np.float32
+        np.testing.assert_allclose(value, [float(index)] * 3)
+
+
+def test_build_aligned_history_falls_back_with_multiple_state_sources():
+    from inference_service.pipeline_policy_node import PipelinePolicyNode
+
+    spec = SimpleNamespace(key="observation.state", ros_type="sensor_msgs/msg/JointState", image_resize=None)
+    host = SimpleNamespace(
+        _state_alignment_window_ns=2_000_000_000,
+        _state_specs=[
+            spec,
+            SimpleNamespace(key="observation.gripper", ros_type="sensor_msgs/msg/JointState", image_resize=None),
+        ],
+        _subs={},
+        get_logger=lambda: SimpleNamespace(warning=lambda *args, **kwargs: None),
+    )
+
+    timestamps, tensors = PipelinePolicyNode._build_aligned_history(
+        host, {"observation.state": object()}, 1_000_000_000_000
+    )
+
+    assert timestamps == ()
+    assert tensors == ()

@@ -506,12 +506,18 @@ class PipelinePolicyNode(Node):
                     deployment_fingerprint=self._manifest.fingerprint,
                 )
             else:
-                self._video_stream_manager = DeviceVideoStreamManager(
-                    pipeline_id=config.pipeline_id,
-                    contract_fingerprint=contract_fingerprint(self._contract),
-                    deployment_fingerprint=self._manifest.fingerprint,
-                    observation_specs=self._obs_specs,
-                )
+                from robot_config.observation_transport import effective_observation_transport
+
+                if any(effective_observation_transport(spec.transport).mode == "rtp" for spec in self._obs_specs):
+                    self._video_stream_manager = DeviceVideoStreamManager(
+                        pipeline_id=config.pipeline_id,
+                        contract_fingerprint=contract_fingerprint(self._contract),
+                        deployment_fingerprint=self._manifest.fingerprint,
+                        observation_specs=self._obs_specs,
+                    )
+                # Pipelines whose observations all ride the request (pure DDS
+                # transport) have no video streams to manage; the frame ingress
+                # rejects an empty stream set, so the manager stays unset.
 
         self._action_pub = None
         if not config.scheduler_enabled:
@@ -523,8 +529,9 @@ class PipelinePolicyNode(Node):
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
+            video_manager = self._video_stream_manager
             descriptor_qos = QoSProfile(
-                depth=max(1, len(self._video_stream_manager.diagnostic_snapshots())),
+                depth=max(1, len(video_manager.diagnostic_snapshots())) if video_manager is not None else 1,
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
