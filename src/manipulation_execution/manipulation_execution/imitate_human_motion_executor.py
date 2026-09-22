@@ -104,6 +104,61 @@ class MockAnimationPlayer:
             self._sleep(min(0.05, duration_sec - elapsed, max(0.0, deadline - now)))
 
 
+class MotionRecorder(Protocol):
+    def record(
+        self,
+        duration_sec: float,
+        *,
+        feedback: Callable[[str, float, str], None],
+        is_cancel_requested: Callable[[], bool],
+        deadline: float,
+    ) -> str:
+        """Return COMPLETED, CANCELED, TIMEOUT, or FAILED."""
+
+
+class MockMotionRecorder:
+    """Hold the ``start`` phase open for exactly the requested capture window.
+
+    The window is defined by elapsed time rather than by a frame count because
+    neither the camera nor the pose estimator delivers a steady frame rate,
+    while the wall-clock length of the window is accurate. Downstream builds the
+    imitation animation from that length, so it has to be the number the caller
+    asked for.
+    """
+
+    def __init__(
+        self,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._clock = clock
+        self._sleep = sleep
+
+    def record(
+        self,
+        duration_sec: float,
+        *,
+        feedback: Callable[[str, float, str], None],
+        is_cancel_requested: Callable[[], bool],
+        deadline: float,
+    ) -> str:
+        started = self._clock()
+        while True:
+            if is_cancel_requested():
+                return "CANCELED"
+            now = self._clock()
+            elapsed = now - started
+            if elapsed >= duration_sec:
+                feedback("start", 1.0, f"captured {duration_sec:.1f}s of human motion")
+                return "COMPLETED"
+            if now >= deadline:
+                return "TIMEOUT"
+            progress = min(1.0, max(0.0, elapsed / duration_sec))
+            feedback("start", progress, f"capturing human motion {elapsed:.1f}/{duration_sec:.1f}s")
+            self._sleep(min(0.05, duration_sec - elapsed, max(0.0, deadline - now)))
+
+
 def _normalized_motion_config(
     joint_names: Sequence[str],
     reset_positions: Mapping[str, float],
@@ -170,12 +225,8 @@ def build_mock_animations(
     auto_left = offset(**{first_joint: -0.5, second_joint: 0.5854})
     auto_right = offset(**{first_joint: 0.5, second_joint: 0.5854})
     return {
-        "mock_left_v1": AnimationPlan(
-            "mock_left_v1", _waypoints(names, limits, home, left, home, right, home)
-        ),
-        "mock_right_v1": AnimationPlan(
-            "mock_right_v1", _waypoints(names, limits, home, right, home, left, home)
-        ),
+        "mock_left_v1": AnimationPlan("mock_left_v1", _waypoints(names, limits, home, left, home, right, home)),
+        "mock_right_v1": AnimationPlan("mock_right_v1", _waypoints(names, limits, home, right, home, left, home)),
         "mock_auto_v1": AnimationPlan(
             "mock_auto_v1", _waypoints(names, limits, home, auto_right, auto_left, auto_right, home)
         ),
@@ -193,6 +244,7 @@ class MockExecutor:
         joint_limits: Mapping[str, Mapping[str, float] | Sequence[float]],
         warmup_ready: bool = True,
         player: AnimationPlayer | None = None,
+        recorder: MotionRecorder | None = None,
         prepare: Callable[[], bool] | None = None,
         recover_safe_pose: Callable[[], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -205,14 +257,13 @@ class MockExecutor:
             warmup_state="READY" if warmup_ready else "NOT_READY",
         )
         self._player = player or MockAnimationPlayer(clock=clock)
+        self._recorder = recorder or MockMotionRecorder(clock=clock)
         self._prepare = prepare or (lambda: True)
         self._recover_safe_pose = recover_safe_pose or (lambda: True)
         self._clock = clock
         self._lock = threading.Lock()
         self._active = False
-        self._animations = build_mock_animations(
-            self._joint_names, self._reset_positions, self._joint_limits
-        )
+        self._animations = build_mock_animations(self._joint_names, self._reset_positions, self._joint_limits)
 
     @property
     def animations(self) -> dict[str, AnimationPlan]:
@@ -284,6 +335,7 @@ class MockExecutor:
         feedback: Callable[[str, float, str], None] | None = None,
         is_cancel_requested: Callable[[], bool] | None = None,
         player: AnimationPlayer | None = None,
+        recorder: MotionRecorder | None = None,
         prepare: Callable[[], bool] | None = None,
         recover_safe_pose: Callable[[], bool] | None = None,
     ) -> MockResult:
@@ -302,6 +354,7 @@ class MockExecutor:
         feedback = feedback or (lambda _phase, _progress, _detail: None)
         is_cancel_requested = is_cancel_requested or (lambda: False)
         active_player = player or self._player
+        active_recorder = recorder or self._recorder
         active_prepare = prepare or self._prepare
         active_recover = recover_safe_pose or self._recover_safe_pose
         phases: list[str] = []
@@ -417,28 +470,43 @@ class MockExecutor:
                         phases=phases,
                     )
                 else:
-                    phase("start", "Human-motion imitation started")
-                    if is_cancel_requested():
+                    # The arm is parked at the imitation start pose and stays
+                    # there for the whole window: this is the data-collection
+                    # phase, and any arm motion during it would both drag the
+                    # wrist camera off the person and pollute what is being
+                    # recorded. ``imitation_duration_sec`` measures exactly this
+                    # window -- not prepare, not playback, not reset -- because
+                    # the animation is built from its wall-clock length rather
+                    # than from a frame count the camera cannot guarantee.
+                    phase("start", f"Capturing human motion for {actual_duration:.1f}s")
+                    capture_started_at = self._clock()
+                    capture_outcome = active_recorder.record(
+                        actual_duration,
+                        feedback=feedback,
+                        is_cancel_requested=is_cancel_requested,
+                        deadline=deadline,
+                    )
+                    captured_duration = max(0.0, self._clock() - capture_started_at)
+                    capture_error, capture_message = {
+                        "CANCELED": ("CANCELED", "imitation cancelled during capture"),
+                        "TIMEOUT": ("SKILL_TIMEOUT", "imitation timeout during capture"),
+                        "COMPLETED": ("", ""),
+                    }.get(capture_outcome, ("CAPTURE_FAILED", "human-motion capture failed"))
+                    if capture_error:
                         result = self._result(
                             success=False,
-                            error_code="CANCELED",
-                            message="imitation cancelled before playback",
-                            plan=plan,
-                            requested_duration=goal.imitation_duration_sec,
-                            actual_duration=0.0,
-                            phases=phases,
-                        )
-                    elif self._clock() >= deadline:
-                        result = self._result(
-                            success=False,
-                            error_code="SKILL_TIMEOUT",
-                            message="imitation timeout before playback",
+                            error_code=capture_error,
+                            message=capture_message,
                             plan=plan,
                             requested_duration=goal.imitation_duration_sec,
                             actual_duration=0.0,
                             phases=phases,
                         )
                     else:
+                        # Stand-in for the animation that will eventually be
+                        # solved from the captured PEAR output; until that
+                        # mapping exists a preset plan is played back instead,
+                        # over the same span that was just recorded.
                         phase("mock_playback", f"Executing {plan.animation_id}")
                         playback_started_at = self._clock()
                         outcome = active_player.play(
@@ -452,7 +520,7 @@ class MockExecutor:
                             "CANCELED": ("CANCELED", "imitation cancelled during playback"),
                             "TIMEOUT": ("SKILL_TIMEOUT", "imitation timeout during playback"),
                             "UNKNOWN": (CANCEL_CLEANUP_TIMEOUT, "primitive execution state is unknown"),
-                            "COMPLETED": ("", "Mock imitation completed"),
+                            "COMPLETED": ("", f"Mock imitation completed; captured {captured_duration:.2f}s"),
                         }.get(outcome, ("MOCK_PLAYBACK_FAILED", "mock playback failed"))
                         result = self._result(
                             success=not error_code,

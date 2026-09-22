@@ -7,10 +7,18 @@ import pytest
 from sensor_msgs.msg import Image
 
 import manipulation_execution.imitate_human_motion_executor_node as vision_module  # noqa: F401
-from ibrobot_msgs.msg import Detection2D, DetectionArray
+from ibrobot_msgs.msg import Detection2D, DetectionArray, DispatchBinding
+from manipulation_execution.imitate_human_motion_executor import (
+    MAX_IMITATION_DURATION_SEC,
+    MockExecutor,
+    MockGoal,
+    MockResult,
+)
 from manipulation_execution.imitate_human_motion_executor_node import (
+    _MAX_CAPTURED_PEAR_FRAMES,
     ImitateHumanMotionExecutorNode,
     _center_fallback_detection,
+    _GuardedPrimitivePlayer,
     _select_person_detection,
     _validated_person_confidence_threshold,
     _validated_yolox_refresh_interval,
@@ -22,6 +30,9 @@ class _Logger:
         pass
 
     def warning(self, _message):
+        pass
+
+    def error(self, _message):
         pass
 
 
@@ -69,7 +80,11 @@ class _VisionHarness:
     _process_pear_frame = ImitateHumanMotionExecutorNode._process_pear_frame
     _call_vision = ImitateHumanMotionExecutorNode._call_vision
     _record_vision_failure = ImitateHumanMotionExecutorNode._record_vision_failure
+    _reset_capture_stats = ImitateHumanMotionExecutorNode._reset_capture_stats
+    _execute = ImitateHumanMotionExecutorNode._execute
+    _begin_capture = ImitateHumanMotionExecutorNode._begin_capture
     _end_capture = ImitateHumanMotionExecutorNode._end_capture
+    _captured_pear_frames = ImitateHumanMotionExecutorNode._captured_pear_frames
 
     def get_logger(self):
         return self._logger
@@ -128,6 +143,8 @@ def _harness(yolox_response, pear_response=None):
     node._yolox_result_ready = False
     node._yolox_calls = 0
     node._pear_calls = 0
+    node._pear_frames = []
+    node._pear_frames_dropped = 0
     node._yolox_client = _Client("/yolox", [yolox_response])
     node._pear_client = _Client("/pear", [] if pear_response is None else [pear_response])
     return node
@@ -396,6 +413,150 @@ def test_pear_failure_or_malformed_output_is_counted(response):
     assert len(node._pear_client.requests) == 1
     assert node._vision_ok == 0
     assert node._vision_failed == 1
+    # A frame that failed validation must not reach the recording either. The
+    # retargeting stage reads this buffer without re-checking it, so a single
+    # NaN pose smuggled in here would come back as a joint command.
+    assert node._pear_frames == []
+
+
+def _stamped_image(*, width=640, height=480, sec=0, nanosec=0, frame_id=""):
+    """An RGB frame carrying a header, which the recording copies verbatim."""
+    message = Image(width=width, height=height)
+    message.header.stamp.sec = sec
+    message.header.stamp.nanosec = nanosec
+    message.header.frame_id = frame_id
+    return message
+
+
+def test_pear_output_is_recorded_frame_by_frame():
+    """The captured window is the only place the per-frame pose survives."""
+    node = _harness(
+        _yolox_response(_detection("person", 0.875, [10.0, 20.0, 110.0, 220.0])),
+        _pear_response(),
+    )
+
+    node._process_vision_frame(
+        _stamped_image(sec=17, nanosec=250000000, frame_id="wrist_camera_color_optical_frame"),
+        1,
+        node._capture_deadline,
+    )
+
+    assert len(node._pear_frames) == 1
+    frame = node._pear_frames[0]
+    # All eight outputs, not a subset: the retargeter reads the whole set, and
+    # a window that is missing fields cannot be recorded a second time.
+    for name in ImitateHumanMotionExecutorNode._PEAR_OUTPUT_FIELDS:
+        assert frame[name] == [1.0], name
+    # Raw sec/nanosec rather than the display string used for the summary. PEAR
+    # answers at roughly 16 Hz against a ~23 fps camera and neither rate is
+    # steady, so the series is non-uniformly sampled and the consumer needs
+    # every frame's own time as a number.
+    assert frame["stamp_sec"] == 17
+    assert frame["stamp_nanosec"] == 250000000
+    assert frame["frame_id"] == "wrist_camera_color_optical_frame"
+    assert frame["source"] == "yolox"
+    assert frame["bbox"] == [10.0, 20.0, 110.0, 220.0]
+    assert frame["confidence"] == pytest.approx(0.875)
+    assert frame["inference_time_ms"] == pytest.approx(12.5)
+
+
+def test_recorded_frame_flags_the_centred_crop_guess():
+    """A fallback crop must stay distinguishable from a real person box.
+
+    On a normal run a good share of the window is inferred from a centred
+    guess, not from a detection. Without the flag the retargeting stage cannot
+    tell those frames from the trustworthy ones.
+    """
+    node = _harness(_yolox_response(), _pear_response())
+
+    node._process_vision_frame(_stamped_image(), 1, node._capture_deadline)
+
+    assert [frame["source"] for frame in node._pear_frames] == ["center_fallback"]
+    # The crop travels with the pose, so the consumer can see which region the
+    # pose was inferred from instead of re-deriving it.
+    assert len(node._pear_frames[0]["bbox"]) == 4
+
+
+def test_recording_is_bounded_and_overflow_is_counted():
+    """The buffer is capped so a deadline defect cannot exhaust a swapless board."""
+    node = _harness(_yolox_response(), _pear_response())
+    node._pear_frames = [{"stamp_sec": index} for index in range(_MAX_CAPTURED_PEAR_FRAMES)]
+
+    node._process_vision_frame(_stamped_image(sec=99), 1, node._capture_deadline)
+
+    assert len(node._pear_frames) == _MAX_CAPTURED_PEAR_FRAMES
+    assert node._pear_frames[-1] == {"stamp_sec": _MAX_CAPTURED_PEAR_FRAMES - 1}
+    assert node._pear_frames_dropped == 1
+    # PEAR did answer and the frame was good, so it still counts as a good
+    # frame; only its storage was refused. Conflating the two would make an
+    # overflow read as a vision failure in the summary.
+    assert node._vision_ok == 1
+    assert node._vision_failed == 0
+
+
+def test_a_frame_arriving_after_the_window_closes_is_not_recorded():
+    """The append is guarded on its own, not only by the call before it.
+
+    ``_call_vision`` re-checks the window before handing a response back, but
+    the window can still close in the gap between that check and the append --
+    a new task starting while PEAR is still thinking. Closing it exactly in
+    that gap is the only way to reach the guard deterministically, and without
+    the guard the frame would land in the next task's recording.
+    """
+    node = _harness(_yolox_response(), _pear_response())
+    inner = node._call_vision
+
+    def _call_then_close(client, request, epoch, deadline, *, metric=""):
+        result = inner(client, request, epoch, deadline, metric=metric)
+        if metric == "pear":
+            with node._capture_lock:
+                node._capture_epoch += 1
+        return result
+
+    node._call_vision = _call_then_close
+
+    node._process_vision_frame(_stamped_image(sec=5), 1, node._capture_deadline)
+
+    assert node._pear_frames == []
+    # Counted nowhere either: the frame belongs to a window that no longer exists.
+    assert node._vision_ok == 0
+
+
+def test_captured_frames_are_handed_over_as_a_snapshot():
+    """The consumer works on the recording while the node moves on."""
+    node = _harness(_yolox_response(), _pear_response())
+    node._process_vision_frame(_stamped_image(sec=3), 1, node._capture_deadline)
+
+    handed = node._captured_pear_frames()
+    node._pear_frames.append({"stamp_sec": 99})
+
+    assert [frame["stamp_sec"] for frame in handed] == [3]
+
+
+def test_begin_capture_clears_the_previous_recording():
+    """A new task must not inherit the last task's frames."""
+    node = _harness(_yolox_response())
+    node._pear_frames = [{"stamp_sec": 1}]
+    node._pear_frames_dropped = 2
+
+    node._begin_capture(time.monotonic() + 5.0)
+
+    assert node._pear_frames == []
+    assert node._pear_frames_dropped == 0
+
+
+def test_end_capture_reports_recording_size_without_the_recording():
+    node = _harness(_yolox_response())
+    node._pear_frames = [{"smplx_pose_raw": [1.0]}, {"smplx_pose_raw": [2.0]}]
+    node._pear_frames_dropped = 3
+
+    summary = node._end_capture()
+
+    assert summary["pear_frames"] == 2
+    assert summary["pear_dropped"] == 3
+    # Counts only. The frames are orders of magnitude too large to travel in
+    # the result message, and nothing outside the node consumes them.
+    assert all(not isinstance(value, (list | dict)) for value in summary.values())
 
 
 def test_end_capture_reports_source_counters_and_invariant():
@@ -665,3 +826,427 @@ def test_response_observed_at_task_deadline_is_not_recorded(monkeypatch):
 
     assert node._vision_ok == 0
     assert node._vision_failed == 0
+    # The window closed while PEAR was still thinking. The frame is counted in
+    # neither direction, so it must not be recorded in either -- a late answer
+    # belongs to no recording at all.
+    assert node._pear_frames == []
+
+
+def test_capture_recorder_publishes_the_recording_when_the_window_closes(monkeypatch):
+    """The recording leaves the node through the recorder, not the summary.
+
+    ``_CaptureRecorder.frames`` is the seam the retargeting stage will read: it
+    is published in the ``finally``, after ``_end_capture`` has closed the
+    window, so what lands there can no longer grow and is exactly the recording.
+    """
+    node = _harness(_yolox_response(), _pear_response())
+    clock = _Clock(now=1000.0)
+    monkeypatch.setattr(vision_module.time, "monotonic", clock.monotonic)
+
+    def _sleep(_seconds):
+        # One PEAR frame arrives while the window is open, then the clock jumps
+        # past its end: a camera publishing into a recording that then closes.
+        node._process_vision_frame(_stamped_image(sec=7), node._capture_epoch, node._capture_deadline)
+        clock.sleep(5.0)
+
+    monkeypatch.setattr(vision_module.time, "sleep", _sleep)
+    recorder = vision_module._CaptureRecorder(node)
+
+    outcome = recorder.record(
+        2.0,
+        feedback=lambda *_args: None,
+        is_cancel_requested=lambda: False,
+        deadline=clock.monotonic() + 30.0,
+    )
+
+    assert outcome == "COMPLETED"
+    assert [frame["stamp_sec"] for frame in recorder.frames] == [7]
+    # The count travels in the summary; the frames themselves never do.
+    assert recorder.summary["pear_frames"] == 1
+
+
+def _lifecycle_harness():
+    """A harness carrying the counters of a task that has already run."""
+    node = _harness(_yolox_response())
+    node._frame_count = 375
+    node._vision_ok = 370
+    node._vision_detected = 5
+    node._vision_fallback = 365
+    node._vision_failed = 2
+    node._vision_sample = "bbox=[176,36,464,324] conf=0.0000"
+    node._yolox_calls = 59
+    node._pear_calls = 370
+    node._first_frame_stamp = "100.000000000"
+    node._last_frame_stamp = "115.000000000"
+    node._last_frame_id = "wrist_camera_color_optical_frame"
+    node._last_frame_received_at = time.monotonic()
+    return node
+
+
+class _GoalHandle:
+    """Minimal action goal handle: records the feedback _execute publishes."""
+
+    def __init__(self, node, imitation_duration_sec=15.0):
+        self.request = SimpleNamespace(
+            dispatch_binding=DispatchBinding(),
+            arm_side="right",
+            imitation_duration_sec=imitation_duration_sec,
+            timeout_sec=300.0,
+        )
+        self.is_cancel_requested = False
+        self._node = node
+        self.outcome = ""
+
+    def publish_feedback(self, feedback):
+        self._node._feedback.append((feedback.phase, feedback.detail))
+
+    def succeed(self):
+        self.outcome = "succeed"
+
+    def abort(self):
+        self.outcome = "abort"
+
+    def canceled(self):
+        self.outcome = "canceled"
+
+
+class _FakeRunner:
+    """Stands in for _GuardedPrimitivePlayer: prepare succeeds, nothing moves."""
+
+    def __init__(self, *_args, **kwargs):
+        self.deadline = kwargs.get("deadline", time.monotonic() + 30.0)
+
+    def prepare(self):
+        return True
+
+    def play(self, _plan, _duration_sec, *, feedback, is_cancel_requested, deadline):
+        self.node._deliver_frames(50)
+        return "COMPLETED"
+
+    def reset(self):
+        return True
+
+
+class _StubMock:
+    """Replays the phase order MockExecutor uses, minus the animation itself.
+
+    RGB frames are delivered in every phase, so the test sees which of them the
+    node actually counts. Only the ``start`` phase is the recording: prepare
+    moves the arm to the imitation start pose, playback moves it through the
+    animation and reset stows it, and in all three the wrist camera is sweeping
+    across the room rather than holding on the person.
+    """
+
+    def __init__(self, node):
+        self._node = node
+
+    def execute(self, goal, *, feedback, is_cancel_requested, player, recorder, prepare, recover_safe_pose):
+        feedback("prepare", 0.05, "moving to imitation start pose")
+        self._node._deliver_frames(20)
+        prepared = prepare()
+        self._node._deliver_frames(20)
+        feedback("prepare", 0.25, "imitation start pose reached")
+        if not prepared:
+            return MockResult(
+                success=False,
+                error_code="PREPARE_FAILED",
+                message="prepare failed",
+                animation_id="",
+                requested_duration_sec=goal.imitation_duration_sec,
+                actual_duration_sec=0.0,
+                completed_phases=(),
+            )
+        feedback("start", 0.3, f"capturing human motion for {goal.imitation_duration_sec:.1f}s")
+        recorder.record(
+            goal.imitation_duration_sec,
+            feedback=feedback,
+            is_cancel_requested=is_cancel_requested,
+            deadline=time.monotonic() + goal.timeout_sec,
+        )
+        feedback("mock_playback", 0.5, "playing animation")
+        player.play(
+            _StubPlan(),
+            goal.imitation_duration_sec,
+            feedback=feedback,
+            is_cancel_requested=is_cancel_requested,
+            deadline=time.monotonic() + goal.timeout_sec,
+        )
+        feedback("reset", 0.9, "returning to safe pose")
+        self._node._deliver_frames(30)
+        recover_safe_pose()
+        return MockResult(
+            success=True,
+            error_code="",
+            message="ok",
+            animation_id="stub",
+            requested_duration_sec=goal.imitation_duration_sec,
+            actual_duration_sec=goal.imitation_duration_sec,
+            completed_phases=("prepare", "start", "mock_playback", "reset"),
+        )
+
+
+class _StubPlan:
+    animation_id = "stub"
+    waypoints = ()
+    duration_sec = 10.0
+
+
+def _execute_harness(monkeypatch):
+    """A harness that can run _execute, carrying a finished task's counters."""
+    node = _lifecycle_harness()
+    node._end_capture()
+    node._feedback = []
+    node._goal_lock = threading.Lock()
+    node._goal_active = True
+    node._joint_names = ["1", "2", "3", "4", "5"]
+    node._reset_positions = {name: 0.0 for name in node._joint_names}
+    node._executor_identity = {}
+    node._primitive_client = None
+    node._mock = _StubMock(node)
+    node._wait_for_vision_services = lambda _deadline: []
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=0))
+    node._deliver_frames = lambda count: [node._on_rgb_frame(Image(width=640, height=480)) for _ in range(count)]
+
+    def _make_runner(*args, **kwargs):
+        runner = _FakeRunner(*args, **kwargs)
+        runner.node = node
+        return runner
+
+    monkeypatch.setattr(vision_module, "_GuardedPrimitivePlayer", _make_runner)
+    return node
+
+
+def _capture_clock(monkeypatch, node, *, frames_per_tick=10, jump_sec=6.0, frames_after_jump=0):
+    """Drive _CaptureRecorder on a fake clock that delivers frames as it waits.
+
+    The recorder waits in ``time.sleep`` between feedback ticks, so replacing
+    sleep with "hand the node some frames, then jump the clock" is what a camera
+    publishing into an open window looks like, without the test depending on
+    real elapsed time. The jump is deliberately coarser than the recorder's own
+    feedback period so the window is crossed in a couple of ticks.
+
+    ``frames_after_jump`` delivers a second batch once the clock has already
+    moved, which is how frames that arrive past the window's end -- while the
+    loop still believes it is recording -- reach the node.
+    """
+    clock = _Clock(now=1000.0)
+    monkeypatch.setattr(vision_module.time, "monotonic", clock.monotonic)
+
+    def _sleep(_seconds):
+        node._deliver_frames(frames_per_tick)
+        clock.sleep(jump_sec)
+        if frames_after_jump:
+            node._deliver_frames(frames_after_jump)
+
+    monkeypatch.setattr(vision_module.time, "sleep", _sleep)
+    return clock
+
+
+def test_only_the_capture_window_is_recorded(monkeypatch):
+    """Counters belong to the capture window, and to nothing around it.
+
+    ``imitation_duration_sec`` is the data-collection window: it opens once
+    prepare has parked the arm at the imitation start pose and closes before the
+    animation plays. Frames from prepare, from playback and from reset are all
+    arm-motion frames with the wrist camera sweeping across the room, and none
+    of them may reach the recording.
+
+    Driven through ``_execute`` rather than by calling the helpers directly: the
+    defect this covers was never in a helper but in where it was called from, so
+    a test that calls them itself would keep passing if the call moved again.
+    """
+    node = _execute_harness(monkeypatch)
+    _capture_clock(monkeypatch, node)
+
+    result = node._execute(_GoalHandle(node, imitation_duration_sec=10.0))
+
+    counts = {}
+    for phase, detail in node._feedback:
+        counts.setdefault(phase, []).append(int(detail.rsplit("rgb_frames=", 1)[1]))
+    assert counts.get("prepare"), "prepare phase published no feedback"
+    # The first feedback line is the one the operator reads to tell whether
+    # capture has started; before the window opens it must be this task's zero,
+    # not the previous task's total.
+    assert counts["prepare"] == [0, 0]
+    # Two ticks of ten frames land inside the ten-second window: the first
+    # feedback line predates any of them, the next two watch them arrive.
+    assert counts["start"] == [0, 0, 10, 20]
+    # 50 frames arrive during playback and 30 during reset. Neither phase is
+    # part of the recording, so the total never moves past the window's 20.
+    assert counts["mock_playback"] == [20]
+    assert counts["reset"] == [20]
+    assert '"frames": 20' in result.message
+
+
+def test_reset_capture_stats_does_not_start_capture():
+    """Zeroing the counters must not make the node start consuming frames."""
+    node = _lifecycle_harness()
+    node._end_capture()
+    epoch_before = node._capture_epoch
+    deadline_before = node._capture_deadline
+
+    with node._capture_lock:
+        node._reset_capture_stats()
+
+    assert node._capture_active is False
+    assert node._capture_epoch == epoch_before
+    assert node._capture_deadline == deadline_before
+
+
+def test_begin_capture_clears_stale_counters():
+    """Extracting the reset helper must not cost _begin_capture its own reset."""
+    node = _lifecycle_harness()
+    node._end_capture()
+    epoch_before = node._capture_epoch
+
+    node._begin_capture(time.monotonic() + 10.0)
+
+    assert node._capture_active is True
+    assert node._capture_epoch == epoch_before + 1
+    assert node._frame_count == 0
+    assert node._vision_detected == 0
+    assert node._yolox_calls == 0
+
+    node._on_rgb_frame(Image(width=640, height=480))
+    assert node._frame_count == 1
+
+
+def test_capture_window_closes_at_the_requested_duration(monkeypatch):
+    """The recording is bounded by time, not by how long the loop actually took.
+
+    The animation is built from the window's wall-clock length, so a recorder
+    that overshoots its own budget must not stretch the recording with it.
+    ``_CaptureRecorder`` arms the capture deadline from the requested duration,
+    and ``_on_rgb_frame`` stops counting once that passes.
+    """
+    node = _execute_harness(monkeypatch)
+    # One tick overshoots the 10-second window by 2 seconds. The batch before
+    # the jump is inside the window; the batch after it arrives while the loop
+    # still believes it is recording, and must be rejected on the deadline
+    # alone -- which only happens if that deadline came from the requested
+    # duration rather than from the task's own much later timeout.
+    _capture_clock(monkeypatch, node, jump_sec=12.0, frames_after_jump=10)
+
+    result = node._execute(_GoalHandle(node, imitation_duration_sec=10.0))
+
+    assert '"frames": 10' in result.message
+
+
+def _motion_config():
+    names = ["1", "2", "3", "4", "5"]
+    return names, {name: 0.0 for name in names}, {name: (-2.0, 2.0) for name in names}
+
+
+def test_capture_runs_to_completion_before_the_animation_plays():
+    """Data collection is a phase of its own, ahead of playback, not alongside it.
+
+    The animation is what the captured motion gets solved into -- today a preset
+    stands in for the solver -- so it cannot begin until the capture window has
+    closed. Playing it during the window would also move the arm, which is
+    exactly what the window exists to prevent: the wrist camera has to hold on
+    the person for the whole recording.
+    """
+    names, reset, limits = _motion_config()
+    executor = MockExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
+    events = []
+
+    class _Recorder:
+        def record(self, duration_sec, *, feedback, is_cancel_requested, deadline):
+            events.append(f"record_start:{duration_sec}")
+            events.append("record_end")
+            return "COMPLETED"
+
+    class _Player:
+        def play(self, _plan, duration_sec, *, feedback, is_cancel_requested, deadline):
+            events.append(f"play_start:{duration_sec}")
+            return "COMPLETED"
+
+    result = executor.execute(
+        MockGoal(arm_side="auto", imitation_duration_sec=7.0, timeout_sec=300.0),
+        recorder=_Recorder(),
+        player=_Player(),
+        prepare=lambda: events.append("prepare") or True,
+        recover_safe_pose=lambda: events.append("reset") or True,
+    )
+
+    assert events == ["prepare", "record_start:7.0", "record_end", "play_start:7.0", "reset"]
+    assert result.completed_phases == ("prepare", "start", "mock_playback", "reset")
+    assert result.success is True
+
+
+@pytest.mark.parametrize(
+    ("outcome", "error_code"),
+    [("CANCELED", "CANCELED"), ("TIMEOUT", "SKILL_TIMEOUT"), ("FAILED", "CAPTURE_FAILED")],
+)
+def test_capture_failure_skips_playback_but_still_resets(outcome, error_code):
+    """A window that did not complete has nothing to animate, but the arm still moved.
+
+    Prepare has already driven the arm out to the imitation start pose by this
+    point, so returning an error and stopping there would leave it standing
+    there. Reset runs on every path that got past prepare; only a goal rejected
+    before prepare leaves the arm untouched, and there is nothing to undo.
+    """
+    names, reset, limits = _motion_config()
+    executor = MockExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
+    played = []
+    reset_calls = []
+
+    class _Recorder:
+        def record(self, _duration_sec, *, feedback, is_cancel_requested, deadline):
+            return outcome
+
+    class _Player:
+        def play(self, *_args, **_kwargs):
+            played.append(True)
+            return "COMPLETED"
+
+    result = executor.execute(
+        MockGoal(arm_side="auto", imitation_duration_sec=5.0, timeout_sec=300.0),
+        recorder=_Recorder(),
+        player=_Player(),
+        prepare=lambda: True,
+        recover_safe_pose=lambda: reset_calls.append(True) or True,
+    )
+
+    assert result.success is False
+    assert result.error_code == error_code
+    assert played == [], "a failed capture must not be animated"
+    assert reset_calls == [True], "the arm is out at the start pose and must be stowed"
+    assert result.completed_phases == ("prepare", "start", "reset")
+
+
+def test_playback_spans_every_segment_at_the_maximum_duration():
+    """The longest legal request must play the animation, not raise on it.
+
+    The waypoint list is one longer than the segment list, so pairing waypoint
+    n with waypoint n+1 is correctly uneven. Pairing them strictly meant that
+    any request long enough to consume every segment -- which the 20 s maximum
+    does exactly -- ended in "zip() argument 2 is shorter than argument 1"
+    instead of a finished animation.
+    """
+    names, reset, limits = _motion_config()
+    executor = MockExecutor(joint_names=names, reset_positions=reset, joint_limits=limits, warmup_ready=True)
+    plan = executor.animations["mock_auto_v1"]
+    runner = _GuardedPrimitivePlayer(
+        None,
+        _GoalHandle(SimpleNamespace(_feedback=[])),
+        joint_names=names,
+        reset_positions=reset,
+        rpc_timeout_sec=5.0,
+        deadline=time.monotonic() + 300.0,
+        ros_now_sec=lambda: 0.0,
+    )
+    segments = []
+    runner._run = lambda **kwargs: segments.append(kwargs["duration_sec"]) or "COMPLETED"
+
+    outcome = runner.play(
+        plan,
+        MAX_IMITATION_DURATION_SEC,
+        feedback=lambda *_args: None,
+        is_cancel_requested=lambda: False,
+        deadline=time.monotonic() + 300.0,
+    )
+
+    assert outcome == "COMPLETED"
+    assert len(segments) == len(plan.waypoints) - 1
+    assert sum(segments) == pytest.approx(plan.duration_sec)

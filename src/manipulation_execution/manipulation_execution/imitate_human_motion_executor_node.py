@@ -35,8 +35,36 @@ from manipulation_execution.imitate_human_motion_executor import (
     PrimitiveStateUnknown,
 )
 
-_PREPARE_DURATION_SEC = 2.0
+_PREPARE_DURATION_SEC = 2.5
 _PEAR_CROP_EXPANSION = 1.25
+
+# Hard ceiling on the recorded PEAR window, in frames. The capture window is
+# already bounded -- 20 s at most, and the camera tops out around 30 fps -- so a
+# legitimate recording cannot exceed a few hundred frames. This is not that
+# limit; it is the backstop that keeps a defect in the deadline logic from
+# growing the buffer without end on a board with no swap. Frames past it are
+# dropped and counted rather than silently discarded.
+_MAX_CAPTURED_PEAR_FRAMES = 2000
+
+# Pose the arm is driven to at the start of every imitation task, in radians.
+# Joint 3 is tilted back 45 degrees so the wrist camera looks up at standing
+# head height; from the stowed pose it sees nothing above the tabletop.
+# Joint 5 rolls the wrist a quarter turn so the person stands upright in the
+# frame: the wrist camera is mounted on its side, and a person lying sideways
+# in the image is not what the person detector was trained on.
+# Deliberately independent of ros2_control.reset_positions: that table is also
+# pick_executor_node's post-grasp home and the baseline the mock animation is
+# clamped against, so the imitation start pose cannot be expressed there without
+# moving the grasp home with it.
+# The gripper joint "6" is driven by gripper_trajectory_controller and is left
+# untouched: move_to_joint_positions only reaches arm_trajectory_controller.
+_PREPARE_JOINT_POSITIONS = {
+    "1": 0.0,
+    "2": 0.0,
+    "3": -0.7854,  # -45 deg
+    "4": 0.0,
+    "5": -1.5708,  # -90 deg
+}
 
 
 def _validated_person_confidence_threshold(value: object) -> float:
@@ -83,6 +111,65 @@ def _center_fallback_detection(image: Image) -> Detection2D:
         center_y + half_side,
     ]
     return detection
+
+
+class _CaptureRecorder:
+    """Hold the arm still at the prepare pose and record RGB for exactly N seconds.
+
+    This is the data-collection phase of the skill. The arm has just reached the
+    imitation start pose, which is what puts the person in the wrist camera's
+    field of view, and it must not move again until the window closes: the
+    frames collected here are the imitation input, and any arm motion would
+    sweep the camera off the person. Nothing commands the arm while this runs,
+    so holding still is simply what the controller already does.
+
+    ``imitation_duration_sec`` is this window and nothing else -- not prepare
+    before it, not playback or reset after it. The length is measured in
+    wall-clock time rather than in frames because neither the camera nor PEAR
+    delivers a steady rate, while the elapsed time is accurate, and the
+    animation is built from that length.
+
+    The capture deadline is armed from the requested duration too, so the window
+    still closes on time if the loop itself overruns.
+    """
+
+    # 5 Hz is frequent enough for the caller to watch ``rgb_frames`` climb while
+    # the arm stands still, without turning a 20 s window into hundreds of
+    # feedback messages.
+    _FEEDBACK_PERIOD_SEC = 0.2
+
+    def __init__(self, node):
+        self._node = node
+        self.summary: dict[str, object] | None = None
+        # The recorded window, published here as soon as capture closes. Empty
+        # until then, and empty on any path that never captured at all.
+        self.frames: list[dict[str, object]] = []
+
+    def record(self, duration_sec: float, *, feedback, is_cancel_requested, deadline) -> str:
+        started = time.monotonic()
+        self._node._begin_capture(min(deadline, started + duration_sec))
+        try:
+            while True:
+                if is_cancel_requested():
+                    return "CANCELED"
+                now = time.monotonic()
+                elapsed = now - started
+                if elapsed >= duration_sec:
+                    feedback("start", 1.0, f"captured {elapsed:.2f}s of human motion")
+                    return "COMPLETED"
+                if now >= deadline:
+                    return "TIMEOUT"
+                feedback(
+                    "start",
+                    min(1.0, elapsed / duration_sec),
+                    f"capturing human motion {elapsed:.1f}/{duration_sec:.1f}s",
+                )
+                time.sleep(min(self._FEEDBACK_PERIOD_SEC, duration_sec - elapsed, max(0.0, deadline - now)))
+        finally:
+            self.summary = self._node._end_capture()
+            # Read after _end_capture has closed the window, so the buffer can
+            # no longer grow: what lands here is exactly the recording.
+            self.frames = self._node._captured_pear_frames()
 
 
 class _GuardedPrimitivePlayer:
@@ -230,7 +317,7 @@ class _GuardedPrimitivePlayer:
     def prepare(self) -> bool:
         outcome = self._run(
             primitive_name="move_to_joint_positions",
-            joint_positions=tuple(self._reset_positions[name] for name in self._joint_names),
+            joint_positions=tuple(_PREPARE_JOINT_POSITIONS.get(name, 0.0) for name in self._joint_names),
             duration_sec=_PREPARE_DURATION_SEC,
             deadline=self._deadline,
         )
@@ -241,7 +328,13 @@ class _GuardedPrimitivePlayer:
     def play(self, plan: AnimationPlan, duration_sec: float, *, feedback, is_cancel_requested, deadline) -> str:
         segment_duration = plan.duration_sec / (len(plan.waypoints) - 1)
         remaining = duration_sec
-        for start, end in zip(plan.waypoints, plan.waypoints[1:], strict=True):
+        # Pairwise: the waypoint list is deliberately one longer than the
+        # segment list, so this zip must not be strict. It used to be, which
+        # made any request long enough to consume every segment -- that is,
+        # exactly the 20 s maximum -- raise "zip() argument 2 is shorter than
+        # argument 1" instead of finishing the animation. The per-joint zip
+        # below stays strict: there a length mismatch is a real defect.
+        for start, end in zip(plan.waypoints, plan.waypoints[1:], strict=False):
             if remaining <= 0.0:
                 break
             active_duration = min(segment_duration, remaining)
@@ -339,6 +432,13 @@ class ImitateHumanMotionExecutorNode(Node):
         self._vision_fallback = 0
         self._vision_failed = 0
         self._vision_sample = ""
+        # The recorded imitation window itself: one entry per PEAR response that
+        # landed inside it, in arrival order. Nothing consumes this yet -- the
+        # retargeting stage that turns it into an SO-101 animation is the next
+        # step -- but it is the only place the per-frame pose output survives at
+        # all, so it has to be collected now or the window is gone.
+        self._pear_frames: list[dict[str, object]] = []
+        self._pear_frames_dropped = 0
         self._frame_count = 0
         self._first_frame_stamp = ""
         self._last_frame_stamp = ""
@@ -575,6 +675,31 @@ class ImitateHumanMotionExecutorNode(Node):
             [round(float(value), 4) for value in values["smplx_scale"][:3]],
             float(result.inference_time_ms),
         )
+        stamp = message.header.stamp
+        # Built outside the lock: this is the whole per-frame payload, and the
+        # capture lock is also on the RGB callback's path.
+        #
+        # The timestamp is kept as raw sec/nanosec rather than the display
+        # string used for the summary because the consumer needs numbers. PEAR
+        # answers at roughly 16 Hz against a ~23 fps camera and neither rate is
+        # steady, so the recording is non-uniformly sampled and every frame has
+        # to carry its own time; the retargeter cannot assume a fixed step.
+        #
+        # ``source``, ``bbox`` and ``confidence`` travel with the pose on
+        # purpose. A ``center_fallback`` frame means PEAR was handed a centred
+        # crop guess instead of a real person box -- on a normal run a good
+        # share of the window is exactly that -- and without the flag the
+        # retargeting stage cannot tell those frames from the trustworthy ones.
+        captured_frame: dict[str, object] = {
+            "stamp_sec": int(stamp.sec),
+            "stamp_nanosec": int(stamp.nanosec),
+            "frame_id": str(message.header.frame_id),
+            "source": source,
+            "bbox": [float(value) for value in detection.bbox],
+            "confidence": float(detection.confidence),
+            "inference_time_ms": float(result.inference_time_ms),
+        }
+        captured_frame.update(values)
         with self._capture_lock:
             if epoch != self._capture_epoch or not self._capture_active or time.monotonic() >= deadline:
                 return
@@ -584,6 +709,12 @@ class ImitateHumanMotionExecutorNode(Node):
             else:
                 self._vision_fallback += 1
             self._vision_sample = sample
+            # Appended under the same guard as the counters, so a frame belongs
+            # to the recording exactly when it is counted as part of it.
+            if len(self._pear_frames) < _MAX_CAPTURED_PEAR_FRAMES:
+                self._pear_frames.append(captured_frame)
+            else:
+                self._pear_frames_dropped += 1
         self.get_logger().info(f"hri vision {sample}")
 
     def _process_vision_frame(self, message: Image, epoch: int, deadline: float) -> None:
@@ -639,25 +770,43 @@ class ImitateHumanMotionExecutorNode(Node):
         if count <= 3 or count % 30 == 0:
             self.get_logger().warning(f"hri vision frame failed ({count}): {detail}")
 
+    def _reset_capture_stats(self) -> None:
+        """Zero the per-task vision counters. Caller must hold ``_capture_lock``.
+
+        Split out of ``_begin_capture`` because capture now starts only after
+        prepare succeeds, while the counters are reported from the first
+        feedback message onwards. Left inside ``_begin_capture`` they would
+        still hold the previous task's totals for the whole prepare phase, and
+        ``rgb_frames`` during prepare is exactly the signal used to show that
+        capture has not started yet.
+
+        Deliberately does not touch ``_capture_active``, ``_capture_epoch`` or
+        ``_capture_deadline``: those decide whether frames are consumed at all,
+        and resetting counters must not start a capture.
+        """
+        self._vision_ok = 0
+        self._vision_detected = 0
+        self._vision_fallback = 0
+        self._vision_failed = 0
+        self._vision_sample = ""
+        self._pear_frames = []
+        self._pear_frames_dropped = 0
+        self._yolox_detection = None
+        self._yolox_result_ready = False
+        self._yolox_calls = 0
+        self._pear_calls = 0
+        self._frame_count = 0
+        self._first_frame_stamp = ""
+        self._last_frame_stamp = ""
+        self._last_frame_id = ""
+        self._last_frame_received_at = 0.0
+
     def _begin_capture(self, deadline: float) -> None:
         with self._capture_lock:
             self._capture_active = True
             self._capture_epoch += 1
             self._capture_deadline = deadline
-            self._vision_ok = 0
-            self._vision_detected = 0
-            self._vision_fallback = 0
-            self._vision_failed = 0
-            self._vision_sample = ""
-            self._yolox_detection = None
-            self._yolox_result_ready = False
-            self._yolox_calls = 0
-            self._pear_calls = 0
-            self._frame_count = 0
-            self._first_frame_stamp = ""
-            self._last_frame_stamp = ""
-            self._last_frame_id = ""
-            self._last_frame_received_at = 0.0
+            self._reset_capture_stats()
         # Frames buffered before this task started belong to the previous one.
         while True:
             try:
@@ -690,6 +839,12 @@ class ImitateHumanMotionExecutorNode(Node):
                 "vision_failed": self._vision_failed,
                 "yolox_calls": self._yolox_calls,
                 "pear_calls": self._pear_calls,
+                # Counts only. The recorded frames themselves stay in the node
+                # and are handed to the next stage in process; they are far too
+                # large to travel in the result message, and nothing outside
+                # this node consumes them.
+                "pear_frames": len(self._pear_frames),
+                "pear_dropped": self._pear_frames_dropped,
                 "vision_sample": self._vision_sample,
                 "first_stamp": self._first_frame_stamp,
                 "last_stamp": self._last_frame_stamp,
@@ -700,6 +855,18 @@ class ImitateHumanMotionExecutorNode(Node):
             else:
                 summary["last_age_sec"] = None
             return summary
+
+    def _captured_pear_frames(self) -> list[dict[str, object]]:
+        """Return the PEAR window just recorded, oldest frame first.
+
+        This is the seam the imitation animation will be built from. The list is
+        a snapshot, so the caller can work on it while the node moves on, and it
+        stays valid until the next task clears the counters -- which means the
+        retargeting stage has the whole gap between capture finishing and
+        playback starting to consume it.
+        """
+        with self._capture_lock:
+            return list(self._pear_frames)
 
     def _run_startup_warmup(self) -> bool:
         """Perform the single launch-time warmup; tasks never repeat it."""
@@ -795,6 +962,15 @@ class ImitateHumanMotionExecutorNode(Node):
 
         last_logged_phase = ""
 
+        # The counters are reported from the first feedback message onwards,
+        # but capture does not start until prepare succeeds, so clear them on
+        # the way in rather than leaving the previous task's totals to be
+        # published as this task's prepare-phase numbers. Safe without further
+        # guarding: _handle_goal rejects a new goal while one is active, so no
+        # capture can be running here.
+        with self._capture_lock:
+            self._reset_capture_stats()
+
         def publish_feedback(phase: str, progress: float, detail: str) -> None:
             nonlocal last_logged_phase
             feedback = ImitateHumanMotion.Feedback()
@@ -834,7 +1010,15 @@ class ImitateHumanMotionExecutorNode(Node):
             goal_handle.abort()
             return result
 
-        self._begin_capture(runner.deadline)
+        def prepare_and_begin_capture() -> bool:
+            # Reaching the imitation start pose is what brings the person into
+            # the wrist camera's field of view; from the stowed pose the camera
+            # sees none of them. Capture itself is opened by _CaptureRecorder,
+            # which runs strictly after this returns True, so the recorded
+            # window starts at the prepare pose and holds there.
+            return runner.prepare()
+
+        capture_recorder = _CaptureRecorder(self)
         try:
             result_value = self._mock.execute(
                 goal,
@@ -843,7 +1027,8 @@ class ImitateHumanMotionExecutorNode(Node):
                 ),
                 is_cancel_requested=lambda: bool(goal_handle.is_cancel_requested),
                 player=runner,
-                prepare=runner.prepare,
+                recorder=capture_recorder,
+                prepare=prepare_and_begin_capture,
                 recover_safe_pose=runner.reset,
             )
         except PrimitiveStateUnknown as exc:
@@ -868,7 +1053,11 @@ class ImitateHumanMotionExecutorNode(Node):
                 completed_phases=(),
             )
         finally:
-            capture_summary = self._end_capture()
+            # The recorder publishes the summary as it closes its own window.
+            # The fallback covers the paths that never reach capture at all --
+            # prepare failing, a cancel, a rejected plan -- which still owe the
+            # caller an rgb_input block, just an empty one.
+            capture_summary = capture_recorder.summary if capture_recorder.summary is not None else self._end_capture()
             with self._goal_lock:
                 self._goal_active = False
         result = ImitateHumanMotion.Result()
