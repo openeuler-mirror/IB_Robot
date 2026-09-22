@@ -2,7 +2,8 @@
 
 `manipulation_execution` 是抓取、放置和 HRI 模拟执行的闭环执行层。它把一次 `PickObject` action 请求编排为
 GraspGen 规划、SO101 目标夹爪几何筛选、IK/FK 接触点补偿、安全 primitive 执行和抓后验证；
-`ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。该 executor 只消费视频，不产生任何运动输出。
+`ImitateHumanMotion` 则提供 delegated 的人体感知生命周期：在任务窗口内以独立订阅者方式接收配置的 RGB 图像，使用低频 YOLOX 刷新任务内 bbox 缓存，再让 PEAR 对持续更新的最新 RGB 帧独立推理，并校验、采样打印结果。采集窗口内每一条 PEAR 结果都会逐帧留存在节点内存里，供后续重定向阶段消费；
+窗口关闭后 executor 会驱动**真实机械臂**回放一段预置动画。也就是说该 executor 既消费视频也产生运动输出。
 
 ### HRI RGB 输入与人体感知链
 
@@ -19,6 +20,37 @@ HRI executor 复用统一 pipeline 和 `qos_profile_sensor_data` 订阅配置，
 
 `rgb_topic` 必须写 bringup remap **之后**的名字。`/camera/wrist_camera/color/image_raw` 是 RealSense
 驱动自己的名字，remap 之后在运行图上并不存在。
+
+### HRI 任务时序与运动输出
+
+一次 `ImitateHumanMotion` 会依次经过四个阶段，其中三个会动真实机械臂：
+
+| 阶段 | 是否动臂 | 时长 |
+| --- | --- | --- |
+| prepare | 是，`move_to_joint_positions` 走到模仿起始位姿 | `_PREPARE_DURATION_SEC` = 2.5 s |
+| capture | 否，停在起始位姿不动，只录 RGB/PEAR | `imitation_duration_sec`，上限 `MAX_IMITATION_DURATION_SEC` = 20 s |
+| playback | 是，逐段回放预置动画 | 同 capture 窗口长度 |
+| reset | 是，`move_to_named_pose(home)` | 由 primitive 决定 |
+
+`imitation_duration_sec` **只是采集窗口**，不含 prepare、playback 和 reset。整条任务的墙钟时长约为
+`2.5 + 2 × imitation_duration_sec + reset`，取满 20 s 时约 45 s，远低于 implementation 里的
+`timeout_sec: 240.0`。manifest 对该参数只约束 `exclusiveMinimum: 0`，超出 20 s 的请求由 executor 截断，
+不报错。
+
+prepare 位姿是执行器内的常量 `_PREPARE_JOINT_POSITIONS`，**不取自** `robot.ros2_control.reset_positions`：
+后者同时是 `pick_executor_node` 的抓后 home 和 mock 动画的钳制基线，模仿起始位姿放进去就会把抓取 home 一起
+挪走。该位姿把 joint 3 后仰 45° 让腕部相机抬到站立人头高度，joint 5 滚转 90° 抵消相机侧装。夹爪关节 `6` 由
+`gripper_trajectory_controller` 驱动，`move_to_joint_positions` 够不到，prepare 不碰它。
+
+result 的 `actual_duration_sec` 报的是**回放**时长，不是采集时长；采集到的秒数写在成功时的 `message` 里。
+
+| `error_code` | 含义 |
+| --- | --- |
+| `PREPARE_FAILED` | 走不到模仿起始位姿，不进入采集 |
+| `CAPTURE_FAILED` | 采集阶段异常结束，跳过回放但仍走 reset |
+| `MOCK_PLAYBACK_FAILED` | 回放阶段失败 |
+| `SKILL_TIMEOUT` / `CANCELED` | 采集或回放阶段超时/取消，`message` 区分发生在哪一段 |
+| `CANCEL_CLEANUP_TIMEOUT` | primitive 终态无法确认，见下文安全边界 |
 
 感知链把 `person_confidence_threshold` 同时传给 YOLOX，并在响应上防御性地过滤非 `person`、
 非有限置信度和低于阈值的框；有候选时取置信度最高的一个。有合格 person 时，executor 缓存该框并让 PEAR
@@ -134,8 +166,9 @@ catalog 的 `pick_object` 只授权 `MODE_EXECUTE`，且不允许调用方请求
 ## 配置
 
 HRI 执行由 `robot.embodied.imitate_human_motion` 启用，`rgb_topic` 与两个模型服务端点见上文表格。关节顺序来自 `robot.joints.arm`，
-prepare 起点来自 `robot.ros2_control.reset_positions`，限位来自
-`robot.teleoperation.safety.joint_limits`；这些值由 `embodied_bringup` 注入，执行器不维护第二份机器人配置。
+限位来自 `robot.teleoperation.safety.joint_limits`，`move_to_named_pose(home)` 的 home 与 mock 动画的钳制基线来自
+`robot.ros2_control.reset_positions`；这些值由 `embodied_bringup` 注入，执行器不维护第二份机器人配置。
+prepare 起始位姿是唯一的例外，理由见上文 HRI 任务时序一节。
 
 所有抓取运行参数来自 robot YAML 的 `robot.grasp_execution`。关键配置包括：
 
