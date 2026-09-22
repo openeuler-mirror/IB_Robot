@@ -27,6 +27,8 @@ from robot_config.observation_transport import (
     effective_observation_transport,
     observation_transport_to_dict,
     parse_observation_transport,
+    require_valid_observation_transports,
+    resolve_observation_transport,
 )
 
 # ---------- Contract datamodel ----------
@@ -605,6 +607,138 @@ def zero_pad(feature_meta: dict[str, Any]) -> Any:
     if dtype == "string":
         return ""
     return None
+
+
+def contract_from_dict(contract_data: dict[str, Any]) -> Contract:
+    """Build a Contract from an already-resolved contract mapping.
+
+    The mapping must carry concrete endpoints: this builder performs no
+    interface binding, so a recorded snapshot reconstructs exactly what the
+    recorder observed without consulting the robot YAML, the provider profile
+    or the calibration file. Callers holding an unresolved document must bind
+    it first.
+    """
+
+    def _obs(it: dict[str, Any]) -> ObservationSpec:
+        peripheral = it.get("_peripheral") or {}
+        transport = resolve_observation_transport(
+            parse_observation_transport(it.get("transport")),
+            image=it.get("image"),
+            camera_width=peripheral.get("width"),
+            camera_height=peripheral.get("height"),
+            camera_fps=peripheral.get("fps"),
+            interface_source=it.get("_interface_source"),
+        )
+        return ObservationSpec(
+            key=it["key"],
+            topic=it["topic"],
+            type=it["type"],
+            selector=it.get("selector"),
+            image=it.get("image"),
+            align=_as_align(it.get("align")),
+            qos=it.get("qos"),
+            transport=transport,
+            _interface_source=it.get("_interface_source"),
+        )
+
+    def _act(it: dict[str, Any]) -> ActionSpec:
+        pub = it["publish"]
+        sb = str(it.get("safety_behavior", "zeros")).lower().strip()
+        if sb not in ("zeros", "hold"):
+            sb = "zeros"
+        return ActionSpec(
+            key=it["key"],
+            publish_topic=pub["topic"],
+            type=pub["type"],
+            selector=it.get("selector"),
+            from_tensor=it.get("from_tensor"),
+            publish_qos=pub.get("qos"),
+            publish_strategy=pub.get("strategy"),
+            safety_behavior=sb,
+            _interface_source=pub.get("_interface_source"),
+        )
+
+    def _task(it: dict[str, Any]) -> Any:
+        return TaskSpec(
+            key=it.get("key", it["topic"]),
+            topic=it["topic"],
+            type=it["type"],
+            qos=it.get("qos"),
+        )
+
+    obs = [_obs(it) for it in (contract_data.get("observations") or [])]
+    acts = [_act(it) for it in (contract_data.get("actions") or [])]
+    tks = [_task(it) for it in (contract_data.get("tasks") or [])]
+    rec = contract_data.get("recording") or {}
+    proc = contract_data.get("process") or {}
+
+    contract = Contract(
+        name=contract_data.get("name", "contract"),
+        version=int(contract_data.get("version", 1)),
+        rate_hz=float(contract_data.get("rate_hz", contract_data.get("fps", 20.0))),
+        max_duration_s=float(contract_data.get("max_duration_s", 30.0)),
+        observations=obs,
+        actions=acts,
+        tasks=tks,
+        recording=rec,
+        robot_type=contract_data.get("robot_type"),
+        timestamp_source=str(contract_data.get("timestamp_source", "receive")).lower(),
+        process=proc,
+    )
+    require_valid_observation_transports(contract.observations)
+    return contract
+
+
+def contract_to_dict(contract) -> dict[str, Any]:
+    """Serialize a Contract into the mapping shape ``contract_from_dict`` reads.
+
+    This is the inverse of ``contract_from_dict``: action
+    publishers are nested back under ``publish`` and transports are rendered
+    through the canonical serializer, so a recorded snapshot round-trips to an
+    identical Contract and therefore an identical fingerprint. Internal
+    ``_interface_source`` provenance is preserved because the binder attaches
+    it to the specs the recorder observed.
+    """
+    data = asdict(contract) if hasattr(contract, "__dataclass_fields__") else dict(contract)
+
+    observations = []
+    for obs in data.get("observations") or []:
+        entry = {key: value for key, value in obs.items() if value is not None or key in ("selector", "image")}
+        transport = obs.get("transport")
+        if transport is not None:
+            entry["transport"] = observation_transport_to_dict(parse_observation_transport(transport))
+        observations.append(entry)
+
+    actions = []
+    for act in data.get("actions") or []:
+        publish = {"topic": act.get("publish_topic"), "type": act.get("type")}
+        if act.get("publish_qos") is not None:
+            publish["qos"] = act["publish_qos"]
+        if act.get("publish_strategy") is not None:
+            publish["strategy"] = act["publish_strategy"]
+        if act.get("_interface_source") is not None:
+            publish["_interface_source"] = act["_interface_source"]
+        entry = {"key": act.get("key"), "publish": publish}
+        for field in ("selector", "from_tensor", "safety_behavior"):
+            if act.get(field) is not None:
+                entry[field] = act[field]
+        actions.append(entry)
+
+    payload = {
+        "name": data.get("name"),
+        "version": data.get("version"),
+        "rate_hz": data.get("rate_hz"),
+        "max_duration_s": data.get("max_duration_s"),
+        "observations": observations,
+        "actions": actions,
+        "tasks": list(data.get("tasks") or []),
+        "recording": data.get("recording") or {},
+        "process": data.get("process") or {},
+        "timestamp_source": data.get("timestamp_source", "receive"),
+    }
+    if data.get("robot_type") is not None:
+        payload["robot_type"] = data["robot_type"]
+    return payload
 
 
 def contract_fingerprint(contract) -> str:

@@ -761,9 +761,80 @@ def _plan_streams(
 # ---------------------------------------------------------------------------
 
 
-def _load_contract_from_robot_config(robot_config_path: Path) -> Contract:
+def _print_contract_streams(contract: Contract) -> None:
+    print(f"[bag_to_lerobot]   Observations: {len(contract.observations)}")
+    for obs in contract.observations:
+        print(f"[bag_to_lerobot]     - {obs.key} <- {obs.topic}")
+    print(f"[bag_to_lerobot]   Actions: {len(contract.actions)}")
+    for act in contract.actions:
+        print(f"[bag_to_lerobot]     - {act.key} -> {act.publish_topic}")
+
+
+def _contract_from_dataset_metadata(dataset_meta: dict[str, Any]) -> Contract | None:
+    """Rebuild the contract recorded next to the bags, or None when absent.
+
+    The snapshot holds concrete endpoints, so it reconstructs without touching
+    the source tree, the provider profile or the calibration file.
+
+    The fingerprint comparison guards serialization, not tampering: both values
+    come from the same write, so they only disagree when the snapshot failed to
+    round-trip through contract_to_dict and contract_from_dict. A mismatch means
+    this converter would read something other than what the recorder observed.
+    """
+    data = dataset_meta.get("contract")
+    if not isinstance(data, dict) or not data:
+        return None
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict
+
+    contract = contract_from_dict(data)
+    recorded = str(dataset_meta.get("contract_fingerprint", "") or "")
+    if recorded:
+        actual = contract_fingerprint(contract)
+        if actual != recorded:
+            raise ValueError(f"recorded contract snapshot does not match its fingerprint: {recorded} != {actual}")
+    return contract
+
+
+def _resolve_contract(bag_dirs: list[Path], robot_config_path: Path | None) -> Contract:
+    """Prefer the contract recorded with the dataset over the source tree."""
+    dataset_meta = _dataset_metadata_for_bag(bag_dirs[0]) if bag_dirs else {}
+    snapshot = _contract_from_dataset_metadata(dataset_meta)
+    if snapshot is not None:
+        fingerprint = str(dataset_meta.get("contract_fingerprint", "") or "")
+        print(f"[bag_to_lerobot] Contract: dataset snapshot (fingerprint {fingerprint or 'n/a'})")
+        _print_contract_streams(snapshot)
+        if robot_config_path:
+            _warn_on_contract_drift(snapshot, robot_config_path)
+        return snapshot
+
+    if not robot_config_path:
+        raise ValueError(
+            "this dataset carries no contract snapshot; pass --robot-config with the robot YAML "
+            "used to record it (datasets recorded after this feature landed are self-contained)"
+        )
+    return _load_contract_from_robot_config(robot_config_path)
+
+
+def _warn_on_contract_drift(snapshot: Contract, robot_config_path: Path) -> None:
+    """Report, without overriding, a source tree that no longer matches the recording."""
+    from robot_config.contract_utils import contract_fingerprint
+
+    try:
+        current = _load_contract_from_robot_config(robot_config_path, quiet=True)
+    except Exception as exc:  # noqa: BLE001 - drift reporting must never fail conversion
+        print(f"[bag_to_lerobot] Could not compare --robot-config against the snapshot: {exc}")
+        return
+    if contract_fingerprint(current) != contract_fingerprint(snapshot):
+        print(
+            "[WARN] --robot-config contract differs from the recorded snapshot; "
+            "using the snapshot so the dataset stays reproducible"
+        )
+
+
+def _load_contract_from_robot_config(robot_config_path: Path, *, quiet: bool = False) -> Contract:
     """Load contract from robot_config.yaml (Single Source of Truth)."""
-    print(f"[bag_to_lerobot] Loading contract from robot_config: {robot_config_path}")
+    if not quiet:
+        print(f"[bag_to_lerobot] Loading contract from robot_config: {robot_config_path}")
     from robot_config.loader import (
         build_contract_from_robot_config_dict,
         load_robot_config_dict,
@@ -772,19 +843,15 @@ def _load_contract_from_robot_config(robot_config_path: Path) -> Contract:
     robot_config = load_robot_config_dict(str(robot_config_path))
     contract = build_contract_from_robot_config_dict(robot_config)
 
-    print(f"[bag_to_lerobot]   Observations: {len(contract.observations)}")
-    for obs in contract.observations:
-        print(f"[bag_to_lerobot]     - {obs.key} <- {obs.topic}")
-    print(f"[bag_to_lerobot]   Actions: {len(contract.actions)}")
-    for act in contract.actions:
-        print(f"[bag_to_lerobot]     - {act.key} -> {act.publish_topic}")
+    if not quiet:
+        _print_contract_streams(contract)
 
     return contract
 
 
 def export_bags_to_lerobot(
     bag_dirs: list[Path],
-    robot_config_path: Path,
+    robot_config_path: Path | None = None,
     out_root: Path = Path("output"),
     repo_id: str = "rosbag_v30",
     use_videos: bool = True,
@@ -831,8 +898,8 @@ def export_bags_to_lerobot(
     RuntimeError
         If a bag contains no usable/decodable messages.
     """
-    contract = _load_contract_from_robot_config(robot_config_path)
-    fallback_conversion_config = _resolve_fallback_conversion_config(robot_config_path)
+    contract = _resolve_contract(bag_dirs, robot_config_path)
+    fallback_conversion_config = _resolve_fallback_conversion_config(robot_config_path) if robot_config_path else {}
     fps = int(contract.rate_hz)
     if fps <= 0:
         raise ValueError("Contract rate_hz must be > 0")
@@ -1433,8 +1500,10 @@ Example:
 
     ap.add_argument(
         "--robot-config",
-        required=True,
-        help="Path to robot_config.yaml (Single Source of Truth)",
+        help=(
+            "Path to robot_config.yaml. Only needed for datasets recorded before the contract "
+            "snapshot was embedded; newer datasets carry their own contract"
+        ),
     )
     ap.add_argument("--out", required=True, help="Output dataset root")
     ap.add_argument("--repo-id", default="rosbag_v30", help="repo_id metadata")
@@ -1488,7 +1557,7 @@ def main() -> None:
 
     export_bags_to_lerobot(
         bag_dirs=bag_dirs,
-        robot_config_path=Path(args.robot_config),
+        robot_config_path=Path(args.robot_config) if args.robot_config else None,
         out_root=Path(args.out),
         repo_id=args.repo_id,
         use_videos=not args.no_videos,

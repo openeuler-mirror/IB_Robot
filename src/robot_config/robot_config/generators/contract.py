@@ -14,8 +14,8 @@ from robot_config.contract_utils import (
     ActionSpec,
     Contract,
     ObservationSpec,
-    TaskSpec,
     _as_align,
+    contract_from_dict,
 )
 from robot_config.interface_binding import resolve_robot_interfaces
 from robot_config.observation_transport import (
@@ -66,81 +66,7 @@ def load_contract_with_robot_config(
     if robot_config:
         contract_data = _resolve_peripheral_references(contract_data, robot_config)
 
-    # Build contract dataclasses
-    def _obs(it: dict[str, Any]) -> ObservationSpec:
-        peripheral = it.get("_peripheral") or {}
-        transport = resolve_observation_transport(
-            parse_observation_transport(it.get("transport")),
-            image=it.get("image"),
-            camera_width=peripheral.get("width"),
-            camera_height=peripheral.get("height"),
-            camera_fps=peripheral.get("fps"),
-            interface_source=it.get("_interface_source"),
-        )
-        obs = ObservationSpec(
-            key=it["key"],
-            topic=it["topic"],
-            type=it["type"],
-            selector=it.get("selector"),
-            image=it.get("image"),
-            align=_as_align(it.get("align")),
-            qos=it.get("qos"),
-            transport=transport,
-            _interface_source=it.get("_interface_source"),
-        )
-        # Add peripheral metadata if available
-        # if "_peripheral" in it:
-        #     object.__setattr__(obs, "_peripheral", it["_peripheral"])
-        return obs
-
-    def _act(it: dict[str, Any]) -> ActionSpec:
-        pub = it["publish"]
-        sb = str(it.get("safety_behavior", "zeros")).lower().strip()
-        if sb not in ("zeros", "hold"):
-            sb = "zeros"
-        return ActionSpec(
-            key=it["key"],
-            publish_topic=pub["topic"],
-            type=pub["type"],
-            selector=it.get("selector"),
-            from_tensor=it.get("from_tensor"),
-            publish_qos=pub.get("qos"),
-            publish_strategy=pub.get("strategy"),
-            safety_behavior=sb,
-            _interface_source=pub.get("_interface_source"),
-        )
-
-    def _task(it: dict[str, Any]) -> Any:
-        return TaskSpec(
-            key=it.get("key", it["topic"]),
-            topic=it["topic"],
-            type=it["type"],
-            qos=it.get("qos"),
-        )
-
-    obs = [_obs(it) for it in (contract_data.get("observations") or [])]
-    acts = [_act(it) for it in (contract_data.get("actions") or [])]
-    tks = [_task(it) for it in (contract_data.get("tasks") or [])]
-    rec = contract_data.get("recording") or {}
-    proc = contract_data.get("process") or {}
-
-    from robot_config.contract_utils import Contract
-
-    contract = Contract(
-        name=contract_data.get("name", "contract"),
-        version=int(contract_data.get("version", 1)),
-        rate_hz=float(contract_data.get("rate_hz", contract_data.get("fps", 20.0))),
-        max_duration_s=float(contract_data.get("max_duration_s", 30.0)),
-        observations=obs,
-        actions=acts,
-        tasks=tks,
-        recording=rec,
-        robot_type=contract_data.get("robot_type"),
-        timestamp_source=str(contract_data.get("timestamp_source", "receive")).lower(),
-        process=proc,
-    )
-    require_valid_observation_transports(contract.observations)
-    return contract
+    return contract_from_dict(contract_data)
 
 
 def _resolve_peripheral_references(contract_data: dict, robot_config: Any) -> dict:

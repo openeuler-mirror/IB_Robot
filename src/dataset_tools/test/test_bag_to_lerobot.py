@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import av
 import numpy as np
 import pytest
+import yaml
 from lerobot.datasets.io_utils import write_info
 from lerobot.datasets.utils import DatasetInfo
 
@@ -20,6 +21,7 @@ from dataset_tools.bag_to_lerobot import (  # noqa: E402
     IntegrityReport,
     _build_feature_conversion_table,
     _clean_float_array,
+    _contract_from_dataset_metadata,
     _dataset_feature_names_for_spec,
     _estimate_stream_rate_hz,
     _image_to_hwc,
@@ -27,6 +29,7 @@ from dataset_tools.bag_to_lerobot import (  # noqa: E402
     _merge_integrity_report,
     _persist_custom_info,
     _plan_streams,
+    _resolve_contract,
     _resolve_video_codec,
     _selected_indices_for_ticks,
     discover_video_adapters,
@@ -1015,3 +1018,116 @@ def test_public_conversion_table_maps_action_indices_to_joints():
     )
     assert len(table) == 6
     assert [row[0] for row in table] == [-1.0 + index for index in range(6)]
+
+
+# ---------------------------------------------------------------------------
+# Dataset-embedded contract snapshots
+# ---------------------------------------------------------------------------
+
+
+def _snapshot_contract_document() -> dict:
+    """A resolved contract mapping shaped like what the recorder embeds."""
+    return {
+        "name": "snapshot_contract",
+        "version": 1,
+        "rate_hz": 20.0,
+        "max_duration_s": 30.0,
+        "robot_type": "so_101",
+        "timestamp_source": "header",
+        "recording": {},
+        "process": {},
+        "tasks": [],
+        "observations": [
+            {
+                "key": "observation.state",
+                "topic": "/joint_states",
+                "type": "sensor_msgs/msg/JointState",
+                "selector": {"names": ["position.1", "position.2"]},
+                "align": {"strategy": "hold", "stamp": "header", "tol_ms": 100},
+            }
+        ],
+        "actions": [
+            {
+                "key": "action",
+                "selector": {"names": ["action.0", "action.1"]},
+                "safety_behavior": "hold",
+                "publish": {
+                    "topic": "/arm_position_controller/commands",
+                    "type": "std_msgs/msg/Float64MultiArray",
+                },
+            }
+        ],
+    }
+
+
+def _dataset_metadata_with_snapshot() -> dict:
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict
+
+    document = _snapshot_contract_document()
+    contract = contract_from_dict(document)
+    return {
+        "contract": document,
+        "contract_fingerprint": contract_fingerprint(contract),
+    }
+
+
+def test_contract_snapshot_round_trips_through_the_recorder_serializer():
+    """contract_to_dict and contract_from_dict must preserve identity."""
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict, contract_to_dict
+
+    original = contract_from_dict(_snapshot_contract_document())
+    restored = contract_from_dict(contract_to_dict(original))
+
+    assert contract_fingerprint(restored) == contract_fingerprint(original)
+    assert restored.rate_hz == original.rate_hz
+    assert restored.robot_type == original.robot_type
+    assert [obs.topic for obs in restored.observations] == [obs.topic for obs in original.observations]
+    assert [act.publish_topic for act in restored.actions] == [act.publish_topic for act in original.actions]
+
+
+def test_contract_snapshot_rebuilds_without_the_source_tree():
+    contract = _contract_from_dataset_metadata(_dataset_metadata_with_snapshot())
+
+    assert contract is not None
+    assert contract.rate_hz == 20.0
+    assert contract.observations[0].topic == "/joint_states"
+    assert contract.actions[0].publish_topic == "/arm_position_controller/commands"
+
+
+def test_absent_contract_snapshot_returns_none():
+    assert _contract_from_dataset_metadata({}) is None
+    assert _contract_from_dataset_metadata({"contract": {}}) is None
+
+
+def test_contract_snapshot_rejects_a_mismatched_fingerprint():
+    """A snapshot that no longer round-trips must not be silently used."""
+    meta = _dataset_metadata_with_snapshot()
+    meta["contract"]["observations"][0]["topic"] = "/somewhere_else"
+
+    with pytest.raises(ValueError, match="does not match its fingerprint"):
+        _contract_from_dataset_metadata(meta)
+
+
+def test_resolve_contract_prefers_the_snapshot_over_robot_config(tmp_path, monkeypatch):
+    dataset_root = tmp_path / "dataset"
+    bag_dir = dataset_root / "episodes" / "episode_000001"
+    bag_dir.mkdir(parents=True)
+    (dataset_root / "dataset.yaml").write_text(yaml.safe_dump(_dataset_metadata_with_snapshot()), encoding="utf-8")
+
+    def _fail(*args, **kwargs):
+        raise AssertionError("the source tree must not be consulted when a snapshot exists")
+
+    monkeypatch.setattr("dataset_tools.bag_to_lerobot._load_contract_from_robot_config", _fail)
+
+    contract = _resolve_contract([bag_dir], None)
+    assert contract.observations[0].topic == "/joint_states"
+
+
+def test_resolve_contract_requires_robot_config_without_a_snapshot(tmp_path):
+    dataset_root = tmp_path / "dataset"
+    bag_dir = dataset_root / "episodes" / "episode_000001"
+    bag_dir.mkdir(parents=True)
+    (dataset_root / "dataset.yaml").write_text(yaml.safe_dump({"name": "x"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no contract snapshot"):
+        _resolve_contract([bag_dir], None)
