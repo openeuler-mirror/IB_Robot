@@ -10,7 +10,7 @@ inference. That keeps train/serve paths aligned and minimizes skew.
 
 The conversion pipeline:
 
-1) Load contract from robot_config.yaml (Single Source of Truth)
+1) Preflight all selected episodes using their dataset-embedded contract and conversion metadata
 2) Scan a bag once; decode each contract topic using shared `decode_value`.
 3) Select timestamps per a policy (`contract` / `bag` / `header`).
 4) Resample each stream at the contract rate and assemble frames.
@@ -21,7 +21,7 @@ Dependencies
 Shared modules (keep it unified with live inference):
 
 - `robot_config.contract_utils`:
-    `load_contract`, `iter_specs`, `feature_from_spec`
+    `contract_from_dict`, `iter_specs`, `feature_from_spec`
 
 Command-line usage
 ------------------
@@ -29,21 +29,17 @@ Convert a single bag:
 
     $ python bag_to_lerobot.py \\
         --bag /path/to/bag_dir \\
-        --robot-config /path/to/robot_config.yaml \\
         --out /path/to/out_root
 
 Convert multiple bags:
 
     $ python bag_to_lerobot.py \\
         --bags /bag/epi1 /bag/epi2 \\
-        --robot-config /path/to/robot_config.yaml \\
         --out /path/to/out_root
 
 Options of note:
 
-- `--robot-config`
-    Path to robot_config.yaml. The contract section is used as the
-    Single Source of Truth for observations and actions.
+The removed `--robot-config` option is rejected; legacy datasets without snapshots are unsupported.
 
 - `--timestamp {contract,bag,header}`
     How to pick per-message timestamps before resampling:
@@ -76,6 +72,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import shutil
 from collections.abc import Iterable
@@ -108,15 +105,7 @@ from robot_config.contract_utils import (
 from robot_config.contract_utils import (
     zero_pad as make_zero_pad,
 )
-from robot_config.utils import (
-    build_joint_conversion_table,
-    build_joint_conversion_table_from_calibration,
-    normalize_lerobot_norm_mode,
-    resolve_calibration_source_specs_from_config,
-    resolve_gripper_joints_from_config,
-    resolve_joint_names_from_config,
-    resolve_lerobot_norm_mode,
-)
+from robot_config.utils import normalize_lerobot_norm_mode
 from robot_runtime.model_metadata import build_joint_conversion_table_from_model, validate_public_conversion_metadata
 
 # ---------------------------------------------------------------------------
@@ -337,11 +326,9 @@ def _lerobot_metadata_entry(
     custom_data = bag_info.get("custom_data")
     fingerprint = ""
     if isinstance(custom_data, dict):
-        fingerprint = str(custom_data.get("ibrobot.lerobot_conversion_fingerprint", "") or "")
-    if not fingerprint:
-        fingerprint = str(lerobot_meta.get("default_conversion_fingerprint", "") or "")
-    if not fingerprint:
-        raise ValueError("new-format recording is missing its conversion fingerprint")
+        fingerprint = custom_data.get("ibrobot.lerobot_conversion_fingerprint", "")
+    if not isinstance(fingerprint, str) or not fingerprint.strip():
+        raise ValueError("recording is missing its per-episode conversion fingerprint")
 
     conversion_meta = conversions.get(fingerprint)
     if not isinstance(conversion_meta, dict):
@@ -349,36 +336,9 @@ def _lerobot_metadata_entry(
     return fingerprint, conversion_meta
 
 
-def _resolve_fallback_conversion_config(robot_config_path: Path) -> dict[str, Any]:
-    """Resolve conversion inputs directly from robot_config for older datasets."""
-    from robot_config.loader import load_robot_config_dict
-
-    try:
-        robot_config = load_robot_config_dict(robot_config_path)
-    except Exception as exc:
-        print(f"[WARN] Failed to load robot_config from {robot_config_path}: {exc}")
-        return {}
-    try:
-        calibration_source_specs = resolve_calibration_source_specs_from_config(robot_config)
-        calibration_file = os.pathsep.join(spec.resolved_path for spec in calibration_source_specs)
-    except (TypeError, ValueError) as exc:
-        print(f"[WARN] Failed to resolve calibration sources from {robot_config_path}: {exc}")
-        calibration_source_specs = []
-        calibration_file = ""
-
-    return {
-        "norm_mode": resolve_lerobot_norm_mode(robot_config),
-        "gripper_joints": resolve_gripper_joints_from_config(robot_config),
-        "calibration_source_specs": calibration_source_specs,
-        "calibration_file": calibration_file,
-        "joint_names": resolve_joint_names_from_config(robot_config),
-    }
-
-
 def _build_feature_conversion_table(
     feature_names: list[str],
     conversion_meta: dict[str, Any],
-    fallback_config: dict[str, Any],
     feature_kind: str = "",
 ) -> list[tuple[float, float, float, float]]:
     """Build a per-feature conversion table in the feature's declared order.
@@ -390,16 +350,14 @@ def _build_feature_conversion_table(
     joint list comes from the contract, so no index range is assumed here: LeKiWi merely
     happens to name its joints "1".."6".
 
-    Features with no calibration entry (base wheels, anything unknown) keep an identity
-    tuple so their native rad/s values pass through untouched.
+    Velocity selectors and declared base action slots keep native values. Missing
+    position/action mappings fail validation instead of silently passing through.
     """
     ordered_names = [str(name) for name in feature_names]
     if not ordered_names:
-        return []
+        raise ValueError("state/action conversion requires feature names")
 
-    arm_joints = [
-        str(name) for name in (conversion_meta.get("joint_names") or fallback_config.get("joint_names") or [])
-    ]
+    arm_joints = [str(name) for name in (conversion_meta.get("joint_names") or [])]
     arm_joint_set = set(arm_joints)
 
     def conversion_names() -> list[str | None]:
@@ -417,23 +375,12 @@ def _build_feature_conversion_table(
                 resolved.append(arm_joints[index] if index < len(arm_joints) else None)
             else:
                 resolved.append(name)
-            # An identity tuple writes raw radians into a field declared as normalized
-            # units. That is intended for base values -- `velocity.*` and the action
-            # indices past the arm -- so warn only about a joint position that should
-            # have been calibrated and was not. Warning on the base wheels every run
-            # would just teach readers to ignore the message.
-            if resolved[-1] is None and field == "position":
-                print(f"[WARN] Feature {name!r} has no calibration mapping; values pass through unconverted")
         return resolved
 
     resolved_names = conversion_names()
 
     def build_in_feature_order(build: Any) -> list[tuple[float, float, float, float]]:
-        """Apply ``build`` once to the mapped names, then restore the feature order.
-
-        Batching matters for the calibration-file paths: ``build_joint_conversion_table``
-        re-reads and re-parses the file on every call.
-        """
+        """Build from the public snapshot, then restore native velocity slots."""
         mapped = [name for name in resolved_names if name is not None]
         mapped_table = list(build(mapped)) if mapped else []
         if len(mapped_table) != len(mapped):
@@ -441,62 +388,29 @@ def _build_feature_conversion_table(
         rows = iter(mapped_table)
         return [(0.0, 1.0, 1.0, 0.0) if name is None else next(rows) for name in resolved_names]
 
-    if conversion_meta:
-        if "description" in conversion_meta:
-            validate_public_conversion_metadata(conversion_meta)
-            feature_map = conversion_meta["feature_names"]
-            # The recorded order is joint names; the requested order is message
-            # field selectors. Compare through the selector -> joint mapping so
-            # both a raw-selector passthrough (missing contract joints) and a
-            # false order conflict are impossible.
-            if feature_names and feature_kind == "state":
-                recorded = list(feature_map.get("observation.state") or [])
-                requested = [name for name in resolved_names if name is not None]
-                if recorded and requested != recorded:
-                    raise ValueError("recorded public conversion feature order conflicts with requested feature order")
-            return build_in_feature_order(
-                lambda names: build_joint_conversion_table_from_model(
-                    conversion_meta["description"]["model"], names, conversion_meta["norm_mode"]
-                )
-            )
-        norm_mode = normalize_lerobot_norm_mode(str(conversion_meta.get("norm_mode", "")))
-        if norm_mode == "none":
-            return []
-        calibration = conversion_meta.get("calibration")
-        if isinstance(calibration, dict):
-            return build_in_feature_order(
-                lambda names: build_joint_conversion_table_from_calibration(
-                    calibration=calibration,
-                    joint_names=names,
-                    gripper_joints=conversion_meta.get("gripper_joints"),
-                    norm_mode=norm_mode,
-                )
-            )
-        raise ValueError("Dataset conversion metadata is missing calibration snapshot")
-
-    if fallback_config.get("new_format"):
-        raise ValueError("new-format recording is missing validated public conversion metadata")
-    calibration_source_specs = fallback_config.get("calibration_source_specs") or []
-    if calibration_source_specs:
-        return build_in_feature_order(
-            lambda names: build_joint_conversion_table(
-                calib_file=calibration_source_specs,
-                joint_names=names,
-                gripper_joints=fallback_config.get("gripper_joints"),
-                norm_mode=str(fallback_config.get("norm_mode", "")),
-            )
-        )
-
-    calib_file = str(fallback_config.get("calibration_file", "") or "")
-    if not calib_file:
+    if not isinstance(conversion_meta, dict) or "norm_mode" not in conversion_meta:
+        raise ValueError("conversion metadata requires explicit norm_mode")
+    norm_mode = normalize_lerobot_norm_mode(conversion_meta["norm_mode"])
+    if "description" in conversion_meta or norm_mode != "none":
+        validate_public_conversion_metadata(conversion_meta)
+    if norm_mode == "none":
         return []
+    feature_map = conversion_meta["feature_names"]
+    if feature_kind == "state":
+        recorded = list(feature_map.get("observation.state") or [])
+        requested = [name for name in resolved_names if name is not None]
+        if requested != recorded:
+            raise ValueError("recorded public conversion feature order conflicts with requested feature order")
+    base_joints = conversion_meta["description"]["model"].get("joint_groups", {}).get("base", [])
+    for name, resolved in zip(ordered_names, resolved_names, strict=True):
+        if feature_kind == "action" and name.startswith("action.") and resolved is None:
+            suffix = name.partition(".")[2]
+            if not suffix.isdigit() or int(suffix) >= len(arm_joints) + len(set(base_joints) - arm_joint_set):
+                raise ValueError(f"Feature {name!r} has no calibration mapping")
+        if name.startswith("position.") and resolved is None:
+            raise ValueError(f"Feature {name!r} has no calibration mapping")
     return build_in_feature_order(
-        lambda names: build_joint_conversion_table(
-            calib_file=calib_file,
-            joint_names=names,
-            gripper_joints=fallback_config.get("gripper_joints"),
-            norm_mode=str(fallback_config.get("norm_mode", "")),
-        )
+        lambda names: build_joint_conversion_table_from_model(conversion_meta["description"]["model"], names, norm_mode)
     )
 
 
@@ -770,88 +684,118 @@ def _print_contract_streams(contract: Contract) -> None:
         print(f"[bag_to_lerobot]     - {act.key} -> {act.publish_topic}")
 
 
-def _contract_from_dataset_metadata(dataset_meta: dict[str, Any]) -> Contract | None:
-    """Rebuild the contract recorded next to the bags, or None when absent.
+def _contract_from_dataset_metadata(dataset_meta: dict[str, Any]) -> Contract:
+    """Reconstruct only complete recorded contracts; never consult source configuration."""
+    from robot_config.contract_utils import contract_from_dict
 
-    The snapshot holds concrete endpoints, so it reconstructs without touching
-    the source tree, the provider profile or the calibration file.
-
-    The fingerprint comparison guards serialization, not tampering: both values
-    come from the same write, so they only disagree when the snapshot failed to
-    round-trip through contract_to_dict and contract_from_dict. A mismatch means
-    this converter would read something other than what the recorder observed.
-    """
+    if not isinstance(dataset_meta, dict):
+        raise ValueError("dataset metadata must be a mapping")
     data = dataset_meta.get("contract")
     if not isinstance(data, dict) or not data:
-        return None
-    from robot_config.contract_utils import contract_fingerprint, contract_from_dict
-
-    contract = contract_from_dict(data)
-    recorded = str(dataset_meta.get("contract_fingerprint", "") or "")
-    if recorded:
-        actual = contract_fingerprint(contract)
-        if actual != recorded:
-            raise ValueError(f"recorded contract snapshot does not match its fingerprint: {recorded} != {actual}")
-    return contract
-
-
-def _resolve_contract(bag_dirs: list[Path], robot_config_path: Path | None) -> Contract:
-    """Prefer the contract recorded with the dataset over the source tree."""
-    dataset_meta = _dataset_metadata_for_bag(bag_dirs[0]) if bag_dirs else {}
-    snapshot = _contract_from_dataset_metadata(dataset_meta)
-    if snapshot is not None:
-        fingerprint = str(dataset_meta.get("contract_fingerprint", "") or "")
-        print(f"[bag_to_lerobot] Contract: dataset snapshot (fingerprint {fingerprint or 'n/a'})")
-        _print_contract_streams(snapshot)
-        if robot_config_path:
-            _warn_on_contract_drift(snapshot, robot_config_path)
-        return snapshot
-
-    if not robot_config_path:
-        raise ValueError(
-            "this dataset carries no contract snapshot; pass --robot-config with the robot YAML "
-            "used to record it (datasets recorded after this feature landed are self-contained)"
-        )
-    return _load_contract_from_robot_config(robot_config_path)
-
-
-def _warn_on_contract_drift(snapshot: Contract, robot_config_path: Path) -> None:
-    """Report, without overriding, a source tree that no longer matches the recording."""
-    from robot_config.contract_utils import contract_fingerprint
-
+        raise ValueError("dataset has no valid contract snapshot")
+    for field in ("name", "rate_hz", "timestamp_source", "observations", "actions", "tasks"):
+        if field not in data:
+            raise ValueError(f"contract snapshot requires {field}")
+    if not isinstance(data["name"], str) or not data["name"].strip():
+        raise ValueError("contract snapshot name must be a non-empty string")
+    if data["timestamp_source"] not in ("receive", "header"):
+        raise ValueError("contract snapshot timestamp_source must be receive or header")
+    rate = data["rate_hz"]
+    if (
+        isinstance(rate, bool)
+        or not isinstance(rate, int | float)
+        or not math.isfinite(rate)
+        or rate < 1
+        or not float(rate).is_integer()
+    ):
+        raise ValueError("contract snapshot rate_hz must be a finite positive integer")
+    for field in ("observations", "actions", "tasks"):
+        if not isinstance(data[field], list) or any(not isinstance(item, dict) for item in data[field]):
+            raise ValueError(f"contract snapshot {field} must be a list of mappings")
+    if not data["observations"] and not data["actions"]:
+        raise ValueError("contract snapshot requires observations or actions")
     try:
-        current = _load_contract_from_robot_config(robot_config_path, quiet=True)
-    except Exception as exc:  # noqa: BLE001 - drift reporting must never fail conversion
-        print(f"[bag_to_lerobot] Could not compare --robot-config against the snapshot: {exc}")
-        return
-    if contract_fingerprint(current) != contract_fingerprint(snapshot):
-        print(
-            "[WARN] --robot-config contract differs from the recorded snapshot; "
-            "using the snapshot so the dataset stays reproducible"
-        )
-
-
-def _load_contract_from_robot_config(robot_config_path: Path, *, quiet: bool = False) -> Contract:
-    """Load contract from robot_config.yaml (Single Source of Truth)."""
-    if not quiet:
-        print(f"[bag_to_lerobot] Loading contract from robot_config: {robot_config_path}")
-    from robot_config.loader import (
-        build_contract_from_robot_config_dict,
-        load_robot_config_dict,
-    )
-
-    robot_config = load_robot_config_dict(str(robot_config_path))
-    contract = build_contract_from_robot_config_dict(robot_config)
-
-    if not quiet:
-        _print_contract_streams(contract)
-
+        contract = contract_from_dict(data)
+        for spec in iter_specs(contract):
+            if any(not isinstance(value, str) or not value.strip() for value in (spec.key, spec.topic, spec.ros_type)):
+                raise ValueError("stream key, topic and type must be non-empty strings")
+            if spec.stamp_src not in ("header", "receive") or spec.resample_policy not in ("hold", "asof", "drop"):
+                raise ValueError("invalid stream timestamp/alignment policy")
+            feature_from_spec(spec, False)
+        actual = contract_fingerprint(contract)
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"invalid contract snapshot: {exc}") from exc
+    recorded = dataset_meta.get("contract_fingerprint")
+    if not isinstance(recorded, str) or not recorded:
+        raise ValueError("dataset requires contract_fingerprint")
+    if actual != recorded:
+        raise ValueError(f"recorded contract snapshot does not match its fingerprint: {recorded} != {actual}")
     return contract
+
+
+def _preflight_bags(bag_dirs: list[Path]) -> tuple[Contract, list[dict[str, Any]]]:
+    """Validate every selected episode and build conversion tables before creating output.
+
+    The existing fingerprint excludes rate. Comparing snapshots detects rate differences
+    across dataset roots, but cannot recover historical per-episode rate changes within
+    one dataset whose only snapshot has been overwritten.
+    """
+    from robot_config.contract_utils import contract_to_dict
+
+    if not bag_dirs:
+        raise ValueError("No bags selected")
+    selected_contract = None
+    selected_snapshot = None
+    episodes = []
+    for bag_dir in bag_dirs:
+        try:
+            dataset_meta = _dataset_metadata_for_bag(bag_dir)
+            contract = _contract_from_dataset_metadata(dataset_meta)
+            snapshot = contract_to_dict(contract)
+            if selected_snapshot is not None and snapshot != selected_snapshot:
+                raise ValueError("selected episodes have incompatible contract snapshots")
+            selected_contract, selected_snapshot = contract, snapshot
+            meta = _read_yaml(bag_dir / "metadata.yaml")
+            info = meta.get("rosbag2_bagfile_information")
+            if not isinstance(info, dict):
+                raise ValueError("episode requires rosbag2_bagfile_information")
+            custom = info.get("custom_data")
+            if not isinstance(custom, dict) or custom.get("ibrobot.contract_fingerprint") != contract_fingerprint(
+                contract
+            ):
+                raise ValueError("episode contract_fingerprint does not match dataset contract snapshot")
+            feature_names: dict[str, list[str]] = {}
+            for spec in iter_specs(contract):
+                if spec.is_action or spec.key == "observation.state":
+                    feature_names.setdefault(spec.key, []).extend(spec.names)
+            tables = {}
+            if feature_names:
+                fingerprint, conversion = _lerobot_metadata_entry(dataset_meta, info)
+                if not conversion:
+                    raise ValueError("episode requires conversion metadata")
+                if (
+                    "norm_mode" not in conversion
+                    or not isinstance(conversion["norm_mode"], str)
+                    or not conversion["norm_mode"].strip()
+                ):
+                    raise ValueError("conversion metadata requires explicit norm_mode")
+                mode = normalize_lerobot_norm_mode(conversion["norm_mode"])
+                if mode != "none" or "description" in conversion:
+                    validate_public_conversion_metadata(conversion)
+                    if conversion["conversion_fingerprint"] != fingerprint:
+                        raise ValueError("conversion fingerprint does not match metadata")
+                for key, names in feature_names.items():
+                    tables[key] = _build_feature_conversion_table(
+                        names, conversion, feature_kind="state" if key == "observation.state" else "action"
+                    )
+            episodes.append({"dataset_meta": dataset_meta, "info": info, "tables": tables})
+        except (KeyError, TypeError, ValueError, AttributeError, OSError, yaml.YAMLError) as exc:
+            raise ValueError(f"Preflight failed for {bag_dir}: {exc}") from exc
+    return selected_contract, episodes
 
 
 def export_bags_to_lerobot(
     bag_dirs: list[Path],
-    robot_config_path: Path | None = None,
     out_root: Path = Path("output"),
     repo_id: str = "rosbag_v30",
     use_videos: bool = True,
@@ -865,14 +809,12 @@ def export_bags_to_lerobot(
 ) -> None:
     """Convert bag directories into a LeRobot v3 dataset under `out_root`.
 
-    Uses robot_config.yaml as the Single Source of Truth for contract.
+    Requires dataset-embedded contract and per-episode conversion metadata.
 
     Parameters
     ----------
     bag_dirs : list[pathlib.Path]
         One or more bag directories (episodes) to convert.
-    robot_config_path : pathlib.Path
-        Path to robot_config.yaml. The contract section will be used.
     out_root : pathlib.Path
         Root directory where the LeRobot dataset will be created/updated.
     repo_id : str, default "rosbag_v30"
@@ -898,8 +840,7 @@ def export_bags_to_lerobot(
     RuntimeError
         If a bag contains no usable/decodable messages.
     """
-    contract = _resolve_contract(bag_dirs, robot_config_path)
-    fallback_conversion_config = _resolve_fallback_conversion_config(robot_config_path) if robot_config_path else {}
+    contract, preflight = _preflight_bags(bag_dirs)
     fps = int(contract.rate_hz)
     if fps <= 0:
         raise ValueError("Contract rate_hz must be > 0")
@@ -1025,17 +966,6 @@ def export_bags_to_lerobot(
     # Precompute zero pads + shapes for fast frame assembly.
     zero_pad_map = {k: make_zero_pad(ft) for k, ft in features.items()}
     write_keys = [k for k, ft in features.items() if ft["dtype"] in ("video", "image", "float32", "float64", "string")]
-    state_feature_names = [str(name) for name in features.get("observation.state", {}).get("names", [])]
-    action_feature_names = {
-        action_key: [str(name) for name in features[action_key].get("names", [])]
-        for action_key in action_specs_by_key
-        if action_key in features
-    }
-    conversion_table_cache: dict[
-        tuple[str, tuple[str, ...]],
-        list[tuple[float, float, float, float]],
-    ] = {}
-
     # Episodes
     converted_episodes = 0
     skipped_bags: list[tuple[Path, str]] = []
@@ -1051,14 +981,11 @@ def export_bags_to_lerobot(
         try:
             video_adapters = discover_video_adapters(bag_dir)
             video_sources.update({key: "Annex-B" for key in video_adapters})
-            meta = _read_yaml(bag_dir / "metadata.yaml")
-            dataset_meta = _dataset_metadata_for_bag(bag_dir)
-            info = meta.get("rosbag2_bagfile_information") or {}
+            episode = preflight[epi_idx]
+            dataset_meta = episode["dataset_meta"]
+            info = episode["info"]
             storage = info.get("storage_identifier") or "mcap"
             meta_dur_ns = int((info.get("duration") or {}).get("nanoseconds") or 0)
-            conversion_fp, conversion_meta = _lerobot_metadata_entry(dataset_meta, info)
-            if isinstance(dataset_meta.get("lerobot"), dict):
-                fallback_conversion_config["new_format"] = True
 
             # Operator prompt (if present). Accept either old/new keys gracefully.
             prompt = ""
@@ -1147,10 +1074,10 @@ def export_bags_to_lerobot(
 
         if decoded_msgs == 0:
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
-        if video_adapters:
+        if video_adapters and (state_specs or action_specs_by_key):
             has_action = any(st.spec.is_action and st.ts for st in streams.values())
             has_state = any(st.spec.key == "observation.state" and st.ts for st in streams.values())
-            if not has_action or not has_state:
+            if (action_specs_by_key and not has_action) or (state_specs and not has_state):
                 raise RuntimeError(
                     f"action/state data required for LeRobot dataset: {bag_dir} "
                     f"(action={'present' if has_action else 'missing'}, state={'present' if has_state else 'missing'})"
@@ -1198,37 +1125,8 @@ def export_bags_to_lerobot(
             pol = st.spec.resample_policy
             resampled[key] = resample(pol, ts, st.val, ticks_ns, step_ns, st.spec.asof_tol_ms)
 
-        state_conversion_table: list[tuple[float, float, float, float]] = []
-        if state_feature_names:
-            cache_key = (conversion_fp or "robot_config", tuple(state_feature_names))
-            if cache_key not in conversion_table_cache:
-                try:
-                    conversion_table_cache[cache_key] = _build_feature_conversion_table(
-                        feature_names=state_feature_names,
-                        conversion_meta=conversion_meta,
-                        fallback_config=fallback_conversion_config,
-                        feature_kind="state",
-                    )
-                except (FileNotFoundError, KeyError, ValueError) as exc:
-                    print(f"[WARN] Failed to build observation.state conversion table for {bag_dir}: {exc}")
-                    conversion_table_cache[cache_key] = []
-            state_conversion_table = conversion_table_cache[cache_key]
-
-        action_conversion_tables: dict[str, list[tuple[float, float, float, float]]] = {}
-        for action_key, feature_names in action_feature_names.items():
-            cache_key = (conversion_fp or "robot_config", tuple(feature_names))
-            if cache_key not in conversion_table_cache:
-                try:
-                    conversion_table_cache[cache_key] = _build_feature_conversion_table(
-                        feature_names=feature_names,
-                        conversion_meta=conversion_meta,
-                        fallback_config=fallback_conversion_config,
-                        feature_kind="action",
-                    )
-                except (FileNotFoundError, KeyError, ValueError) as exc:
-                    print(f"[WARN] Failed to build {action_key} conversion table for {bag_dir}: {exc}")
-                    conversion_table_cache[cache_key] = []
-            action_conversion_tables[action_key] = conversion_table_cache[cache_key]
+        state_conversion_table = episode["tables"].get("observation.state", [])
+        action_conversion_tables = episode["tables"]
 
         # Write frames
         try:
@@ -1487,7 +1385,7 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example:
-    python bag_to_lerobot.py --bag /path/to/bag --robot-config /path/to/robot_config.yaml --out /path/to/out
+    python bag_to_lerobot.py --bag /path/to/bag --out /path/to/out
 """,
     )
     g = ap.add_mutually_exclusive_group(required=True)
@@ -1498,13 +1396,6 @@ Example:
         help="Directory containing multiple bag subdirectories (auto-discovers all valid bags)",
     )
 
-    ap.add_argument(
-        "--robot-config",
-        help=(
-            "Path to robot_config.yaml. Only needed for datasets recorded before the contract "
-            "snapshot was embedded; newer datasets carry their own contract"
-        ),
-    )
     ap.add_argument("--out", required=True, help="Output dataset root")
     ap.add_argument("--repo-id", default="rosbag_v30", help="repo_id metadata")
     ap.add_argument("--no-videos", action="store_true", help="Store images instead of videos")
@@ -1557,7 +1448,6 @@ def main() -> None:
 
     export_bags_to_lerobot(
         bag_dirs=bag_dirs,
-        robot_config_path=Path(args.robot_config) if args.robot_config else None,
         out_root=Path(args.out),
         repo_id=args.repo_id,
         use_videos=not args.no_videos,

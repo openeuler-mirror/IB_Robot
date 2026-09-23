@@ -426,7 +426,6 @@ After recording, convert the episodic dataset to LeRobot format:
 ```bash
 ros2 run dataset_tools bag_to_lerobot \
     --bags-dir ~/rosbag/episodes/so101_single_arm \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
     --out /path/to/output_dataset
 ```
 

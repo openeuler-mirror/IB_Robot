@@ -51,12 +51,9 @@ LeRobot 单位转换的标定来源同样来自 `robot_config`。单臂旧配置
 便于和 `joint_names`、数据集 metadata 及策略特征对齐。`calib_file` 不能与
 namespace 后缀标定来源混用。
 
-Episode 录制会在 dataset metadata 中保存 LeRobot conversion snapshot。
-`bag_to_lerobot` 转换旧 dataset 时按以下顺序恢复转换表：已有 dataset metadata
-中的 calibration snapshot、从 `robot_config` 解析出的 named calibration sources、
-最后才是 legacy `calibration_file` pathsep 字符串。`policy_eval` 的静态
-calibration 检查也复用同一解析规则，因此重复 namespace 或混用 legacy/new schema
-会在评估报告中暴露为配置问题。
+Episode 录制会在 dataset metadata 中保存契约与 LeRobot conversion snapshot。
+`bag_to_lerobot` 仅支持包含这些嵌入元数据的新数据集，不再读取外部机器人配置或标定文件。
+`policy_eval` 的静态 calibration 检查仍使用机器人配置中的标定来源解析规则。
 
 ## 工具
 
@@ -248,13 +245,43 @@ legacy 行为；scheduled restart endpoint 统一使用 `restart_session_service
 ```bash
 ros2 run dataset_tools bag_to_lerobot \
     --bags-dir ~/rosbag/episodes/so101_single_arm \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
     --out /path/to/output_dataset
 ```
 
 ### 2. bag_to_lerobot - Bag 转 LeRobot 数据集
 
 将 ROS 2 episodic dataset 根目录转换为 LeRobot v3 数据集格式。
+
+**元数据要求 / Metadata requirements**
+
+转换器在创建任何输出前预检所有选中的 episode。每个 episode 必须位于
+`<dataset_root>/episodes/<episode>`，并具有有效的 `dataset.yaml` 嵌入契约与采样率。
+每个 bag 的 `ibrobot.contract_fingerprint` 必须与重建契约及 dataset fingerprint 一致。
+跨 dataset 选择的契约快照必须兼容（含采样率）；不支持在一个输出中混合不同快照。
+现有 fingerprint 算法不包含采样率，因此无法检测同一 dataset 中曾发生、但唯一快照已被覆盖的
+历史 episode 采样率变更。
+
+state/action 必须通过各自 bag 的 `ibrobot.lerobot_conversion_fingerprint` 查到 conversion metadata；
+不使用 dataset 默认 fingerprint。归一化要求完整、通过校验的 public conversion metadata，
+缺失信息会直接报错，不会静默写入原始弧度。显式 `norm_mode: none` 保留原始值，无需标定；
+纯图像契约无需 conversion metadata。`--robot-config` 已移除，传入该参数会报错。
+缺失快照的旧数据集不受支持，也没有外部配置/标定文件回退路径。
+
+All selected episodes are preflighted before output creation. Each bag must live under
+`<dataset_root>/episodes/<episode>` with a valid embedded contract and explicit rate in
+`dataset.yaml`. Its `ibrobot.contract_fingerprint` must match both the reconstructed contract
+and dataset fingerprint. Selected snapshots must be compatible, including rate; mixed
+snapshots are rejected. The unchanged fingerprint algorithm excludes rate, so historical
+per-episode rate changes cannot be detected when a dataset's sole snapshot was overwritten.
+
+State/action features require the episode's own `ibrobot.lerobot_conversion_fingerprint`
+to resolve conversion metadata; the dataset default is never substituted. Normalization
+requires complete validated public conversion metadata and fails rather than silently writing
+raw radians. Explicit `norm_mode: none` preserves native values without calibration, and
+image-only contracts need no conversion metadata. `--robot-config` has been removed and
+is rejected. Legacy recordings without snapshots and external config/calibration fallback
+are no longer supported.
+
 
 #### RTP 编码视频录制
 
@@ -304,7 +331,6 @@ edge 仍以 `record:=true record_mode:=episodic` 启动机器人，但 RTP 配�
 ```bash
 ros2 run dataset_tools bag_to_lerobot \
     --bags-dir ~/rosbag/episodes/so101_single_arm \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
     --out /path/to/output_dataset
 ```
 
@@ -313,7 +339,6 @@ ros2 run dataset_tools bag_to_lerobot \
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--bags-dir` | dataset 根目录或 episodes 目录，自动发现多个 episode bag | 必需 |
-| `--robot-config` | robot_config.yaml 路径 | 必需 |
 | `--out` | 输出数据集目录 | 必需 |
 | `--repo-id` | 数据集 repo_id | `rosbag_v30` |
 | `--no-videos` | 存储 PNG 图像而非视频 | `false` |
