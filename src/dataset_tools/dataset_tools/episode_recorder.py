@@ -869,22 +869,6 @@ class EpisodeRecorderServer(Node):
             self._episodes_dir.mkdir(parents=True, exist_ok=True)
         return sorted(p for p in self._episodes_dir.iterdir() if p.is_dir() and p.name.startswith(EPISODE_DIR_PREFIX))
 
-    def _robot_config_digest(self) -> str:
-        """Digest identifying the bound runtime description, or an empty string."""
-        meta = self._lerobot_conversion_meta or {}
-        return str(meta.get("description_digest", "") or "")
-
-    def _robot_config_provenance(self) -> dict[str, str]:
-        """Path-free provenance for the configuration this dataset was recorded with."""
-        provenance = {
-            "config_name": self._robot_config_path.stem,
-            "contract_name": str(getattr(self._contract, "name", "")),
-        }
-        digest = self._robot_config_digest()
-        if digest:
-            provenance["description_digest"] = digest
-        return provenance
-
     def _write_dataset_metadata(self, total_episodes: int | None = None) -> None:
         """Create or refresh dataset metadata stored at dataset root."""
         meta = self._read_dataset_metadata()
@@ -895,10 +879,6 @@ class EpisodeRecorderServer(Node):
         meta.setdefault("layout_version", DATASET_LAYOUT_VERSION)
         meta.setdefault("name", self._dataset_name)
         meta.setdefault("recording_type", "episodic")
-        # Provenance without a filesystem path: the recording configuration is
-        # reproduced from the embedded contract and conversion snapshots, so a
-        # dataset stays convertible after it is copied to another machine.
-        meta.setdefault("robot_config_source", self._robot_config_provenance())
         meta.setdefault("robot_type", getattr(self._contract, "robot_type", ""))
         meta.setdefault("contract_name", getattr(self._contract, "name", ""))
         meta.setdefault(
@@ -1190,10 +1170,6 @@ class EpisodeRecorderServer(Node):
                 custom["ibrobot.dataset_name"] = self._dataset_name
                 custom["ibrobot.episode_index"] = str(episode_index)
                 custom["ibrobot.episode_dir"] = bag_dir.name
-                # A recorded absolute path breaks as soon as the dataset moves
-                # or the temporary snapshot is reclaimed; the digest identifies
-                # the same configuration without depending on the filesystem.
-                custom["ibrobot.robot_config_digest"] = self._robot_config_digest()
                 custom["ibrobot.contract_name"] = str(getattr(self._contract, "name", ""))
                 if self._control_mode:
                     custom["ibrobot.control_mode"] = self._control_mode
