@@ -1106,3 +1106,97 @@ def test_malformed_episode_yaml_reports_bag_context(tmp_path):
     (bag / "metadata.yaml").write_text("broken: [")
     with pytest.raises(ValueError, match=str(bag)):
         _preflight_bags([bag])
+
+
+@pytest.mark.parametrize(
+    ("mode", "integrity_mode"),
+    [("omitted", None), ("dds", None), ("rtp", None), ("rtp", "strict"), ("rtp", "tolerant")],
+)
+def test_transport_snapshot_yaml_round_trip(tmp_path, mode, integrity_mode):
+    """Recorded transport survives YAML and the converter's snapshot loader."""
+    from dataclasses import asdict
+
+    from robot_config.contract_utils import contract_fingerprint, contract_from_dict, contract_to_dict
+    from robot_config.observation_transport import effective_observation_transport
+
+    document = _snapshot_contract_document()
+    observation = {
+        "key": "observation.images.top",
+        "topic": "/camera/top/image_raw",
+        "type": "sensor_msgs/msg/Image",
+        "image": {"resize": [240, 320], "encoding": "rgb8"},
+    }
+    transport = {
+        "mode": "rtp",
+        "stream_id": "top-recorded",
+        "endpoint": {"host": "192.0.2.17", "port": 5012},
+        "h264": {"profile": "main", "bitrate_bps": 2_500_000, "gop_frames": 12},
+        "media": {
+            "width": 640,
+            "height": 480,
+            "frame_rate_hz": 25,
+            "pixel_format": "nv12",
+            "color_space": "bt709",
+            "color_range": "full",
+        },
+        "buffer": {
+            "sender_queue_frames": 3,
+            "receiver_queue_packets": 512,
+            "decoded_frame_capacity": 48,
+            "retention_ms": 1600,
+        },
+        "readiness": {
+            "keyframe_timeout_ms": 4500,
+            "timestamp_mapping_max_age_ms": 1500,
+            "max_inter_camera_skew_ms": 60,
+            "state_alignment_window_ms": 2500,
+            "state_alignment_tolerance_ms": 35,
+        },
+    }
+    if mode == "dds":
+        observation["transport"] = {"mode": "dds"}
+    elif mode == "rtp":
+        if integrity_mode is not None:
+            transport["recording"] = {"integrity_mode": integrity_mode}
+        observation["transport"] = transport
+    document["observations"] = [observation]
+    original = contract_from_dict(document)
+    snapshot = contract_to_dict(original)
+    path = tmp_path / "dataset.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "contract": snapshot,
+                "contract_fingerprint": contract_fingerprint(original),
+            }
+        ),
+        encoding="utf-8",
+    )
+    recorded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    restored = _contract_from_dataset_metadata(recorded)
+
+    before = original.observations[0].transport
+    after = restored.observations[0].transport
+    assert after == before
+    assert effective_observation_transport(after) == effective_observation_transport(before)
+    assert restored.observations[0].image == observation["image"]
+    assert contract_fingerprint(restored) == contract_fingerprint(original)
+    serialized = recorded["contract"]["observations"][0]
+    if mode == "omitted":
+        assert "transport" not in serialized
+        assert after is None
+        assert effective_observation_transport(after).mode == "dds"
+    elif mode == "dds":
+        assert serialized["transport"] == {"mode": "dds"}
+        assert after.mode == "dds"
+    else:
+        actual = asdict(after)
+        for field in ("mode", "stream_id", "endpoint", "h264", "media", "buffer", "readiness"):
+            assert actual[field] == transport[field], field
+            assert serialized["transport"][field] == transport[field], field
+        if integrity_mode is None:
+            assert "recording" not in serialized["transport"]
+            assert after.recording is None
+        else:
+            assert serialized["transport"]["recording"] == {"integrity_mode": integrity_mode}
+            assert after.recording.integrity_mode == integrity_mode

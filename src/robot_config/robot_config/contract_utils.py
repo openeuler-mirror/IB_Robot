@@ -706,7 +706,10 @@ def contract_to_dict(contract) -> dict[str, Any]:
         entry = {key: value for key, value in obs.items() if value is not None or key in ("selector", "image")}
         transport = obs.get("transport")
         if transport is not None:
-            entry["transport"] = observation_transport_to_dict(parse_observation_transport(transport))
+            # asdict expands DDS into all dataclass fields, including RTP defaults.
+            # Restore its canonical declaration before parsing the transport schema.
+            declaration = {"mode": "dds"} if transport.get("mode", "dds") == "dds" else transport
+            entry["transport"] = observation_transport_to_dict(parse_observation_transport(declaration))
         observations.append(entry)
 
     actions = []
