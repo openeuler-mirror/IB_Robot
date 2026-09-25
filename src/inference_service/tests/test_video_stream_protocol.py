@@ -52,6 +52,7 @@ def test_video_descriptor_and_status_ros_messages_round_trip():
         lifecycle_state="ready",
         ready=True,
         selected_backend="software",
+        status_origin="sender",
         timestamp_mapping_valid=True,
         mapping_rtp_timestamp=90_000,
         mapping_capture_timestamp_ns=1_000_000_000,

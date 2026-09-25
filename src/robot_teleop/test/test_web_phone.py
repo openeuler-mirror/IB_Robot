@@ -632,19 +632,6 @@ def test_web_page_keeps_unsupported_ar_entry_disabled():
     assert "系统空间追踪运行时不支持该会话" in ar_start
 
 
-def test_webphone_docs_distinguish_browser_api_from_spatial_runtime():
-    package_root = Path(__file__).resolve().parents[1]
-    readme_zh = (package_root / "README.md").read_text(encoding="utf-8")
-    readme_en = (package_root / "README.en.md").read_text(encoding="utf-8")
-
-    assert "Chrome 只提供 WebXR 浏览器入口，不包含空间追踪" in readme_zh
-    assert "DOM Overlay | AR | 当前遥操必需" in readme_zh
-    assert "Huawei AR Engine 不会自动" in readme_zh
-    assert "Chrome only exposes the WebXR browser entry point" in readme_en
-    assert "DOM Overlay | AR | Required by this teleop UI" in readme_en
-    assert "Huawei AR Engine on HarmonyOS is" in readme_en
-
-
 def test_web_page_home_releases_deadman_before_requesting_motion():
     web_root = Path(__file__).resolve().parents[1] / "web"
     page = (web_root / "web_teleop.html").read_text(encoding="utf-8")

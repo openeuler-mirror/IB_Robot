@@ -63,6 +63,10 @@ def test_legacy_result_send_is_paired_once_for_success_and_failure(monkeypatch, 
         _sample_observations=lambda *a, **kw: {},
         _to_policy_inputs=lambda inputs: inputs,
         _require_manager=lambda: SimpleNamespace(infer=infer),
+        # Monolithic execution must not consult the distributed session
+        # (pipeline_policy_node._ensure_distributed_session_ready returns
+        # before _require_edge_session); fail loudly if that ever changes.
+        _require_edge_session=lambda: (_ for _ in ()).throw(AssertionError("session must not be touched")),
         _commit_action=commit,
         _fail_distributed_after_deadline=lambda *args: None,
         get_logger=lambda: logger,
@@ -72,6 +76,10 @@ def test_legacy_result_send_is_paired_once_for_success_and_failure(monkeypatch, 
         "_goal_cancel_requested",
         "_goal_cancel_confirmed",
         "_finish_canceled_goal",
+        # _ensure_distributed_session_ready joined _execute_inference_request
+        # in 92e9f7118; bind it like the other production methods the fixture
+        # exercises. Monolithic mode returns before touching the session stub.
+        "_ensure_distributed_session_ready",
         "_execute_inference_request",
     ):
         setattr(node, name, MethodType(getattr(PipelinePolicyNode, name), node))

@@ -62,6 +62,9 @@ class DeviceVideoStreamManager:
             streams=configs,
             codec_registry=codec_registry or create_default_video_codec_registry(),
             sender_factory=sender_factory,
+            # create_frame_ingress defaults to an older wire version. The compute
+            # side rejects any descriptor whose protocol_version is not this
+            # constant, so the device must advertise it explicitly.
             protocol_version=PROTOCOL_VERSION,
         )
         self._diagnostic_started_monotonic_ns = time.monotonic_ns()

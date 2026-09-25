@@ -718,6 +718,9 @@ def test_real_pipeline_global_dispatcher_reaches_command_topic(
         node._action_specs = [spec for spec in iter_specs(contract) if spec.is_action]
         node._safe_stop_plan = build_safe_stop_plan(action_specs=node._action_specs, joint_order=["1", "2"])
         node._joint_max_age_ns = 1_000_000_000
+        # The real _load_contract_and_plan publishes the loaded robot config
+        # for the runtime-admission provider check; no provider in this test.
+        node._robot_config = SimpleNamespace(runtime={})
 
     monkeypatch.setattr(pipeline_policy_module, "load_inference_manifest", lambda *_args, **_kwargs: manifest)
     manager_options = {}

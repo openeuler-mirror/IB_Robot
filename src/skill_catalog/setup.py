@@ -20,6 +20,7 @@ setup(
         for root, _dirs, files in os.walk("config")
     ],
     install_requires=["setuptools", "pyyaml", "jsonschema"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",

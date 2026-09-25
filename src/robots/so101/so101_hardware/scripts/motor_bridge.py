@@ -22,7 +22,7 @@ from sensor_msgs.msg import JointState
 from ibrobot_msgs.msg import JointCurrent
 
 try:
-    import deepdiff  # type: ignore  # noqa: F401
+    import deepdiff  # type: ignore  # noqa: F401  # probe: presence decides the stub below
 except ImportError:  # create stub
     import types
 
@@ -35,7 +35,7 @@ except ImportError:  # create stub
     sys.modules["deepdiff"] = deepdiff_stub
 
 try:
-    import tqdm  # type: ignore  # noqa: F401
+    import tqdm  # type: ignore  # noqa: F401  # probe: presence decides the stub below
 except ImportError:  # create stub
     import types
 
@@ -80,6 +80,9 @@ class MotorBridge(Node):
         port = self.get_parameter("port").get_parameter_value().string_value
         if not port:
             port = PORT_DEFAULT
+        # Kept on the instance: the calibration error paths below quote the port
+        # back to the operator in the command they need to run.
+        self.port = port
 
         # Build motor objects
         motors = {name: Motor(cfg["id"], cfg["model"], cfg["mode"]) for name, cfg in JOINTS.items()}
@@ -237,6 +240,8 @@ class MotorBridge(Node):
     def _command_cb(self, msg: JointState):
         """Store desired joint positions (converting rad -> normalized)."""
         try:
+            # strict=False: a malformed JointState may carry fewer positions
+            # than names; dropping the extras is preferable to raising here.
             for name, pos_rad in zip(msg.name, msg.position, strict=False):
                 if name in JOINTS:
                     # 修复: 将 ros2_control 的相对指令 (pos_rad) 转换为 绝对弧度目标

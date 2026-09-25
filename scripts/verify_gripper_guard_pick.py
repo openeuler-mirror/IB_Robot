@@ -41,7 +41,7 @@ the ``gripper_guard`` node is running::
 
 Then in another terminal::
 
-    python3 scripts/test_gripper_guard_pick.py
+    python3 scripts/verify_gripper_guard_pick.py
 
 Place a target object between the gripper fingers at the grasp pose so the
 close step physically cannot reach 0.0 (this is the stall condition).

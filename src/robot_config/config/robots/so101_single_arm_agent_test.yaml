@@ -39,3 +39,9 @@ robot:
     enabled: false
   voice_tts:
     enabled: false
+
+  # The agent test profile drives no perception; drop the base contract's
+  # interface-bound observations the way the other agent overlays do, so a
+  # deferred offline load exposes no camera/joint consumers.
+  contract:
+    observations: []

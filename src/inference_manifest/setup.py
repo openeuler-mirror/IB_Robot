@@ -12,6 +12,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
     ],
     install_requires=["pydantic>=2,<3", "jsonschema>=4,<5"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",

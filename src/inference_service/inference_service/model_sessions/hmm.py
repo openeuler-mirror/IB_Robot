@@ -241,6 +241,8 @@ class HMMModelSession(ModelSession):
         role: str,
         inputs: Mapping[str, object],
         outputs: Mapping[str, object],
+        *,
+        isolated: bool = False,
     ) -> None:
         context = self._require_context()
         deployment = context.deployment
@@ -250,6 +252,11 @@ class HMMModelSession(ModelSession):
             bindings = deployment.bindings[role]
         except KeyError as exc:
             raise BackendInferenceError(f"unknown execution role {role!r}", code="unknown_execution_role") from exc
+        # Isolated role execution never reaches here on the HMM backend (the
+        # base class raises BackendCapabilityError first); accept the flag to
+        # match the ModelSession._validate_role_values signature that
+        # execute_role always passes.
+        del isolated
         linked_inputs = self._linked_input_semantics(deployment, role)
         linked_outputs = self._linked_output_semantics(deployment, role)
         host_inputs = tuple(binding for binding in bindings.inputs if binding.semantic not in linked_inputs)

@@ -11,6 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml", "README.md"]),
     ],
     install_requires=["setuptools", "aero-open-sdk==0.1.0.dev1"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="IB-Robot Team",
     maintainer_email="maintainer@example.com",

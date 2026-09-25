@@ -1,11 +1,14 @@
 #include "lekiwi_hardware/lekiwi_system_hardware.hpp"
-#include "lekiwi_hardware/lekiwi_conversions.hpp"
-#include "hardware_interface/types/hardware_interface_type_values.hpp"
-#include "rclcpp/rclcpp.hpp"
-#include "SMS_STS.h"
-#include <fstream>
+
 #include <cmath>
+#include <fstream>
+
 #include <nlohmann/json.hpp>
+
+#include "SMS_STS.h"
+#include "hardware_interface/types/hardware_interface_type_values.hpp"
+#include "lekiwi_hardware/lekiwi_conversions.hpp"
+#include "rclcpp/rclcpp.hpp"
 
 namespace lekiwi_hardware
 {
@@ -13,8 +16,11 @@ namespace lekiwi_hardware
 hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
   const hardware_interface::HardwareInfo & info)
 {
-  if (hardware_interface::SystemInterface::on_init(info) != hardware_interface::CallbackReturn::SUCCESS)
+  if (hardware_interface::SystemInterface::on_init(info) !=
+    hardware_interface::CallbackReturn::SUCCESS)
+  {
     return hardware_interface::CallbackReturn::ERROR;
+  }
 
   const size_t n = info_.joints.size();
   num_joints_ = n;
@@ -56,7 +62,8 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
     }
   }
 
-  RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"),
+  RCLCPP_INFO(
+    rclcpp::get_logger("LeKiwiSystemHardware"),
     "Initialized: %zu arm joints + %zu base joints on port %s",
     arm_motor_ids_.size(), base_motor_ids_.size(), port_.c_str());
 
@@ -70,13 +77,13 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_configure(
 
   const bool base_only = base_only_mode_;
   auto set_default_limits = [this]() {
-    for (size_t i = 0; i < motor_ids_.size(); i++) {
-      u8 id = motor_ids_[i];
-      homing_offsets_[id] = 0;
-      range_mins_[id] = 0;
-      range_maxes_[id] = 4095;
-    }
-  };
+      for (size_t i = 0; i < motor_ids_.size(); i++) {
+        u8 id = motor_ids_[i];
+        homing_offsets_[id] = 0;
+        range_mins_[id] = 0;
+        range_maxes_[id] = 4095;
+      }
+    };
 
   if (base_only) {
     set_default_limits();
@@ -89,7 +96,8 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_configure(
 
   std::ifstream f(calib_file_);
   if (!f.is_open()) {
-    RCLCPP_WARN(rclcpp::get_logger("LeKiwiSystemHardware"),
+    RCLCPP_WARN(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
       "Calibration file not found: %s", calib_file_.c_str());
     return hardware_interface::CallbackReturn::ERROR;
   }
@@ -117,7 +125,8 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_configure(
       continue;
     }
     if (calib_by_id.find(id) == calib_by_id.end()) {
-      RCLCPP_ERROR(rclcpp::get_logger("LeKiwiSystemHardware"),
+      RCLCPP_ERROR(
+        rclcpp::get_logger("LeKiwiSystemHardware"),
         "Calibration entry not found for arm motor %d", id);
       return hardware_interface::CallbackReturn::ERROR;
     }
@@ -165,13 +174,14 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Activating...");
 
   if (!sms_sts_.begin(1000000, port_.c_str())) {
-    RCLCPP_ERROR(rclcpp::get_logger("LeKiwiSystemHardware"),
+    RCLCPP_ERROR(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
       "Failed to connect to motors on port %s", port_.c_str());
     return hardware_interface::CallbackReturn::ERROR;
   }
 
   // Give motors time to initialize after serial connection
-  usleep(500000); // 500ms delay
+  usleep(500000);  // 500ms delay
 
   // Ping each motor
   for (size_t i = 0; i < motor_ids_.size(); i++) {
@@ -186,7 +196,8 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
       usleep(10000);
     }
     if (!found) {
-      RCLCPP_ERROR(rclcpp::get_logger("LeKiwiSystemHardware"),
+      RCLCPP_ERROR(
+        rclcpp::get_logger("LeKiwiSystemHardware"),
         "Motor ID %d is NOT responding!", id);
       return hardware_interface::CallbackReturn::FAILURE;
     }
@@ -239,7 +250,10 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
   sms_sts_.syncReadBegin(motor_ids_.size(), 2, 10);
 
   // Initial read for arm positions
-  if (sms_sts_.syncReadPacketTx(motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_POSITION_L, 2) > 0) {
+  if (sms_sts_.syncReadPacketTx(
+      motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_POSITION_L,
+      2) > 0)
+  {
     for (size_t i = 0; i < motor_ids_.size(); i++) {
       u8 data[2];
       if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
@@ -253,7 +267,8 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
     }
   }
 
-  RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"),
+  RCLCPP_INFO(
+    rclcpp::get_logger("LeKiwiSystemHardware"),
     "Activated! %zu arm + %zu base motors running.",
     arm_motor_ids_.size(), base_motor_ids_.size());
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -291,7 +306,8 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
   int read_len = sms_sts_.syncReadPacketTx(
     motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_POSITION_L, 2);
   if (read_len <= 0) {
-    RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+    RCLCPP_ERROR_THROTTLE(
+      rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
       "SyncRead PacketTx FAILED");
     return hardware_interface::return_type::ERROR;
   }
@@ -300,7 +316,8 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
   for (size_t i = 0; i < motor_ids_.size(); i++) {
     u8 data[2];
     if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) != 2) {
-      RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+      RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
         "SyncRead position response missing for motor ID %d", motor_ids_[i]);
       return hardware_interface::return_type::ERROR;
     }
@@ -319,7 +336,8 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
   read_len = sms_sts_.syncReadPacketTx(
     motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_SPEED_L, 2);
   if (read_len <= 0) {
-    RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+    RCLCPP_ERROR_THROTTLE(
+      rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
       "SyncRead speed PacketTx FAILED");
     return hardware_interface::return_type::ERROR;
   }
@@ -328,7 +346,8 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
   for (size_t i = 0; i < motor_ids_.size(); i++) {
     u8 data[2];
     if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) != 2) {
-      RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+      RCLCPP_ERROR_THROTTLE(
+        rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
         "SyncRead speed response missing for motor ID %d", motor_ids_[i]);
       return hardware_interface::return_type::ERROR;
     }

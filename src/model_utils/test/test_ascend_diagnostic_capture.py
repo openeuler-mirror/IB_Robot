@@ -11,6 +11,12 @@ from inference_service.model_sessions import AscendOmModelSession
 def _capture_session(captured):
     session = AscendOmModelSession(
         0,
+        # The session now requires the ACL runtime to be injected rather than
+        # discovered. This test exercises diagnostic capture only and never
+        # loads a model, so a placeholder satisfies the constructor without
+        # pulling in a real Ascend runtime - the same stand-in the
+        # StatefulAscendOmModelSession tests use.
+        runtime_manager=object(),
         diagnostic_capture=lambda name, value: captured.setdefault(name, np.asarray(value).copy()),
     )
     bindings = SimpleNamespace(

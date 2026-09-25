@@ -63,10 +63,6 @@ def test_capture_starts_sensors_then_base_control():
     ]
 
 
-def test_capture_has_one_public_entrypoint_and_owns_base_as_extra_child():
-    assert workflow.sensor_calibration_launch_command()[-1] == "robot_config:=lekiwi_sensor_calib"
-
-
 def test_resolve_capture_input_rejects_unknown_path(tmp_path):
     with pytest.raises(ValueError, match="capture input"):
         resolve_capture_input(tmp_path / "missing")

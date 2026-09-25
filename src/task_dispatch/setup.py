@@ -16,7 +16,7 @@ setup(
     maintainer_email="roboguru.92@gmail.com",
     description="Task-level execution framework for IB-Robot",
     license="Apache-2.0",
-    tests_require=["pytest"],
+    extras_require={"test": ["pytest"]},
     entry_points={
         "console_scripts": [
             "task_executor_node = task_dispatch.task_executor_node:main",

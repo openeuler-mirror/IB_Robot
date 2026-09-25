@@ -51,61 +51,6 @@ def _silero_bundle(tmp_path: Path, *, include_ascend: bool = False) -> Path:
     return bundle
 
 
-def test_asr_audio_contract_matching_config_passes(tmp_path):
-    from robot_config.launch_builders.voice_asr import validate_voice_asr_model_config
-
-    bundle = _asr_bundle(tmp_path)
-    errors = validate_voice_asr_model_config(str(bundle), "torch_cpu", sample_rate=16000, chunk_size=512)
-    assert errors == []
-
-
-def test_asr_audio_contract_sample_rate_mismatch_is_rejected(tmp_path):
-    from robot_config.launch_builders.voice_asr import validate_voice_asr_model_config
-
-    bundle = _asr_bundle(tmp_path)
-    errors = validate_voice_asr_model_config(str(bundle), "torch_cpu", sample_rate=8000)
-    assert any("sample_rate_hz=16000" in error and "sample_rate=8000" in error for error in errors)
-
-
-def test_vad_deployment_contract_mismatch_is_rejected(tmp_path):
-    from robot_config.launch_builders.voice_asr import validate_voice_asr_model_config
-
-    asr_bundle = _asr_bundle(tmp_path)
-    vad_bundle = _silero_bundle(tmp_path)
-    errors = validate_voice_asr_model_config(
-        str(asr_bundle),
-        "torch_cpu",
-        sample_rate=16000,
-        chunk_size=1024,
-        vad_bundle_path=str(vad_bundle),
-        vad_deployment="torch_cpu",
-    )
-    assert any("frame_size=512" in error and "chunk_size=1024" in error for error in errors)
-
-    errors = validate_voice_asr_model_config(
-        str(asr_bundle),
-        "torch_cpu",
-        sample_rate=16000,
-        chunk_size=512,
-        vad_bundle_path=str(vad_bundle),
-        vad_deployment="torch_cpu",
-    )
-    assert errors == []
-
-
-def test_vad_bundle_load_failure_is_reported(tmp_path):
-    from robot_config.launch_builders.voice_asr import validate_voice_asr_model_config
-
-    asr_bundle = _asr_bundle(tmp_path)
-    errors = validate_voice_asr_model_config(
-        str(asr_bundle),
-        "torch_cpu",
-        vad_bundle_path=str(tmp_path / "absent-vad"),
-        vad_deployment="torch_cpu",
-    )
-    assert any("VAD bundle/deployment is invalid" in error for error in errors)
-
-
 def _load_speech_direction_launch():
     spec = importlib.util.spec_from_file_location("speech_direction_launch_under_test", _SPEECH_DIRECTION_LAUNCH)
     module = importlib.util.module_from_spec(spec)

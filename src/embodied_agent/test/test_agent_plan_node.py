@@ -181,7 +181,9 @@ def plan_rig(request):
     from robot_config.loader import load_robot_config_dict
     from robot_skill_cli.catalog import compile_local_snapshot
 
-    config_name = getattr(request, "param", "so101_single_arm")
+    # Offline-complete variant of the provider-bound so101_single_arm config:
+    # catalog compilation needs real joint groups without a live description.
+    config_name = getattr(request, "param", "so101_single_arm_legacy")
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / f"{config_name}.yaml"
     snapshot = compile_local_snapshot(load_robot_config_dict(config_path), config_path)
     registry = ("epoch-test", 7, snapshot.registry_digest)
@@ -495,6 +497,9 @@ def test_validate_plan_unexpected_error_returns_stable_failure_and_service_survi
 
 
 @pytest.mark.parametrize("plan_rig", ["lekiwi_handeye_realsense_grasp_pc"], indirect=True)
+# Loads a robot config whose perception services reference a gitignored
+# model bundle; see the root conftest.py.
+@pytest.mark.model_bundle("grounded_sam2_swint_ogc")
 def test_marker_outputs_replay_uses_hermes_pick_contract_without_hardware(plan_rig):
     """Replay the saved marker planning evidence through the Agent plan boundary only."""
     repository_root = Path(__file__).parents[3]
@@ -558,6 +563,9 @@ def test_marker_outputs_replay_uses_hermes_pick_contract_without_hardware(plan_r
     assert child.dispatch_binding.expected_registry_digest == plan_rig.registry[2]
 
 
+# Replays a capture from a recorded run. outputs/ is gitignored, so the
+# file is absent on any machine that did not produce it.
+@pytest.mark.repo_asset("outputs/success_cloud_replay_20260806/current_phases_after_wait_future_fix.json")
 def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware(tmp_path):
     """Run the Hermes-bound CLI lifecycle through the real Gateway and a replay-only pick server."""
     allocated_domain = os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID", "")

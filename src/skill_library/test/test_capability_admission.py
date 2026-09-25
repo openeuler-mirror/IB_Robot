@@ -270,7 +270,7 @@ def test_external_primitive_uses_the_same_runtime_admission():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_constructor_explicit_opt_in_controls_endpoint_and_status_qos(monkeypatch, enabled):
+def test_constructor_explicit_opt_in_controls_runtime_wiring(monkeypatch, enabled):
     parameters = {"runtime_enabled": enabled, "runtime_name": "test_runtime"}
     subscriptions = []
     clients = []
@@ -308,9 +308,10 @@ def test_constructor_explicit_opt_in_controls_endpoint_and_status_qos(monkeypatc
     monkeypatch.setattr(skill_executor_node.Node, "create_client", lambda _node, *args, **_kwargs: clients.append(args))
     with pytest.raises(SetupCaptured):
         SkillExecutorNode()
-    assert parameters["move_configuration_service"] == (
-        "/motion/move_to_joint" if enabled else "/moveit_gateway/move_to_configuration"
-    )
+    # The moveit_gateway provider was removed together with the conditional
+    # default (38b35aac9); the precise-configuration service default is the
+    # runtime-neutral endpoint regardless of the explicit opt-in.
+    assert parameters["move_configuration_service"] == "/motion/move_to_joint"
     assert parameters["runtime_status_freshness_sec"] == 3.0
     if enabled:
         assert len(subscriptions) == 1

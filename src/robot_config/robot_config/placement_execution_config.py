@@ -29,7 +29,11 @@ def _unit_interval(value: Any) -> bool:
 
 def validate_placement_execution_config(value: Any) -> list[str]:
     """Return fail-closed schema/range errors for ``placement_execution``."""
-    if value is None:
+    # An absent block and an empty one mean the same thing: the robot does not
+    # configure placement execution. RobotConfig defaults this field to {}, not
+    # None, so treating only None as absent made every config that never opted in
+    # fail with ten missing-field errors.
+    if value is None or value == {}:
         return []
     prefix = "placement_execution"
     if not isinstance(value, dict):

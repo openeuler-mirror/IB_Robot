@@ -17,6 +17,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
     ],
     install_requires=["setuptools", "av", "pandas", "numpy", "scipy", "matplotlib", "pyarrow"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",

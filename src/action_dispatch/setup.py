@@ -11,6 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
     ],
     install_requires=["setuptools", "numpy"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="LeRobot-ROS2 Team",
     maintainer_email="dev@example.com",

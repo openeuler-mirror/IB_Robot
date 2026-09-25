@@ -72,7 +72,18 @@ class MockController:
 
     @staticmethod
     def _execute(handle):
+        # Must terminate on shutdown, not only on cancellation. rclpy runs an
+        # action execute_callback on a ThreadPoolExecutor worker, and
+        # concurrent.futures joins those workers from an atexit hook with no
+        # timeout. A goal left uncancelled by a test therefore keeps a worker
+        # spinning, and the pytest process hangs at interpreter exit AFTER
+        # reporting every test as passed - which reads as colcon never finishing
+        # the package rather than as a test failure.
+        deadline = time.monotonic() + 10.0
         while not handle.is_cancel_requested:
+            if not rclpy.ok() or time.monotonic() > deadline:
+                handle.abort()
+                return FollowPath.Result()
             time.sleep(0.01)
         handle.canceled()
         return FollowPath.Result()
@@ -239,3 +250,44 @@ def test_target_transform_uses_humble_pose_api(ros_context):
         assert y == pytest.approx(2.0)
     finally:
         follower.destroy_node()
+
+
+def test_mock_controller_goal_releases_its_worker_when_the_context_shuts_down(monkeypatch):
+    """The execute callback must not outlive the ROS context.
+
+    rclpy runs an action execute_callback on a ThreadPoolExecutor worker, and
+    concurrent.futures joins those workers from an atexit hook with no timeout.
+    A callback that only ends on cancellation pins a worker once its server is
+    destroyed, because an orphaned goal handle never reports one - and the
+    pytest process then hangs at interpreter exit with every test reported as
+    passed. Assert the loop honours shutdown so that cannot regress silently.
+
+    rclpy.ok is patched rather than actually shut down: the global context is
+    shared with the other ROS test module in this package.
+    """
+
+    class _OrphanedHandle:
+        """A goal handle whose server is gone: it never reports a cancellation."""
+
+        is_cancel_requested = False
+        aborted = False
+
+        def abort(self):
+            self.aborted = True
+
+        def canceled(self):  # pragma: no cover - reaching this means the premise broke
+            raise AssertionError("handle reported a cancellation it cannot receive")
+
+    handle = _OrphanedHandle()
+    context_ok = True
+    monkeypatch.setattr(rclpy, "ok", lambda *args, **kwargs: context_ok)
+
+    finished = threading.Event()
+    worker = threading.Thread(target=lambda: (MockController._execute(handle), finished.set()), daemon=True)
+    worker.start()
+
+    assert not finished.wait(timeout=0.2), "callback returned before shutdown"
+
+    context_ok = False
+    assert finished.wait(timeout=5.0), "callback ignored shutdown and would hang the process at exit"
+    assert handle.aborted

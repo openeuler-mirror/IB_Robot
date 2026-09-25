@@ -287,6 +287,12 @@ def test_runtime_snapshot_uses_configured_context_schema(monkeypatch, context_sc
     node._delegated_executor_descriptors = lambda: {}
     snapshot = type("Snapshot", (), {"enabled_skill_names": ()})()
 
+    # _compile_runtime_snapshot now cross-checks the compiled catalog against the
+    # runtime config, so the stand-in has to expose enabled_skill_names. This test
+    # is about the context handed to the compiler, so an empty catalog matches the
+    # node's imitate_human_motion setting left at its default of disabled.
+    snapshot = SimpleNamespace(enabled_skill_names=())
+
     def compile_catalog(_compiler, _source, *, profile_name, context):
         captured["profile_name"] = profile_name
         captured["context"] = context

@@ -34,7 +34,10 @@ GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
 @pytest.fixture(scope="module")
 def robot_config() -> dict:
     repo_root = Path(__file__).resolve().parents[3]
-    config_path = repo_root / "src" / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    # Offline-complete variant of the provider-bound so101_single_arm config:
+    # gesture templates need real joint groups, and the provider config gets
+    # them only from a live runtime description.
+    config_path = repo_root / "src" / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
     return load_robot_config_dict(config_path)
 
 
@@ -46,7 +49,7 @@ def embodied_config(robot_config: dict) -> dict:
 @pytest.fixture(scope="module")
 def skill_templates(robot_config: dict) -> dict:
     repo_root = Path(__file__).resolve().parents[3]
-    config_path = repo_root / "src" / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    config_path = repo_root / "src" / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
     snapshot = compile_local_snapshot(robot_config, config_path)
     profile_path = repo_root / "src" / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
     profile = yaml.safe_load(profile_path.read_text(encoding="utf-8"))

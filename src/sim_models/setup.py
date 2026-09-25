@@ -42,6 +42,7 @@ setup(
         ("share/sim_models/props/calib/aruco_a4/mujoco", glob("props/calib/aruco_a4/mujoco/*")),
     ],
     install_requires=["setuptools"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="IB Robot Contributors",
     maintainer_email="ib-robot@openeuler.org",

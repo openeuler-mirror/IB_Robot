@@ -88,6 +88,10 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     assert config["speech_direction"]["microphone"] == "respeaker"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     hybrid = load_robot_config_dict(CONFIG_PATH)
     grasp = load_robot_config_dict(CONFIG_PATH, nav_stage="grasp")
@@ -159,6 +163,10 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_grasp_stage_uses_matching_v1_manipulation_catalog():
     grasp = load_robot_config_dict(CONFIG_PATH, nav_stage="grasp")
 
@@ -167,6 +175,10 @@ def test_grasp_stage_uses_matching_v1_manipulation_catalog():
     assert robot_context_schema_version(grasp) == 1
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_hybrid_keeps_static_semantic_query_and_disables_online_services():
     raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
     assert raw["semantic_mapping"]["enabled"] is True
@@ -216,6 +228,10 @@ def test_hybrid_keeps_static_semantic_query_and_disables_online_services():
     }
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_lean_stages_keep_semantic_mapping_disabled():
     for stage in ("grasp", "mapping", "navigation"):
         config = load_robot_config_dict(CONFIG_PATH, nav_stage=stage)
@@ -238,6 +254,10 @@ def test_unified_profile_launches_wrist_and_front_realsense_drivers():
     assert {vars(node).get("_Node__node_name") for node in drivers} == {"wrist_camera", "front"}
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_hybrid_startup_mode_and_navigation_gate_must_match():
     hybrid = load_robot_config_dict(CONFIG_PATH)
 
@@ -250,6 +270,10 @@ def test_hybrid_startup_mode_and_navigation_gate_must_match():
     assert any("must match default_control_mode" in error for error in validate_motion_mode_config(navigation_startup))
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_unified_profile_applies_only_the_front_camera_artifact(monkeypatch, tmp_path):
     artifact = tmp_path / ".ros/ibrobot/calib/current/base_to_front_camera.yaml"
     artifact.parent.mkdir(parents=True, exist_ok=True)

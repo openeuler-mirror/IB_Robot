@@ -94,6 +94,16 @@ def test_forward_resets_stateful_pipeline_and_separates_raw_from_final_actions(m
     assert torch.equal(outputs[0], utils._raw_preds[0] + 10.0)
 
 
+def _runtime_dependencies():
+    """Stand in for the lazily built runtime dependencies.
+
+    ``loss_compare`` resolves PureInferenceEngine and runtime_dependencies in the
+    same deferred-import step, so a test that replaces only the engine leaves the
+    module global at None and prepare_policy fails reaching .registry_set.
+    """
+    return SimpleNamespace(registry_set="registry-set-sentinel", providers="providers-sentinel")
+
+
 def test_prepare_policy_forwards_exact_named_deployment(monkeypatch, tmp_path):
     created = []
 
@@ -103,6 +113,7 @@ def test_prepare_policy_forwards_exact_named_deployment(monkeypatch, tmp_path):
             created.append(kwargs)
 
     monkeypatch.setattr(loss_compare, "PureInferenceEngine", Engine)
+    monkeypatch.setattr(loss_compare, "runtime_dependencies", _runtime_dependencies())
     args = _args(tmp_path)
     args.deployment = "lab.ascend-310p3"
 
@@ -111,6 +122,8 @@ def test_prepare_policy_forwards_exact_named_deployment(monkeypatch, tmp_path):
     assert engine is not None
     assert created[0]["deployment"] == "lab.ascend-310p3"
     assert created[0]["runtime_options"] == {}
+    assert created[0]["registry_set"] == "registry-set-sentinel"
+    assert created[0]["providers"] == "providers-sentinel"
 
 
 def test_prepare_policy_forwards_transient_ascend_diagnostics(monkeypatch, tmp_path):
@@ -122,6 +135,7 @@ def test_prepare_policy_forwards_transient_ascend_diagnostics(monkeypatch, tmp_p
             created.append(kwargs)
 
     monkeypatch.setattr(loss_compare, "PureInferenceEngine", Engine)
+    monkeypatch.setattr(loss_compare, "runtime_dependencies", _runtime_dependencies())
     args = _args(tmp_path)
     schedule_path = tmp_path / "schedule.json"
     schedule_path.write_text(

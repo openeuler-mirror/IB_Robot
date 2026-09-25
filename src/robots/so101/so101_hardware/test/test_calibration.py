@@ -3,25 +3,31 @@
 import pytest
 
 
-def test_calibration_constants():
-    """Test that calibration constants are defined."""
+def test_calibration_constants_agree_with_each_other():
+    """The per-motor tables must stay the same length and agree on the full-turn motor.
+
+    This replaces a set of asserts that restated each constant's own literal
+    (MOTOR_COUNT == 6, DEFAULT_SERIAL_PORT == "/dev/ttyACM0", ...). Those could
+    only fail when someone deliberately changed the value, which is exactly when
+    the change was intended. The relations below are what nothing else guards:
+    adding a motor to one table and not the others is a real, silent break.
+    """
     from so101_hardware.calibration.constants import (
-        CURRENT_RAW_TO_AMPERE,
-        DEFAULT_CONTROL_RATE,
-        DEFAULT_LEADER_PUBLISH_RATE,
-        DEFAULT_SERIAL_PORT,
+        DEFAULT_MOTOR_CONFIGS,
+        FULL_TURN_MOTOR_ID,
         JOINT_NAMES,
         MOTOR_COUNT,
         MOTOR_IDS,
     )
 
-    assert MOTOR_COUNT == 6
-    assert len(MOTOR_IDS) == 6
-    assert len(JOINT_NAMES) == 6
-    assert DEFAULT_SERIAL_PORT == "/dev/ttyACM0"
-    assert DEFAULT_LEADER_PUBLISH_RATE == 50.0
-    assert DEFAULT_CONTROL_RATE == 100.0
-    assert pytest.approx(0.0065) == CURRENT_RAW_TO_AMPERE
+    assert len(MOTOR_IDS) == MOTOR_COUNT
+    assert len(JOINT_NAMES) == MOTOR_COUNT
+    assert len(DEFAULT_MOTOR_CONFIGS) == MOTOR_COUNT
+    assert {int(key) for key in DEFAULT_MOTOR_CONFIGS} == set(MOTOR_IDS)
+
+    # The full-turn motor is the one configured for the 0..100 range.
+    assert FULL_TURN_MOTOR_ID in MOTOR_IDS
+    assert DEFAULT_MOTOR_CONFIGS[str(FULL_TURN_MOTOR_ID)]["mode"] == "RANGE_0_100"
 
 
 def test_read_motor_currents_converts_raw_values():

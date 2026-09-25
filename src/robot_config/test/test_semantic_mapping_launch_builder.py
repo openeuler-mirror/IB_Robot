@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from robot_config.launch_builders.semantic_mapping import generate_semantic_mapping_nodes
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -62,6 +64,10 @@ def test_disabled_config_starts_no_mapping_node():
     assert generate_semantic_mapping_nodes(config) == []
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_hybrid_config_starts_query_only_mapping_node(monkeypatch, tmp_path):
     from robot_config.loader import load_robot_config_dict
 

@@ -25,6 +25,7 @@ setup(
         ),
     ],
     install_requires=["setuptools"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="IB-Robot Team",
     maintainer_email="maintainer@example.com",

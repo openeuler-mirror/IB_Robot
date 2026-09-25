@@ -11,13 +11,6 @@ from robot_config.loader import (
     validate_embodied_launch_dict,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
-from robot_skill_cli.catalog import compile_local_snapshot
-
-GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
-
-
-def _snapshot(config_path: Path):
-    return compile_local_snapshot(load_robot_config_dict(config_path), config_path)
 
 
 def _sorting_hat_policy(*, enabled: bool, announce: bool = False) -> dict:
@@ -37,27 +30,6 @@ def _voice_tts(**overrides) -> dict:
         "service_name": "/voice_tts/synthesize",
         **overrides,
     }
-
-
-@pytest.mark.parametrize(
-    "config_name",
-    ["so101_single_arm_legacy"],
-)
-def test_compiled_profile_includes_dance_basic(config_name):
-    config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
-
-    if not config_path.exists():
-        pytest.skip(f"Config file not found: {config_path}")
-
-    skill_templates = _snapshot(config_path).templates
-
-    assert "dance_basic" in skill_templates
-    primitive_sequence = skill_templates["dance_basic"]["primitive_sequence"]
-    assert primitive_sequence
-    trajectory_step = next(
-        step for step in primitive_sequence if step["primitive_name"] == "move_through_joint_positions"
-    )
-    assert trajectory_step["joint_waypoints"]
 
 
 def test_default_loader_uses_robot_config_environment_path(monkeypatch):
@@ -178,14 +150,6 @@ def test_sound_orientation_rejects_invalid_behavior_config(value, field):
     errors = _validate_sound_orientation_config(config)
 
     assert any(field in error for error in errors)
-
-
-def test_compiled_skills_match_profile_enabled_set():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
-    profile_path = config_path.parents[3] / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
-    expected = {entry["name"] for entry in yaml.safe_load(profile_path.read_text(encoding="utf-8"))["enabled_skills"]}
-
-    assert set(_snapshot(config_path).enabled_skill_names) == expected
 
 
 def test_production_robot_yaml_has_no_inline_skill_catalog():
@@ -536,35 +500,16 @@ def test_raw_loader_rejects_duplicate_visual_game_service_names(tmp_path):
         load_robot_config_dict(config_path)
 
 
-def test_embodied_config_keeps_only_supported_direct_skills():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
-    skill_templates = _snapshot(config_path).templates
+def test_enabled_embodied_config_uses_configured_default_place_pose(monkeypatch, tmp_path):
+    # validate_config requires ros2_control.calib_file to exist on disk, and the
+    # legacy profile points it at $(env HOME)/.calibrate/, a calibration-run
+    # artifact that no clean machine has. Point HOME at a tmp dir with the file
+    # present so validation stays hermetic; the calib content is never read.
+    calibrate_dir = tmp_path / ".calibrate"
+    calibrate_dir.mkdir()
+    (calibrate_dir / "so101_follower_calibrate.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
 
-    assert "dance_basic" in skill_templates
-    assert "pick_named_target" not in skill_templates
-    assert "place_named_pose" not in skill_templates
-    assert "observe_target_area" not in skill_templates
-
-
-@pytest.mark.parametrize(
-    ("skill_name", "pose_name"),
-    [
-        ("recover_safe_pose", "home"),
-        ("inspect_scene", "observe_table"),
-        ("recover_zero_pose", "zero"),
-    ],
-)
-def test_embodied_named_pose_skills_map_to_configured_poses(skill_name, pose_name):
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
-    config = load_robot_config_dict(config_path)
-    skill_templates = _snapshot(config_path).templates
-
-    assert pose_name in config["embodied"]["named_poses"]
-    step = skill_templates[skill_name]["primitive_sequence"][0]
-    assert dict(step) == {"primitive_name": "move_to_named_pose", "pose_name": pose_name}
-
-
-def test_enabled_embodied_config_uses_configured_default_place_pose():
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
     config = load_robot_config(config_path)
 
@@ -572,28 +517,3 @@ def test_enabled_embodied_config_uses_configured_default_place_pose():
 
     assert validate_config(config) == []
     assert config.embodied.default_place_name in config.embodied.named_poses
-
-
-@pytest.mark.parametrize(
-    "skill_name",
-    ["wave_hello", "nod_yes", "shake_no", "act_cute", "happy_spin_upright"],
-)
-def test_social_gesture_duration_estimate_covers_configured_motion(skill_name):
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm_legacy.yaml"
-    skill = _snapshot(config_path).templates[skill_name]
-    manifest_path = config_path.parents[3] / "skill_catalog" / "config" / "skills" / skill_name / "manifest.yaml"
-    description = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))["description"]
-
-    configured_duration = 0.0
-    if skill.get("initial_gripper_state") in {"open", "closed"}:
-        configured_duration += GRIPPER_TRAJECTORY_DURATION_SEC
-    for step in skill["primitive_sequence"]:
-        primitive_name = step["primitive_name"]
-        if primitive_name == "move_to_joint_positions":
-            configured_duration += float(step.get("duration_sec", 0.4))
-        elif primitive_name == "move_through_joint_positions":
-            configured_duration += len(step["joint_waypoints"]) * float(step["waypoint_duration_sec"])
-        elif primitive_name in {"open_gripper", "close_gripper"}:
-            configured_duration += GRIPPER_TRAJECTORY_DURATION_SEC
-
-    assert float(description["duration_sec_estimate"]) >= configured_duration

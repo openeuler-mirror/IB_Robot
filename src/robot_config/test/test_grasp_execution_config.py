@@ -18,6 +18,10 @@ def _write_config(tmp_path: Path, mutate) -> Path:
     return path
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_grasp_execution_config_accepts_repository_profile() -> None:
     config = load_robot_config_dict(CONFIG)
     grasp_execution = config["grasp_execution"]
@@ -141,6 +145,10 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert any(abs(float(wrist["transform"][axis])) > 1e-9 for axis in ("x", "y", "z", "roll", "pitch", "yaw"))
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_profile_requires_final_fk_fixed_finger_inward_clearance() -> None:
     config = load_robot_config_dict(PC_CONFIG)
     orientation_guard = config["grasp_execution"]["target_gripper"]["ik_orientation_guard"]
@@ -310,6 +318,10 @@ def test_grasp_execution_config_rejects_invalid_candidate_target_offset(tmp_path
         load_robot_config_dict(path)
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_grasp_execution_config_accepts_local_ascend_full_pipeline(tmp_path: Path) -> None:
     def enable_ascend(config):
         config["planner_node"].update(
@@ -332,6 +344,10 @@ def test_grasp_execution_config_accepts_local_ascend_full_pipeline(tmp_path: Pat
     assert config["planner_node"]["inference_backend"] == "ascend_local"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_grasp_execution_config_accepts_unbounded_candidate_pool(tmp_path: Path) -> None:
     path = _write_config(tmp_path, lambda config: config["planner_node"].update({"topk_num_grasps": -1}))
 

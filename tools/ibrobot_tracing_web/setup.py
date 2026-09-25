@@ -36,6 +36,9 @@ setup(
     # Keep version constraints aligned with requirements/tracing-web.txt; the
     # package.xml entries describe ROS dependencies rather than pip constraints.
     install_requires=["fastapi>=0.100,<1", "pydantic>=2,<3", "setuptools", "uvicorn>=0.23,<1"],
+    # ament_python packages must declare the pytest extra or colcon silently
+    # falls back to unittest, collects 0 tests and reports a false OK.
+    extras_require={"test": ["pytest"]},
     zip_safe=False,
     maintainer="IB-Robot Team",
     maintainer_email="dev@example.com",

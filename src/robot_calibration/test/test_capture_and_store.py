@@ -4,20 +4,20 @@ import tarfile
 
 import pytest
 
-from robot_calibration.capture import CaptureError, finalize_capture, import_legacy_capture
+from robot_calibration.capture import (
+    REQUIRED_SCENES,
+    REQUIRED_TOPICS,
+    CaptureError,
+    finalize_capture,
+    import_legacy_capture,
+)
 from robot_calibration.store import ArtifactStore, StoreError
 
-SCENES = ("scene-01", "scene-02", "scene-03", "scene-04-test")
-TOPICS = (
-    "/livox/lidar",
-    "/livox/imu",
-    "/cloud_registered_body",
-    "/odometry/filtered",
-    "/camera/front/image_raw",
-    "/camera/front/camera_info",
-    "/tf",
-    "/tf_static",
-)
+# Import rather than transcribe: every fixture in this file is built from these
+# two tables, so a verbatim copy let the whole file drift silently when the
+# production tuples changed.
+SCENES = REQUIRED_SCENES
+TOPICS = REQUIRED_TOPICS
 
 
 def _scene(scene_id: str, *, stationary: bool = True) -> dict:

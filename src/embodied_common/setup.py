@@ -15,6 +15,7 @@ setup(
         (os.path.join("share", package_name, "config"), glob(package_name + "/*.yaml")),
     ],
     install_requires=["setuptools", "pyyaml", "inference_manifest"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",

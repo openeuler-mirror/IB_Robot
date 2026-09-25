@@ -2088,10 +2088,12 @@ def test_pipeline_executor_preserves_legacy_thread_count(monkeypatch):
     monkeypatch.setattr(pipeline_policy_module.rclpy, "init", lambda **_kwargs: None)
     monkeypatch.setattr(pipeline_policy_module.rclpy, "ok", lambda: False)
     monkeypatch.setattr(pipeline_policy_module, "_read_config", lambda: next(configs))
+    # main() now builds the runtime dependencies and injects registry_set and
+    # providers, so the stand-in has to accept them.
     monkeypatch.setattr(
         pipeline_policy_module,
         "PipelinePolicyNode",
-        lambda _config, node_name, registry_set, providers: _Node(),
+        lambda _config, node_name, registry_set=None, providers=None: _Node(),
     )
     monkeypatch.setattr(pipeline_policy_module, "MultiThreadedExecutor", _Executor)
 

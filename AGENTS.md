@@ -84,6 +84,19 @@ Signed-off-by: Name <email>  # 必须，使用 git commit -s
 准备交给 reviewer 正式检视。WIP 标题统一为 `[WIP] <title>` 并暂缓双平台 Docker；移除 `[WIP]`
 转为正式检视时，必须补齐当前 Git tree 的两平台验证。WIP 不豁免 DCO、AI 披露、其他测试或 CI。
 
+### 测试规范（ROS 2 / ament）
+
+完整规范（判定标准、反例、排障案例）见 [`docs/testing.md`](docs/testing.md)。核心规则：
+
+- **正式验收唯一入口是 `colcon test`**。裸 `pytest` 可作定向验证（复现缺陷、隔离排查），但合入前对包的正式结论必须来自 `colcon test`。
+- `ament_python` 包必须在 `setup.py` 声明 `extras_require={"test": ["pytest"]}`，否则 colcon 静默回退 unittest、报告"假绿"。
+- 测试导入的每个兄弟包都要在本包 `package.xml` 声明 `<test_depend>`；成环说明测试放错了包，移测试，不要声明环依赖。
+- 需要真实 ROS 图的测试依赖根 `conftest.py` 的每进程域隔离（`IBROBOT_TEST_ROS_DOMAIN_ID`）。**包内自带 `pytest.ini` 会把 conftest 搜索截断在包目录，根隔离逻辑不会加载**——必须像 `src/inference_service/conftest.py` 那样在包内显式加载（`confcutdir` 不能写进 ini）。
+- 测试"全部通过"和进程"能退出"是两件事；`timeout` 包裹下退出码 124 = 挂死，即使全绿。
+- 带自有 `pytest.ini` 的包必须重复根 `addopts` 的 `-p no:launch_testing -p no:launch_ros`，防止模块级 skip 把整包测试静默归零。
+- 删测试前先判断被测行为是否仍然存在；删除时在 commit message 写明覆盖面去向（先例：`src/inference_service/tests/LEGACY_COVERAGE.md`）。
+- AI 生成的测试按草稿对待：断言行为而非结构、真在 `colcon test` 下跑过、API 确实存在、不与既有测试重复。
+
 ## 关键约定
 
 ### 环境初始化

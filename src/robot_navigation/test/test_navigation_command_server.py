@@ -221,6 +221,10 @@ def test_nav2_acceptance_timeout_keeps_fault_ownership_and_cancels_late_goal():
     server.stop_confirmation_timeout = 0.01
     server._resolve_target = lambda _request: PoseStamped()
     server._wait_for_nav2_server = lambda: True
+    # _start_goal clears the costmap gate; this test drives the Nav2
+    # acceptance-timeout path, so start already-ready instead of polling.
+    server._costmap_ready = threading.Event()
+    server._wait_for_costmap_ready = lambda: True
     server._nav_client = SimpleNamespace(send_goal_async=lambda *_args, **_kwargs: send_future)
     execute_goal = _ExecuteGoalHandle()
 
@@ -273,6 +277,10 @@ def test_cancel_during_nav2_readiness_prevents_goal_dispatch():
     server._stop_gate = SimpleNamespace(reset=lambda: None)
     server.stop_confirmation_timeout = 0.01
     server._resolve_target = lambda _request: PoseStamped()
+    # The server gained a costmap readiness gate; this test is about the cancel
+    # path, so start already-ready rather than exercising the wait.
+    server._costmap_ready = threading.Event()
+    server._costmap_ready.set()
 
     def ready_after_cancel():
         server._cancel_requested.set()

@@ -24,6 +24,7 @@ setup(
         "PyYAML",
         "safetensors>=0.4.3,<1.0.0",
     ],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="lwh",
     maintainer_email="liuweihong8@huawei.com",

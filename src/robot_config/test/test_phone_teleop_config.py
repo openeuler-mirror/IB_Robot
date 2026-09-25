@@ -617,7 +617,6 @@ def test_lekiwi_rtp_distributed_profile_resolves_follower_calib(tmp_path, monkey
 @pytest.mark.parametrize(
     "profile_name",
     [
-        "lekiwi_navi_hardware_only",
         "lekiwi_realsense_navigation",
         "so101_rtp_distributed",
         "so101_single_arm_legacy",

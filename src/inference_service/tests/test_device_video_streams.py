@@ -104,6 +104,26 @@ class _Sender:
         self.closed = True
 
 
+class _BlockingEncoder(_Encoder):
+    """Encoder that can be held inside encode() to widen a race window.
+
+    ``entered`` is set as soon as the worker reaches encode(); ``block`` gates
+    when it is allowed to finish. Starts unblocked so it behaves like _Encoder
+    until a test clears ``block``.
+    """
+
+    def __init__(self, **options):
+        super().__init__(**options)
+        self.entered = threading.Event()
+        self.block = threading.Event()
+        self.block.set()
+
+    def encode(self, frame):
+        self.entered.set()
+        self.block.wait(timeout=5.0)
+        return super().encode(frame)
+
+
 def _spec(mode="rtp", *, key="observation.images.top", stream_id="top", port=5004):
     transport = ObservationTransportSpec()
     if mode == "rtp":
@@ -137,12 +157,20 @@ def _spec(mode="rtp", *, key="observation.images.top", stream_id="top", port=500
     )
 
 
-def _manager():
+def _manager(encoder_cls=None):
+    """Build a manager over one RTP and one DDS spec with fake codec and sender.
+
+    ``encoder_cls`` is injected through the codec registry rather than assigned
+    onto the manager afterwards: the frame ingress moved to observation_transport
+    and no longer exposes per-stream internals, so construction-time injection is
+    the only supported way to install a specific encoder.
+    """
     registry = VideoCodecRegistry()
     encoders = []
+    encoder_cls = encoder_cls or _Encoder
 
     def factory(**options):
-        encoder = _Encoder(**options)
+        encoder = encoder_cls(**options)
         encoders.append(encoder)
         return encoder
 
@@ -170,6 +198,25 @@ def _manager():
     return manager, encoders[0], senders
 
 
+def _drain(manager, *, until, timeout_s: float = 2.0) -> bool:
+    """Wait for an explicit completion condition, never for an empty queue.
+
+    The encode worker dequeues a frame before encoding and sending it, and
+    ``sender_queue_depth`` only counts queued frames, so it reads 0 while a
+    frame is still in flight. Waiting on the queue alone could return before
+    the worker finished, racing every assertion that follows. ``until`` must
+    observe the outcome the test actually waits for: the expected count of
+    encoded frames or sent packets, a readiness or failed status, or the
+    dropped-frame count.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if until():
+            return True
+        time.sleep(0.005)
+    return False
+
+
 def _image():
     pixels = np.arange(2 * 16, dtype=np.uint8).reshape(2, 16)
     return SimpleNamespace(width=4, height=2, step=16, encoding="rgb8", data=pixels.tobytes())
@@ -188,7 +235,7 @@ def test_device_stream_manager_sends_raw_uint8_frames_independent_of_requests():
     assert manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=2_000_000, receive_timestamp_ns=2_000_100
     )
-    assert manager.flush()
+    assert _drain(manager, until=lambda: len(encoder.frames) == 2)
 
     assert len(encoder.frames) == len(senders[-1].packets) == 2
     assert encoder.frames[0].data.shape == (2, 4, 3)
@@ -262,7 +309,7 @@ def test_latest_sent_capture_ns_tracks_wire_sends_and_clears_on_rollover():
     assert manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=1_000_000_000, receive_timestamp_ns=1_000_000_000
     )
-    assert manager.flush()
+    assert _drain(manager, until=lambda: len(senders[-1].packets) == 1)
     # The fake sender invokes on_sent inline with the encoder's packet, so
     # the last-sent capture is the frame's capture timestamp, not its
     # receive timestamp or its local buffer arrival.
@@ -284,7 +331,10 @@ def test_device_stream_manager_drops_non_monotonic_capture_timestamps():
     assert not manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=12
     )
-    assert manager.flush()
+    assert _drain(
+        manager,
+        until=lambda: len(encoder.frames) == 1 and manager.statuses()[0].dropped_frames == 1,
+    )
     assert len(encoder.frames) == 1
     assert manager.statuses()[0].dropped_frames == 1
 
@@ -303,17 +353,23 @@ def test_device_stream_manager_rejects_frames_after_session_clear():
 def test_device_stream_manager_encodes_distinct_streams_concurrently():
     registry = VideoCodecRegistry()
     encode_barrier = threading.Barrier(2, timeout=2)
+    encoders = []
 
     class _ConcurrentEncoder(_Encoder):
         def encode(self, frame):
             encode_barrier.wait()
             return super().encode(frame)
 
+    def encoder_factory(**options):
+        encoder = _ConcurrentEncoder(**options)
+        encoders.append(encoder)
+        return encoder
+
     registry.register(
         "software",
         priority=0,
         probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
-        encoder_factory=lambda **options: _ConcurrentEncoder(**options),
+        encoder_factory=encoder_factory,
     )
     manager = DeviceVideoStreamManager(
         pipeline_id="policy",
@@ -343,7 +399,7 @@ def test_device_stream_manager_encodes_distinct_streams_concurrently():
 
     assert not any(thread.is_alive() for thread in threads)
     assert results == [True, True]
-    assert manager.flush()
+    assert _drain(manager, until=lambda: sum(len(encoder.frames) for encoder in encoders) == 2)
 
 
 def test_device_stream_manager_assigns_unique_ascend_encoder_channels():
@@ -390,7 +446,7 @@ def test_device_stream_diagnostic_snapshot_is_immutable_deterministic_and_tracks
 
     manager.bind_session("session", 1)
     manager.submit_ros_image("observation.images.top", _image(), capture_timestamp_ns=10, receive_timestamp_ns=11)
-    assert manager.flush()
+    assert _drain(manager, until=lambda: len(_encoder.frames) == 1)
     assert manager.diagnostic_snapshots()[0].ready
 
 
@@ -405,12 +461,19 @@ def test_submit_ros_image_returns_before_slow_encode_completes():
             release.wait(timeout=5)
             return super().encode(frame)
 
+    slow_encoders = []
+
+    def encoder_factory(**options):
+        encoder = _SlowEncoder(**options)
+        slow_encoders.append(encoder)
+        return encoder
+
     registry = VideoCodecRegistry()
     registry.register(
         "software",
         priority=0,
         probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
-        encoder_factory=lambda **options: _SlowEncoder(**options),
+        encoder_factory=encoder_factory,
     )
     manager = DeviceVideoStreamManager(
         pipeline_id="policy",
@@ -430,7 +493,7 @@ def test_submit_ros_image_returns_before_slow_encode_completes():
     assert slow_started.wait(timeout=2)
 
     release.set()
-    assert manager.flush()
+    assert _drain(manager, until=lambda: len(slow_encoders[-1].frames) == 1)
     manager.close()
 
 
@@ -445,12 +508,19 @@ def test_encode_queue_overflow_drops_oldest_frames():
             release.wait(timeout=5)
             return super().encode(frame)
 
+    stalled_encoders = []
+
+    def encoder_factory(**options):
+        encoder = _StalledEncoder(**options)
+        stalled_encoders.append(encoder)
+        return encoder
+
     registry = VideoCodecRegistry()
     registry.register(
         "software",
         priority=0,
         probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
-        encoder_factory=lambda **options: _StalledEncoder(**options),
+        encoder_factory=encoder_factory,
     )
     manager = DeviceVideoStreamManager(
         pipeline_id="policy",
@@ -472,7 +542,10 @@ def test_encode_queue_overflow_drops_oldest_frames():
         )
 
     release.set()
-    assert manager.flush()
+    assert _drain(
+        manager,
+        until=lambda: manager.statuses()[0].dropped_frames == 2 and len(stalled_encoders[-1].frames) >= 1,
+    )
     assert manager.statuses()[0].dropped_frames == 2
     manager.close()
 
@@ -506,7 +579,10 @@ def test_concurrent_same_key_submits_enqueue_in_timestamp_order():
         thread.join(timeout=3)
 
     assert not any(thread.is_alive() for thread in threads)
-    assert manager.flush()
+    assert _drain(
+        manager,
+        until=lambda: len(encoder.frames) == sum(accepted) and sum(accepted) >= 1,
+    )
     timestamps = [frame.capture_timestamp_ns for frame in encoder.frames]
     assert timestamps == sorted(timestamps)
     assert len(timestamps) == sum(accepted)
@@ -518,37 +594,48 @@ def test_encode_worker_drops_frames_retired_by_session_rollover():
     """A frame that passed the submit gate of the retired session but is only
     processed after the rollover must be dropped by the worker instead of
     surfacing as the first frame of the new session."""
-    manager, encoder, _senders = _manager()
+    manager, encoder, _senders = _manager(_BlockingEncoder)
     manager.bind_session("session-a", 1)
     assert manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=1_000_000, receive_timestamp_ns=1_000_100
     )
-    assert manager.flush()
+    assert _drain(manager, until=lambda: len(encoder.frames) == 1)
     assert [frame.capture_timestamp_ns for frame in encoder.frames] == [1_000_000]
+    encoder.entered.clear()
 
-    stream = manager._streams["observation.images.top"]
-    manager.bind_session("session-b", 2)
-    # Simulate a session-a frame that was already queued when the rollover
-    # committed: retired session generation and retired lifecycle epoch.
-    stale = (_image(), 2_000_000, 2_000_100, 1, stream.lifecycle_epoch - 1)
-    stream.encode_queue.put(stale)
-    assert manager.flush(timeout_s=1.0)
-
-    assert [frame.capture_timestamp_ns for frame in encoder.frames] == [1_000_000]
-
-    # The new session still accepts fresh frames.
+    # Park the worker inside encode() on one session-a frame so a second one
+    # is still sitting in the queue when the rollover commits. Driving the real
+    # submit path is what makes this a rollover test; hand-placing a tuple on
+    # the internal queue only tested that queue's own record layout.
+    encoder.block.clear()
+    assert manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=2_000_000, receive_timestamp_ns=2_000_100
+    )
+    assert encoder.entered.wait(timeout=2.0), "encode worker never picked up the in-flight frame"
     assert manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=3_000_000, receive_timestamp_ns=3_000_100
     )
-    assert manager.flush()
-    assert [frame.capture_timestamp_ns for frame in encoder.frames] == [1_000_000, 3_000_000]
+
+    manager.bind_session("session-b", 2)
+    encoder.block.set()
+    assert _drain(manager, timeout_s=2.0, until=lambda: len(encoder.frames) == 2)
+
+    # The in-flight frame finishes, but the one dequeued after the rollover
+    # carries a retired session and must not surface under session-b.
+    assert [frame.capture_timestamp_ns for frame in encoder.frames] == [1_000_000, 2_000_000]
+
+    # The new session still accepts fresh frames.
+    assert manager.submit_ros_image(
+        "observation.images.top", _image(), capture_timestamp_ns=4_000_000, receive_timestamp_ns=4_000_100
+    )
+    assert _drain(manager, until=lambda: len(encoder.frames) == 3)
+    assert [frame.capture_timestamp_ns for frame in encoder.frames] == [1_000_000, 2_000_000, 4_000_000]
     manager.close()
 
 
 def test_encode_failure_clears_readiness_and_recovers_encoder():
     """A swallowed encode exception must surface: readiness drops, the error
     is reported, and a failed encoder is reset so later frames can recover."""
-    manager, _encoder, _senders = _manager()
 
     class _FailingOnceEncoder(_Encoder):
         def __init__(self, **options):
@@ -562,14 +649,15 @@ def test_encode_failure_clears_readiness_and_recovers_encoder():
                 raise RuntimeError("encode boom")
             return super().encode(frame)
 
-    # Swap the encoder for one that fails on the first frame.
-    failing = _FailingOnceEncoder()
-    manager._streams["observation.images.top"].encoder = failing
+    manager, failing, _senders = _manager(_FailingOnceEncoder)
     manager.bind_session("session", 1)
     assert manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=1_000_000, receive_timestamp_ns=1_000_100
     )
-    assert manager.flush()
+    assert _drain(
+        manager,
+        until=lambda: manager.statuses()[0].last_error != "" or manager.statuses()[0].dropped_frames == 1,
+    )
 
     status = manager.statuses()[0]
     assert not status.ready
@@ -583,7 +671,10 @@ def test_encode_failure_clears_readiness_and_recovers_encoder():
     assert manager.submit_ros_image(
         "observation.images.top", _image(), capture_timestamp_ns=2_000_000, receive_timestamp_ns=2_000_100
     )
-    assert manager.flush()
+    assert _drain(
+        manager,
+        until=lambda: manager.statuses()[0].last_error == "" and manager.statuses()[0].ready,
+    )
     status = manager.statuses()[0]
     assert status.ready
     assert status.last_error == ""
@@ -604,12 +695,28 @@ def test_close_leaves_sender_open_while_worker_is_wedged():
             release.wait(timeout=5)
             return super().encode(frame)
 
+    # Capture the instances from the factories: the frame ingress moved to
+    # observation_transport and the manager no longer exposes per-stream
+    # internals, so the factory call is the only place to get a handle on them.
+    encoders = []
+    senders = []
+
+    def encoder_factory(**options):
+        encoder = _StalledEncoder(**options)
+        encoders.append(encoder)
+        return encoder
+
+    def sender_factory(**options):
+        sender = _Sender(**options)
+        senders.append(sender)
+        return sender
+
     registry = VideoCodecRegistry()
     registry.register(
         "software",
         priority=0,
         probe=lambda _kind: CodecCapabilities(pixel_formats=("rgb24",)),
-        encoder_factory=lambda **options: _StalledEncoder(**options),
+        encoder_factory=encoder_factory,
     )
     manager = DeviceVideoStreamManager(
         pipeline_id="policy",
@@ -617,13 +724,13 @@ def test_close_leaves_sender_open_while_worker_is_wedged():
         deployment_fingerprint="deployment",
         observation_specs=(_spec(), _spec("dds")),
         codec_registry=registry,
-        sender_factory=_Sender,
+        sender_factory=sender_factory,
     )
     manager.bind_session("session", 1)
     assert manager.submit_ros_image("observation.images.top", _image(), capture_timestamp_ns=1, receive_timestamp_ns=1)
     assert stalled.wait(timeout=2)
-    stream = manager._streams["observation.images.top"]
-    sender = stream.sender
+    encoder = encoders[0]
+    sender = senders[-1]
 
     started = time.monotonic()
     manager.close(timeout_s=0.2)
@@ -633,6 +740,6 @@ def test_close_leaves_sender_open_while_worker_is_wedged():
     assert elapsed < 2.0
     # The encoder was closed to unblock the wedged write, but the sender was
     # left open: the worker may still touch it once it unblocks.
-    assert stream.encoder.closed
+    assert encoder.closed
     assert not sender.closed
     release.set()

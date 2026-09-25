@@ -262,6 +262,10 @@ def test_sound_orientation_node_is_projected_from_robot_config():
     assert _decode_launch_string(params["skill_action_name"]) == "/embodied/execute_skill"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_hybrid_profile_projects_runtime_control_mode_switching_parameters():
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_nav_grasp.yaml"
     config = load_robot_config_dict(config_path)
@@ -906,6 +910,10 @@ def test_moveit_visual_closure_starts_perception_before_controller_readiness(mon
     ]
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_handeye_grasp_config_launches_pick_and_place_pipelines():
     config_path = (
         Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
@@ -1010,6 +1018,10 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
     assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     config_path = (
         Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"

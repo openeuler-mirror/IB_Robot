@@ -7,6 +7,49 @@ test = [
     "pytest-cov>=4,<7",
 ]
 
+[tool.pytest.ini_options]
+# Deliberately NO `testpaths` here. `colcon test` runs `python -m pytest` with no
+# path argument and cwd set to the package source directory, so pytest walks up,
+# finds this file as its rootdir config, and would apply `testpaths` INSTEAD of the
+# package's own tests. Setting it here silently replaces every per-package suite
+# with whatever this list names. Run repo-level tests by naming them explicitly:
+#   pytest tests scripts .agents
+# Everything under src/ is run by `colcon test`, never by a bare root pytest.
+#
+# `norecursedirs` is safe to set globally: it only prunes directories that do not
+# exist inside a ROS package, and it stops a bare `pytest` at the workspace root
+# from walking the LeRobot submodule, the model conversion work directories and
+# any local virtualenv, which would collect thousands of third-party tests.
+# The list restates pytest's defaults because assigning to this key replaces them.
+# The autoloaded launch_testing plugin turns a module-level skip into a
+# session-wide collection abort: one unimportable optional dependency makes the
+# whole package report "collected 0 items" instead of skipping that one module.
+# colcon treats pytest's no-tests-collected exit code as success, so the package
+# would pass with zero tests run. No collected test needs this plugin - the
+# launch smoke scripts under tests/ci_smoke/ are standalone and not named
+# test_*.py - so switch it off rather than leave that trap armed.
+addopts = "-p no:launch_testing -p no:launch_ros"
+
+norecursedirs = [
+    "*.egg",
+    "*.egg-info",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "node_modules",
+    "venv",
+    "{arch}",
+    "install",
+    "log",
+    "libs",
+    "third_party",
+    "models",
+    "src/pymoveit2",
+    "src/rosclaw",
+]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 120

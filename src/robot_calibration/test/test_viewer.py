@@ -1,3 +1,4 @@
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -70,23 +71,59 @@ def test_validate_viewer_starts_preview_decoder(monkeypatch, tmp_path):
     ]
 
 
-def test_viewer_can_redirect_child_output_to_capture_log():
-    source = Path(__file__).parents[1] / "robot_calibration/viewer.py"
-    text = source.read_text(encoding="utf-8")
+def test_viewer_can_redirect_child_output_to_capture_log(monkeypatch, tmp_path):
+    """Every child gets its stdout and stderr sent to the capture log.
 
-    assert "def start_viewer(mode: str, log_path: Path | None = None)" in text
-    assert "stdout=log" in text
-    assert "stderr=subprocess.STDOUT" in text
+    Previously asserted by grepping viewer.py for the literal signature and the
+    string "stdout=log", which passed whether or not the redirect worked and
+    failed on any rename. Assert the Popen kwargs instead.
+    """
+    calls = []
+
+    class FakeProcess:
+        def __init__(self, command):
+            self.command = command
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr("robot_calibration.viewer.display_environment", lambda: {"DISPLAY": ":0"})
+    monkeypatch.setattr("robot_calibration.viewer.package_share", lambda: tmp_path)
+    monkeypatch.setattr(
+        "robot_calibration.viewer.subprocess.Popen",
+        lambda command, **kwargs: calls.append((command, kwargs)) or FakeProcess(command),
+    )
+
+    log_path = tmp_path / "viewer.log"
+    assert start_viewer("validate", log_path=log_path) is not None
+
+    assert calls, "no child process was started"
+    for _command, kwargs in calls:
+        assert kwargs["stdout"] is not None
+        assert kwargs["stdout"].name == str(log_path)
+        assert kwargs["stderr"] == subprocess.STDOUT
+    assert log_path.exists()
 
 
 def test_viewer_does_not_override_ros_transport_configuration():
-    source = Path(__file__).parents[1] / "robot_calibration/viewer.py"
-    text = source.read_text(encoding="utf-8")
+    """The viewer inherits the caller's ROS transport rather than picking its own.
 
-    assert "ROS_DOMAIN_ID" not in text
-    assert "CYCLONEDDS_URI" not in text
-    assert "RMW_IMPLEMENTATION" not in text
-    assert "domain_bridge" not in text
+    Previously asserted by grepping viewer.py for these names, which silently
+    stopped checking anything the moment the assignment moved into a helper.
+    Assert the environment actually handed to the child instead.
+    """
+    caller_environment = {
+        "DISPLAY": ":0",
+        "ROS_DOMAIN_ID": "42",
+        "RMW_IMPLEMENTATION": "rmw_cyclonedds_cpp",
+        "CYCLONEDDS_URI": "file:///etc/cyclonedds.xml",
+    }
+
+    child_environment = display_environment(caller_environment)
+
+    for name, value in caller_environment.items():
+        assert child_environment[name] == value, f"viewer changed {name}"
+    assert "domain_bridge" not in " ".join(rviz_command("validate", Path("/tmp")))
 
 
 def test_display_environment_preserves_existing_display(tmp_path):

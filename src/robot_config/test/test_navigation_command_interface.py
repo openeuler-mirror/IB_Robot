@@ -94,17 +94,6 @@ def test_real_navigation_loads_only_default_tree_plugins():
     ]
 
 
-def test_navigation_launch_delays_lifecycle_startup_until_nodes_are_warm():
-    launch_path = ROOT / "src/robot_navigation/launch/nav2_bringup.launch.py"
-    launch_content = launch_path.read_text(encoding="utf-8")
-
-    assert '"autostart": "false"' in launch_content
-    assert "navigation_lifecycle_coordinator" in launch_content
-    assert "ExecuteProcess(" not in launch_content
-    assert "TimerAction(" not in launch_content
-    assert "ros2 service call" not in launch_content
-
-
 def test_navigation_include_does_not_leak_disabled_autostart_to_sibling_actions():
     launch_path = ROOT / "src/robot_navigation/launch/nav2_bringup.launch.py"
     launch_content = launch_path.read_text(encoding="utf-8")

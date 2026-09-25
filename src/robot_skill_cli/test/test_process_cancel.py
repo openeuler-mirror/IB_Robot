@@ -10,7 +10,9 @@ from robot_config.loader import load_robot_config_dict
 from robot_skill_cli.catalog import compile_local_snapshot, load_capability_catalog
 from skill_catalog.models import SkillSnapshot
 
-CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+# Offline-complete variant of the provider-bound so101_single_arm config; the
+# catalog compiler needs real joint groups without a live runtime description.
+CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
 
 class _CancelBridge:
@@ -750,15 +752,11 @@ def test_execute_plan_signal_during_preflight_converges(monkeypatch, capsys):
     assert ("cancel_agent_plan", "agent-task-1") in bridge.calls
 
 
-@pytest.mark.parametrize("mode", ["server_unavailable", "goal_rejected"])
-def test_execute_plan_admission_failure_converges_existing_goal(mode, monkeypatch, capsys):
+def test_execute_plan_server_unavailable_converges_existing_goal(monkeypatch, capsys):
     from robot_skill_cli import cli
 
     bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
-    if mode == "server_unavailable":
-        bridge.server_ready = False
-    else:
-        bridge.goal_handle.accepted = False
+    bridge.server_ready = False
     monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
 
     exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
@@ -767,6 +765,27 @@ def test_execute_plan_admission_failure_converges_existing_goal(mode, monkeypatc
     assert exit_code == 13
     assert event["data"]["error_code"] == "SKILL_CANCELLED"
     assert ("cancel_agent_plan", "agent-task-1") in bridge.calls
+
+
+def test_execute_plan_rejected_goal_reports_rejection_without_cancel(monkeypatch, capsys):
+    # The gateway rejects only malformed admissions and never creates the
+    # goal (agent_plan_node._handle_goal; same-task retries take the
+    # idempotent replay path instead of being rejected). Rejection therefore
+    # implies there is no goal to converge, so the CLI mirrors
+    # interactive_control's GOAL_REJECTED terminal: report the rejection
+    # and never fire a speculative cancel.
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    bridge.goal_handle.accepted = False
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 13
+    assert event["data"]["error_code"] == "GOAL_REJECTED"
+    assert ("cancel_agent_plan", "agent-task-1") not in bridge.calls
 
 
 @pytest.mark.parametrize(

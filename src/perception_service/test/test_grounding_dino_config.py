@@ -128,7 +128,6 @@ def test_bert_model_warper_does_not_register_full_bert_model() -> None:
     """
     import torch
     import torch.nn as nn
-
     from groundingdino.models.GroundingDINO.bertwarper import BertModelWarper
 
     class FakeBertModel(nn.Module):
@@ -143,13 +142,17 @@ def test_bert_model_warper_does_not_register_full_bert_model() -> None:
         def get_extended_attention_mask(self, attention_mask, input_shape, dtype=None):
             return attention_mask
 
+        def invert_attention_mask(self, encoder_attention_mask):
+            # BertModelWarper.__init__ copies this across alongside embeddings,
+            # encoder, pooler and config; a stand-in missing it fails at
+            # construction before the state_dict leak can be checked.
+            return encoder_attention_mask
+
     bert = FakeBertModel()
     warper = BertModelWarper(bert)
     state_dict_keys = set(warper.state_dict().keys())
     leaked = {key for key in state_dict_keys if key.startswith("_bert_model")}
-    assert not leaked, (
-        f"BertModelWarper leaked internal BertModel reference into state_dict: {leaked}"
-    )
+    assert not leaked, f"BertModelWarper leaked internal BertModel reference into state_dict: {leaked}"
 
 
 def test_cuda_autocast_uses_fp16_for_grounding_dino_extension(monkeypatch):

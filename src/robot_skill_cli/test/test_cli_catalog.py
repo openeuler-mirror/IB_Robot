@@ -17,7 +17,11 @@ from embodied_common.visual_game_contracts import build_visual_game_capability_v
 from robot_config.loader import load_robot_config_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
-CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+# The provider-bound so101_single_arm.yaml needs a live runtime description
+# before its logical interfaces can resolve; offline catalog tests use the
+# self-contained legacy variant, which compiles the same so101_arm_v1
+# capability surface (see test_so101_v1_catalog_identity.py for the digest).
+CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm_legacy.yaml"
 
 
 def _enabled_game_view() -> dict:
@@ -66,6 +70,10 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
     }
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
     from robot_skill_cli.catalog import compile_local_snapshot
 
@@ -213,6 +221,10 @@ def test_load_catalog_uses_exported_config_resolver(monkeypatch):
     assert view["robot_name"] == "so101_single_arm"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_grasp_catalog_registers_enabled_delegated_executors(monkeypatch):
     from robot_skill_cli.catalog import load_capability_catalog
 

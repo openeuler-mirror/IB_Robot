@@ -9,6 +9,10 @@ from types import SimpleNamespace
 
 from dataset_tools.record_cli import RecordCLI
 
+# The CLI's ROS parameter surface is pinned: any new declare_parameter must
+# update this set consciously. The managed-teleop admission parameters and
+# the bounded shutdown draining timeout were added with the runtime-contract
+# consumers change (38b35aac9) and are documented in README.md.
 _PRE_SCHEDULER_PARAMETERS = {
     "control_mode",
     "dispatcher_reset_service",
@@ -16,6 +20,13 @@ _PRE_SCHEDULER_PARAMETERS = {
     "restart_session_service",
     "reset_before_episode",
     "reset_timeout_sec",
+    "runtime_set_mode_service",
+    "teleop_rearm_service",
+    "teleop_stop_service",
+    "runtime_status_topic",
+    "admission_timeout_sec",
+    "admission_attempts",
+    "shutdown_timeout_sec",
 }
 
 

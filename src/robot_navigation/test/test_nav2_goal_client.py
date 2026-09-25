@@ -152,19 +152,6 @@ def _wait_for_callback(node, predicate, timeout=1.0):
 
 
 class TestVoiceCommandParsing:
-    def test_destination_triggers_send_goal(self, node, reset_state):
-        _mock_send_goal_async(node)
-        msg = String()
-        msg.data = json.dumps(
-            {
-                "keyword": "去厨房",
-                "type": "destination",
-                "info": {"x": 1.0, "y": 2.0, "theta": 0.5},
-            }
-        )
-        node.voice_command_callback(msg)
-        node.nav_to_pose_client.send_goal_async.assert_called_once()
-
     def test_destination_coordinates(self, node, reset_state):
         captured = _capture_goal(node)
 

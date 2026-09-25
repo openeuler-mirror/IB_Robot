@@ -244,6 +244,10 @@ def test_generate_controller_spawners_rejects_overlapping_groups():
         )
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
     config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
     robot_config = load_robot_config_dict(config_path)
@@ -270,6 +274,10 @@ def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
     assert "120.0" in _text(deferred_spawners[0]._Node__arguments)
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_hybrid_real_hardware_spawner_keeps_arm_state_stream_active():
     config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_nav_grasp.yaml"
     robot_config = load_robot_config_dict(config_path)
@@ -827,6 +835,10 @@ def test_simulation_scheduler_is_rejected_before_generating_nodes(tmp_path, monk
 
 
 @pytest.mark.parametrize("enable_tracing", [False, True])
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp_path, enable_tracing):
     monkeypatch.delenv("IB_TRACE_ENABLED", raising=False)
     monkeypatch.setattr(tracing_builder, "_resolve_trace_session", lambda name, _root: (name, tmp_path / name))

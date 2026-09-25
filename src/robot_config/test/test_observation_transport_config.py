@@ -23,6 +23,10 @@ from robot_config.observation_transport import (
     validate_robot_config_observation_transports,
 )
 
+# Config lookups are anchored to this file: colcon runs pytest from the
+# package directory, so a repository-relative path does not resolve there.
+ROBOTS_DIR = Path(__file__).resolve().parents[1] / "config" / "robots"
+
 
 def _rtp_observation(*, stream_id="top", port=5004, color_range="limited"):
     return {
@@ -259,7 +263,7 @@ def test_explicit_rtp_mode_is_never_rewritten_to_dds():
 def test_generated_yaml_round_trip_preserves_rtp_transport():
     config = load_robot_config(
         # The development profile has no runtime dependency on a camera being present during parsing.
-        "src/robot_config/config/robots/dev_rtp_single_camera.yaml"
+        ROBOTS_DIR / "dev_rtp_single_camera.yaml"
     )
 
     generated = generate_contract_from_robot_config(config)
@@ -284,7 +288,7 @@ def test_standalone_contract_yaml_preserves_rtp_transport(tmp_path):
 
 
 def test_development_profile_typed_and_raw_contracts_match():
-    path = Path("src/robot_config/config/robots/dev_rtp_multi_camera.yaml")
+    path = ROBOTS_DIR / "dev_rtp_multi_camera.yaml"
     typed = load_robot_config(path)
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))["robot"]
 

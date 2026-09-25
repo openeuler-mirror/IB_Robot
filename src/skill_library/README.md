@@ -566,7 +566,7 @@ Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admissio
 | `arm_trajectory_action_name` | `/arm_trajectory_controller/follow_joint_trajectory` | 手臂轨迹 action 名 |
 | `task_executor_action_name` | `/task_executor/execute_task_plan` | task_dispatch 执行动作名 |
 | `pick_action_name` | `/manipulation/execute_pick` | 委托型抓取技能 action 名 |
-| `move_configuration_service` | legacy: `/moveit_gateway/move_to_configuration`; runtime: `/motion/move_to_joint` | 精确关节配置服务；仅显式 runtime 使用中立默认端点 |
+| `move_configuration_service` | `/motion/move_to_joint` | 精确关节配置服务；默认即 runtime 中立端点，moveit_gateway 移除后不再按 opt-in 切换 |
 | `runtime_enabled` | `false` | 启动时固定；由 launch 根据显式 `runtime.provider` 设置，不根据收到的状态推断 |
 | `runtime_name` | 空字符串 | runtime 启用时必填，必须匹配选定 provider 发布的 `RuntimeStatus.runtime_name` |
 | `runtime_status_topic` | `/runtime_status` | reliable / volatile / keep-last 10，与公共 runtime 发布端一致 |

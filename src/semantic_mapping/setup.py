@@ -19,6 +19,7 @@ setup(
         ),
     ],
     install_requires=["setuptools", "pyyaml"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="IB-Robot Developers",
     maintainer_email="dev@openeuler.org",

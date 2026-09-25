@@ -28,6 +28,7 @@ setup(
         ),
     ],
     install_requires=["setuptools", "pyyaml"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",

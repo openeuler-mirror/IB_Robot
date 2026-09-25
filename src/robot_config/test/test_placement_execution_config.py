@@ -17,6 +17,10 @@ def _write(tmp_path: Path, mutate) -> Path:
     return path
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_repository_placement_contract_loads():
     config = load_robot_config_dict(CONFIG)
     placement = config["placement_execution"]
@@ -58,6 +62,10 @@ def test_repository_placement_contract_loads():
     assert config["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
 def test_pc_placement_contract_uses_grounding_masks_without_a_separate_segmenter():
     placement = load_robot_config_dict(PC_CONFIG)["placement_execution"]
 

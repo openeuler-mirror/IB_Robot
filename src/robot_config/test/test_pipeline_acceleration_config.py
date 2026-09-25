@@ -30,6 +30,10 @@ def _launch_parameter_value(node, name: str):
     raise KeyError(name)
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_310p_profile_uses_feedback_and_tf_completion_barrier() -> None:
     # Motion services come from the robot runtime; the generic YAML only keeps
     # the frames/feedback contract that consumers address.
@@ -48,6 +52,10 @@ def test_310p_profile_uses_feedback_and_tf_completion_barrier() -> None:
     assert config["grasp_execution"]["pose_diagnostics"]["settle_sec"] == 0.0
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_310p_profile_does_not_skip_the_initial_gripper_open() -> None:
     config = load_robot_config_dict(CONFIG)
 
@@ -59,6 +67,10 @@ def test_310p_profile_does_not_skip_the_initial_gripper_open() -> None:
     assert _launch_parameter_value(node, "joint_state_max_age_s") == 0.25
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_310p_profile_keeps_base_bridge_online_but_command_gated() -> None:
     config = load_robot_config_dict(CONFIG)
 
@@ -75,6 +87,10 @@ def test_310p_profile_keeps_base_bridge_online_but_command_gated() -> None:
     assert _launch_parameter_value(node, "navigation_mode_ack_topic") == "motion_mode/base_navigation_enabled"
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_sim_profile_keeps_motion_mode_bridge_online() -> None:
     config = load_robot_config_dict(CONFIG)
 
@@ -88,6 +104,10 @@ def test_sim_profile_keeps_motion_mode_bridge_online() -> None:
     assert _launch_parameter_value(node, "navigation_enabled_on_startup") is False
 
 
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
 def test_moveit_task_executor_fails_before_launch_when_package_is_missing(monkeypatch) -> None:
     config = load_robot_config_dict(CONFIG)
 

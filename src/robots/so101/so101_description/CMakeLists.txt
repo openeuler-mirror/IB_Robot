@@ -22,13 +22,18 @@ if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   ament_add_pytest_test(test_single_arm_model test/test_single_arm_model.py)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
-  set(ament_cmake_copyright_FOUND TRUE)
   # the following line skips cpplint (only works in a git repo)
   # comment the line when this package is in a git repo and when
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
+  # Ruff is this repository's Python linter (see pyproject.toml): line-length 120
+  # with E501 ignored, and no pydocstyle rules selected. ament_flake8 (99 columns)
+  # and ament_pep257 (D rules) therefore fail permanently on conforming code, and
+  # ament_copyright enforces a header convention the repository does not follow.
+  # Skipping them here keeps `colcon test` output limited to real failures.
+  set(ament_cmake_flake8_FOUND TRUE)
+  set(ament_cmake_pep257_FOUND TRUE)
+  set(ament_cmake_copyright_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
 

@@ -236,7 +236,14 @@ class StatefulAscendOmModelSession(AscendOmModelSession):
         role: str,
         inputs: Mapping[str, object],
         outputs: Mapping[str, object],
+        *,
+        isolated: bool = False,
     ) -> None:
+        # Isolated role execution never reaches here on the stateful Ascend
+        # backend (the base class raises BackendCapabilityError first); accept
+        # the flag to match the ModelSession._validate_role_values signature
+        # that execute_role always passes.
+        del isolated
         deployment = self._require_context().deployment
         bindings = deployment.bindings[role]
         state_input_indices = {input_index for input_index, _output_index in self._state_indices.get(role, ())}

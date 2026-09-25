@@ -157,7 +157,14 @@ def _manager(specs, *, n_obs_steps=1):
     return manager, receivers
 
 
-def _status(descriptor, capture_timestamp_ns):
+def _status(descriptor, capture_timestamp_ns, *, encoded_frames=1):
+    """Build a sender-originated status for the compute side to observe.
+
+    ``encoded_frames`` defaults to 1 because the compute manager only adopts an
+    advertised timestamp mapping once the sender reports having encoded a frame.
+    Pass 0 to model a sender that has announced a mapping but not yet produced
+    one, which is what a receiver sees before the first frame.
+    """
     return VideoStreamRuntimeStatus(
         protocol_version=PROTOCOL_VERSION,
         pipeline_id=descriptor.pipeline_id,
@@ -168,7 +175,11 @@ def _status(descriptor, capture_timestamp_ns):
         lifecycle_state="ready",
         ready=True,
         selected_backend="software",
+        # The compute side only accepts sender-originated status: see
+        # ComputeVideoStreamManager.observe_status, which drops anything else.
+        status_origin="sender",
         timestamp_mapping_valid=True,
+        encoded_frames=encoded_frames,
         mapping_rtp_timestamp=90_000,
         mapping_capture_timestamp_ns=capture_timestamp_ns,
         keyframe_ready=True,
@@ -387,7 +398,9 @@ def test_compute_stream_status_reports_receiver_metrics():
     descriptor = _descriptor(spec)
     assert manager.observe_descriptor(descriptor)
     capture_timestamp_ns = 1_000_000_000
-    manager.observe_status(_status(descriptor, capture_timestamp_ns), receive_time_ns=capture_timestamp_ns)
+    manager.observe_status(
+        _status(descriptor, capture_timestamp_ns, encoded_frames=0), receive_time_ns=capture_timestamp_ns
+    )
     receivers[0].options["frame_buffer"].push(
         capture_timestamp_ns,
         VideoFrame(np.zeros((2, 4, 3), dtype=np.uint8), capture_timestamp_ns, capture_timestamp_ns, 4, 2, "rgb24"),

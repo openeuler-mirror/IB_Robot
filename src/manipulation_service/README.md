@@ -18,7 +18,7 @@
   夹爪/手腕自遮挡、目标离开视野、深度缺失或反光而不可靠；此时视觉结果
   只作为诊断/弱证据，不会单独判失败。深度订阅回调只保留最新消息；全帧有效率、近距比例和
   中位深度在 `VerifyGrasp` 请求时计算，避免空闲期间持续扫描 30 Hz 深度图。
-- `test_graspgen.py`：离线 GraspGen 调试脚本。读取已有 RGB-D/mask fixture 目录，直接运行
+- `debug_graspgen.py`：离线 GraspGen 调试脚本。读取已有 RGB-D/mask fixture 目录，直接运行
   GraspGen，并保存 PLY、JSON 和可选 Open3D 视图。
 
 ROS 接口：
@@ -464,9 +464,9 @@ Robotiq 候选扫描，同时保留 table plane 和 object-top：
 PNG/HTML 渲染在后台 daemon thread 中执行；service response 不等待图像导出。
 因此 `grasp_result.json` 可能先出现，预览文件稍后出现。
 
-## 调试 test_graspgen.py
+## 调试 debug_graspgen.py
 
-`test_graspgen.py` 不依赖 ROS service。它读取已有 fixture 中的 `result.json`、mask、深度和
+`debug_graspgen.py` 不依赖 ROS service。它读取已有 fixture 中的 `result.json`、mask、深度和
 CameraInfo，直接运行 GraspGen，适合单独验证 GraspGen
 模型、过滤器和可视化。
 
@@ -475,7 +475,7 @@ CameraInfo，直接运行 GraspGen，适合单独验证 GraspGen
 ```bash
 fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
 test -d "$fixture_dir" && source .shrc_local && \
-  python3 src/manipulation_service/test_graspgen.py --data-dir "$fixture_dir"
+  python3 src/manipulation_service/debug_graspgen.py --data-dir "$fixture_dir"
 ```
 
 显示交互式 Open3D 视图和分数标签：
@@ -483,7 +483,7 @@ test -d "$fixture_dir" && source .shrc_local && \
 ```bash
 fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
 test -d "$fixture_dir" && source .shrc_local && \
-  python3 src/manipulation_service/test_graspgen.py \
+  python3 src/manipulation_service/debug_graspgen.py \
   --data-dir "$fixture_dir" \
   --show \
   --show-scores
@@ -494,7 +494,7 @@ test -d "$fixture_dir" && source .shrc_local && \
 ```bash
 fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
 test -d "$fixture_dir" && source .shrc_local && \
-  python3 src/manipulation_service/test_graspgen.py \
+  python3 src/manipulation_service/debug_graspgen.py \
   --data-dir "$fixture_dir" \
   --no-enable-tabletop-filter \
   --no-require-tabletop-filter
@@ -555,7 +555,7 @@ runtime info 正确后，再进入本包调 GraspGen。
 
 ### 只调 GraspGen，不启动 ROS service
 
-使用已有 RGB-D/mask fixture 目录运行 `test_graspgen.py`。这样可以排除
+使用已有 RGB-D/mask fixture 目录运行 `debug_graspgen.py`。这样可以排除
 ROS topic 同步、service timeout 和在线 perception 的影响。
 
 ### 调完整在线链路

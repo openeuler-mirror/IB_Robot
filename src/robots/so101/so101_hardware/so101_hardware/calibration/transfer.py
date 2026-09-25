@@ -18,7 +18,8 @@ NAMED_JOINT_ORDER = [
     "wrist_roll",
     "gripper",
 ]
-JOINT_ALIASES = dict(zip(JOINT_ORDER, NAMED_JOINT_ORDER, strict=False))
+# strict: the numeric and named joint tables above must stay the same length.
+JOINT_ALIASES = dict(zip(JOINT_ORDER, NAMED_JOINT_ORDER, strict=True))
 JOINT_ALIASES.update({value: key for key, value in JOINT_ALIASES.items()})
 SPECIAL_RANGE_JOINTS = {"2", "3", "shoulder_lift", "elbow_flex"}
 SKIP_JOINTS = {"6", "gripper"}
@@ -122,7 +123,7 @@ def migrate_calibration_data(template_data: Mapping, legacy_data: Mapping) -> di
     migrated = copy.deepcopy(template_data)
     legacy_meta = _legacy_joint_meta(legacy_data, migrated.keys())
 
-    for _index, (joint_name, joint_data) in enumerate(migrated.items()):
+    for joint_name, joint_data in migrated.items():
         if joint_name in SKIP_JOINTS or JOINT_ALIASES.get(joint_name) in SKIP_JOINTS:
             continue
 

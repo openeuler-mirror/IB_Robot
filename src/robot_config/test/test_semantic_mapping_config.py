@@ -72,7 +72,6 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
     assert config.semantic_mapping.filtering["max_object_extent_m"] == 0.65
     assert "allowed_labels" not in config.semantic_mapping.labels
     assert "actionable_labels" not in config.semantic_mapping.labels
-    assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 
 def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -> None:
@@ -178,12 +177,6 @@ def test_allowed_label_aliases_and_actionable_labels_fail_closed(tmp_path: Path)
             lambda config: config["semantic_mapping"]["labels"].update({"excluded_labels": "sky"}),
             "labels.excluded_labels must be a list",
         ),
-        (
-            lambda config: config["semantic_mapping"].update(
-                {"migration": {**config["semantic_mapping"]["migration"], "grounded_sam2_snapshot": "production"}}
-            ),
-            "migration.grounded_sam2_snapshot must be one of",
-        ),
     ],
 )
 def test_semantic_mapping_contract_fails_closed(tmp_path: Path, mutate, expected: str) -> None:
@@ -191,14 +184,6 @@ def test_semantic_mapping_contract_fails_closed(tmp_path: Path, mutate, expected
     mutate(config)
 
     with pytest.raises(ValueError, match=expected):
-        load_robot_config_dict(_write_config(tmp_path, config))
-
-
-def test_embedded_mapping_requires_explicit_migration_state(tmp_path: Path) -> None:
-    config = _enabled_config(tmp_path)
-    config["semantic_mapping"]["perception"].update({"mapping_backend": "embedded", "allow_legacy_embedded": True})
-
-    with pytest.raises(ValueError, match="embedded_mapping_backend must be 'migration_only'"):
         load_robot_config_dict(_write_config(tmp_path, config))
 
 

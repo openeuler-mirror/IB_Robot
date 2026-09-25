@@ -22,7 +22,7 @@ setup(
         "to action topics declared in robot_config YAML."
     ),
     license="Apache-2.0",
-    tests_require=["pytest"],
+    extras_require={"test": ["pytest"]},
     entry_points={
         "console_scripts": [
             "contract_mock = hardware_mock.contract_mock_node:main",

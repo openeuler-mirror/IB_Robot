@@ -392,9 +392,9 @@ def test_register_hermes_skill_updates_only_launcher_managed_copy(tmp_path) -> N
     source.write_text("---\nname: ibrobot-control\n---\nold\n", encoding="utf-8")
     skills_directory = tmp_path / "hermes" / "skills"
 
-    target = hermes_launcher._register_hermes_skill(source, skills_directory)
+    target = hermes_launcher.register_hermes_skill(source, skills_directory)
     source.write_text("---\nname: ibrobot-control\n---\nnew\n", encoding="utf-8")
-    assert hermes_launcher._register_hermes_skill(source, skills_directory) == target
+    assert hermes_launcher.register_hermes_skill(source, skills_directory) == target
 
     assert target.read_bytes() == source.read_bytes()
     assert (target.parent / ".ibrobot-managed").read_text(encoding="utf-8") == ("robot_skill_cli:ibrobot-control\n")
@@ -409,7 +409,7 @@ def test_register_hermes_skill_rejects_unmanaged_conflict(tmp_path) -> None:
     target.write_text("---\nname: ibrobot-control\n---\nuser copy\n", encoding="utf-8")
 
     with pytest.raises(hermes_launcher.LauncherError, match="unmanaged ibrobot-control") as error:
-        hermes_launcher._register_hermes_skill(source, tmp_path / "hermes" / "skills")
+        hermes_launcher.register_hermes_skill(source, tmp_path / "hermes" / "skills")
 
     assert error.value.code == "AGENT_SKILL_CONFLICT"
     assert "user copy" in target.read_text(encoding="utf-8")
