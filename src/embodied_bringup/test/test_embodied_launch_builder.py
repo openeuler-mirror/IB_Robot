@@ -1182,3 +1182,67 @@ def test_embodied_runtime_readiness_handler_starts_only_after_success():
     failure_actions = handler(type("Event", (), {"returncode": 1})(), None)
     assert len(failure_actions) == 1
     assert isinstance(failure_actions[0], EmitEvent)
+
+
+def _motion_owning_runtime_config(public_description, *, arm_surface):
+    """A runtime robot without arm motion: no model, ee pose, trajectory or move-to-joint."""
+    from robot_runtime.interface_description import description_digest, validate_description
+
+    description = json.loads(json.dumps(public_description))
+    description.pop("model")
+    for interface_id in ("motion.move_to_joint", "motion.ee_pose", "joint.arm_trajectory"):
+        description["interfaces"].pop(interface_id)
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    validate_description(description)
+    embodied = {"enabled": True, "entry_mode": "hermes"}
+    if arm_surface is not None:
+        embodied["arm_surface"] = arm_surface
+    return {
+        "name": "motion_owning_robot",
+        "runtime": {"provider": "so101_robot", "interface_description": description},
+        "control_modes": {"named_motion": {"runtime_mode": "idle"}},
+        "skill_required_control_mode": "named_motion",
+        "embodied": embodied,
+    }
+
+
+def test_runtime_without_arm_surface_binds_only_runtime_admission(public_description):
+    config = _motion_owning_runtime_config(public_description, arm_surface=False)
+
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion", motion_authorized=True))
+
+    assert params["runtime_enabled"] is True
+    assert _decode_launch_string(params["runtime_status_topic"]) == "/test/runtime_status"
+    assert _decode_launch_string(params["runtime_mode_service"]) == "/test/runtime/set_mode"
+    assert _decode_launch_json_string(params["runtime_mode_map_json"]) == {"named_motion": "idle"}
+    assert "arm_trajectory_action_name" not in params
+    assert "ee_pose_topic" not in params
+    assert "joint_state_topic" not in params
+    assert _decode_launch_string(params["move_configuration_service"]) == RUNTIME.MOVE_TO_JOINT_SERVICE
+
+
+@pytest.mark.parametrize("arm_surface", [None, True])
+def test_runtime_without_arm_interfaces_still_fails_closed_unless_opted_out(public_description, arm_surface):
+    config = _motion_owning_runtime_config(public_description, arm_surface=arm_surface)
+
+    with pytest.raises(ValueError, match="robot_model"):
+        generate_embodied_nodes(config, "named_motion")
+
+
+def test_arm_runtime_still_requires_its_trajectory_action(public_description):
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    from robot_runtime.interface_description import description_digest
+
+    description = json.loads(json.dumps(public_description))
+    description["interfaces"].pop("joint.arm_trajectory")
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    config = bind_robot_interfaces(
+        load_robot_config_dict(config_path, defer_interface_binding=True), public_description
+    )
+    config["runtime"]["interface_description"] = description
+    config["embodied"]["enabled"] = True
+
+    with pytest.raises(ValueError, match="arm trajectory action"):
+        generate_embodied_nodes(config, "moveit_planning")

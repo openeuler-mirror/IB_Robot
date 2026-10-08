@@ -414,6 +414,55 @@ def _canonical_digest_json(value: Any) -> str:
     )
 
 
+# Runtime capabilities that only an arm execution surface provides. A robot that
+# opts out of the arm surface must not require them.
+_ARM_SURFACE_CAPABILITIES = (
+    "joint.trajectory",
+    "motion.move_to_joint",
+    "motion.move_to_pose",
+    "motion.fk",
+    "motion.ik",
+)
+
+
+def robot_requires_arm_surface(robot_config: dict[str, Any]) -> bool:
+    """Whether the embodied stack must bind an arm execution surface.
+
+    The arm surface is the public model, joint limits, end-effector pose, joint
+    trajectory action and move-to-configuration service, plus the arm named
+    poses. Every robot has it unless its configuration explicitly opts out with
+    ``embodied.arm_surface: false`` - a runtime that owns its own motion (for
+    example a vendor motion-control tier serving named motions) and runs only
+    delegated skills. Opting out is explicit so that a robot that merely forgot
+    to declare a capability keeps failing closed.
+    """
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        return True
+    return embodied.get("arm_surface", True) is not False
+
+
+def validate_arm_surface_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the explicit arm-surface opt-out."""
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict) or "arm_surface" not in embodied:
+        return []
+    if not isinstance(embodied["arm_surface"], bool):
+        return ["embodied.arm_surface must be a boolean"]
+    if embodied["arm_surface"]:
+        return []
+    errors: list[str] = []
+    runtime = robot_config.get("runtime", {})
+    if not isinstance(runtime, dict) or not str(runtime.get("provider", "") or "").strip():
+        errors.append("embodied.arm_surface: false requires a runtime.provider that owns robot motion")
+    capabilities = robot_config.get("capabilities", {})
+    requires = capabilities.get("requires", []) if isinstance(capabilities, dict) else []
+    arm_required = sorted(set(_ARM_SURFACE_CAPABILITIES) & {str(name) for name in requires or []})
+    if arm_required:
+        errors.append("embodied.arm_surface: false contradicts required arm capabilities: " + ", ".join(arm_required))
+    return errors
+
+
 def robot_context_schema_version(robot_config: dict[str, Any]) -> int:
     """Select the context schema from the resolved navigation endpoint projection."""
     if robot_config.get("nav_stage") == "hybrid":
@@ -1797,6 +1846,7 @@ def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfa
     """Validate an effective config, including an in-memory launch binding before snapshotting."""
     validation_errors = validate_navigation_endpoint_contract(robot_config)
     validation_errors.extend(validate_runtime_provider_config(robot_config))
+    validation_errors.extend(validate_arm_surface_config(robot_config))
     validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))
@@ -2110,6 +2160,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
 
     return EmbodiedConfig(
         enabled=data.get("enabled", False),
+        arm_surface=data.get("arm_surface", True) is not False,
         entry_mode=data.get("entry_mode", "hermes"),
         agent=dict(data.get("agent", {})),
         debug_tracing=data.get("debug_tracing", True),
@@ -2755,11 +2806,15 @@ def validate_config(config: RobotConfig) -> list[str]:
         errors.extend(
             validate_agent_entry_config({"entry_mode": config.embodied.entry_mode, "agent": config.embodied.agent})
         )
-        required_pose_names = {"home", "observe_table", "zero"}
+        required_pose_names = {"home", "observe_table", "zero"} if config.embodied.arm_surface else set()
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
             errors.append("embodied.named_poses is missing required pose(s): " + ", ".join(missing_pose_names))
-        if config.embodied.default_place_name and config.embodied.default_place_name not in config.embodied.named_poses:
+        if (
+            config.embodied.arm_surface
+            and config.embodied.default_place_name
+            and config.embodied.default_place_name not in config.embodied.named_poses
+        ):
             errors.append(
                 f"embodied.default_place_name references undefined pose: {config.embodied.default_place_name}"
             )

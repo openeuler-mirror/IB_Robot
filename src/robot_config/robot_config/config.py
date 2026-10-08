@@ -160,6 +160,9 @@ class EmbodiedConfig:
     """Minimum embodied claw closure configuration."""
 
     enabled: bool = False
+    # False only for a runtime that owns its own motion and runs delegated
+    # skills; see robot_config.loader.robot_requires_arm_surface.
+    arm_surface: bool = True
     entry_mode: str = "hermes"
     agent: dict[str, Any] = field(default_factory=dict)
     debug_tracing: bool = True

@@ -13,6 +13,7 @@ from robot_config.loader import (
     navigation_endpoint_projection,
     robot_config_digest,
     robot_context_schema_version,
+    robot_requires_arm_surface,
     robot_supported_control_modes,
     validate_agent_entry_config,
     validate_navigation_endpoint_contract,
@@ -116,7 +117,12 @@ def generate_embodied_nodes(
     teleoperation = robot_config.get("teleoperation", {})
     runtime = robot_config.get("runtime", {})
     runtime_enabled = bool(runtime.get("provider"))
+    # Runtime admission (status, mode service, mode map) applies to every
+    # runtime robot running skills. The arm surface (public model, joint
+    # limits, ee pose, joint trajectory, move-to-configuration) is bound only
+    # when the robot has one; a robot opts out explicitly, never by omission.
     runtime_motion = runtime_enabled and include_motion and motion_mode_compatible
+    arm_surface = runtime_motion and robot_requires_arm_surface(robot_config)
     description = runtime.get("interface_description", {}) if runtime_enabled else {}
     joint_limits = teleoperation.get("safety", {}).get("joint_limits", {})
     home_positions = robot_config.get("ros2_control", {}).get("reset_positions", {})
@@ -124,6 +130,7 @@ def generate_embodied_nodes(
         from robot_runtime.interface_description import validate_description
 
         validate_description(description)
+    if arm_surface:
         model = robot_config.get("robot_model")
         if model != description.get("model") or not model:
             raise ValueError("embodied motion requires bound robot_model from the public description")
@@ -272,6 +279,9 @@ def generate_embodied_nodes(
                     if isinstance(mode, dict) and mode.get("runtime_mode")
                 }
             ),
+        )
+    if arm_surface:
+        common_params.update(
             move_configuration_service=public_endpoint(
                 "motion.move_to_joint", "service", "ibrobot_msgs/srv/MoveToConfiguration"
             ),
