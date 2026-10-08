@@ -50,6 +50,9 @@ SUPPORTED_SKILL_EXECUTORS = {
     "semantic_map_query",
     "imitate_human_motion",
     "sound_following",
+    # A named motion the robot runtime owns and executes itself (for example a
+    # vendor preset gesture), bound per skill by the catalog implementation.
+    "runtime_named_motion",
 }
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 

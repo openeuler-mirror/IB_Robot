@@ -20,7 +20,7 @@ from skill_catalog.models import SkillCompileContext, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
 
 
-def _snapshot(tmp_path):
+def _snapshot(tmp_path, *, required_capabilities: str = ""):
     package = tmp_path / "config" / "skills" / "open_gripper_skill"
     package.mkdir(parents=True)
     (tmp_path / "config" / "profiles").mkdir(parents=True)
@@ -36,7 +36,7 @@ enabled_skills:
         encoding="utf-8",
     )
     (package / "manifest.yaml").write_text(
-        """schema_version: 1
+        f"""schema_version: 1
 name: open_gripper_skill
 version: 1.0.0
 semantic_level: atomic_operator
@@ -52,9 +52,9 @@ capability:
   domain: manipulation
   moves_robot: true
   required_control_mode: moveit_planning
-  parameters: {type: object, properties: {}, required: [], additionalProperties: false}
+  parameters: {{type: object, properties: {{}}, required: [], additionalProperties: false}}
   recovery_policy: never_retry
-implementations:
+{required_capabilities}implementations:
   test_robot: implementations/test_robot.yaml
 """,
         encoding="utf-8",
@@ -241,3 +241,25 @@ def test_consumer_rejects_noncanonical_capability_field_sets(tmp_path, version, 
             ),
             CatalogIdentity("epoch", 1, registry_digest),
         )
+
+
+def test_consumer_accepts_compiled_required_capabilities(tmp_path):
+    snapshot = _snapshot(tmp_path, required_capabilities="  required_capabilities: [motion.named]\n")
+
+    view = verify_snapshot_response(_response(snapshot), CatalogIdentity("epoch", 1, snapshot.registry_digest))
+
+    assert list(view.capability_view["open_gripper_skill"]["required_capabilities"]) == ["motion.named"]
+    registry = json.loads(snapshot.registry_preimage_json)
+    assert derive_capability_view_from_registry(registry)["open_gripper_skill"]["required_capabilities"] == [
+        "motion.named"
+    ]
+
+
+@pytest.mark.parametrize("required", [[], [""], "motion.named", [7]])
+def test_derived_capability_view_rejects_malformed_required_capabilities(tmp_path, required):
+    snapshot = _snapshot(tmp_path, required_capabilities="  required_capabilities: [motion.named]\n")
+    registry = json.loads(snapshot.registry_preimage_json)
+    registry["skills"][0]["template"]["capability"]["required_capabilities"] = required
+
+    with pytest.raises(ValueError, match="capability fields"):
+        derive_capability_view_from_registry(registry)

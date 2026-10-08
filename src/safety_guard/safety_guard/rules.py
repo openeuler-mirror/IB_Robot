@@ -190,6 +190,23 @@ def validate_skill_request(
             if motion_distance:
                 return False, "motion_distance is not accepted by sound_following"
             return True, ""
+        if executor_name == "runtime_named_motion":
+            # The motion is bound by the catalog; the skill accepts no argument.
+            supplied = [
+                name
+                for name, value in (
+                    ("target_name", str(target_name).strip()),
+                    ("direction", str(direction).strip()),
+                    ("distance", distance),
+                    ("degree", degree),
+                    ("x", x),
+                    ("y", y),
+                    ("yaw", yaw),
+                )
+                if value not in ("", 0.0, None)
+            ]
+            if supplied:
+                return False, f"{', '.join(supplied)} not accepted by {skill_name}"
         if motion_direction or motion_distance:
             return False, f"motion parameters are not accepted by {skill_name}"
         return True, ""

@@ -289,6 +289,57 @@ def test_validate_sound_following_toggle_direction():
     assert reason == ""
 
 
+def _runtime_named_motion_templates():
+    return {
+        "handshake": {
+            "executor": "runtime_named_motion",
+            "binding": {"motion": "handshake"},
+            "required_args": [],
+            "capability": {"schema_version": 1},
+        }
+    }
+
+
+def test_validate_runtime_named_motion_accepts_a_request_without_arguments():
+    allowed, reason = validate_skill_request(
+        "handshake", "", "", "", 0.0, {}, {}, _runtime_named_motion_templates(), schema_version=1
+    )
+
+    assert allowed
+    assert reason == ""
+
+
+@pytest.mark.parametrize(
+    ("overrides", "rejected"),
+    [
+        ({"target_name": "cup"}, "target_name not accepted by handshake"),
+        ({"arm_side": "left"}, "arm_side is not accepted by handshake"),
+        ({"motion_direction": "up"}, "motion parameters are not accepted by handshake"),
+        ({"place_name": "home"}, "place_name is not accepted by handshake"),
+        ({"direction": "forward", "distance": 0.5}, "direction, distance not accepted by handshake"),
+        ({"x": 1.0, "yaw": 0.3}, "x, yaw not accepted by handshake"),
+    ],
+)
+def test_validate_runtime_named_motion_rejects_every_caller_argument(overrides, rejected):
+    request = {
+        "skill_name": "handshake",
+        "target_name": "",
+        "place_name": "",
+        "motion_direction": "",
+        "motion_distance": 0.0,
+        "named_poses": {},
+        "named_targets": {},
+        "skill_templates": _runtime_named_motion_templates(),
+        "schema_version": 1,
+        **overrides,
+    }
+
+    allowed, reason = validate_skill_request(**request)
+
+    assert not allowed
+    assert reason == rejected
+
+
 def test_validate_relative_skill_rejects_non_finite_distance():
     allowed, reason = validate_skill_request(
         "move_relative_ee",

@@ -223,6 +223,16 @@ def derive_capability_view_from_registry(registry_preimage: Mapping[str, Any]) -
         }
         if capability_version == 2:
             expected_fields.add("schema_version")
+        # Optional, and emitted by the compiler only when the manifest declares it.
+        if "required_capabilities" in capability:
+            required = capability["required_capabilities"]
+            if (
+                not isinstance(required, list | tuple)
+                or not required
+                or any(not isinstance(item, str) or not item.strip() for item in required)
+            ):
+                raise ValueError("registry skill capability fields are invalid")
+            expected_fields.add("required_capabilities")
         if set(capability) != expected_fields:
             raise ValueError("registry skill capability fields are invalid")
         rebuilt = dict(capability)

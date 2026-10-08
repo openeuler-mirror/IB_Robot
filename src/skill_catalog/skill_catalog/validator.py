@@ -23,12 +23,17 @@ SEMVER_PATTERN = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"
 )
 SEMANTIC_LEVELS = frozenset({"atomic_operator", "skill"})
-CONTROL_MODES = frozenset({"teleop", "model_inference", "moveit_planning", "base_navigation"})
+# named_motion: the application issues no stream or trajectory; the robot
+# runtime executes named motions it owns (delegated runtime_named_motion skills).
+CONTROL_MODES = frozenset({"teleop", "model_inference", "moveit_planning", "base_navigation", "named_motion"})
 CONTROL_MODES_BY_SCHEMA_VERSION = {
-    1: frozenset({"teleop", "model_inference", "moveit_planning"}),
+    1: frozenset({"teleop", "model_inference", "moveit_planning", "named_motion"}),
     2: CONTROL_MODES,
     3: CONTROL_MODES,
 }
+# Delegated executor whose implementation binds the runtime motion it runs;
+# the caller supplies no argument (see validate_implementation).
+RUNTIME_NAMED_MOTION_EXECUTOR = "runtime_named_motion"
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
@@ -473,7 +478,12 @@ def validate_implementation(
             _validate_robot_compatibility(normalized_steps, context, diagnostics, source_relative_path)
         return diagnostics, normalized, frozenset(requirements)
     if kind == "delegated_executor":
+        executor_name = implementation.get("executor")
+        runtime_named = executor_name == RUNTIME_NAMED_MOTION_EXECUTOR
         allowed = {"schema_version", "kind", "robot", "executor", "required_args", "timeout_sec"}
+        if runtime_named:
+            # The bound motion is implementation data, never a caller argument.
+            allowed.add("binding")
         _exact_fields(implementation, allowed, diagnostics, source_relative_path=source_relative_path)
         if implementation.get("schema_version") != source_version:
             _error(
@@ -491,7 +501,6 @@ def validate_implementation(
                 source_relative_path=source_relative_path,
                 field_path="robot",
             )
-        executor_name = implementation.get("executor")
         executor = delegated_executors.get(executor_name)
         if executor is None:
             _error(
@@ -505,7 +514,15 @@ def validate_implementation(
             _validate_executor(executor, diagnostics, source_relative_path, "executor")
         required_args = implementation.get("required_args")
         capability_parameters = manifest.get("capability", {}).get("parameters", {}).get("properties", {})
-        if (
+        if runtime_named:
+            _validate_runtime_named_motion(
+                implementation,
+                capability_parameters,
+                manifest.get("capability", {}).get("required_capabilities", []),
+                diagnostics,
+                source_relative_path=source_relative_path,
+            )
+        elif (
             not isinstance(required_args, list)
             or not required_args
             or any(not isinstance(arg, str) for arg in required_args)
@@ -545,6 +562,65 @@ def validate_implementation(
         field_path="kind",
     )
     return diagnostics, normalized, frozenset()
+
+
+# Runtime capabilities that advertise the names a runtime_named_motion skill may bind.
+NAMED_MOTION_CAPABILITIES = frozenset({"motion.named", "motion.posture"})
+
+
+def _validate_runtime_named_motion(
+    implementation: Mapping[str, Any],
+    capability_parameters: Any,
+    required_capabilities: Any,
+    diagnostics: list[SkillDiagnostic],
+    *,
+    source_relative_path: str,
+) -> None:
+    """A runtime named-motion skill binds exactly one motion and takes no arguments.
+
+    The skill must require the runtime capability that advertises its motion,
+    so the gateway checks the runtime provides it before dispatch.
+    """
+    if not isinstance(required_capabilities, list) or not NAMED_MOTION_CAPABILITIES & set(
+        item for item in required_capabilities if isinstance(item, str)
+    ):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "runtime_named_motion skills must require motion.named or motion.posture",
+            source_relative_path=source_relative_path,
+            field_path="capability.required_capabilities",
+        )
+    if implementation.get("required_args") != []:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "runtime_named_motion takes no caller arguments; required_args must be []",
+            source_relative_path=source_relative_path,
+            field_path="required_args",
+        )
+    if capability_parameters:
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "runtime_named_motion skills must declare no capability parameters",
+            source_relative_path=source_relative_path,
+            field_path="required_args",
+        )
+    binding = implementation.get("binding")
+    if (
+        not isinstance(binding, Mapping)
+        or set(binding) != {"motion"}
+        or not isinstance(binding.get("motion"), str)
+        or not NAME_PATTERN.fullmatch(binding["motion"])
+    ):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "binding must be exactly {motion: <runtime motion name>}",
+            source_relative_path=source_relative_path,
+            field_path="binding",
+        )
 
 
 def _validate_description(
