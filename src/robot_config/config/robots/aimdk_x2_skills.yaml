@@ -1,0 +1,48 @@
+# AgiBot X2 deployment that runs the platform's preset social gestures as
+# embodied skills.
+#
+# The base configuration (aimdk_x2.yaml) stays the runtime author's: it selects
+# the aimdk_robot runtime and states what the application requires. This file
+# only adds the skill stack. The X2 runtime owns its own motion (vendor
+# motion-control tier): there is no public model, joint trajectory, kinematics
+# or ee pose, so the embodied stack runs without an arm surface and every skill
+# is a delegated runtime_named_motion skill bound to one runtime motion name.
+#
+# Launch with control_mode:=named_motion. Motion stays disabled until the
+# operator passes motion_authorized:=true; named motions cannot be cancelled
+# through the skill path, and /runtime/stop is the operator interrupt.
+robot:
+  base_config: aimdk_x2.yaml
+  name: aimdk_x2_skills
+
+  default_control_mode: "named_motion"
+  skill_required_control_mode: "named_motion"
+
+  control_modes:
+    named_motion:
+      description: "Runtime-owned named motions (preset gestures)"
+      description_cn: "运行时自持的命名动作（预设手势）"
+      # The runtime admits named motions only in idle (stable stand); the skill
+      # executor never requests a switch to idle, which would clear a stop latch.
+      runtime_mode: idle
+      inference:
+        enabled: false
+      executor:
+        # No action dispatcher: this mode commands no streaming channel.
+        enabled: false
+
+  embodied:
+    enabled: true
+    arm_surface: false
+    skill_catalog_profile: aimdk_x2_skills
+    skill_catalog_source_mode: development
+    skill_catalog_source_root: src/skill_catalog
+    runtime_named_motion:
+      enabled: true
+      # Logical binding: launch waits for this runtime interface and binds its
+      # endpoint from the live description (never a hard-coded name).
+      interface: motion.named
+      kind: action
+      type: ibrobot_msgs/action/ExecuteNamedMotion
+      requires:
+        capability: motion.named

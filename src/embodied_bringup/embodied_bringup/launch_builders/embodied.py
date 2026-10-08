@@ -10,6 +10,7 @@ from launch_ros.actions import Node
 from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import SoundOrientationConfig
 from robot_config.loader import (
+    RUNTIME_NAMED_MOTION_ACTION_TYPE,
     navigation_endpoint_projection,
     robot_config_digest,
     robot_context_schema_version,
@@ -278,6 +279,15 @@ def generate_embodied_nodes(
                     for name, mode in robot_config.get("control_modes", {}).items()
                     if isinstance(mode, dict) and mode.get("runtime_mode")
                 }
+            ),
+        )
+    named_motion_config = embodied_config.get("runtime_named_motion", {})
+    if runtime_motion and isinstance(named_motion_config, dict) and named_motion_config.get("enabled") is True:
+        # Runtime-owned named motions; the endpoint comes only from the bound public description.
+        common_params.update(
+            runtime_named_motion_enabled=True,
+            runtime_named_motion_action=public_endpoint(
+                named_motion_config.get("interface", ""), "action", RUNTIME_NAMED_MOTION_ACTION_TYPE
             ),
         )
     if arm_surface:

@@ -43,6 +43,24 @@ def _bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str, str]]:
 
 def _endpoint_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str]]:
     """Yield non-topic consumer bindings such as business services and actions."""
+    yield from _interaction_demo_bindings(config)
+    yield from _runtime_named_motion_bindings(config)
+
+
+def _runtime_named_motion_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str]]:
+    """The action an enabled embodied runtime_named_motion executor dispatches to."""
+    embodied = config.get("embodied")
+    item = embodied.get("runtime_named_motion") if isinstance(embodied, Mapping) else None
+    if not isinstance(item, dict) or item.get("enabled") is not True:
+        return
+    path = "embodied.runtime_named_motion"
+    interface_id = item.get("interface")
+    if not isinstance(interface_id, str) or not interface_id or interface_id.strip() != interface_id:
+        raise InterfaceBindingError("invalid_interface", path, "interface must be a non-empty logical ID")
+    yield item, f"{path} interface={interface_id!r}"
+
+
+def _interaction_demo_bindings(config: Mapping[str, Any]) -> Iterator[tuple[dict, str]]:
     demo = config.get("interaction_demo")
     if demo is None:
         return

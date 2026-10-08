@@ -1,0 +1,50 @@
+schema_version: 1
+name: wave_hand
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Wave one hand in greeting or farewell.
+  category: social_greeting
+  when_to_use:
+  - greet someone casually
+  - say hi or bye
+  - wave to a person
+  do_not_use:
+  - condition: greet someone formally
+    instead_use: handshake
+  - condition: volunteer or ask for attention
+    instead_use: raise_hand
+  aliases_zh:
+  - 挥手
+  - 挥挥手
+  - 打招呼
+  - 招手
+  - 再见
+  aliases_en:
+  - wave
+  - wave hello
+  - say goodbye
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  # Placeholder until measured on the robot; the runtime bounds the motion itself.
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Wave one hand in greeting or farewell.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # A preset motion cannot be cancelled; a failure is reported, never retried.
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

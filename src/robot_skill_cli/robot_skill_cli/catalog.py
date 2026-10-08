@@ -258,6 +258,25 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         )
         delegated[descriptor.name] = descriptor
 
+    named_motion = embodied.get("runtime_named_motion", {})
+    if isinstance(named_motion, dict) and named_motion.get("enabled") is True:
+        # Mirror SkillExecutorNode: the endpoint and runtime identity come from
+        # the bound public description when this config snapshot carries one.
+        runtime = robot_config.get("runtime", {}) if isinstance(robot_config.get("runtime"), dict) else {}
+        description = runtime.get("interface_description") or {}
+        interface = (description.get("interfaces") or {}).get(named_motion.get("interface", "")) or {}
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="runtime_named_motion",
+                endpoint_name=interface.get("endpoint", "/motion/execute_named"),
+                endpoint_kind="ros_action",
+                configuration={
+                    "runtime_name": (description.get("robot") or {}).get("runtime_name", runtime.get("provider", ""))
+                },
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
     semantic_mapping = robot_config.get("semantic_mapping", {})
     if isinstance(semantic_mapping, dict) and semantic_mapping.get("enabled", False):
         interfaces = semantic_mapping.get("interfaces", {})

@@ -463,6 +463,49 @@ def validate_arm_surface_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
+# The neutral action a runtime_named_motion executor dispatches to.
+RUNTIME_NAMED_MOTION_ACTION_TYPE = "ibrobot_msgs/action/ExecuteNamedMotion"
+_RUNTIME_NAMED_MOTION_DECLARED_KEYS = frozenset({"enabled", "interface", "kind", "type", "requires"})
+# Keys interface binding records on the declaration once the live description is bound.
+_RUNTIME_NAMED_MOTION_BOUND_KEYS = frozenset({"endpoint", "capability", "_interface_source"})
+
+
+def validate_runtime_named_motion_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the explicit binding for skills that run runtime-owned named motions.
+
+    When enabled it is a logical endpoint binding (like interaction_demo.interfaces):
+    the launch waits for the declared action and binds its endpoint from the live
+    runtime description, so the embodied consumers receive that description.
+    """
+    embodied = robot_config.get("embodied", {})
+    config = embodied.get("runtime_named_motion") if isinstance(embodied, dict) else None
+    if config is None:
+        return []
+    prefix = "embodied.runtime_named_motion"
+    if not isinstance(config, dict) or not isinstance(config.get("enabled"), bool):
+        return [f"{prefix}.enabled must be a boolean"]
+    unknown = set(config) - _RUNTIME_NAMED_MOTION_DECLARED_KEYS - _RUNTIME_NAMED_MOTION_BOUND_KEYS
+    if unknown:
+        return [f"{prefix} has unknown keys: {sorted(unknown)}"]
+    if not config["enabled"]:
+        return []
+    errors: list[str] = []
+    if not isinstance(config.get("interface"), str) or not config["interface"].strip():
+        errors.append(f"{prefix}.interface must name the runtime's named-motion action interface")
+    if config.get("kind") != "action":
+        errors.append(f"{prefix}.kind must be action")
+    if config.get("type") != RUNTIME_NAMED_MOTION_ACTION_TYPE:
+        errors.append(f"{prefix}.type must be {RUNTIME_NAMED_MOTION_ACTION_TYPE}")
+    runtime = robot_config.get("runtime", {})
+    if not isinstance(runtime, dict) or not str(runtime.get("provider", "") or "").strip():
+        errors.append(f"{prefix} requires a runtime.provider")
+    capabilities = robot_config.get("capabilities", {})
+    requires = capabilities.get("requires", []) if isinstance(capabilities, dict) else []
+    if not {"motion.named", "motion.posture"} & {str(name) for name in requires or []}:
+        errors.append(f"{prefix} requires capabilities motion.named or motion.posture")
+    return errors
+
+
 def robot_context_schema_version(robot_config: dict[str, Any]) -> int:
     """Select the context schema from the resolved navigation endpoint projection."""
     if robot_config.get("nav_stage") == "hybrid":
@@ -1847,6 +1890,7 @@ def validate_robot_config_dict(robot_config: dict[str, Any], *, deferred_interfa
     validation_errors = validate_navigation_endpoint_contract(robot_config)
     validation_errors.extend(validate_runtime_provider_config(robot_config))
     validation_errors.extend(validate_arm_surface_config(robot_config))
+    validation_errors.extend(validate_runtime_named_motion_config(robot_config))
     validation_errors.extend(validate_grasp_execution_config(robot_config.get("grasp_execution")))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))

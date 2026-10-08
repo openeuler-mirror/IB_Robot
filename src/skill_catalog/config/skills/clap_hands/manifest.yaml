@@ -1,0 +1,47 @@
+schema_version: 1
+name: clap_hands
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Clap both hands to applaud or celebrate.
+  category: social_emotion
+  when_to_use:
+  - applaud someone
+  - celebrate a result
+  - cheer a performance
+  do_not_use:
+  - condition: show affection
+    instead_use: blow_kiss
+  - condition: ask for attention
+    instead_use: raise_hand
+  aliases_zh:
+  - 鼓掌
+  - 拍手
+  - 拍拍手
+  aliases_en:
+  - clap
+  - applaud
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  # Placeholder until measured on the robot; the runtime bounds the motion itself.
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Clap both hands to applaud or celebrate.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # A preset motion cannot be cancelled; a failure is reported, never retried.
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

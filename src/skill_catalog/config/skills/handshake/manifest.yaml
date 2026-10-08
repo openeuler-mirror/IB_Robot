@@ -1,0 +1,44 @@
+schema_version: 1
+name: handshake
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Offer a hand for a handshake.
+  category: social_greeting
+  when_to_use:
+  - greet someone formally
+  - close an agreement
+  - welcome a visitor
+  do_not_use:
+  - condition: greet someone casually from a distance
+    instead_use: wave_hand
+  aliases_zh:
+  - 握手
+  - 握个手
+  aliases_en:
+  - handshake
+  - shake hands
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  # Placeholder until measured on the robot; the runtime bounds the motion itself.
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Offer a hand for a handshake.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # A preset motion cannot be cancelled; a failure is reported, never retried.
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml

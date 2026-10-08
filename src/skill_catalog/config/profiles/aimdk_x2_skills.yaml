@@ -1,0 +1,19 @@
+schema_version: 1
+name: aimdk_x2_skills
+robot_name: aimdk_x2_skills
+enabled_skills:
+- name: wave_hand
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: handshake
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: raise_hand
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: blow_kiss
+  implementation: x2_runtime_v1
+  planner_visible: true
+- name: clap_hands
+  implementation: x2_runtime_v1
+  planner_visible: true

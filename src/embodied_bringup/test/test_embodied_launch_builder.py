@@ -1246,3 +1246,55 @@ def test_arm_runtime_still_requires_its_trajectory_action(public_description):
 
     with pytest.raises(ValueError, match="arm trajectory action"):
         generate_embodied_nodes(config, "moveit_planning")
+
+
+_NAMED_MOTION_BINDING = {
+    "enabled": True,
+    "interface": "motion.named",
+    "kind": "action",
+    "type": "ibrobot_msgs/action/ExecuteNamedMotion",
+}
+
+
+def _with_named_motion_interface(config):
+    from robot_runtime.interface_description import description_digest, validate_description
+
+    description = config["runtime"]["interface_description"]
+    description["interfaces"]["motion.named"] = {
+        "capability": "motion.named",
+        "kind": "action",
+        "direction": "serve",
+        "endpoint": "/test/motion/execute_named",
+        "message_type": "ibrobot_msgs/action/ExecuteNamedMotion",
+    }
+    description.pop("digest")
+    description["digest"] = description_digest(description)
+    validate_description(description)
+    return config
+
+
+def test_runtime_named_motion_endpoint_comes_from_the_public_description(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+    config["embodied"]["runtime_named_motion"] = dict(_NAMED_MOTION_BINDING)
+
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    assert params["runtime_named_motion_enabled"] is True
+    assert _decode_launch_string(params["runtime_named_motion_action"]) == "/test/motion/execute_named"
+
+
+def test_runtime_named_motion_requires_the_public_action(public_description):
+    config = _motion_owning_runtime_config(public_description, arm_surface=False)
+    config["embodied"]["runtime_named_motion"] = dict(_NAMED_MOTION_BINDING)
+
+    with pytest.raises(ValueError, match="motion.named"):
+        generate_embodied_nodes(config, "named_motion")
+
+
+def test_runtime_named_motion_stays_off_unless_enabled(public_description):
+    config = _with_named_motion_interface(_motion_owning_runtime_config(public_description, arm_surface=False))
+
+    params = _skill_executor_params(generate_embodied_nodes(config, "named_motion"))
+
+    assert "runtime_named_motion_enabled" not in params
+    assert "runtime_named_motion_action" not in params

@@ -1,0 +1,46 @@
+schema_version: 1
+name: raise_hand
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Raise one hand, as when volunteering or asking for attention.
+  category: social_greeting
+  when_to_use:
+  - volunteer or answer a call
+  - ask for attention
+  - signal presence
+  do_not_use:
+  - condition: say hi or bye
+    instead_use: wave_hand
+  - condition: applaud someone
+    instead_use: clap_hands
+  aliases_zh:
+  - 举手
+  - 举起手
+  aliases_en:
+  - raise hand
+  - raise your hand
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: moderate
+  # Placeholder until measured on the robot; the runtime bounds the motion itself.
+  duration_sec_estimate: 10.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Raise one hand, as when volunteering or asking for attention.
+  domain: social
+  moves_robot: true
+  required_control_mode: named_motion
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  # A preset motion cannot be cancelled; a failure is reported, never retried.
+  recovery_policy: never_retry
+  required_capabilities:
+  - motion.named
+implementations:
+  x2_runtime_v1: implementations/x2_runtime_v1.yaml
