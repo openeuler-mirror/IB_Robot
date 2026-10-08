@@ -559,6 +559,45 @@ V3 额外包含 `supported_control_modes`。切换 `context_schema_version` 会�
 `skill_catalog` 重新编译并生成新 registry generation。V1、V2 与 V3 snapshot 在 registry 层
 永远不可互换校验。
 
+## 运行时自持运动的机器人（arm_surface / runtime_named_motion）
+
+有些运行时自己执行运动（例如灵犀 X2 的厂商运动控制层播放命名手势），不公开模型、关节轨迹、运动学或末端
+位姿。这类部署的 embodied 技能栈用两个显式开关描述，参考 `config/robots/aimdk_x2_skills.yaml`：
+
+```yaml
+robot:
+  base_config: aimdk_x2.yaml          # 运行时作者的基础配置保持不变
+  name: aimdk_x2_skills
+  default_control_mode: named_motion
+  skill_required_control_mode: named_motion
+  control_modes:
+    named_motion:
+      runtime_mode: idle              # 运行时只在 idle（稳定站立）准入命名动作
+      inference: {enabled: false}
+      executor: {enabled: false}      # 必须显式关闭：缺省视为启用，会启动 action_dispatcher
+  embodied:
+    enabled: true
+    arm_surface: false
+    runtime_named_motion:
+      enabled: true
+      interface: motion.named
+      kind: action
+      type: ibrobot_msgs/action/ExecuteNamedMotion
+      requires: {capability: motion.named}
+```
+
+- `embodied.arm_surface`（默认 `true`）：为 `false` 时，embodied launch 只绑定运行时准入（status、
+  set_mode、模式映射），不再要求公开模型、关节限位、末端位姿、臂轨迹 action 和 move-to-joint，loader
+  也不再要求 `home` / `observe_table` / `zero` 命名位姿。只能显式退出、不会从能力声明推断，因此漏配
+  能力的臂式机器人仍会失败。退出时必须有 `runtime.provider`，且 `capabilities.requires` 不得含臂式能力
+  （`joint.trajectory`、`motion.move_to_joint`、`motion.move_to_pose`、`motion.fk`、`motion.ik`）。
+- `embodied.runtime_named_motion`：启用 `runtime_named_motion` 执行器的**逻辑接口绑定**，写法与
+  `interaction_demo.interfaces` 相同。统一 launch 等待该运行时接口、从实时接口描述绑定端点，再把绑定后的
+  配置交给 embodied 节点。要求 `runtime.provider`，且 `capabilities.requires` 含 `motion.named` 或
+  `motion.posture`。因为是实时绑定，离线 `load_robot_config_dict()` 需要 `defer_interface_binding=True`；
+  robot-skill CLI 请用 launch 日志里 `consumer snapshot:` 给出的绑定后配置（`--config-path`）。
+- `named_motion` 控制模式：应用不发流式或轨迹指令，由运行时执行命名动作。
+
 ## 控制模式配置
 
 robot_config 包支持双控制模式，以满足不同 AI 模型的需求：

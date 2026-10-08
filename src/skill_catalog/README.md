@@ -16,7 +16,8 @@ The current source-workspace profiles are `so101_single_arm`,
 `lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`,
 `lekiwi_handeye_realsense_grasp_lidar`,
 `lekiwi_handeye_realsense_grasp_lidar_sound_following`,
-`so101_rtp_distributed`, `lekiwi_lidar`, and `lekiwi_lidar_sound_following`.
+`so101_rtp_distributed`, `lekiwi_lidar`, `lekiwi_lidar_sound_following`, and
+`aimdk_x2_skills`.
 The `lekiwi_handeye_realsense_grasp_lidar` profile is the unified mobile-manipulator
 profile: it exposes manipulation, navigation, and approved social arm skills in one immutable snapshot.
 The shared stable
@@ -40,6 +41,49 @@ the `lekiwi_nav_grasp` hybrid stage: it is the full mobile-manipulator skill set
 overlay: it additionally exposes `sound_following`, a session-toggle delegated
 executor. Actual periodic turns remain separate `nav_turn` root requests admitted
 by the Gateway. The ordinary profiles do not require the sound-following runtime.
+
+`aimdk_x2_skills` (AgiBot X2) exposes five planner-visible social gestures -
+`wave_hand`, `handshake`, `raise_hand`, `blow_kiss`, `clap_hands` - as runtime named
+motions; see [Runtime named-motion skills](#runtime-named-motion-skills).
+
+## Runtime named-motion skills
+
+Some robot runtimes own their motion: a vendor motion-control tier plays named
+gestures itself and exposes no arm trajectory, kinematics or ee pose. Their skills
+are `delegated_executor` implementations with `executor: runtime_named_motion`,
+which the skill executor sends to the runtime's neutral
+`ibrobot_msgs/action/ExecuteNamedMotion` action. Rules enforced at compile time:
+
+- The implementation binds exactly one runtime motion name and nothing else:
+  `binding: {motion: <name>}`. The binding is implementation data, not a request
+  parameter, so no wire field exists for it and callers cannot choose the motion.
+  Only this executor may declare `binding`.
+- `required_args` must be `[]` and the capability must declare no parameters.
+  Other delegated executors keep their non-empty `required_args` rule.
+- `capability.required_capabilities` must contain `motion.named` (preset gestures)
+  or `motion.posture` (posture changes). The Gateway checks the runtime advertises
+  it, and the executor checks the bound name against that capability's advertised
+  list before dispatch.
+- `required_control_mode` is `named_motion`: the application issues no stream or
+  trajectory and the runtime executes the motion. The value belongs to the control
+  mode vocabulary of every source and context schema version; it does not need a
+  new context schema version.
+
+```yaml
+# config/skills/handshake/implementations/x2_runtime_v1.yaml
+schema_version: 1
+kind: delegated_executor
+robot: x2_runtime_v1
+executor: runtime_named_motion
+binding:
+  motion: handshake   # a name the runtime advertises in motion.named.names
+required_args: []
+timeout_sec: 45.0     # above the runtime's own motion timeout
+```
+
+Named motions cannot be cancelled once started (the runtime refuses it); see the
+`skill_library` README for the executor's cancel and deadline semantics. Postures
+and stairs are deliberately not exposed by `aimdk_x2_skills`.
 
 ## Source Modes
 

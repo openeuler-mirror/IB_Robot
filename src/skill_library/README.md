@@ -74,6 +74,9 @@ SO101 当前配置示例：
 | 抓取与放置 | `pick_object`、`place_in_container`（固定位置释放，要求显式传入 `target_name` 和 `container_name` 做验证） |
 | 人机交互模拟执行 | `imitate_human_motion`（要求 `arm_side` 和 `imitation_duration_sec`） |
 
+灵犀 X2（`aimdk_x2_skills` 部署，profile 同名）：`wave_hand`、`handshake`、`raise_hand`、`blow_kiss`、
+`clap_hands`。它们不展开 primitive，而是委托给运行时自持的命名动作，见 [§8.7](#87-运行时命名动作执行器)。
+
 ## 3. 当前支持的 primitive
 
 `skill_library` 只允许有限 primitive，避免上层直接下发任意危险动作：
@@ -529,6 +532,55 @@ Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admissio
 调用方必须先等待 `ExecuteNavigation` 进入终态或调用 `/navigation/cancel_current` 成功。cancel 路径
 详见 [§9 取消终态契约](#取消终态契约)。
 
+### 8.7 运行时命名动作执行器
+
+对于自持运动的运行时（例如灵犀 X2 的厂商运动控制层：没有公开模型、关节轨迹、运动学或末端位姿），
+技能不展开成 primitive，而由 `runtime_named_motion` delegated executor 调用运行时的中立 action
+`ibrobot_msgs/action/ExecuteNamedMotion`（通常是 `/motion/execute_named`）。每个技能的
+catalog implementation 用 `binding: {motion: <名字>}` 绑定一个运行时动作名，调用方不传任何参数
+（safety_guard 拒绝该类技能的一切请求参数）。
+
+执行顺序：
+
+1. Gateway 常规准入：`motion_authorized`、root lease、运行时状态新鲜度、`ACTIVE`、stop 未锁存、
+   控制模式。该部署的技能控制模式是 `named_motion`，映射到运行时 `idle`；执行器从不请求切到 `idle`
+   （那会清除操作员的 stop latch）。运行时处在 `stream` 等其他模式时返回 `CONTROL_MODE_MISMATCH`，
+   不抢占其他指令源。
+2. `capability.required_capabilities`（`motion.named` 或 `motion.posture`）必须出现在 `RuntimeStatus`。
+3. **名字预检**：绑定名必须在最新 `RuntimeStatus.capabilities_json` 中对应能力的
+   `names` / `postures` 列表里，否则 `NAMED_MOTION_UNKNOWN` 且不发送 goal。运行时对未知名字在
+   goal acceptance 阶段直接拒绝且不带原因，所以必须在这里检查。
+4. 发送 goal：`target=""`（使用运行时 profile 声明的默认侧）、`interrupt=false`（不打断正在播放的动作）。
+5. 等待运行时终态并映射错误码：
+
+| 运行时 `ExecuteNamedMotion.Result` | 技能 `error_code` |
+| --- | --- |
+| `UNKNOWN_MOTION` / `INVALID_TARGET` | `NAMED_MOTION_UNKNOWN` |
+| `BUSY` | `NAMED_MOTION_BUSY` |
+| `MODE_NOT_ALLOWED` | `CONTROL_MODE_MISMATCH` |
+| `STOP_LATCHED` | `NAMED_MOTION_STOP_LATCHED` |
+| `RUNTIME_UNAVAILABLE`（含“平台不在该动作要求的状态”，如未处于稳定站立） | `NAMED_MOTION_PLATFORM_NOT_READY` |
+| `REJECTED_BY_PLATFORM` / `UNSAFE_POSTURE` | `NAMED_MOTION_REJECTED` |
+| `TIMEOUT` | `NAMED_MOTION_TIMEOUT` |
+| `CANCELLED`（被后续 goal 或运行时取代） | `NAMED_MOTION_PREEMPTED` |
+| 其他 | `NAMED_MOTION_FAILED` |
+
+运行时的 message 原样透传。执行器侧的失败另有：`NAMED_MOTION_INVALID_BINDING`（模板无 binding 或技能
+未声明命名动作能力）、`NAMED_MOTION_RUNTIME_UNAVAILABLE`（未启用或 action 不可达）、
+`NAMED_MOTION_REJECTED`（goal 被拒，通常是已有动作在播放）。
+
+**取消语义（与其他技能不同）**：运行时拒绝取消命名动作（平台无法停止预设动作，姿态切换半途停止会摔倒），
+因此执行器收到取消请求时只审计 `cancel_not_supported`，**不**向运行时转发取消，继续等待动作结束，
+并按真实结果上报（成功时 message 以 `cancel not supported;` 开头）。动作结束前 root lease 一直占用，
+其他技能返回 `SKILL_BUSY`。需要立即中断运动只能由操作员调用运行时的 `/runtime/stop`。
+技能 deadline 先到时同样不取消，而是走 late-cleanup：Gateway 以 `SKILL_CANCEL_TIMEOUT` 结束该请求并保留
+admission，直到运行时报告终态（运行时自己对每个动作有超时上限）。
+
+部署接线：`robot_config` 的 `embodied.runtime_named_motion` 是显式逻辑接口绑定（`interface`、
+`kind: action`、`type`、`requires`），统一 launch 等待该运行时接口就绪、从实时接口描述解析端点，再注入
+`runtime_named_motion_enabled` / `runtime_named_motion_action`。`runtime_named_motion_enabled` 必须与当前
+catalog 是否包含该执行器的技能一致，否则节点拒绝启动。
+
 ## 9. 主要参数
 
 | 参数 | 默认值 | 说明 |
@@ -579,6 +631,8 @@ Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admissio
 | `runtime_mode_service` | `/runtime/set_mode` | `SetRuntimeMode` 服务；不得退回 legacy motion-mode 服务 |
 | `runtime_status_freshness_sec` | `3.0` | 正有限值；同时约束本机 monotonic 收包年龄和 ROS 消息时间戳年龄 |
 | `runtime_mode_map_json` | `{"moveit_planning":"trajectory","teleop":"stream","model_inference":"stream"}` | 应用控制模式到 runtime 模式的映射；目标必须在 `declared_modes` 中 |
+| `runtime_named_motion_enabled` | `false` | 启动时固定；启用 `runtime_named_motion` 执行器，需 `runtime_enabled` 且与 catalog 一致 |
+| `runtime_named_motion_action` | 空字符串 | 启动时固定；由 launch 从实时接口描述绑定的 `ExecuteNamedMotion` 端点，启用时必填 |
 | `ee_pose_topic` | `/robot_status/ee_pose` | 末端位姿反馈 topic |
 | `joint_state_topic` | `/joint_states` | 关节状态反馈 topic |
 | `debug_tracing` | `false` | 是否输出调试日志 |
@@ -589,7 +643,8 @@ Gateway 在 dispatch 一个 nav_* primitive 前会做下列按顺序的 admissio
 请求之后的新鲜状态确认；服务等待、RPC 和状态确认分别受 `rpc_timeout_sec` 约束。
 执行器不会自动请求 `idle` 清除 stop latch。runtime 与执行器必须使用一致的 ROS 时钟。
 
-父 launch 负责从已验证的 `descriptor.model` 绑定到 `config.robot_model`，按选定命名 group 的
+对有臂式执行面的机器人（默认；`embodied.arm_surface: false` 显式退出），父 launch 负责从已验证的
+`descriptor.model` 绑定到 `config.robot_model`，按选定命名 group 的
 `joints` 顺序投影 `arm_joint_names_json`，从同一模型投影 `joint_limits_json`（应用限制只能收窄），
 并投影 `arm_trajectory_action_name`、`joint_state_topic`、`ee_pose_topic`、`move_configuration_service`。
 这里不读取 provider 私有 profile/calibration，也不自行选取第一个 group。无 provider 的旧配置

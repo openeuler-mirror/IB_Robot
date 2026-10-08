@@ -365,9 +365,18 @@ become ACTIVE on mismatch.
 - **Embodied primitives.** `look_at` / `set_posture` / `play_preset_motion` /
   `speak` as skill primitives would change the primitive contract, the skill
   resolver and the skill executor — code SO-101 and LeKiwi execute. That
-  extension is specified in the OpenSpec change and delivered separately; the X2
-  deployment ships with `embodied.enabled: false`. The capabilities themselves
-  are available now through `/motion/execute_named`, `/speech/speak` and friends.
+  extension is specified in the OpenSpec change and delivered separately; the
+  base X2 deployment (`aimdk_x2.yaml`) ships with `embodied.enabled: false`. The
+  capabilities themselves are available now through `/motion/execute_named`,
+  `/speech/speak` and friends.
+- **Embodied skills, by delegation.** The `aimdk_x2_skills` deployment exposes
+  the preset gestures `wave`, `handshake`, `raise_hand`, `blow_kiss` and `clap`
+  as planner-visible catalog skills without any new primitive: each skill binds
+  one name and the skill executor's `runtime_named_motion` executor sends it to
+  `/motion/execute_named`, so this runtime stays the only `aimdk_msgs` boundary
+  and its admission (lifecycle, arbitration, mode, stable stand) still decides.
+  Postures, stairs and speech are not exposed as skills. See
+  [the X2 named-motion skills guide](../../../../docs/aimdk_x2_named_motion_skills.md).
 - **Voice ASR/TTS services.** The runtime publishes the audio contract, but
   enabling `voice_asr` still requires `robot_config` to accept a
   runtime-provided capture source.
