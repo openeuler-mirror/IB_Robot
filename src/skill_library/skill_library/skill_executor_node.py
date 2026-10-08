@@ -50,6 +50,7 @@ from embodied_common.workflow_contracts import (
     validate_workflow_steps,
 )
 from ibrobot_msgs.action import (
+    ExecuteNamedMotion,
     ExecuteNavigation,
     ExecuteTaskPlan,
     ImitateHumanMotion,
@@ -78,6 +79,7 @@ from robot_runtime import contract as RUNTIME
 from skill_catalog.compiler import SkillCatalogCompiler
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
+from skill_library import runtime_named_motion as named_motion
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -395,6 +397,9 @@ class SkillExecutorNode(Node):
         self.declare_parameter("imitate_human_motion_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("sound_following_service", "/sound_orientation_node/set_following")
         self.declare_parameter("sound_following_enabled", False, descriptor=startup_descriptor)
+        # Named motions the robot runtime owns (ibrobot_msgs/action/ExecuteNamedMotion).
+        self.declare_parameter("runtime_named_motion_action", "", descriptor=startup_descriptor)
+        self.declare_parameter("runtime_named_motion_enabled", False, descriptor=startup_descriptor)
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("semantic_map_target_service", "")
@@ -480,6 +485,15 @@ class SkillExecutorNode(Node):
         self._imitate_human_motion_enabled = self.get_parameter("imitate_human_motion_enabled").value
         self._sound_following_enabled = self.get_parameter("sound_following_enabled").value
         self._sound_following_service = self.get_parameter("sound_following_service").get_parameter_value().string_value
+        self._runtime_named_motion_enabled = self.get_parameter("runtime_named_motion_enabled").value is True
+        self._runtime_named_motion_action = (
+            self.get_parameter("runtime_named_motion_action").get_parameter_value().string_value.strip()
+        )
+        if self._runtime_named_motion_enabled and not self._runtime_named_motion_action:
+            raise ValueError("runtime_named_motion_action must be set when runtime_named_motion_enabled is true")
+        if self._runtime_named_motion_enabled and not self._runtime_enabled:
+            # Admission (mode, capabilities, stop latch) comes from the runtime status.
+            raise ValueError("runtime_named_motion requires runtime admission (runtime_enabled)")
         self._grasp_execution = load_json_mapping(self.get_parameter("grasp_execution_json").value)
         self._placement_execution = load_json_mapping(self.get_parameter("placement_execution_json").value)
         self._semantic_map_target_service = self.get_parameter("semantic_map_target_service").value
@@ -745,6 +759,12 @@ class SkillExecutorNode(Node):
         self._sound_following_client = self.create_client(
             SetSoundFollowing, self._sound_following_service, callback_group=callback_group
         )
+        # Only a deployment that enabled the executor gets the client.
+        self._runtime_named_motion_client = (
+            ActionClient(self, ExecuteNamedMotion, self._runtime_named_motion_action, callback_group=callback_group)
+            if self._runtime_named_motion_enabled
+            else None
+        )
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
             self._move_configuration_service,
@@ -891,6 +911,17 @@ class SkillExecutorNode(Node):
                 "imitate_human_motion configuration mismatch: "
                 f"runtime enabled={runtime_enabled}, catalog enabled={catalog_enabled}"
             )
+        named_runtime_enabled = bool(getattr(self, "_runtime_named_motion_enabled", False))
+        named_catalog_enabled = any(
+            str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME
+            for template in (getattr(snapshot, "templates", None) or {}).values()
+            if isinstance(template, Mapping)
+        )
+        if named_runtime_enabled != named_catalog_enabled:
+            raise ValueError(
+                "runtime_named_motion configuration mismatch: "
+                f"runtime enabled={named_runtime_enabled}, catalog enabled={named_catalog_enabled}"
+            )
         sound_runtime_enabled = bool(getattr(self, "_sound_following_enabled", False))
         sound_catalog_enabled = "sound_following" in snapshot.enabled_skill_names
         if sound_runtime_enabled != sound_catalog_enabled:
@@ -922,11 +953,28 @@ class SkillExecutorNode(Node):
             configured_executors.add("imitate_human_motion")
         if getattr(self, "_sound_following_enabled", False):
             configured_executors.add("sound_following")
+        if getattr(self, "_runtime_named_motion_enabled", False):
+            configured_executors.add(named_motion.EXECUTOR_NAME)
         # Startup compilation runs before skill templates are cached. The
         # configured service is the SSOT signal that this executor is present.
         if self._semantic_map_target_service:
             configured_executors.add("semantic_map_query")
         for name in sorted(configured_executors):
+            if name == named_motion.EXECUTOR_NAME:
+                endpoint_name = getattr(self, "_runtime_named_motion_action", "")
+                if not getattr(self, "_runtime_named_motion_enabled", False) or not endpoint_name:
+                    continue
+                descriptor = DelegatedExecutorDescriptor(
+                    **delegated_executor_identity(
+                        name=name,
+                        endpoint_name=endpoint_name,
+                        endpoint_kind="ros_action",
+                        # The serving runtime is part of the identity the catalog binds.
+                        configuration={"runtime_name": getattr(self, "_runtime_name", "")},
+                    )
+                )
+                descriptors[descriptor.name] = descriptor
+                continue
             if name == "sound_following":
                 endpoint_name = self._sound_following_service
                 descriptor = DelegatedExecutorDescriptor(
@@ -974,6 +1022,185 @@ class SkillExecutorNode(Node):
             )
             descriptors[descriptor.name] = descriptor
         return descriptors
+
+    def _execute_runtime_named_motion_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+    ) -> SkillCommand.Result:
+        """Run the named motion the catalog binds through the runtime's neutral action.
+
+        The runtime refuses cancellation of named motions, so a cancel request is
+        recorded but never forwarded and the motion is reported as it ends. If
+        the skill deadline passes first, the admission is retained until the
+        runtime reports a terminal state; the runtime bounds every motion itself.
+        """
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        client = getattr(self, "_runtime_named_motion_client", None)
+        if client is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                named_motion.RUNTIME_UNAVAILABLE,
+                "runtime named motion executor is not enabled for this deployment",
+            )
+        motion = named_motion.bound_motion_name(template)
+        if not motion:
+            return self._abort_skill(
+                result, goal_handle, [], named_motion.INVALID_BINDING, "skill template binds no motion"
+            )
+        status, reason = self._runtime_status_for_admission()
+        if status is None:
+            return self._abort_skill(result, goal_handle, [], named_motion.PLATFORM_NOT_READY, reason)
+        names, error_code, reason = named_motion.advertised_motion_names(
+            status.capabilities_json, self._required_capabilities_for_skill(goal.skill_name)
+        )
+        if names is None:
+            return self._abort_skill(result, goal_handle, [], error_code, reason)
+        if motion not in names:
+            # Checked here because the runtime rejects an unknown name at goal
+            # acceptance, which carries no reason.
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                named_motion.UNKNOWN,
+                f"runtime does not advertise named motion {motion!r}",
+            )
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 30.0))
+        if not client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                named_motion.RUNTIME_UNAVAILABLE,
+                f"named motion action unavailable: {self._runtime_named_motion_action}",
+            )
+
+        executed = [f"{named_motion.EXECUTOR_NAME}:{motion}"]
+        motion_goal = ExecuteNamedMotion.Goal()
+        motion_goal.name = motion
+        # The runtime applies the side its profile declares for this name.
+        motion_goal.target = ""
+        # Never pre-empt a motion that is already playing.
+        motion_goal.interrupt = False
+
+        def feedback_cb(feedback_msg) -> None:
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = f"{named_motion.EXECUTOR_NAME}:{motion}:{feedback_msg.feedback.state}"
+            goal_handle.publish_feedback(feedback)
+
+        def keep_running(_motion_handle) -> None:
+            """A late-accepted motion is not cancelled; only its terminal state is awaited."""
+
+        admission = self._active_skill_admission
+        nonce = uuid.uuid4().hex
+        cleanup_key = self._register_delegated_dispatch(nonce, admission, goal.dispatch_binding)
+        terminal = False
+        late_cleanup = _LateCleanupConfirmation()
+        late_cleanup.add_callback(lambda: self._confirm_delegated_terminal(admission, nonce, cleanup_key))
+        send_future = None
+        result_future = None
+        try:
+            send_future = client.send_goal_async(motion_goal, feedback_callback=feedback_cb)
+            if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+                late_cleanup.watch_goal_future(send_future, keep_running)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    f"named motion {motion} goal response timed out: runtime motion state is unknown",
+                )
+            motion_handle = send_future.result()
+            if motion_handle is None or not motion_handle.accepted:
+                terminal = True
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    named_motion.REJECTED,
+                    f"runtime refused named motion {motion} (another motion is playing or the name is unknown)",
+                )
+            result_future = motion_handle.get_result_async()
+            deadline = time.monotonic() + timeout_sec
+            cancel_recorded = False
+            while rclpy.ok() and not result_future.done():
+                if goal_handle.is_cancel_requested and not cancel_recorded:
+                    cancel_recorded = True
+                    self._audit("cancel_not_supported", **self._public_audit_context_copy())
+                    self.get_logger().warning(
+                        f"named motion {motion} cannot be cancelled; waiting for it to finish (use the runtime stop)"
+                    )
+                if time.monotonic() >= deadline:
+                    late_cleanup.watch_result_future(result_future)
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed,
+                        PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                        f"named motion {motion} still running at the skill deadline; admission held until it ends",
+                    )
+                time.sleep(0.05)
+            if not result_future.done():
+                late_cleanup.watch_result_future(result_future)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    f"named motion {motion} execution state is unknown",
+                )
+            terminal = True
+            wrapped = result_future.result()
+        except Exception:
+            self.get_logger().error(f"runtime named motion execution failed:\n{traceback.format_exc()}")
+            if result_future is not None:
+                late_cleanup.watch_result_future(result_future)
+            elif send_future is not None:
+                late_cleanup.watch_goal_future(send_future, keep_running)
+            else:
+                terminal = True
+            return self._abort_skill(
+                result,
+                goal_handle,
+                executed if send_future is not None else [],
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT if send_future is not None else named_motion.FAILED,
+                f"runtime named motion {motion} execution state is unknown",
+            )
+        finally:
+            if terminal:
+                late_cleanup.confirm()
+
+        motion_result = getattr(wrapped, "result", None) if wrapped is not None else None
+        if motion_result is None:
+            return self._abort_skill(
+                result, goal_handle, executed, named_motion.FAILED, f"named motion {motion} returned no result"
+            )
+        message = str(motion_result.message).strip()
+        if not motion_result.success:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                executed,
+                named_motion.public_error_code(motion_result.error_code),
+                message or f"named motion {motion} failed",
+            )
+        if goal_handle.is_cancel_requested:
+            message = f"cancel not supported; {message or f'named motion {motion} completed'}"
+        result.success = True
+        result.error_code = ""
+        result.message = message or f"named motion {motion} completed"
+        result.executed_primitives = executed
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
 
     def _execute_sound_following_skill(self, goal_handle, *, effective_timeout_sec: float | None = None):
         result = SkillCommand.Result()
@@ -5124,6 +5351,12 @@ class SkillExecutorNode(Node):
             )
         if str(template.get("executor", "")).strip() == "imitate_human_motion":
             return self._execute_imitate_human_motion_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == named_motion.EXECUTOR_NAME:
+            return self._execute_runtime_named_motion_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
