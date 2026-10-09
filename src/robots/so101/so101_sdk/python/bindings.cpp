@@ -35,7 +35,7 @@ namespace
 {
 
 // ArmState as a plain Python dict: {joint_name: {"position": ..., "velocity":
-// ..., "effort": ...}} — no C++ types leak into Python.
+// ..., "effort": ..., "protection": ...}} — no C++ types leak into Python.
 py::dict arm_state_to_dict(const ArmState & state)
 {
   py::dict result;
@@ -44,6 +44,7 @@ py::dict arm_state_to_dict(const ArmState & state)
     entry["position"] = reading.position;
     entry["velocity"] = reading.velocity;
     entry["effort"] = reading.effort;
+    entry["protection"] = reading.protection;
     result[py::str(name)] = entry;
   }
   return result;

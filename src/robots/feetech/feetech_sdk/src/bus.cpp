@@ -350,7 +350,11 @@ public:
       const auto rollback = detail::rollback_partial_config(
         touched, unlocked,
         [this](std::uint8_t mid, std::uint8_t enable) {
-          return proto->EnableTorque(mid, enable) != 0 && proto->getState() == 0;
+          // An acknowledged torque command is delivered: a non-zero reply
+          // status reports the motor's own protection state, not a transport
+          // failure (see sync_read). Requiring a clean status here would leave
+          // a protected motor impossible to disable.
+          return proto->EnableTorque(mid, enable) != 0;
         },
         [this](std::uint8_t mid) {
           return proto->LockEprom(mid) != 0 && proto->getState() == 0;
@@ -677,12 +681,13 @@ MotorOpResult Bus::sync_read(
       return make_failure(Fault::SyncReadFailed, id,
         "feedback checksum mismatch for motor " + std::to_string(id));
     }
-    if (impl_->proto->getState() != 0) {
-      impl_->note_failure(Fault::SyncReadFailed);
-      return make_failure(Fault::SyncReadFailed, id,
-        "motor " + std::to_string(id) + " reported feedback status " +
-        std::to_string(impl_->proto->getState()));
-    }
+    // A non-zero status byte is the motor firmware reporting a protection
+    // state (overload / over-current / over-heat / voltage / angle). The frame
+    // decoded correctly, so the sample is still delivered: callers need the
+    // feedback stream to keep controlling the rest of the group, and the
+    // protection state travels per motor through `sample.protection`. Treating
+    // it as a transport failure is what used to take the whole arm down.
+    const std::uint8_t protection = impl_->proto->getState();
     const int pos_raw = data[0] | (data[1] << 8);
     const int speed_raw = decode_sign_magnitude15(
       static_cast<std::uint16_t>(data[2] | (data[3] << 8)));
@@ -697,7 +702,8 @@ MotorOpResult Bus::sync_read(
                         : ticks_to_radians(pos_raw);
     sample.velocity = steps_to_rad_per_s(speed_raw);
     sample.effort = raw_current_to_ampere(current_raw);
-    sample.valid = true;
+    sample.protection = protection;
+    sample.valid = !protection_invalidates_feedback(protection);
     samples.push_back(sample);
   }
   impl_->note_success();
@@ -832,7 +838,10 @@ MotorOpResult Bus::emergency_release(const std::vector<std::uint8_t> & ids)
     }
     bool disabled = false;
     for (int attempt = 0; attempt < kTorqueRetryCount && !disabled; ++attempt) {
-      disabled = impl_->proto->EnableTorque(id, 0) != 0 && impl_->proto->getState() == 0;
+      // Acknowledged is delivered: a motor reporting a protection still
+      // receives and executes the release, and torque release is the safe
+      // direction, so a non-zero status must not be reported as a failure.
+      disabled = impl_->proto->EnableTorque(id, 0) != 0;
     }
     if (!disabled) {
       unreleased.push_back(id);

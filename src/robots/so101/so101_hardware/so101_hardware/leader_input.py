@@ -3,6 +3,10 @@
 import math
 from pathlib import Path
 
+# feetech status byte: bit 1 (0x02) flags a faulty angle sensor, so the position
+# delivered with that frame must never be trusted.
+_PROTECTION_ANGLE = 0x02
+
 
 class LeaderInput:
     def __init__(self, config, sdk=None):
@@ -51,6 +55,10 @@ class LeaderInput:
                 return None
             values = {name: float(state[name]["position"]) for name in self.names}
             if not all(math.isfinite(value) for value in values.values()):
+                return None
+            # An angle-sensor fault still decodes to finite numbers, so check the
+            # status byte too: such a pose must never reach teleop.
+            if any(int(state[name].get("protection") or 0) & _PROTECTION_ANGLE for name in self.names):
                 return None
             if not 0.0 <= values[self.gripper] <= 1.0:
                 return None

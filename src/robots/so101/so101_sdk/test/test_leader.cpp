@@ -156,4 +156,25 @@ TEST(LeaderArm, IncompleteReadClearsPreviousSampleAndDisconnectCloses)
   EXPECT_THROW(leader.sim(), std::logic_error);
 }
 
+/// The relaxed sync_read contract keeps a protection from failing the transport
+/// read, but a leader pose from a faulty angle sensor must never reach teleop.
+TEST(LeaderArm, AngleSensorFaultFailsTheReadInsteadOfPublishingAPose)
+{
+  TempCalibFile calib;
+  so101::LeaderArm leader(simulated_leader_config(calib.path()));
+  ASSERT_TRUE(leader.connect());
+
+  leader.sim().set_position_ticks(1, 3000);
+  leader.sim().set_response_status(1, feetech::kProtectionAngle);
+  so101::ArmState state;
+  EXPECT_FALSE(leader.read(state));
+  EXPECT_NE(leader.health().detail.find("angle sensor"), std::string::npos);
+
+  // A protection whose values stay trustworthy is still delivered, with the raw
+  // status byte attached so consumers can classify it.
+  leader.sim().set_response_status(1, feetech::kProtectionOverload);
+  ASSERT_TRUE(leader.read(state));
+  EXPECT_EQ(state.joints.at("1").protection, feetech::kProtectionOverload);
+}
+
 }  // namespace

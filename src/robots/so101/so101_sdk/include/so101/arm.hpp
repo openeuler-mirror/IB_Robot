@@ -54,6 +54,11 @@ struct JointReading
   double position = 0.0;  // rad
   double velocity = 0.0;  // rad/s
   double effort = 0.0;    // A
+  /// Raw motor status byte (0 when healthy). Non-zero means the firmware has
+  /// tripped a protection: the reading is still delivered so callers can keep
+  /// the feedback stream. Check protection_invalidates_feedback() before
+  /// trusting position/velocity (an angle-sensor fault invalidates them).
+  std::uint8_t protection = 0;
 };
 
 /// Named-joint arm state with a single read timestamp. Callers never depend
@@ -119,6 +124,9 @@ public:
   /// Synchronized read of every joint while connected or activated.
   /// On failure `out` is cleared and the
   /// return value is false; stale values are never returned as fresh.
+  /// A motor reporting a firmware protection does NOT fail the read: the frame
+  /// decoded, so the reading is delivered with `protection` set and health()
+  /// reporting Fault::MotorProtection (see decode_protection_bits).
   bool read(ArmState & out);
 
   /// Command positions in radians by joint name. Unknown joint names fail.

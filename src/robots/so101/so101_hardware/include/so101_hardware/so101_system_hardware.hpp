@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
@@ -80,8 +81,42 @@ public:
 
 private:
   friend struct SO101HardwareTestAccess;
+
+  /// A gripper overload hold persists independently of the firmware status.
+  /// This is position holding, not a force/torque guarantee.
+  struct ProtectionTracking
+  {
+    std::uint8_t bits = 0;
+    double hold_position = 0.0;
+    std::chrono::steady_clock::time_point first_seen{};
+    bool opening_pending = false;
+    double opening_target = 0.0;
+  };
+
   void publish_currents(const rclcpp::Time & stamp);
 
+  // --- read path -----------------------------------------------------------
+  /// Communication-failure path: tolerate a transient drop for
+  /// FAILURE_TOLERANCE (holding the last known state) and report ERROR once it
+  /// persists.
+  hardware_interface::return_type handle_read_failure(
+    std::chrono::steady_clock::time_point started,
+    std::chrono::steady_clock::duration budget);
+  /// Copy one joint reading into the state interfaces. Position and velocity
+  /// are kept only while the status byte does not invalidate them (angle-sensor
+  /// fault); the current stays readable either way.
+  void store_reading(size_t index, const so101::JointReading & reading);
+  /// Validate the entire frame before seeding or issuing any position targets.
+  bool validate_feedback(const so101::ArmState & state);
+  /// Only explicitly identified grippers with overload alone may keep holding.
+  void track_protection(
+    const std::string & joint, std::uint8_t bits, double pose,
+    std::chrono::steady_clock::time_point now);
+  /// Compare clamped commands in device ticks, using model-provided direction.
+  bool is_opening_target(const std::string & joint, double target, double hold) const;
+  /// A clear status never resets the event age; only a reported overload expires.
+  hardware_interface::return_type handle_active_protections(
+    std::chrono::steady_clock::time_point now);
   so101::ArmConfig arm_config_;
   // Declared before arm_ so the non-owning Arm attachment is destroyed first.
   std::unique_ptr<feetech::Bus> bus_;
@@ -100,6 +135,15 @@ private:
   std::chrono::steady_clock::duration write_retry_budget_{};
   std::optional<std::chrono::steady_clock::time_point> first_read_failure_;
   std::optional<std::chrono::steady_clock::time_point> first_write_failure_;
+
+  std::map<std::string, ProtectionTracking> protection_;
+  // Joint metadata identifies the gripper without assuming a joint name or ID.
+  std::map<std::string, int> gripper_opening_directions_;
+  std::map<std::string, std::pair<double, double>> calibrated_ranges_;
+  bool motion_faulted_ = false;
+  bool feedback_valid_ = false;
+  /// Event-age bound when overload is still/recurrently reported, not a thermal limit.
+  std::chrono::steady_clock::duration protection_timeout_{std::chrono::seconds(1)};
 };
 
 }  // namespace so101_hardware

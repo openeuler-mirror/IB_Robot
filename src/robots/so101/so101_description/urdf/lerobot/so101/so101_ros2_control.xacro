@@ -7,6 +7,9 @@
     <!-- Legacy explicit startup motion only. Semantic HOME belongs to the
          runtime model and must never be passed as reset_positions. -->
     <xacro:arg name="reset_positions" default=""/>
+    <!-- Escalation bound (issue #138): how long a motor protection may stay
+         active before the component reports ERROR (default 1 s). -->
+    <xacro:arg name="protection_timeout" default=""/>
     <!-- simulated: run the SO101 hardware plugin on the SDK simulated transport
          (no serial port, no physics) so the production controller stack runs
          headless for runtime conformance. Independent of use_sim (Gazebo/MuJoCo). -->
@@ -36,6 +39,7 @@
                 <param name="port">$(arg port)</param>
                 <param name="calib_file">$(arg calib_file)</param>
                 <param name="reset_positions">$(arg reset_positions)</param>
+                <param name="protection_timeout">$(arg protection_timeout)</param>
                 <param name="simulated">$(arg simulated)</param>
             </hardware>
         </xacro:unless>
@@ -95,6 +99,10 @@
         </joint>
 
         <joint name="6">
+            <!-- Follower model conversion maps closed to calibrated min and
+                 open to calibrated max. This identifies the gripper and its
+                 opening direction; leader drive_mode is a separate mapping. -->
+            <param name="gripper_opening_direction">1</param>
             <command_interface name="position">
                 <!-- Mechanical envelope in centered coordinates; the 0..1 URDF
                      joint limit element stays the simulation's model convention. -->

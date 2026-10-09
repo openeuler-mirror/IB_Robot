@@ -71,8 +71,15 @@ struct MotorSample
   double velocity = 0.0;
   /// Amperes (motor current estimate).
   double effort = 0.0;
-  /// True only when this sample came from a successful group read.
+  /// True when the frame decoded and position/velocity are trustworthy. A
+  /// motor reporting a protection state still yields usable feedback unless the
+  /// status byte flags the angle sensor (see protection_invalidates_feedback).
   bool valid = false;
+  /// Raw status/error byte delivered with this sample (0 when healthy).
+  /// Non-zero means the motor firmware has tripped a protection (overload,
+  /// over-current, over-heat, voltage, angle). The sample is still delivered so
+  /// callers keep the feedback stream and classify the event themselves.
+  std::uint8_t protection = 0;
 };
 
 /// Command for one motor.
@@ -106,7 +113,65 @@ enum class Fault : std::uint8_t
   ConfigFailed,
   /// Emergency torque release could not reach every motor.
   EmergencyPartiallyFailed,
+  /// A motor answered with a non-zero protection status byte (overload,
+  /// over-current, over-heat, voltage or angle-sensor error). The read itself
+  /// succeeded: the protection state is reported per motor on the sample.
+  MotorProtection,
 };
+
+/// Status-byte error bits reported by Feetech STS/SMS servos. The same bits
+/// appear in the read-only "Status" register (65) and in every reply packet.
+inline constexpr std::uint8_t kProtectionVoltage = 0x01;
+inline constexpr std::uint8_t kProtectionAngle = 0x02;
+inline constexpr std::uint8_t kProtectionOverheat = 0x04;
+inline constexpr std::uint8_t kProtectionOverCurrent = 0x08;
+inline constexpr std::uint8_t kProtectionOverload = 0x20;
+
+/// True when the status byte makes position/velocity feedback unreliable. A
+/// broken angle sensor invalidates the position reading, while current feedback
+/// may still be usable; this is therefore reported separately from the
+/// protection classification.
+inline bool protection_invalidates_feedback(std::uint8_t status)
+{
+  return (status & kProtectionAngle) != 0;
+}
+
+/// Human-readable decode of a status byte, e.g. "OVERLOAD (0x20)" or
+/// "OVER_CURRENT|OVERLOAD (0x28)"; "none (0x00)" for a healthy motor.
+inline std::string decode_protection_bits(std::uint8_t status)
+{
+  std::string out;
+  const auto append = [&out](const char * name) {
+      if (!out.empty()) {
+        out += "|";
+      }
+      out += name;
+    };
+  if ((status & kProtectionVoltage) != 0) {
+    append("VOLTAGE");
+  }
+  if ((status & kProtectionAngle) != 0) {
+    append("ANGLE");
+  }
+  if ((status & kProtectionOverheat) != 0) {
+    append("OVERHEAT");
+  }
+  if ((status & kProtectionOverCurrent) != 0) {
+    append("OVER_CURRENT");
+  }
+  if ((status & kProtectionOverload) != 0) {
+    append("OVERLOAD");
+  }
+  if (out.empty()) {
+    out = "none";
+  }
+  static constexpr char kHexDigits[] = "0123456789ABCDEF";
+  std::string hex = " (0x";
+  hex += kHexDigits[(status >> 4) & 0x0F];
+  hex += kHexDigits[status & 0x0F];
+  hex += ")";
+  return out + hex;
+}
 
 /// Bus health information.
 struct BusHealth

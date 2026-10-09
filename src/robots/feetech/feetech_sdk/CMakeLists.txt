@@ -104,6 +104,9 @@ if(BUILD_TESTING)
   ament_add_gtest(test_sim_transport test/test_sim_transport.cpp)
   target_link_libraries(test_sim_transport ${SDK_TEST_LIBS})
 
+  ament_add_gtest(test_protection test/test_protection.cpp)
+  target_link_libraries(test_protection ${SDK_TEST_LIBS})
+
   ament_add_gtest(test_serial_hardening test/test_serial_hardening.cpp)
   target_include_directories(test_serial_hardening PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src ${VENDOR_DIR})

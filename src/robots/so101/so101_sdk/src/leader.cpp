@@ -115,7 +115,18 @@ bool LeaderArm::read(ArmState & out)
   state.stamp = std::chrono::steady_clock::now();
   for (std::size_t i = 0; i < config_.joint_order.size(); ++i) {
     const std::string & joint = config_.joint_order[i];
+    if (feetech::protection_invalidates_feedback(samples[i].protection)) {
+      // The frame decoded but its position must not be trusted (angle-sensor
+      // fault). Teleop would otherwise move the follower to a finite-but-wrong
+      // leader pose, so the read fails instead of publishing it.
+      health_.fault = feetech::Fault::MotorProtection;
+      health_.detail = "motor " + joint + ": " +
+        feetech::decode_protection_bits(samples[i].protection) +
+        " (angle sensor fault: leader feedback rejected)";
+      return false;
+    }
     JointReading reading;
+    reading.protection = samples[i].protection;
     reading.velocity = samples[i].velocity;
     reading.effort = samples[i].effort;
     if (joint == config_.gripper_joint) {

@@ -305,4 +305,18 @@ TEST(Arm, SupportsExplicitMappedNamesAndRejectsInvalidIds)
   EXPECT_THROW(so101::Arm invalid(config), std::invalid_argument);
 }
 
+TEST(Arm, ActivationRejectsAngleFaultInsteadOfSeedingItsPosition)
+{
+  TempCalibFile calib;
+  so101::Arm arm(simulated_config(calib.path()));
+  ASSERT_TRUE(arm.connect());
+  arm.sim().set_position_ticks(6, 3000);
+  arm.sim().set_response_status(6, feetech::kProtectionAngle);
+  EXPECT_FALSE(arm.activate());
+  EXPECT_TRUE(arm.command_targets().empty());
+  for (std::uint8_t id = 1; id <= 6; ++id) {
+    EXPECT_FALSE(arm.sim().torque_enabled(id));
+  }
+}
+
 }  // namespace

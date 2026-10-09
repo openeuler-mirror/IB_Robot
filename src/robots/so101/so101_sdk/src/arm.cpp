@@ -150,6 +150,17 @@ bool Arm::activate()
     return abort(sync_result.fault, "activation failed during initial feedback sync: " + sync_result.detail);
   }
 
+  if (samples.size() != config_.joint_order.size()) {
+    return abort(feetech::Fault::SyncReadFailed, "activation feedback is incomplete");
+  }
+  for (const auto & sample : samples) {
+    if (!sample.valid || !std::isfinite(sample.position) || !std::isfinite(sample.velocity)) {
+      return abort(feetech::Fault::MotorProtection,
+        "activation cannot seed targets from invalid feedback for motor " +
+        std::to_string(sample.id));
+    }
+  }
+
   // Explicit legacy startup targets remain supported; semantic HOME is not
   // part of SDK activation. Without overrides every joint holds its reading.
   last_targets_.clear();
@@ -183,16 +194,32 @@ bool Arm::read(ArmState & out)
   }
   ArmState state;
   state.stamp = std::chrono::steady_clock::now();
+  std::string protection_detail;
   for (std::size_t i = 0; i < config_.joint_order.size(); ++i) {
+    const auto & sample = samples[i];
     JointReading reading;
-    reading.position = samples[i].position;
-    reading.velocity = samples[i].velocity;
-    reading.effort = samples[i].effort;
+    reading.position = sample.position;
+    reading.velocity = sample.velocity;
+    reading.effort = sample.effort;
+    reading.protection = sample.protection;
     state.joints[config_.joint_order[i]] = reading;
+    if (sample.protection != 0) {
+      if (!protection_detail.empty()) {
+        protection_detail += "; ";
+      }
+      protection_detail += "motor " + config_.joint_order[i] + ": " +
+        feetech::decode_protection_bits(sample.protection);
+    }
   }
   out = std::move(state);
-  health_.fault = feetech::Fault::None;
-  health_.detail.clear();
+  if (protection_detail.empty()) {
+    health_.fault = feetech::Fault::None;
+    health_.detail.clear();
+  } else {
+    // The read itself succeeded; the protection state is what needs attention.
+    health_.fault = feetech::Fault::MotorProtection;
+    health_.detail = protection_detail;
+  }
   return true;
 }
 
@@ -230,7 +257,6 @@ bool Arm::write_targets(const std::map<std::string, double> & targets)
   }
   return true;
 }
-
 bool Arm::hold()
 {
   return bus_ && health_.lifecycle == Lifecycle::Activated &&

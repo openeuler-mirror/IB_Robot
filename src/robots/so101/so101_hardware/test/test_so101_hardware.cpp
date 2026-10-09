@@ -46,6 +46,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "feetech/conversion.hpp"
 #include "hardware_interface/hardware_info.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/state.hpp"
@@ -61,6 +62,12 @@ struct SO101HardwareTestAccess
   {return hw.hw_currents_;}
   static std::chrono::steady_clock::duration write_budget(const SO101SystemHardware & hw)
   {return hw.write_retry_budget_;}
+  static void age_hold(
+    SO101SystemHardware & hw, const std::string & name,
+    std::chrono::steady_clock::duration elapsed)
+  {hw.protection_.at(name).first_seen -= elapsed;}
+  static std::chrono::steady_clock::duration protection_timeout(const SO101SystemHardware & hw)
+  {return hw.protection_timeout_;}
   static bool attach_bus(SO101SystemHardware & hw, std::unique_ptr<feetech::Bus> bus)
   {
     hw.bus_ = std::move(bus);
@@ -87,6 +94,9 @@ hardware_interface::HardwareInfo make_arm_info(
     hardware_interface::ComponentInfo joint;
     joint.name = name;
     joint.parameters["id"] = name;  // SO-101: joint name IS the motor id
+    if (name == "6") {
+      joint.parameters["gripper_opening_direction"] = "1";
+    }
     hardware_interface::InterfaceInfo position_cmd;
     position_cmd.name = "position";
     joint.command_interfaces.push_back(position_cmd);
@@ -530,6 +540,409 @@ TEST(SO101HardwareAdapter, SimulatedLifecycleDeactivateReactivates)
   EXPECT_EQ(hw.on_deactivate(unused), hardware_interface::CallbackReturn::SUCCESS);
   EXPECT_EQ(hw.on_cleanup(unused), hardware_interface::CallbackReturn::SUCCESS);
   rclcpp::shutdown();
+}
+
+// Gripper overload handling. These tests exercise commands and fault handling;
+// simulated positions cannot establish safe force or thermal behaviour.
+class SO101HardwareProtection : public ::testing::Test
+{
+protected:
+  virtual hardware_interface::HardwareInfo hardware_info()
+  {
+    return make_arm_info({{"simulated", "true"}, {"calib_file", calib_.path()}});
+  }
+
+  void SetUp() override
+  {
+    rclcpp::init(0, nullptr);
+    ASSERT_EQ(hw_.on_init(hardware_info()), hardware_interface::CallbackReturn::SUCCESS);
+    ASSERT_EQ(hw_.on_configure(unused_), hardware_interface::CallbackReturn::SUCCESS);
+    ASSERT_EQ(hw_.on_activate(unused_), hardware_interface::CallbackReturn::SUCCESS);
+    commands_ = hw_.export_command_interfaces();
+    sim().set_converge_step_ticks(0);
+  }
+
+  void TearDown() override
+  {
+    EXPECT_EQ(hw_.on_shutdown(unused_), hardware_interface::CallbackReturn::SUCCESS);
+    rclcpp::shutdown();
+  }
+
+  hardware_interface::return_type read()
+  {return hw_.read(rclcpp::Time(0), rclcpp::Duration(0, 0));}
+  hardware_interface::return_type write()
+  {return hw_.write(rclcpp::Time(0), rclcpp::Duration(0, 0));}
+  feetech::Bus::SimControl & sim()
+  {return so101_hardware::SO101HardwareTestAccess::bus(hw_).sim();}
+  const std::map<std::string, double> & targets()
+  {return so101_hardware::SO101HardwareTestAccess::arm(hw_).command_targets();}
+  void trip(const std::string & name = "6", std::uint8_t id = 6)
+  {
+    sim().set_position_ticks(id, feetech::kCenterTick);
+    sim().set_response_status(id, feetech::kProtectionOverload);
+    ASSERT_EQ(read(), hardware_interface::return_type::OK);
+    ASSERT_EQ(write(), hardware_interface::return_type::OK);
+    EXPECT_DOUBLE_EQ(targets().at(name), 0.0);
+  }
+  void age_hold(std::chrono::steady_clock::duration elapsed, const std::string & name = "6")
+  {so101_hardware::SO101HardwareTestAccess::age_hold(hw_, name, elapsed);}
+
+  TempCalibFile calib_;
+  so101_hardware::SO101SystemHardware hw_;
+  const rclcpp_lifecycle::State unused_;
+  std::vector<hardware_interface::CommandInterface> commands_;
+};
+
+TEST_F(SO101HardwareProtection, ClearAndClosingCommandsNeverReleaseTheHold)
+{
+  commands_[5].set_value(-1.5);
+  trip();
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  // Tighter, partially relaxed but still closing, and equal targets all hold.
+  for (double target : {-2.0, -1.0, -0.1, 0.0}) {
+    commands_[5].set_value(target);
+    commands_[0].set_value(0.4);
+    ASSERT_EQ(write(), hardware_interface::return_type::OK);
+    EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+    EXPECT_DOUBLE_EQ(targets().at("1"), 0.4);
+  }
+}
+
+TEST_F(SO101HardwareProtection, OneDeviceTickOpeningRestoresOnlyTheGripper)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  const double tick = 1.0 / feetech::kTicksPerRad;
+  commands_[5].set_value(0.1 * tick);  // rounds back to the same device tick
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+  commands_[5].set_value(tick);  // no arbitrary angular release threshold
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), tick);
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  commands_[5].set_value(-0.1);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), -0.1);
+}
+
+TEST_F(SO101HardwareProtection, ClampedTargetAtOpenLimitCannotFalselyReleaseHold)
+{
+  sim().set_position_ticks(6, feetech::kMaxTick);
+  sim().set_response_status(6, feetech::kProtectionOverload);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  commands_[5].set_value(100.0);  // clamps to the hold tick, not beyond it
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  const double captured = targets().at("6");
+  commands_[5].set_value(-1.0);
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), captured);
+}
+
+TEST_F(SO101HardwareProtection, FaultLatchRequiresSuccessfulLifecycleRecovery)
+{
+  sim().set_response_status(6, feetech::kProtectionAngle);
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  sim().set_response_status(6, 0);
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+  ASSERT_EQ(hw_.on_deactivate(unused_), hardware_interface::CallbackReturn::SUCCESS);
+  ASSERT_EQ(hw_.on_activate(unused_), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(read(), hardware_interface::return_type::OK);
+  EXPECT_EQ(write(), hardware_interface::return_type::OK);
+}
+
+TEST_F(SO101HardwareProtection, FailedOpeningWriteDoesNotDiscardTheHold)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  auto & bus = so101_hardware::SO101HardwareTestAccess::bus(hw_);
+  bus.close();
+  commands_[5].set_value(0.5);
+  EXPECT_EQ(write(), hardware_interface::return_type::OK);  // transient I/O grace
+  ASSERT_TRUE(bus.open());
+  commands_[5].set_value(-1.0);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+}
+
+TEST_F(SO101HardwareProtection, CommunicationFailureCannotReleaseTheHold)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  sim().inject_sync_read_failure();
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  commands_[5].set_value(0.5);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.5);
+}
+
+TEST_F(SO101HardwareProtection, DefaultTimeoutIsOneSecondAndPersistsAcrossClears)
+{
+  EXPECT_EQ(
+    so101_hardware::SO101HardwareTestAccess::protection_timeout(hw_),
+    std::chrono::seconds(1));
+  commands_[5].set_value(-1.0);
+  trip();
+  sim().set_response_status(6, 0);
+  age_hold(std::chrono::seconds(30));
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+  // Re-reporting after a long clear must not restart the same hold's budget.
+  sim().set_response_status(6, feetech::kProtectionOverload);
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+}
+
+TEST_F(SO101HardwareProtection, RepeatedClearsDoNotRefreshTheEventBudget)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  for (int cycle = 0; cycle < 4; ++cycle) {
+    sim().set_response_status(6, 0);
+    ASSERT_EQ(read(), hardware_interface::return_type::OK);
+    age_hold(std::chrono::milliseconds(300));
+    ASSERT_EQ(write(), hardware_interface::return_type::OK);
+    sim().set_response_status(6, feetech::kProtectionOverload);
+    EXPECT_EQ(
+      read(), cycle == 3 ? hardware_interface::return_type::ERROR :
+      hardware_interface::return_type::OK);
+  }
+}
+
+TEST_F(SO101HardwareProtection, PersistentOverloadErrorsAndBlocksFurtherWrites)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  age_hold(std::chrono::seconds(2));
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  const auto old = targets();
+  commands_[0].set_value(1.2);
+  sim().set_response_status(6, 0);
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(targets(), old);
+}
+
+TEST_F(SO101HardwareProtection, OpeningEndsTheOldEventAndNextTripGetsANewBudget)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  age_hold(std::chrono::seconds(20));
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  commands_[5].set_value(0.5);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);  // post-write clear confirms recovery
+  commands_[5].set_value(-1.0);
+  trip();  // confirmed opening ended the previous hold
+  EXPECT_EQ(read(), hardware_interface::return_type::OK);
+}
+
+TEST_F(SO101HardwareProtection, OpeningWritesDoNotResetPersistentOverloadDeadline)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  commands_[5].set_value(0.5);
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(write(), hardware_interface::return_type::OK);
+    EXPECT_DOUBLE_EQ(targets().at("6"), 0.5);  // opening stays allowed while pending
+    age_hold(std::chrono::milliseconds(300));
+    ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  }
+  age_hold(std::chrono::milliseconds(300));
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+}
+
+TEST_F(SO101HardwareProtection, PreWriteClearDoesNotConfirmOpening)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);  // clear before opening
+  commands_[5].set_value(0.5);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  // No subsequent read: a closing write still must be blocked.
+  commands_[5].set_value(-1.0);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+}
+
+TEST_F(SO101HardwareProtection, ClosingBeforeClearFeedbackCancelsPendingRecovery)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  commands_[5].set_value(0.5);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  commands_[5].set_value(-1.0);
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+  age_hold(std::chrono::seconds(2));
+  sim().set_response_status(6, feetech::kProtectionOverload);
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+}
+
+TEST_F(SO101HardwareProtection, MissingFeedbackCannotConfirmOpening)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  commands_[5].set_value(0.5);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  sim().inject_sync_read_failure();
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);  // transport grace, not recovery
+  age_hold(std::chrono::seconds(2));
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+}
+
+TEST_F(SO101HardwareProtection, ModeSwitchCannotBypassAnExistingOverloadHold)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  sim().set_response_status(6, 0);
+  sim().set_position_ticks(6, 2300);  // feedback moved while the hold stayed locked
+  EXPECT_EQ(
+    hw_.perform_command_mode_switch({}, {"6/position"}),
+    hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+  EXPECT_DOUBLE_EQ(commands_[5].get_value(), 0.0);
+}
+
+TEST_F(SO101HardwareProtection, ModeSwitchDetectsANewOverloadBeforeItsDirectWrite)
+{
+  sim().set_response_status(6, feetech::kProtectionOverload);
+  EXPECT_EQ(
+    hw_.perform_command_mode_switch({}, {"6/position"}),
+    hardware_interface::return_type::OK);
+  commands_[5].set_value(-1.0);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("6"), 0.0);
+}
+
+TEST_F(SO101HardwareProtection, ControllerStopRejectsTheWholeAngleFaultFrame)
+{
+  commands_[5].set_value(-1.0);  // an old motion target, NOT a confirmed hold pose
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  sim().set_position_ticks(6, 3000);
+  sim().set_response_status(6, feetech::kProtectionAngle);
+  EXPECT_EQ(
+    hw_.perform_command_mode_switch({}, {"6/position"}),
+    hardware_interface::return_type::ERROR);
+  EXPECT_TRUE(targets().empty());  // TorqueOff discards SDK motion targets
+  EXPECT_DOUBLE_EQ(commands_[5].get_value(), -1.0);  // no fault-pose seeding
+  for (std::uint8_t id = 1; id <= 6; ++id) {
+    EXPECT_FALSE(sim().torque_enabled(id));
+  }
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+}
+
+TEST_F(SO101HardwareProtection, NonGripperOverloadUsesTheExistingErrorPath)
+{
+  const auto old = targets();
+  sim().set_response_status(1, feetech::kProtectionOverload);
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(targets(), old);
+  EXPECT_EQ(hw_.on_error(unused_), hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(
+    so101_hardware::SO101HardwareTestAccess::arm(hw_).health().lifecycle,
+    so101::Lifecycle::Disconnected);
+}
+
+class SO101HardwareSevereProtection : public SO101HardwareProtection,
+  public ::testing::WithParamInterface<int> {};
+
+TEST_P(SO101HardwareSevereProtection, GripperHoldingNeverMasksAnotherFault)
+{
+  commands_[5].set_value(-1.0);
+  trip();
+  sim().set_response_status(6, static_cast<std::uint8_t>(GetParam()));
+  commands_[5].set_value(0.5);  // opening cannot override a severe/unknown fault
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+  EXPECT_EQ(write(), hardware_interface::return_type::ERROR);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+  FaultBits, SO101HardwareSevereProtection,
+  ::testing::Values(1, 2, 4, 8, 16, 32 | 2, 32 | 4, 32 | 8));
+
+class SO101HardwareReverseGripper : public SO101HardwareProtection
+{
+protected:
+  hardware_interface::HardwareInfo hardware_info() override
+  {
+    auto info = SO101HardwareProtection::hardware_info();
+    // Named/reordered gripper with an explicit motor mapping and reverse opening.
+    info.joints[5].name = "tool";
+    info.joints[5].parameters["gripper_opening_direction"] = "-1";
+    return info;
+  }
+};
+
+TEST_F(SO101HardwareReverseGripper, DirectionAndIdentityComeFromJointMetadata)
+{
+  commands_[5].set_value(1.0);
+  trip("tool", 6);
+  sim().set_response_status(6, 0);
+  ASSERT_EQ(read(), hardware_interface::return_type::OK);
+  commands_[5].set_value(0.2);  // relaxed but still on the closing side
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("tool"), 0.0);
+  commands_[5].set_value(-0.01);
+  ASSERT_EQ(write(), hardware_interface::return_type::OK);
+  EXPECT_DOUBLE_EQ(targets().at("tool"), -0.01);
+}
+
+class SO101HardwareUnspecifiedGripper : public SO101HardwareProtection
+{
+protected:
+  hardware_interface::HardwareInfo hardware_info() override
+  {
+    auto info = SO101HardwareProtection::hardware_info();
+    info.joints[5].parameters.erase("gripper_opening_direction");
+    return info;
+  }
+};
+
+TEST_F(SO101HardwareUnspecifiedGripper, MotorSixDoesNotImplicitlyMeanGripper)
+{
+  sim().set_response_status(6, feetech::kProtectionOverload);
+  EXPECT_EQ(read(), hardware_interface::return_type::ERROR);
+}
+
+TEST(SO101HardwareAdapter, ProtectionTimeoutRemainsConfigurable)
+{
+  so101_hardware::SO101SystemHardware hw;
+  ASSERT_EQ(
+    hw.on_init(make_arm_info({{"protection_timeout", "2.5"}})),
+    hardware_interface::CallbackReturn::SUCCESS);
+  EXPECT_EQ(
+    so101_hardware::SO101HardwareTestAccess::protection_timeout(hw),
+    std::chrono::milliseconds(2500));
+}
+
+TEST(SO101HardwareAdapter, InvalidProtectionConfigurationFailsClosed)
+{
+  for (const auto * value : {"0", "-1", "nan", "inf", "10garbage", "1e100", "1e-100"}) {
+    so101_hardware::SO101SystemHardware hw;
+    EXPECT_EQ(
+      hw.on_init(make_arm_info({{"protection_timeout", value}})),
+      hardware_interface::CallbackReturn::ERROR) << value;
+  }
+  for (const auto * value : {"0", "2", "-2", "nan", "1junk"}) {
+    auto info = make_arm_info();
+    info.joints[5].parameters["gripper_opening_direction"] = value;
+    so101_hardware::SO101SystemHardware hw;
+    EXPECT_EQ(hw.on_init(info), hardware_interface::CallbackReturn::ERROR) << value;
+  }
 }
 
 }  // namespace

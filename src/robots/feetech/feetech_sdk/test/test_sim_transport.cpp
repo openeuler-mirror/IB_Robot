@@ -138,7 +138,7 @@ TEST(SimTransport, FailureInjectionMatchesRealFailureSemantics)
   EXPECT_TRUE(bus.sync_read(samples).ok);
 }
 
-TEST(SimTransport, ResponseStatusReachesReadAndWriteFailureChecks)
+TEST(SimTransport, ProtectionStatusIsDeliveredWithoutFailingTheGroupRead)
 {
   feetech::BusOptions options;
   options.simulated = true;
@@ -151,17 +151,22 @@ TEST(SimTransport, ResponseStatusReachesReadAndWriteFailureChecks)
   ASSERT_TRUE(bus.open());
   bus.sim().set_response_status(2, 0x20);
   std::vector<feetech::MotorSample> samples;
+  // A protection status byte no longer fails the transport read: the group
+  // keeps streaming and the protected motor is flagged on its own sample.
   const auto feedback = bus.sync_read(samples);
-  EXPECT_FALSE(feedback.ok);
-  EXPECT_EQ(feedback.fault, feetech::Fault::SyncReadFailed);
-  EXPECT_EQ(feedback.failed_id, 2U);
-  EXPECT_TRUE(samples.empty());
-  EXPECT_EQ(bus.health().fault, feetech::Fault::SyncReadFailed);
+  EXPECT_TRUE(feedback.ok) << feedback.detail;
+  ASSERT_EQ(samples.size(), 2U);
+  EXPECT_EQ(samples[0].protection, 0U);
+  EXPECT_TRUE(samples[0].valid);
+  EXPECT_EQ(samples[1].protection, feetech::kProtectionOverload);
+  EXPECT_TRUE(samples[1].valid);
+  EXPECT_EQ(bus.health().fault, feetech::Fault::None);
+  // Register-level operations still surface the firmware protection state.
   EXPECT_FALSE(bus.verify_calibration().ok);
+  // Releasing torque must still succeed while the protection is reported: the
+  // release is acknowledged and is the safe direction.
   const auto release = bus.emergency_release_all();
-  EXPECT_FALSE(release.ok);
-  EXPECT_EQ(release.fault, feetech::Fault::EmergencyPartiallyFailed);
-  EXPECT_EQ(release.failed_id, 2U);
+  EXPECT_TRUE(release.ok) << release.detail;
   bus.sim().clear_injections();
   EXPECT_TRUE(bus.sync_read(samples).ok);
   EXPECT_TRUE(bus.verify_calibration().ok);
