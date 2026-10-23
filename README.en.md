@@ -1,6 +1,6 @@
 # IB-Robot
 
-> IB-Robot (Intelligence Boom Robot): An integrated embodied AI framework merging the Hugging Face LeRobot ecosystem with ROS 2.
+> IB-Robot (Intelligence Boom Robot): An embodied AI development and runtime framework for diverse robot forms and heterogeneous compute platforms.
 
 ## New: OpenClaw Social Control Support!
 
@@ -16,16 +16,18 @@ IB-Robot now fully supports remote social control via the **[OpenClaw](https://g
 
 **User Guide**: [IB-Robot Usage Guide](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)
 
-IB-Robot is an **integrated robot development framework** designed to bridge the gap between the Hugging Face LeRobot machine learning ecosystem and the ROS 2 robotics middleware. It provides a complete toolchain from data collection and training to real-world deployment.
+IB-Robot connects teleoperation, data collection, model training, edge-cloud collaborative inference, embodied skills, and robot control. It organizes applications through unified observation/action contracts, robot capability interfaces, and model execution abstractions, while Robot Runtime adapts robotic arms, mobile bases, humanoid robots, and vendor control systems.
 
-### Core Integration Capabilities
+### Project Capabilities
 
-| Dimension | LeRobot Ecosystem | ROS 2 Ecosystem | IB-Robot Solution |
-|-----------|-------------------|-----------------|-------------------|
-| **Data Flow** | Episode-based | Topic-based | Contract-driven bidirectional real-time conversion |
-| **Temporal** | Discrete Steps | Continuous RT Stream | Automated alignment and high-frequency interpolation |
-| **Control** | End-to-end Policies | Hierarchical Planning | **Dual-mode control (ACT vs. MoveIt)** |
-| **Deployment** | Python Scripts | ROS 2 Nodes | Distributed edge-cloud collaborative deployment |
+| Area | Core Capabilities |
+| --- | --- |
+| Embodied Agents and Skills | Converts natural-language requests into robot skill execution constrained by planning, safety preflight checks, and a capability gateway |
+| Unified Inference and Execution Optimization | Unifies heterogeneous compute through the `ModelSession` abstraction, multi-model execution and scheduling, edge-cloud collaborative inference, and execution strategies such as AutoHorizon, RTC, temporal ensembling, and speculative execution |
+| Data and Training | Connects teleoperation, contract-driven data collection and conversion, model training, and evaluation; supports multiple teleoperation devices, distillation, and data-quality weighting |
+| Perception, Manipulation, and Spatial Intelligence | Provides scene understanding, grasping, speech interaction, SLAM, semantic mapping, object tracking, and navigation |
+| Robot Runtime | Decouples hardware from applications through consistent state, capability, and interface contracts for robotic arms, mobile robots, humanoid robots, and other robot forms |
+| Middleware and System Interoperability | Uses the independent [IBMW](https://atomgit.com/openeuler/IBMW) project for module lifecycle, execution scheduling, transport, and RPC foundations, with DDS interoperability for existing robot systems |
 
 ### Platform Support
 
@@ -40,6 +42,10 @@ The mainline workflow now supports three runtime platforms:
 ## System Architecture
 
 ![IB-Robot Architecture](docs/pictures/ib-robot-architecture.drawio.svg)
+
+IB-Robot organizes robot applications around observation/action contracts, Robot Runtime, and the model execution framework. IBMW in the diagram is an independently built and deployed middleware for robots and real-time systems; it is not a source package or submodule in this repository. ROS 2 and LeRobot are integrated as needed as an existing communication runtime and a source of model and data capabilities, respectively.
+
+See the [architecture document](docs/architecture.md#架构说明) for architecture layers, module responsibilities, IBMW integration boundaries, and key data flows.
 
 ### Architecture Deep Dive
 

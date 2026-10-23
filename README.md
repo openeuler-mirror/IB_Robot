@@ -1,8 +1,8 @@
 # IB-Robot
 
-> IB-Robot (Intelligence Boom Robot)：融合 LeRobot 与 ROS 2 生态的具身智能机器人开发框架。
+> IB-Robot (Intelligence Boom Robot)：面向多形态机器人与异构算力的具身智能开发和运行框架。
 
-IB-Robot 把遥操作、数据采集、模型训练、边端协同推理、具身技能与机器人控制连接起来。上层应用通过统一的观测／动作契约和机器人能力接口工作，底层按机器人运行时接入机械臂、移动底盘或厂商控制系统。
+IB-Robot 贯通遥操作、数据采集、模型训练、边端协同推理、具身技能与机器人控制。系统通过统一的观测／动作契约、机器人能力接口和模型执行抽象组织业务，并通过 Robot Runtime 适配机械臂、移动底盘、人形机器人及厂商控制系统。
 
 **[用户指导文档](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)** · **[机器人配置](src/robot_config/README.md)** · **[推理运行时](src/inference_service/README.md)** · **[Agent 技能入口](src/agent/robot_skill_cli/README.md)** · **[开发与测试](docs/testing.md)**
 
@@ -15,12 +15,15 @@ IB-Robot 把遥操作、数据采集、模型训练、边端协同推理、具�
 | 数据与训练 | 贯通遥操作、契约驱动的数据采集与转换、模型训练和评估流程；支持 Xbox、同构硬件、手机 IMU、动捕设备等多种设备遥操作；支持蒸馏学习、数据质量权重配置等训练优化方法 |
 | 感知、操作与空间能力 | 提供场景理解、抓取操作、语音交互、SLAM、语义地图、目标追踪和导航能力 |
 | Robot Runtime | 提供统一本体抽象，通过一致的状态、能力与接口契约将硬件与业务功能解耦，便于接入机械臂、移动机器人、人形机器人等不同形态的硬件本体 |
+| 中间件与系统互操作 | 通过独立项目 [IBMW](https://atomgit.com/openeuler/IBMW) 提供模块生命周期、执行调度、传输与 RPC 等基础能力，并通过 DDS 与现有机器人系统互操作 |
 
 ## 系统架构
 
 ![IB-Robot 当前架构：Agent 技能链路、VLA 增强、机器人运行时与具身模型统一执行框架](docs/pictures/ib-robot-architecture.drawio.svg)
 
-架构分层、模块职责与关键数据流详见 [架构文档](docs/architecture.md#架构说明)。
+IB-Robot 以观测／动作契约、Robot Runtime 和模型执行框架组织机器人业务。图中的 IBMW 是独立构建和部署的机器人与实时系统中间件，不属于本仓库源码包或子模块；ROS 2 和 LeRobot 分别作为现有通信运行环境及模型／数据能力来源按需接入。
+
+架构分层、模块职责、IBMW 集成边界与关键数据流详见 [架构文档](docs/architecture.md#架构说明)。
 
 ## 平台与部署
 

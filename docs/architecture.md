@@ -1,6 +1,6 @@
 # IB-Robot 架构文档
 
-IB-Robot 将 LeRobot 模型与数据流程接入 ROS 2 机器人系统，通过机器人公开接口、观测／动作契约和模型执行抽象，连接具身 Agent、策略推理、遥操作、数据采集与训练。
+IB-Robot 将 LeRobot 模型与数据流程接入机器人系统，并引入独立项目 [IBMW](https://atomgit.com/openeuler/IBMW) 作为机器人与实时系统中间件。IBMW 提供模块生命周期、扩展加载、任务调度、传输与 RPC 能力，并通过 DDS 与 ROS 2 系统兼容互通；IB-Robot 在其上组织机器人公开接口、观测／动作契约、模型执行、具身 Agent、遥操作、数据采集与训练。
 
 本文说明模块职责、配置归属与关键数据流。环境准备和启动命令见 [README 运行指南](../README.md#运行指南)，具体参数以各包文档和所选机器人配置为准。
 
@@ -15,12 +15,14 @@ IB-Robot 将 LeRobot 模型与数据流程接入 ROS 2 机器人系统，通过�
 - [感知、操作与 SLAM 导航](#感知操作与-slam-导航)
 - [数据与训练](#数据与训练)
 - [启动编排与部署](#启动编排与部署)
-- [通信、配置与观测](#通信配置与观测)
+- [IBMW、通信互操作与观测](#ibmw通信互操作与观测)
 - [模块与扩展入口](#模块与扩展入口)
 
 ## 架构说明
 
 ![IB-Robot 架构图](pictures/ib-robot-architecture.drawio.svg)
+
+IBMW 由独立仓库维护，不作为 IB-Robot 源码包或子模块存在。架构图表达两者的系统集成关系，不表示 IB-Robot 的 `scripts/build.sh` 会构建或安装 IBMW。
 
 架构按职责组织，而不是把所有包排列成固定的进程调用顺序：
 
@@ -29,10 +31,11 @@ IB-Robot 将 LeRobot 模型与数据流程接入 ROS 2 机器人系统，通过�
 - **模型执行与 VLA 优化**：统一异构计算资源上的模型执行，并协调策略推理与连续动作执行。
 - **感知、操作与空间能力**：提供场景理解、语音、抓取、追踪、SLAM 和导航服务，按应用需要组合。
 - **Robot Runtime**：以统一的状态、能力和接口描述连接不同形态的机器人本体。
+- **IBMW 中间件**：提供统一运行时、Module／Extension 生命周期、Executor 调度、Transport、RPC、日志和参数能力；具体通信后端由部署配置选择。
 
-底部有两条独立的适配路径：机器人本体经 Robot Runtime 接入业务，CPU／GPU／NPU 经模型会话接入统一执行框架。替换机器人不应要求业务层理解厂商控制接口；替换推理设备也不应要求业务层直接调用厂商模型 API。
+底部有两条独立适配路径：机器人本体经 Robot Runtime 暴露状态、能力与控制接口；CPU／GPU／NPU 经模型会话提供观测处理、推理请求和动作结果。IBMW 为这些运行时能力提供模块承载、执行调度、传输与 RPC 基础设施，并通过 DDS 与现有 ROS 2 节点互操作。替换机器人不应要求业务层理解厂商控制接口；替换推理设备也不应要求业务层直接调用厂商模型 API。
 
-配置、通信与 Profiling 贯穿这些职责。架构图中的功能块可以跨节点或跨设备部署，不要求同时启动。
+配置、IBMW 中间件、通信互操作与 Profiling 贯穿这些职责。架构图中的功能块可以跨节点或跨设备部署，不要求同时启动。
 
 ## 配置与契约
 
@@ -45,12 +48,17 @@ IB-Robot 将 LeRobot 模型与数据流程接入 ROS 2 机器人系统，通过�
 | 运行时接口描述 | 实际公开的端点、消息类型、QoS、坐标系、模型与能力信息 | [公开接口 schema](robot_interface_schema.md) |
 | 模型 manifest | 模型语义、产物、命名 deployment、后端 runtime profile 与 tensor 绑定 | [inference_manifest](../src/inference_manifest/README.md) |
 | 技能目录快照 | 技能定义、参数、primitive 契约、机器人上下文及目录身份 | [skill_catalog](../src/agent/skill_catalog/README.md)、[skill_library](../src/agent/skill_library/README.md) |
+| IBMW Runtime YAML | Extension 加载、Module 包、Executor、Transport／RPC Driver、路由、DDS Domain 与 QoS | [IBMW User Guide](https://atomgit.com/openeuler/IBMW/blob/master/docs/guides/user-guide.zh.md) |
+
+IB-Robot 应用 YAML 管理机器人、模型和业务组合；IBMW Runtime YAML 管理中间件运行时资源与后端选择。两者职责不同，不应合并为同一个配置 SSOT。
 
 `robot_config` 支持 `base_config` 继承与启动前校验。采用 `runtime.provider` 的配置把本体参数交给机器人 profile，应用只选择运行时并声明绑定关系；旧式无 provider 配置仍有自身的启动路径，不能把其硬件字段直接套用到新运行时。
 
 `RuntimeStatus` 携带运行时状态、能力和公开接口描述。启动编排取得有效接口快照、核对应用需要的能力并完成绑定，随后启动消费者；上层不根据机器人名称猜测话题或控制器名。
 
 观测／动作 Contract 定义语义字段、类型、来源、频率与时间对齐要求。`tensormsg` 负责 ROS 消息与 tensor 编解码，观测缓冲负责按时间戳组织输入。采集、推理与转换共享契约；数据集还保存采集时的契约和单位转换快照，避免离线转换依赖后来修改的机器人配置。
+
+观测／动作 Contract 属于 IB-Robot 的模型与机器人语义层；IBMW 的 DDS IDL、FastCDR 和 TypeSupport 属于中间件类型与传输层。两者通过明确的消息映射衔接，不能以 DDS 类型定义替代模型 Contract。
 
 ## Robot Runtime 与本体适配
 
@@ -213,6 +221,7 @@ Hermes / 外部 Agent → robot-skill ──────────┐
 | 推理、遥操作与采集 | `robot_config robot.launch.py` | 加载应用配置、启动 provider、取得公开接口快照、绑定并启动业务消费者 |
 | Hermes／Agent 技能链路 | `embodied_bringup embodied_pipeline.launch.py` | 复用基础机器人启动过程，在就绪后组合计划、安全和技能节点 |
 | 分布式算力侧 | `inference_service cloud_inference.launch.py` | 加载模型部署、配置契约和通信端点 |
+| IBMW Runtime／Module | `ibmw run <config.yaml>`、App 或 Registration 模式 | 加载 Extension 与 Module，初始化 Executor、Transport、RPC、日志和运行时配置 |
 
 采用 runtime provider 时，启动就绪判断基于运行时状态与能力核对；旧式路径可能使用控制器就绪检查。`robot_config` 本身不直接启动具身技能节点，仅设置 `with_embodied` 不能代替具身流水线入口。
 
@@ -222,19 +231,25 @@ Hermes / 外部 Agent → robot-skill ──────────┐
 
 Ubuntu／openEuler 源码工作区通过 `.shrc_local` 加载环境，使用 `scripts/build.sh` 构建。OpenHarmony 使用交叉构建后的板端发布包和板端环境入口，不能直接照搬源码工作区命令。
 
-同一系统内的机器人、推理、技能与录制进程需要一致的 ROS Domain 和兼容的 RMW／QoS 配置；各机器路径可以不同，但模型与契约身份必须匹配。具体命令见 [README](../README.md#运行指南) 与 [OpenHarmony 指南](../README.OpenHarmony.md)。
+IBMW 采用独立的 CMake Preset 和 C++20 构建流程，不由 IB-Robot 的 colcon 工作区自动构建。部署时需要显式准备兼容版本的 IBMW Runtime、Extension、TypeSupport 和配置文件。
 
-## 通信、配置与观测
+同一系统内的机器人、推理、技能与录制进程需要一致的 ROS Domain 和兼容的 RMW／QoS 配置；各机器路径可以不同，但模型与契约身份必须匹配。采用 IBMW 与 ROS 2 互操作时，两侧还必须匹配 DDS Domain、话题名称、DDS 类型、序列化、QoS 和接口身份。当前兼容性结论以 IBMW 文档列明的 ROS 2 Humble／FastDDS 路径为准，不应泛化为任意 RMW 或 ROS 2 发行版均可直接互通。Topic 和 Service 按已验证路径使用；Action 需遵守 IBMW 实验性 DDS-only Adapter 的支持范围。具体命令见 [README](../README.md#运行指南)、[OpenHarmony 指南](../README.OpenHarmony.md) 与 [IBMW 兼容性边界](https://atomgit.com/openeuler/IBMW/blob/master/docs/reference/compatibility.md)。
 
-图中的 **IBMW · ROS 2 / DDS** 表达通信层。Topic、Service 和 Action 连接观测、模型、任务及机器人能力；`ibrobot_msgs` 定义项目共享的消息、服务和 action，`tensormsg` 处理业务 tensor 与 ROS 数据之间的转换。
+## IBMW、通信互操作与观测
+
+图中的 IBMW 是独立的机器人与实时系统中间件，不只是通信总线。它通过统一 Runtime 管理 Module 生命周期，通过 Extension 装载通信与管理能力，通过 Executor 调度异步和实时任务，并为发布订阅与请求响应分别提供 Transport 和 RPC 抽象。应用模块依赖公开 API，不直接依赖具体 Transport 实现。
+
+IBMW 与 ROS 2 的推荐互操作路径是 DDS Extension：使用 ROS 2 兼容的话题命名、DDS 类型和线协议与 ROS 2 节点通信，IBMW 侧运行时不依赖 RCL、RCLCPP 或 RMW。基于 RCL 的 ROS 2 Extension 已废弃，不应作为新集成方案。Topic 和 Service 连接观测、模型、任务及机器人能力；Action 的 DDS-only 互操作仍属于实验性能力，应按 IBMW 文档限定的范围使用。
+
+`ibrobot_msgs` 定义 IB-Robot 共享的消息、服务和 action，`tensormsg` 处理业务 tensor 与 ROS 数据之间的转换。将这些接口接入 IBMW 时，仍需导入或生成对应 TypeSupport，并逐项验证名称、类型、QoS 和线协议兼容性，不能假定所有 IB-Robot 接口都会自动互通。
 
 图像可通过 `observation_transport` 接入，并按部署选择 H.264 RTP/UDP。DDS 仍承担请求、结果、状态与非图像观测；图像传输不替代业务会话和执行契约。
 
 右侧配置设施分别管理应用组合、runtime profile、模型部署与启动绑定；DDS 可视化配置归属通信配置和管理职责，不替代上述配置来源。
 
-**Profiling** 使用 `ibrobot_tracing` 采集并分析推理、动作与跨节点调用信息。可选 Web 工作台提供浏览器分析界面，需要单独准备依赖和构建。Trace 是观测数据，不改变业务调度；主机调用耗时也不自动等价于 GPU／NPU kernel 的完成时间。
+**Profiling** 使用 `ibrobot_tracing` 采集并分析推理、动作与跨节点调用信息。可选 Web 工作台提供浏览器分析界面，需要单独准备依赖和构建。IBMW 自身还提供结构化日志、Topic Logger、运行时图和可选 OpenTelemetry 等中间件观测能力。需要端到端关联时，应显式统一时间基准、请求身份和 Trace 上下文，不能默认两套观测数据已经自动贯通。Trace 是观测数据，不改变业务调度；主机调用耗时也不自动等价于 GPU／NPU kernel 的完成时间。
 
-详见 [Tracing Core](../src/ibrobot_tracing/README.md) 与 [Profiling Web](../tools/ibrobot_tracing_web/README.md)。
+详见 [Tracing Core](../src/ibrobot_tracing/README.md)、[Profiling Web](../tools/ibrobot_tracing_web/README.md) 与 [IBMW 文档索引](https://atomgit.com/openeuler/IBMW/blob/master/docs/README.md)。
 
 ## 模块与扩展入口
 
