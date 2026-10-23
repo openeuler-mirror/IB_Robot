@@ -424,6 +424,8 @@ class SO101PlacoServoNode(Node):
             max_joint_speed=self.max_joint_speed,
             orientation_weight=0.0 if self.position_only else self.orientation_weight,
             max_task_step=self.diffik_max_task_step,
+            # The QP must respect the same limits the output clamp below enforces.
+            joint_limits=(self.joint_lo, self.joint_hi),
         )
         # Measured flip onset ~= 21.3 * damping (m) in the worst frame/mode
         # (tcp, position-only); keep ~2x margin below it (#156).

@@ -300,6 +300,7 @@ class SO101PlacoDiffIK:
         max_joint_speed: float | None = DEFAULT_DIFFIK_MAX_JOINT_SPEED,
         orientation_weight: float = 0.0,
         max_task_step: float | None = DEFAULT_DIFFIK_MAX_TASK_STEP,
+        joint_limits: tuple[np.ndarray | list[float], np.ndarray | list[float]] | None = None,
     ) -> None:
         """Build the differential-IK solver.
 
@@ -325,9 +326,21 @@ class SO101PlacoDiffIK:
                 absolute-reference solves hand to the QP; the orientation error
                 is scaled by the same factor. ``None`` disables it. See
                 :data:`DEFAULT_DIFFIK_MAX_TASK_STEP` and :meth:`_bounded_targets`.
+            joint_limits: Optional ``(lower, upper)`` arm joint limits (rad),
+                ordered by ``arm_joint_names``, that replace the URDF limits
+                inside the QP. ``None`` keeps the URDF limits.
         """
         if max_task_step is not None and not (math.isfinite(max_task_step) and max_task_step > 0.0):
             raise ValueError(f"max_task_step must be a finite positive distance or None, got {max_task_step!r}")
+        limits = None
+        if joint_limits is not None:
+            lower = np.asarray(joint_limits[0], dtype=np.float64)
+            upper = np.asarray(joint_limits[1], dtype=np.float64)
+            if lower.shape != (len(arm_joint_names),) or upper.shape != (len(arm_joint_names),):
+                raise ValueError(f"joint_limits must hold {len(arm_joint_names)} lower and upper values")
+            if not (np.all(np.isfinite(lower)) and np.all(np.isfinite(upper)) and np.all(lower < upper)):
+                raise ValueError("joint_limits must be finite with lower < upper for every joint")
+            limits = (lower, upper)
 
         import placo  # local import: heavy native lib
 
@@ -371,7 +384,8 @@ class SO101PlacoDiffIK:
         # DLS-like damping for smooth yielding at singularities / boundaries.
         self.solver.add_regularization_task(damping)
 
-        # Hard QP constraints: URDF joint limits + velocity limits. The velocity
+        # Hard QP constraints: joint limits (URDF, or ``joint_limits``) + velocity
+        # limits. The velocity
         # limit uses solver.dt to bound per-tick Δq, so unreachable directions
         # are projected onto the feasible set rather than snapping a branch.
         # Tighten the per-joint velocity ceiling below the URDF's 10 rad/s for
@@ -379,6 +393,13 @@ class SO101PlacoDiffIK:
         if max_joint_speed is not None:
             for name in self.arm_joint_names:
                 self.robot.set_velocity_limit(name, float(max_joint_speed))
+        # Callers that clamp their output to narrower limits (the servo node's
+        # YAML limits) must hand them to the QP too: otherwise the QP keeps
+        # pushing joints past the clamp, the clamp discards that motion, and the
+        # arm parks against a limit far from the reachable solution.
+        if limits is not None:
+            for name, lo, hi in zip(self.arm_joint_names, limits[0], limits[1], strict=True):
+                self.robot.set_joint_limits(name, float(lo), float(hi))
         self.solver.enable_joint_limits(True)
         self.solver.enable_velocity_limits(True)
         self.solver.dt = self.control_period

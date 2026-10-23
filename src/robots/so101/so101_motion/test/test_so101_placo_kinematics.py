@@ -681,16 +681,68 @@ def test_reachable_reference_still_converges_quickly(urdf_xml: str) -> None:
 @pytest.mark.parametrize("frame", ["gripper", "tcp"])
 @pytest.mark.parametrize("ori", [0.01, 0.0])
 def test_deployed_yaml_parameters_park_without_oscillation(urdf_xml: str, frame, ori) -> None:
-    """The committed YAML (damping, speed, step bound) must not flip in any frame/mode.
+    """The committed YAML (damping, speed, step bound, limits) must not flip in any frame/mode.
 
     The flip onset scales with damping, so lowering diffik_damping without also
     lowering diffik_max_task_step must make this test fail.
     """
     cfg = _servo_cfg()
     assert "diffik_max_task_step" in cfg, "so101_placo_servo.yaml must set diffik_max_task_step (#156)"
-    solver = _deployed_diffik(urdf_xml, frame, ori, max_task_step=cfg["diffik_max_task_step"] or None)
+    solver = _deployed_diffik(
+        urdf_xml,
+        frame,
+        ori,
+        max_task_step=cfg["diffik_max_task_step"] or None,
+        joint_limits=_yaml_limits(cfg),
+    )
     published, _, _, _ = _servo_loop(solver, np.zeros(5), _EP10_DELTA, ticks=300)
     assert _tail_flips(published)[0] == 0
+
+
+# Cases found by adversarial review where the QP's URDF limits (+-pi) and the
+# node's narrower YAML clamp disagreed: the QP kept pushing joints past the
+# YAML limits, the clamp discarded it, and the arm parked far from the stable
+# solution. With the YAML limits inside the QP, the bounded reference step must
+# park exactly where the unbounded (non-flipping) solver does.
+_LIMIT_CASES = [
+    pytest.param(
+        "tcp",
+        0.01,
+        [-0.22029741576488338, 0.027610172650482268, -1.3665789484590722, -1.4756065906018172, 0.5692942007034465],
+        [0.16004658622492893, 0.07396871453539017, -0.09441249656548835],
+        [-0.1543072145187761, -0.5536564562899937, -1.3855157205733404],
+        id="case6-tcp-200mm",
+    ),
+    pytest.param(
+        "gripper",
+        0.01,
+        [-2.049479780543262, 0.0026654561196406412, -1.2817760550408697, -1.0485405999357194, 1.3900460407264092],
+        [0.0, 0.0, 0.0],
+        [1.9789294775126287, 2.300835934897635, 0.7660888484473072],
+        id="case87-rotation-only",
+    ),
+]
+
+
+@pytest.mark.parametrize("frame,ori,q0,delta,rotvec", _LIMIT_CASES)
+def test_yaml_limits_in_qp_park_like_unbounded_solver(urdf_xml: str, frame, ori, q0, delta, rotvec) -> None:
+    limits = _yaml_limits(_servo_cfg())
+    bounded = _deployed_diffik(urdf_xml, frame, ori, joint_limits=limits)
+    unbounded = _deployed_diffik(urdf_xml, frame, ori, joint_limits=limits, max_task_step=None)
+    pub_b, raw_b, p_ref, r_ref = _servo_loop(bounded, q0, delta, ticks=1600, rotvec=rotvec)
+    pub_u, _, _, _ = _servo_loop(unbounded, q0, delta, ticks=1600, rotvec=rotvec)
+
+    def residuals(q):
+        pos = np.linalg.norm(bounded.ee_position(q) - p_ref)
+        ang = np.linalg.norm(Rotation.from_matrix(r_ref @ bounded.ee_rotation(q).T).as_rotvec())
+        return pos, ang
+
+    pos_b, ang_b = residuals(pub_b[-1])
+    pos_u, ang_u = residuals(pub_u[-1])
+    assert abs(pos_b - pos_u) < 2e-3, f"parked {pos_b * 1000:.1f} mm vs unbounded {pos_u * 1000:.1f} mm"
+    assert abs(ang_b - ang_u) < 0.02, f"orientation residual {ang_b:.3f} vs unbounded {ang_u:.3f} rad"
+    # With the limits inside the QP the post-QP clamp is idle: no hidden push into a limit.
+    assert np.abs(raw_b[-_TAIL_TICKS:]).max() < np.radians(_FLIP_FLOOR_DEG)
 
 
 def test_max_task_step_bounds_each_tick(urdf_xml: str) -> None:
@@ -722,6 +774,18 @@ def test_step_velocity_api_unaffected_by_task_step_bound(urdf_xml: str) -> None:
     v = np.array([0.0, 0.0, 0.2])
     q = _DIFFIK_HOME.copy()
     np.testing.assert_allclose(bounded.step(q, v, _DIFFIK_DT), unbounded.step(q, v, _DIFFIK_DT), atol=1e-9)
+
+
+@pytest.mark.parametrize(
+    "limits",
+    [
+        (np.zeros(4), np.ones(4)),  # wrong length
+        (np.ones(5), np.zeros(5)),  # lower > upper
+    ],
+)
+def test_joint_limits_rejects_invalid_values(urdf_xml: str, limits) -> None:
+    with pytest.raises(ValueError):
+        SO101PlacoDiffIK(urdf_xml=urdf_xml, joint_limits=limits)
 
 
 if __name__ == "__main__":

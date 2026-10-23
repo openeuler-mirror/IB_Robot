@@ -19,7 +19,8 @@
 #     dominating the under-actuated 5-DOF arm.
 #   - Joint + velocity limits are HARD QP constraints (enable_joint_limits /
 #     enable_velocity_limits): the unreachable velocity component is projected
-#     onto the feasible set (correct energy decomposition).
+#     onto the feasible set (correct energy decomposition). The joint limits
+#     below are handed to the QP, not only clamped afterwards.
 #   - The arm parks at the reachable edge only because diffik_max_task_step
 #     bounds the per-tick task error: a far unreachable reference fed straight
 #     to the QP oscillates at max joint speed (#156).
@@ -83,8 +84,8 @@ output_lowpass_alpha: 0.0        # 0 = off; (0,1] enables first-order LP on q_de
                                  # Start at 0; only raise if jitter remains.
 
 # --- self-owned joint limits (rad) ---------------------------------------
-# Must match the URDF link limits for joints 1..5 (so101_base xacro).
-# The node refuses to start if these keys are absent.
+# Narrower than the URDF (+-pi). Applied both inside the QP and as the node's
+# post-QP output clamp. The node refuses to start if these keys are absent.
 joint_limits_lower: [-2.0693, -1.92, -1.6813, -1.65806, -2.9115]
 joint_limits_upper: [2.0709, 1.92, 1.6828, 1.65806, 2.9115]
 

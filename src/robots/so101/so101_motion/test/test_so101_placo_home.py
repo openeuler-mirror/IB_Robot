@@ -1087,9 +1087,12 @@ def _construct_diffik(monkeypatch, **overrides):
     return built, [w for w in warnings if "diffik_max_task_step" in w]
 
 
-def test_diffik_receives_task_step_bound(monkeypatch):
+def test_diffik_receives_task_step_bound_and_yaml_joint_limits(monkeypatch):
     built, warnings = _construct_diffik(monkeypatch, diffik_max_task_step=0.01, diffik_damping=1e-3)
     assert built["max_task_step"] == 0.01
+    lower, upper = built["joint_limits"]
+    np.testing.assert_array_equal(lower, [-2.0] * 5)
+    np.testing.assert_array_equal(upper, [2.0] * 5)
     assert warnings == []
 
 
