@@ -19,8 +19,10 @@
 #     dominating the under-actuated 5-DOF arm.
 #   - Joint + velocity limits are HARD QP constraints (enable_joint_limits /
 #     enable_velocity_limits): the unreachable velocity component is projected
-#     onto the feasible set (correct energy decomposition) and the arm yields
-#     at the reachable edge. No workspace box / per-tick clip needed.
+#     onto the feasible set (correct energy decomposition).
+#   - The arm parks at the reachable edge only because diffik_max_task_step
+#     bounds the per-tick task error: a far unreachable reference fed straight
+#     to the QP oscillates at max joint speed (#156).
 #   - Self-owned joint-limit clamp: in Cartesian mode the arm command chain
 #     bypasses TeleopNode's SafetyFilter, so the node also clamps outputs as
 #     defense in depth.
@@ -49,6 +51,20 @@ orientation_weight: 0.01
 # singularities / reachable boundaries. Larger = smoother but less crisp
 # tracking; smaller = crisper but more sensitive near singularities.
 diffik_damping: 0.001
+
+# diffik_max_task_step: per-tick bound (m) on the Cartesian error the QP sees;
+# position and orientation errors are scaled by the same factor and the
+# reference itself is untouched (#156). Above a damping-dependent onset the
+# reachable-edge equilibrium flips every tick at max joint speed. Measured
+# onset at damping 0.001 (speed 4 rad/s, dt 0.02 s):
+#                gripper   tcp
+#   ori 0.01     ~47 mm    ~47 mm
+#   position-only ~31 mm   ~22 mm   <- worst case
+# The onset scales roughly with diffik_damping (~21*damping m in the worst
+# case), so lower damping needs a proportionally smaller bound; the node warns
+# above 10.6*damping. 0.010 keeps ~2x margin. Normal VR tracking (p99 ~7 mm
+# per frame) rarely hits it. 0 disables the bound (not recommended).
+diffik_max_task_step: 0.010
 
 # max_joint_speed: per-joint velocity ceiling (rad/s) for the QP velocity-limit
 # constraint and the REAL speed ceiling of the servo. The SO-101 URDF declares

@@ -28,10 +28,12 @@ expansion helper, so it can be exercised by unit tests without a live robot.
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import tempfile
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 # Default location of the SO-101 description, relative to the ROS package
 # ``so101_description``. Resolved lazily so importing this module never
@@ -241,6 +243,14 @@ DEFAULT_CONTROL_PERIOD = 0.02  # s (50 Hz) — solver.dt for the velocity step
 # keep the URDF limits unchanged.
 DEFAULT_DIFFIK_MAX_JOINT_SPEED: float | None = 2.0
 DEFAULT_DIFFIK_ORIENTATION_WEIGHT = 0.01
+# Per-tick bound (m) on the Cartesian error handed to the QP by the
+# absolute-reference solves (issue #156). Far references make the reachable-edge
+# equilibrium unstable (period-2 flip at max joint speed); the onset grows with
+# damping and was measured at ~22 mm (tcp, position-only) / ~47 mm (gripper,
+# orientation 0.01) for damping 1e-3. 10 mm keeps ~2x margin on the worst case.
+# Empirical for damping 1e-3, max speed 4 rad/s, dt 0.02 s — lower damping
+# needs a proportionally smaller bound. None disables the bound.
+DEFAULT_DIFFIK_MAX_TASK_STEP: float | None = 0.010
 
 
 class SO101PlacoDiffIK:
@@ -289,6 +299,7 @@ class SO101PlacoDiffIK:
         control_period: float = DEFAULT_CONTROL_PERIOD,
         max_joint_speed: float | None = DEFAULT_DIFFIK_MAX_JOINT_SPEED,
         orientation_weight: float = 0.0,
+        max_task_step: float | None = DEFAULT_DIFFIK_MAX_TASK_STEP,
     ) -> None:
         """Build the differential-IK solver.
 
@@ -310,7 +321,14 @@ class SO101PlacoDiffIK:
             orientation_weight: Optional soft orientation-task weight. ``0.0``
                 keeps position-only behaviour; a small positive value enables
                 low-priority Cartesian orientation tracking.
+            max_task_step: Per-tick bound (m) on the position error the
+                absolute-reference solves hand to the QP; the orientation error
+                is scaled by the same factor. ``None`` disables it. See
+                :data:`DEFAULT_DIFFIK_MAX_TASK_STEP` and :meth:`_bounded_targets`.
         """
+        if max_task_step is not None and not (math.isfinite(max_task_step) and max_task_step > 0.0):
+            raise ValueError(f"max_task_step must be a finite positive distance or None, got {max_task_step!r}")
+
         import placo  # local import: heavy native lib
 
         self._owns_temp_urdf = False
@@ -329,6 +347,7 @@ class SO101PlacoDiffIK:
         self.arm_joint_names: list[str] = list(arm_joint_names)
         self.control_period = float(control_period)
         self.orientation_weight = float(orientation_weight)
+        self.max_task_step = None if max_task_step is None else float(max_task_step)
 
         self.robot = placo.RobotWrapper(urdf_path)
         self.solver = placo.KinematicsSolver(self.robot)
@@ -396,6 +415,42 @@ class SO101PlacoDiffIK:
         """Target-frame rotation (base frame, 3x3) for the given joints."""
         return self.forward_kinematics(q_rad)[:3, :3].copy()
 
+    def _bounded_targets(
+        self,
+        target_position: np.ndarray | list[float],
+        target_rotation: np.ndarray | list[list[float]] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Shrink this tick's task error to at most ``max_task_step`` (issue #156).
+
+        Must be called after :meth:`_seed`. Handing the QP a reference far
+        outside the reachable set makes the edge equilibrium unstable: the
+        per-tick map overshoots into a period-2 flip at the joint speed ceiling.
+        Scaling the error down keeps the QP in its stable range while the
+        caller's reference stays untouched, so the arm still closes the full
+        gap over several ticks and follows immediately once the reference
+        becomes reachable.
+
+        Position and orientation errors are scaled by the SAME factor ``s``:
+        bounding only the position error would raise the relative orientation
+        priority by ``1/s`` and park the arm away from the stationary point of
+        the original weighted objective.
+        """
+        target_p = np.asarray(target_position, dtype=np.float64)
+        target_r = None if target_rotation is None else np.asarray(target_rotation, dtype=np.float64)
+        if self.max_task_step is None:
+            return target_p, target_r
+        p_cur = np.asarray(self.robot.get_T_world_frame(self.target_frame), dtype=np.float64)[:3, 3]
+        error = target_p - p_cur
+        dist = float(np.linalg.norm(error))
+        if dist <= self.max_task_step:
+            return target_p, target_r
+        s = self.max_task_step / dist
+        if target_r is not None:
+            r_cur = np.asarray(self.robot.get_T_world_frame(self.target_frame), dtype=np.float64)[:3, :3]
+            rotvec = Rotation.from_matrix(target_r @ r_cur.T).as_rotvec()
+            target_r = Rotation.from_rotvec(s * rotvec).as_matrix() @ r_cur
+        return p_cur + s * error, target_r
+
     def solve_to_position(
         self,
         q_seed_rad: np.ndarray | list[float],
@@ -413,6 +468,8 @@ class SO101PlacoDiffIK:
         so a large reference error cannot snap the arm; it converges over a few
         ticks. Holding (zero user velocity) keeps the reference fixed, so the
         only motion the QP produces is the small correction that cancels sag.
+        A reference farther than ``max_task_step`` is approached in bounded
+        steps (see :meth:`_bounded_targets`).
 
         Args:
             q_seed_rad: Seed arm joints (rad), ordered by ``arm_joint_names``.
@@ -427,7 +484,7 @@ class SO101PlacoDiffIK:
         step_dt = self.control_period if dt is None else float(dt)
         self._seed(np.asarray(q_seed_rad, dtype=np.float64))
 
-        self.pos_task.target_world = np.asarray(target_position, dtype=np.float64)
+        self.pos_task.target_world, _ = self._bounded_targets(target_position)
 
         self.solver.dt = step_dt
         self.solver.solve(True)
@@ -445,13 +502,20 @@ class SO101PlacoDiffIK:
         target_rotation: np.ndarray | list[list[float]],
         dt: float | None = None,
     ) -> np.ndarray:
-        """One QP step toward an absolute position + soft orientation target."""
+        """One QP step toward an absolute position + soft orientation target.
+
+        Far references are approached in bounded steps with position and
+        orientation errors scaled together (see :meth:`_bounded_targets`).
+        """
         step_dt = self.control_period if dt is None else float(dt)
         self._seed(np.asarray(q_seed_rad, dtype=np.float64))
 
-        self.pos_task.target_world = np.asarray(target_position, dtype=np.float64)
-        if self.orientation_task is not None:
-            self.orientation_task.R_world_frame = np.asarray(target_rotation, dtype=np.float64)
+        if self.orientation_task is None:
+            self.pos_task.target_world, _ = self._bounded_targets(target_position)
+        else:
+            target_p, target_r = self._bounded_targets(target_position, target_rotation)
+            self.pos_task.target_world = target_p
+            self.orientation_task.R_world_frame = target_r
 
         self.solver.dt = step_dt
         self.solver.solve(True)

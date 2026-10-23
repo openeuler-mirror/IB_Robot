@@ -191,6 +191,11 @@ class SO101PlacoServoNode(Node):
         # yielding at singularities / reachable boundaries.
         self.declare_parameter("diffik_damping", 1e-3)
 
+        # Per-tick bound (m) on the Cartesian error handed to the QP (#156): a
+        # far, unreachable reference otherwise drives a period-2 oscillation at
+        # max joint speed. 0 disables it. Must shrink with diffik_damping.
+        self.declare_parameter("diffik_max_task_step", 0.010)
+
         # Orientation tracking: small soft weight, lower than position.
         # Ignored when position_only=true.
         self.declare_parameter("orientation_weight", 0.01)
@@ -285,6 +290,10 @@ class SO101PlacoServoNode(Node):
         self.arm_joint_names: list[str] = list(self.get_parameter("arm_joint_names").value)
         self.position_only = bool(self.get_parameter("position_only").value)
         self.diffik_damping = float(self.get_parameter("diffik_damping").value)
+        max_task_step = float(self.get_parameter("diffik_max_task_step").value)
+        if not np.isfinite(max_task_step) or max_task_step < 0.0:
+            raise RuntimeError(f"diffik_max_task_step must be >= 0 (0 disables), got {max_task_step}")
+        self.diffik_max_task_step: float | None = max_task_step if max_task_step > 0.0 else None
         self.orientation_weight = float(self.get_parameter("orientation_weight").value)
         self.max_joint_speed = float(self.get_parameter("max_joint_speed").value)
         self.output_lowpass_alpha = _clamp(float(self.get_parameter("output_lowpass_alpha").value), 0.0, 1.0)
@@ -414,7 +423,17 @@ class SO101PlacoServoNode(Node):
             control_period=self.control_period,
             max_joint_speed=self.max_joint_speed,
             orientation_weight=0.0 if self.position_only else self.orientation_weight,
+            max_task_step=self.diffik_max_task_step,
         )
+        # Measured flip onset ~= 21.3 * damping (m) in the worst frame/mode
+        # (tcp, position-only); keep ~2x margin below it (#156).
+        task_step_ceiling = 10.6 * self.diffik_damping
+        if self.diffik_max_task_step is None or self.diffik_max_task_step > task_step_ceiling:
+            self.get_logger().warning(
+                f"diffik_max_task_step={self.diffik_max_task_step} is above {task_step_ceiling:.4f} m for "
+                f"diffik_damping={self.diffik_damping}: an unreachable reference may oscillate at max "
+                f"joint speed (#156); use <= {task_step_ceiling:.4f}"
+            )
 
         # ---- state ----
         self._enabled: bool = False
@@ -563,6 +582,7 @@ class SO101PlacoServoNode(Node):
             f"mode={self.input_mode} "
             f"joints={self.arm_joint_names} rate={1.0 / self.control_period:.0f}Hz "
             f"diffik(damping={self.diffik_damping}, max_speed={self.max_joint_speed}rad/s, "
+            f"max_task_step={self.diffik_max_task_step}m, "
             f"orientation_weight={0.0 if self.position_only else self.orientation_weight}) "
             f"{'POSITION-ONLY ' if self.position_only else ''}"
             f"lowpass={self.output_lowpass_alpha}"

@@ -33,6 +33,8 @@ import sys
 
 import numpy as np
 import pytest
+import yaml
+from scipy.spatial.transform import Rotation
 
 # Make the wrapper importable both from a sourced install and directly from
 # the source tree (offline run before colcon install).
@@ -40,7 +42,15 @@ _SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
-placo = pytest.importorskip("placo", reason="placo not installed (kinematics extra)")
+# Under colcon test (CMakeLists sets IBROBOT_REQUIRE_PLACO=1) a missing placo,
+# import error or xacro failure must FAIL: a module-level skip would report the
+# whole suite as green while running nothing.
+_REQUIRE_PLACO = os.environ.get("IBROBOT_REQUIRE_PLACO") == "1"
+
+if _REQUIRE_PLACO:
+    import placo  # noqa: F401
+else:
+    placo = pytest.importorskip("placo", reason="placo not installed (kinematics extra)")
 
 try:
     from so101_placo_kinematics import (
@@ -53,6 +63,8 @@ try:
         expand_so101_xacro,
     )
 except ImportError as exc:  # pragma: no cover - import diagnostics
+    if _REQUIRE_PLACO:
+        raise
     pytest.skip(f"cannot import so101_placo_kinematics: {exc}", allow_module_level=True)
 
 
@@ -82,6 +94,8 @@ def urdf_xml() -> str:
     try:
         return expand_so101_xacro()
     except Exception as exc:  # noqa: BLE001
+        if _REQUIRE_PLACO:
+            raise
         pytest.skip(f"xacro expansion needs a built/sourced so101_description: {exc}")
 
 
@@ -530,6 +544,184 @@ def test_solve_to_position_follows_moving_reference(diffik: SO101PlacoDiffIK) ->
     # The EE must track the reference it was given (sub-mm), proving the sag did
     # not detach the command from the reference.
     assert np.linalg.norm(reached - p_ref) < 2e-3
+
+
+# --- #156: an unreachable absolute reference must park, not oscillate ---------
+# A VR tracking jump put the absolute reference ~0.66 m outside the workspace.
+# Fed straight to the QP, the edge equilibrium loses stability (period-2 flip):
+# every tick hit the joint speed ceiling and alternated between two joint sets
+# until the trigger was released. These tests drive the solver exactly like
+# so101_placo_servo_node: seeded from the previous command, fixed reference,
+# post-QP clamp to the YAML joint limits.
+
+_SERVO_YAML = os.path.join(os.path.dirname(_SCRIPTS_DIR), "config", "so101_placo_servo.yaml")
+_EP10_DELTA = np.array([-0.056, -0.134, 0.645])  # issue #156 ep10 reference offset (m)
+_BENT_Q0 = np.radians([15.0, 12.0, -72.0, 5.0, -15.0])
+_BENT_DELTA = np.array([0.0, -0.6, 0.3])
+_FLIP_FLOOR_DEG = 0.2  # reversals of smaller steps are numerical nullspace drift
+_TAIL_TICKS = 50  # last 1 s at 50 Hz
+
+
+def _servo_cfg() -> dict:
+    with open(_SERVO_YAML, encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def _yaml_limits(cfg: dict) -> tuple[np.ndarray, np.ndarray]:
+    return np.array(cfg["joint_limits_lower"], dtype=np.float64), np.array(cfg["joint_limits_upper"], dtype=np.float64)
+
+
+def _deployed_diffik(urdf_xml: str, frame: str, ori: float, **overrides) -> SO101PlacoDiffIK:
+    """Solver with the deployed YAML gains; the reference-step bound is the class default."""
+    cfg = _servo_cfg()
+    kwargs = {
+        "damping": cfg["diffik_damping"],
+        "control_period": _DIFFIK_DT,
+        "max_joint_speed": cfg["max_joint_speed"],
+        "orientation_weight": ori,
+    }
+    kwargs.update(overrides)
+    return SO101PlacoDiffIK(urdf_xml=urdf_xml, target_frame=frame, **kwargs)
+
+
+def _servo_loop(solver, q0, delta, ticks, rotvec=None):
+    """Run the node's hot path; return published joints and raw (pre-clamp) QP steps."""
+    lo, hi = _yaml_limits(_servo_cfg())
+    q = np.asarray(q0, dtype=np.float64).copy()
+    p_ref = solver.ee_position(q) + np.asarray(delta, dtype=np.float64)
+    r_ref = solver.ee_rotation(q)
+    if rotvec is not None:
+        r_ref = Rotation.from_rotvec(rotvec).as_matrix() @ r_ref
+    position_only = solver.orientation_weight == 0.0
+    published, raw_steps = [q.copy()], []
+    for _ in range(ticks):
+        if position_only:
+            q_raw = solver.solve_to_position(q, p_ref, _DIFFIK_DT)
+        else:
+            q_raw = solver.solve_to_pose(q, p_ref, r_ref, _DIFFIK_DT)
+        raw_steps.append(q_raw - q)
+        q = np.clip(q_raw, lo, hi)
+        published.append(q.copy())
+    return np.array(published), np.array(raw_steps), p_ref, r_ref
+
+
+def _tail_flips(published: np.ndarray) -> tuple[int, float]:
+    """Count significant same-joint direction reversals in the last second."""
+    steps = np.diff(published[-(_TAIL_TICKS + 1) :], axis=0)
+    big = np.abs(steps) > np.radians(_FLIP_FLOOR_DEG)
+    flips = (np.sign(steps[1:]) != np.sign(steps[:-1])) & big[1:] & big[:-1]
+    return int(flips.sum()), float(np.degrees(np.abs(steps).max()))
+
+
+_UNREACHABLE_CASES = [
+    pytest.param("gripper", 0.01, np.zeros(5), _EP10_DELTA, id="gripper-pose-ep10"),
+    pytest.param("gripper", 0.0, np.zeros(5), _EP10_DELTA, id="gripper-position-ep10"),
+    pytest.param("tcp", 0.01, np.zeros(5), _EP10_DELTA, id="tcp-pose-ep10"),
+    pytest.param("tcp", 0.0, np.zeros(5), _EP10_DELTA, id="tcp-position-ep10"),
+    pytest.param("gripper", 0.01, _BENT_Q0, _BENT_DELTA, id="gripper-pose-bent"),
+    pytest.param("tcp", 0.0, _BENT_Q0, _BENT_DELTA, id="tcp-position-bent"),
+]
+
+
+@pytest.mark.parametrize("frame,ori,q0,delta", _UNREACHABLE_CASES)
+def test_unreachable_reference_parks_without_oscillation(urdf_xml: str, frame, ori, q0, delta) -> None:
+    """The arm must come to rest at the reachable edge instead of flipping every tick."""
+    solver = _deployed_diffik(urdf_xml, frame, ori)
+    published, _, _, _ = _servo_loop(solver, q0, delta, ticks=300)
+    flips, tail_max = _tail_flips(published)
+    assert flips == 0, f"{flips} direction reversals > {_FLIP_FLOOR_DEG} deg in the last second"
+    assert tail_max < _FLIP_FLOOR_DEG, f"arm still moving {tail_max:.2f} deg/tick after 6 s"
+
+
+@pytest.mark.parametrize("frame,ori,q0,delta", _UNREACHABLE_CASES)
+def test_unreachable_reference_does_not_saturate_speed_limit(urdf_xml: str, frame, ori, q0, delta) -> None:
+    """Neither the raw QP step nor the published step may sit at the speed ceiling."""
+    solver = _deployed_diffik(urdf_xml, frame, ori)
+    published, raw_steps, _, _ = _servo_loop(solver, q0, delta, ticks=300)
+    ceiling = 0.95 * _servo_cfg()["max_joint_speed"] * _DIFFIK_DT
+    raw_tail = float(np.abs(raw_steps[-_TAIL_TICKS:]).max())
+    pub_tail = float(np.abs(np.diff(published[-(_TAIL_TICKS + 1) :], axis=0)).max())
+    assert raw_tail < ceiling, f"raw QP step {raw_tail:.4f} rad at the speed ceiling"
+    assert pub_tail < ceiling, f"published step {pub_tail:.4f} rad at the speed ceiling"
+
+
+def test_unreachable_reference_parks_at_stable_edge(urdf_xml: str) -> None:
+    """Parking must match the stable solution of the same objective (heavy damping, no flip)."""
+    published, _, p_ref, _ = _servo_loop(_deployed_diffik(urdf_xml, "gripper", 0.01), np.zeros(5), _EP10_DELTA, 600)
+    reference_solver = _deployed_diffik(urdf_xml, "gripper", 0.01, damping=0.1)
+    stable, _, _, _ = _servo_loop(reference_solver, np.zeros(5), _EP10_DELTA, 600)
+    err = np.linalg.norm(reference_solver.ee_position(published[-1]) - p_ref)
+    err_stable = np.linalg.norm(reference_solver.ee_position(stable[-1]) - p_ref)
+    assert _tail_flips(published)[0] == 0
+    assert err <= err_stable + 2e-3, f"parked {err * 1000:.1f} mm away vs stable {err_stable * 1000:.1f} mm"
+
+
+def test_unreachable_reference_stable_at_half_speed(urdf_xml: str) -> None:
+    """The flip does not come from speed saturation: a slower ceiling must not reintroduce it."""
+    solver = _deployed_diffik(urdf_xml, "tcp", 0.0, max_joint_speed=2.0)
+    published, _, _, _ = _servo_loop(solver, np.zeros(5), _EP10_DELTA, ticks=300)
+    assert _tail_flips(published)[0] == 0
+
+
+def test_reachable_reference_still_converges_quickly(urdf_xml: str) -> None:
+    """Guard against over-damping: a reachable 5 cm pose target must converge within 15 ticks."""
+    solver = _deployed_diffik(urdf_xml, "gripper", 0.01)
+    q0 = _DIFFIK_HOME.copy()
+    q_goal = q0 + np.array([0.25, -0.2, 0.2, 0.0, 0.0])  # ~50 mm, 4 ticks unbounded
+    p_goal, r_goal = solver.ee_position(q_goal), solver.ee_rotation(q_goal)
+    assert 0.04 < np.linalg.norm(p_goal - solver.ee_position(q0)) < 0.07
+    q = q0.copy()
+    for _ in range(15):
+        q = solver.solve_to_pose(q, p_goal, r_goal, _DIFFIK_DT)
+        if np.linalg.norm(solver.ee_position(q) - p_goal) < 1e-3:
+            return
+    pytest.fail(f"still {np.linalg.norm(solver.ee_position(q) - p_goal) * 1000:.1f} mm away after 15 ticks")
+
+
+@pytest.mark.parametrize("frame", ["gripper", "tcp"])
+@pytest.mark.parametrize("ori", [0.01, 0.0])
+def test_deployed_yaml_parameters_park_without_oscillation(urdf_xml: str, frame, ori) -> None:
+    """The committed YAML (damping, speed, step bound) must not flip in any frame/mode.
+
+    The flip onset scales with damping, so lowering diffik_damping without also
+    lowering diffik_max_task_step must make this test fail.
+    """
+    cfg = _servo_cfg()
+    assert "diffik_max_task_step" in cfg, "so101_placo_servo.yaml must set diffik_max_task_step (#156)"
+    solver = _deployed_diffik(urdf_xml, frame, ori, max_task_step=cfg["diffik_max_task_step"] or None)
+    published, _, _, _ = _servo_loop(solver, np.zeros(5), _EP10_DELTA, ticks=300)
+    assert _tail_flips(published)[0] == 0
+
+
+def test_max_task_step_bounds_each_tick(urdf_xml: str) -> None:
+    """One tick toward a far target may move the EE at most max_task_step (plus solver slack)."""
+    solver = _deployed_diffik(urdf_xml, "gripper", 0.0, max_task_step=0.01)
+    q0 = _DIFFIK_HOME.copy()
+    p0 = solver.ee_position(q0)
+    q1 = solver.solve_to_position(q0, p0 + np.array([0.0, 0.0, 0.3]), _DIFFIK_DT)
+    assert np.linalg.norm(solver.ee_position(q1) - p0) <= 0.0105
+
+
+@pytest.mark.parametrize("bad", [0.0, -0.01, float("nan"), float("inf")])
+def test_max_task_step_rejects_invalid_values(urdf_xml: str, bad) -> None:
+    with pytest.raises(ValueError):
+        SO101PlacoDiffIK(urdf_xml=urdf_xml, max_task_step=bad)
+
+
+def test_max_task_step_none_disables_bound(urdf_xml: str) -> None:
+    """None restores the unbounded behaviour (the old flip on ep10) — the opt-out must work."""
+    solver = _deployed_diffik(urdf_xml, "gripper", 0.01, max_task_step=None)
+    published, _, _, _ = _servo_loop(solver, np.zeros(5), _EP10_DELTA, ticks=300)
+    assert _tail_flips(published)[0] > 0
+
+
+def test_step_velocity_api_unaffected_by_task_step_bound(urdf_xml: str) -> None:
+    """step() already targets p + v*dt; the bound must not change its output."""
+    bounded = _deployed_diffik(urdf_xml, "gripper", 0.0, max_task_step=0.01)
+    unbounded = _deployed_diffik(urdf_xml, "gripper", 0.0, max_task_step=None)
+    v = np.array([0.0, 0.0, 0.2])
+    q = _DIFFIK_HOME.copy()
+    np.testing.assert_allclose(bounded.step(q, v, _DIFFIK_DT), unbounded.step(q, v, _DIFFIK_DT), atol=1e-9)
 
 
 if __name__ == "__main__":

@@ -1032,3 +1032,85 @@ def test_managed_status_budget_default_and_validation(monkeypatch, budget):
     else:
         with pytest.raises(RuntimeError, match="runtime_status_stale_s"):
             node.__init__()
+
+
+# --- #156: diff-IK construction parameters ------------------------------------
+
+
+def _construct_diffik(monkeypatch, **overrides):
+    """Run node __init__ up to the diff-IK build; return its kwargs and warnings."""
+    params = {
+        "joint_limits_lower": [-2.0] * 5,
+        "joint_limits_upper": [2.0] * 5,
+        "robot_description": "<robot/>",
+    }
+    params.update(overrides)
+    monkeypatch.setattr(mod.Node, "__init__", lambda self, *args: None)
+    monkeypatch.setattr(
+        mod.Node,
+        "declare_parameter",
+        lambda self, name, value=None, **kw: params.setdefault(name, value),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mod.Node, "get_parameter", lambda self, name: types.SimpleNamespace(value=params[name]), raising=False
+    )
+    warnings = []
+
+    class _Logger(_FakeLogger):
+        def warning(self, msg, *_args, **_kwargs):
+            warnings.append(msg)
+
+        warn = warning
+
+    monkeypatch.setattr(mod.Node, "get_logger", lambda self: _Logger(), raising=False)
+    monkeypatch.setattr(mod, "_require_placo", lambda _logger: None)
+    built = {}
+
+    class _RecordingDiffIK:
+        def __init__(self, **kwargs):
+            built.update(kwargs)
+
+    monkeypatch.setattr(mod, "SO101PlacoDiffIK", _RecordingDiffIK)
+
+    class _Built(Exception):
+        pass
+
+    def _stop(_self):
+        raise _Built
+
+    # _now() is first called right after the diff-IK block.
+    monkeypatch.setattr(mod.SO101PlacoServoNode, "_now", _stop)
+    node = mod.SO101PlacoServoNode.__new__(mod.SO101PlacoServoNode)
+    with pytest.raises(_Built):
+        node.__init__()
+    return built, [w for w in warnings if "diffik_max_task_step" in w]
+
+
+def test_diffik_receives_task_step_bound(monkeypatch):
+    built, warnings = _construct_diffik(monkeypatch, diffik_max_task_step=0.01, diffik_damping=1e-3)
+    assert built["max_task_step"] == 0.01
+    assert warnings == []
+
+
+def test_diffik_task_step_defaults_to_bounded(monkeypatch):
+    built, warnings = _construct_diffik(monkeypatch)
+    assert built["max_task_step"] == 0.01
+    assert warnings == []
+
+
+def test_diffik_task_step_zero_disables_with_warning(monkeypatch):
+    built, warnings = _construct_diffik(monkeypatch, diffik_max_task_step=0.0)
+    assert built["max_task_step"] is None
+    assert len(warnings) == 1
+
+
+def test_diffik_task_step_warns_when_damping_lowered(monkeypatch):
+    _, warnings = _construct_diffik(monkeypatch, diffik_max_task_step=0.01, diffik_damping=2.5e-4)
+    assert len(warnings) == 1
+
+
+@pytest.mark.parametrize("bad", [-0.01, float("nan"), float("inf")])
+def test_diffik_task_step_rejects_invalid(monkeypatch, bad):
+    with pytest.raises(RuntimeError, match="diffik_max_task_step"):
+        _construct_diffik(monkeypatch, diffik_max_task_step=bad)

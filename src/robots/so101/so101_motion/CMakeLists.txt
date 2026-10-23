@@ -46,6 +46,14 @@ if(BUILD_TESTING)
     test/test_ik_workers_launch.py
     ENV "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1"
   )
+  # IBROBOT_REQUIRE_PLACO turns the module's placo/xacro skips into failures so
+  # a missing dependency cannot report an all-skipped suite as passing.
+  ament_add_pytest_test(
+    test_so101_placo_kinematics
+    test/test_so101_placo_kinematics.py
+    TIMEOUT 300
+    ENV "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1" "IBROBOT_REQUIRE_PLACO=1"
+  )
 endif()
 
 ament_package()
