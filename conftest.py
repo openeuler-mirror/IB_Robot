@@ -39,6 +39,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pathlib
+from collections import Counter
 
 import pytest
 
@@ -173,3 +174,43 @@ def pytest_collection_modifyitems(config, items):
                         )
                     )
                     break
+
+
+@pytest.fixture
+def track_digest_reads(monkeypatch):
+    """Count digest/comparison bytes via Path.open(...).read() on selected paths.
+
+    Excludes copy2/OS I/O, other read APIs and unlisted aliases; this is not a
+    whole-publication I/O budget. An optional callback mutates after a read.
+    """
+    original_open = pathlib.Path.open
+
+    def track(paths, *, after_read=None):
+        counts = Counter()
+
+        class CountedReader:
+            def __init__(self, path, stream):
+                self.path = path
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.stream.close()
+
+            def read(self, size=-1):
+                data = self.stream.read(size)
+                counts[self.path] += len(data)
+                if after_read is not None:
+                    after_read(self.path, data)
+                return data
+
+        def open_file(path, mode="r", *args, **kwargs):
+            stream = original_open(path, mode, *args, **kwargs)
+            return CountedReader(path, stream) if mode == "rb" and path in paths else stream
+
+        monkeypatch.setattr(pathlib.Path, "open", open_file)
+        return counts
+
+    return track

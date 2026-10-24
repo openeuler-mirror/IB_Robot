@@ -26,6 +26,7 @@ from uuid import uuid4
 import onnx
 
 from inference_manifest import (
+    ARTIFACT_INTEGRITY_UNVERIFIED,
     ArtifactBindings,
     AscendRuntimeProfile,
     BackendRuntimeProfile,
@@ -41,7 +42,10 @@ from inference_manifest import (
     HMMRuntimeProfile,
     InferenceManifest,
     ManifestBundle,
+    ManifestIntegrityError,
+    ManifestPathError,
     ModelDescriptor,
+    PublishedArtifactIndex,
     RKNNRuntimeProfile,
     RoleRuntimeProfile,
     SemanticTensor,
@@ -50,13 +54,17 @@ from inference_manifest import (
     TorchRuntimeProfile,
     ValidatedManifest,
     canonical_bundle_digest,
+    finalize_deployment_artifacts,
+    inherit_deployment_version,
     is_image_semantic,
     load_inference_manifest,
     load_policy_metadata,
     normalize_bundle_path,
+    resolve_bundle_file,
     write_inference_manifest,
 )
 from inference_manifest.json_utils import load_json_strict
+from inference_manifest.paths import depends_on_file_replacement
 from inference_manifest.schema import validate_manifest_schema
 
 _ONNX_DTYPES = {
@@ -157,6 +165,16 @@ def artifact_bindings(
     )
 
 
+def load_published_artifact_index(bundle_root: str | Path) -> PublishedArtifactIndex:
+    """Load one evidence/cache snapshot for a single-writer packaging operation.
+
+    Share across roles and descriptor construction, then discard. Final upsert
+    deliberately reloads evidence and independently verifies published bytes.
+    """
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    return PublishedArtifactIndex(root, _load_existing_manifest(root / "inference_manifest.json"))
+
+
 def deployment_artifact(
     bundle_root: str | Path,
     path: str | Path,
@@ -167,6 +185,13 @@ def deployment_artifact(
     """Create a structural artifact descriptor safely contained by the bundle."""
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
+    published = PublishedArtifactIndex(root, _load_existing_manifest(root / "inference_manifest.json"))
+    return _deployment_artifact(root, path, artifact_format, share_group, published)
+
+
+def _deployment_artifact(
+    root: Path, path: str | Path, artifact_format: str, share_group: str | None, published: PublishedArtifactIndex
+) -> DeploymentArtifact:
     artifact_path = Path(path).expanduser()
     if not artifact_path.is_absolute():
         artifact_path = root / artifact_path
@@ -177,10 +202,13 @@ def deployment_artifact(
         relative = artifact_path.relative_to(root).as_posix()
     except ValueError as exc:
         raise ValueError(f"Deployment artifact escapes bundle root {root}: {artifact_path}") from exc
+    # Immutable published generations retain their original evidence when a
+    # compiler input resolves back to them (including hardlink aliases).
     return DeploymentArtifact(
         path=normalize_bundle_path(relative),
         format=artifact_format,
         share_group=share_group,
+        sha256=published.declared_digest(artifact_path),
     )
 
 
@@ -193,8 +221,14 @@ def package_deployment_artifact(
     role: str,
     force_copy: bool = False,
     prefer_hardlink: bool = False,
+    published: PublishedArtifactIndex | None = None,
 ) -> Path:
-    """Copy a compiler output into one immutable artifact generation when needed."""
+    """Copy a compiler output into one immutable artifact generation when needed.
+
+    Multi-role callers share a published index loaded from this bundle before
+    packaging. Only immutable generations may be added during that operation;
+    final publication still performs its own independent integrity check.
+    """
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
     source = Path(source_path).expanduser().resolve(strict=True)
@@ -203,18 +237,37 @@ def package_deployment_artifact(
     del force_copy  # Kept for CLI compatibility; normal publication always creates a generation.
     suffix = "".join(source.suffixes)
     artifacts_root = root / "artifacts" / backend
-    manifest = _load_existing_manifest(root / "inference_manifest.json")
+    published = published if published is not None else load_published_artifact_index(root)
+    manifest = published.manifest
+    published.verify_declared_digest(source)
+
+    def can_reuse(destination: Path) -> bool:
+        if not destination.is_file():
+            return False
+        source_info, destination_info = source.stat(), destination.stat()
+        if source_info.st_size != destination_info.st_size or stat.S_IMODE(source_info.st_mode) != stat.S_IMODE(
+            destination_info.st_mode
+        ):
+            return False
+        # Sources tied to old evidence have already passed the pre-write check.
+        # An independent compiler input may instead publish a new generation;
+        # never deduplicate it onto a known damaged generation.
+        try:
+            return published.reusable_digest(source, destination) is not None
+        except ManifestIntegrityError:
+            return False
+
     if manifest is not None:
         deployment = manifest.deployments.get(deployment_name)
         if isinstance(deployment, CompiledDeployment) and deployment.backend == backend:
             current = deployment.artifacts.get(role)
             if current is not None:
                 current_path = root.joinpath(*current.path.split("/"))
-                if _same_file(source, current_path):
+                if can_reuse(current_path):
                     return current_path
     if artifacts_root.is_dir():
         for existing in artifacts_root.glob(f"*/generations/*/{role}{suffix}"):
-            if _same_file(source, existing):
+            if can_reuse(existing):
                 return existing
     generation = str(uuid4())
     relative = normalize_bundle_path(f"artifacts/{backend}/{deployment_name}/generations/{generation}/{role}{suffix}")
@@ -255,6 +308,7 @@ def compiled_deployment(
     artifact_share_groups: Mapping[str, str] | None = None,
     runtime_profile: BackendRuntimeProfile | None = None,
     execution_contract: ExecutionContract | None = None,
+    published: PublishedArtifactIndex | None = None,
 ) -> CompiledDeployment:
     """Build a typed compiled deployment from structural artifact descriptors."""
 
@@ -263,15 +317,18 @@ def compiled_deployment(
     share_groups = dict(artifact_share_groups or {})
     target = DeploymentTarget(soc=target_soc, runtime=target_runtime, runtime_abi=runtime_abi)
     profile = runtime_profile or _default_runtime_profile(backend, target_soc)
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    published = published if published is not None else load_published_artifact_index(root)
     return CompiledDeployment(
         execution_contract=execution_contract or _request_direct_contract(),
         runtime_profile=RoleRuntimeProfile(backend=backend, target=target, profile=profile),
         artifacts={
-            role: deployment_artifact(
-                bundle_root,
+            role: _deployment_artifact(
+                root,
                 path,
                 artifact_format,
-                share_group=share_groups.get(role),
+                share_groups.get(role),
+                published,
             )
             for role, (path, artifact_format) in artifacts.items()
         },
@@ -371,17 +428,25 @@ def _upsert_deployment_unlocked(
     manifest_path = root / "inference_manifest.json"
     existing = _load_existing_manifest(manifest_path)
     deployments = dict(existing.deployments) if existing is not None else {}
+    published = PublishedArtifactIndex(root, existing)
+    # Atomic publication changes the manifest entry, including references
+    # through symlink chains. Reject those before binding the old bytes' SHA.
+    for name, candidate in {**deployments, deployment_name: deployment}.items():
+        for role, artifact in candidate.artifacts.items():
+            try:
+                resolve_bundle_file(root, artifact.path)
+                if depends_on_file_replacement(root / artifact.path, {manifest_path}):
+                    raise ManifestIntegrityError(
+                        f"{ARTIFACT_INTEGRITY_UNVERIFIED}: deployment={name!r} role={role!r} "
+                        f"path={artifact.path!r} depends on the manifest publication target"
+                    )
+            except (ManifestPathError, OSError) as exc:
+                raise ManifestIntegrityError(
+                    f"{ARTIFACT_INTEGRITY_UNVERIFIED}: deployment={name!r} role={role!r} path={artifact.path!r}: {exc}"
+                ) from exc
+    deployment = finalize_deployment_artifacts(root, deployment, published=published)
     previous_deployment = deployments.get(deployment_name)
-    if previous_deployment is not None:
-        previous_value = previous_deployment.model_dump(mode="json", exclude={"uuid", "revision"})
-        candidate_value = deployment.model_dump(mode="json", exclude={"uuid", "revision"})
-        deployment = (
-            previous_deployment
-            if previous_value == candidate_value
-            else deployment.model_copy(
-                update={"uuid": previous_deployment.uuid, "revision": previous_deployment.revision + 1}
-            )
-        )
+    deployment = inherit_deployment_version(deployment, previous_deployment)
     deployments[deployment_name] = deployment
 
     require_native_weights = any(candidate.backend == "torch" for candidate in deployments.values())
@@ -463,7 +528,9 @@ def copy_policy_metadata_bundle(source_root: str | Path, destination_root: str |
             changed = tuple(
                 relative
                 for relative in policy.required_files
-                if not _same_file(staging.joinpath(*relative.split("/")), destination.joinpath(*relative.split("/")))
+                if not _same_content_and_mode(
+                    staging.joinpath(*relative.split("/")), destination.joinpath(*relative.split("/"))
+                )
             )
             if not changed:
                 return policy.required_files
@@ -533,7 +600,7 @@ def _refresh_bundle_revision_unlocked(root: Path) -> InferenceManifest:
     return manifest
 
 
-def _same_file(source: Path, destination: Path) -> bool:
+def _same_content_and_mode(source: Path, destination: Path) -> bool:
     return (
         destination.is_file()
         and stat.S_IMODE(source.stat().st_mode) == stat.S_IMODE(destination.stat().st_mode)

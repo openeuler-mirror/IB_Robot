@@ -1,6 +1,9 @@
 import json
 
-from inference_manifest import load_inference_manifest
+import pytest
+from conftest import _bundle_snapshot
+
+from inference_manifest import ManifestIntegrityError, load_inference_manifest, validate_deployment_artifact_integrity
 from perception_service.package_perception_bundles import _specs, package_bundle
 
 
@@ -52,6 +55,7 @@ def test_ram_plus_packager_promotes_available_ascend_deployments(tmp_path) -> No
     package_bundle(root, spec)
     first = load_inference_manifest(root, "ascend_310p").manifest
     for compiled in spec.compiled:
+        validate_deployment_artifact_integrity(load_inference_manifest(root, compiled.deployment))
         deployment = first.deployments[compiled.deployment]
         assert (root / compiled.artifact).read_bytes() == compiled.deployment.encode()
         assert deployment.target.soc == compiled.target_soc
@@ -105,3 +109,71 @@ def test_grounded_sam2_packager_removes_legacy_copied_config(tmp_path) -> None:
     assert not legacy_config.exists()
     manifest = load_inference_manifest(root, "torch_cpu").manifest
     assert all(not entry.path.endswith(".py") for entry in manifest.bundle.files)
+
+
+@pytest.fixture
+def ram_plus_publication(tmp_path):
+    spec = _specs()["ram_plus"]
+    root = tmp_path / spec.name
+    _write_required_assets(root, spec)
+    for compiled in spec.compiled:
+        source = tmp_path / "_work" / root.name / compiled.source
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_bytes(b"compiled")
+    package_bundle(root, spec)
+    return root, spec
+
+
+@pytest.mark.parametrize("missing", ["assets/adapter.json", "assets/artifact-digests.json", "first_om", "other_om"])
+def test_repackaging_restores_generated_files_and_compiled_outputs(ram_plus_publication, missing):
+    root, spec = ram_plus_publication
+    document = json.loads((root / "inference_manifest.json").read_text())
+    first_name = next(iter(document["deployments"]))
+    first = load_inference_manifest(root, first_name).manifest
+    if missing == "first_om":
+        missing = first.deployments[first_name].artifacts["model"].path
+    elif missing == "other_om":
+        missing = next(item.artifact for item in spec.compiled if item.deployment != first_name)
+    target = root / missing
+    expected = target.read_bytes()
+    target.unlink()
+
+    package_bundle(root, spec)
+
+    assert target.read_bytes() == expected
+    second = load_inference_manifest(root, first_name).manifest
+    assert second.bundle.uuid == first.bundle.uuid
+    assert second.deployments == first.deployments
+    for name in second.deployments:
+        validate_deployment_artifact_integrity(load_inference_manifest(root, name))
+
+
+def test_repair_still_rejects_corrupt_retained_artifacts_before_writing(ram_plus_publication):
+    root, spec = ram_plus_publication
+    updated, retained = spec.compiled
+    (root.parent / "_work" / root.name / retained.source).unlink()
+    (root / retained.artifact).write_bytes(b"corrupt retained model")
+    (root.parent / "_work" / root.name / updated.source).write_bytes(b"new compilation")
+    (root / "assets/adapter.json").unlink()
+    before = _bundle_snapshot(root)
+
+    with pytest.raises(ManifestIntegrityError, match="artifact_digest_mismatch.*retained artifact"):
+        package_bundle(root, spec)
+
+    assert _bundle_snapshot(root) == before
+
+
+@pytest.mark.parametrize("first_deployment", [True, False])
+def test_missing_published_om_without_source_is_rejected_before_writes(ram_plus_publication, first_deployment):
+    root, spec = ram_plus_publication
+    document = json.loads((root / "inference_manifest.json").read_text())
+    first_name = next(iter(document["deployments"]))
+    compiled = next(item for item in spec.compiled if (item.deployment == first_name) == first_deployment)
+    (root / compiled.artifact).unlink()
+    (root.parent / "_work" / root.name / compiled.source).unlink()
+    before = _bundle_snapshot(root)
+
+    with pytest.raises(ManifestIntegrityError, match="artifact_integrity_unverified.*published deployment"):
+        package_bundle(root, spec)
+
+    assert _bundle_snapshot(root) == before

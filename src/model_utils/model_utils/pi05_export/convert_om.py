@@ -63,6 +63,7 @@ from model_utils.acl_abi_inspection import write_acl_om_abi
 from model_utils.inference_manifest_export import (
     artifact_bindings,
     deployment_artifact,
+    load_published_artifact_index,
     package_deployment_artifact,
     read_runtime_abi,
     update_deployment,
@@ -319,6 +320,8 @@ def write_pi05_ascend_deployment(
         for semantic in ("internal.past_kv", "internal.prefix_pad_masks")
     )
 
+    published = load_published_artifact_index(bundle_root)
+
     def package(role: str, source: Path) -> Path:
         artifact = package_deployment_artifact(
             bundle_root,
@@ -328,6 +331,7 @@ def write_pi05_ascend_deployment(
             role=role,
             force_copy=True,
             prefer_hardlink=prefer_hardlink,
+            published=published,
         )
         created_artifacts.append(artifact)
         return artifact

@@ -28,6 +28,22 @@ import pytest
 from model_utils.graspgen_contract import GRASPGEN_CONTRACT_VERSION, GRASPGEN_EXECUTION, graspgen_geometry
 from model_utils.inference_manifest_export import RuntimeABI, RuntimeTensor
 
+
+def _bundle_snapshot(root):
+    snapshot = {}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", str(path.readlink()))
+        elif path.is_file():
+            snapshot[relative] = ("file", path.read_bytes())
+        elif path.is_dir():
+            snapshot[relative] = ("directory",)
+        else:
+            snapshot[relative] = ("special", path.lstat().st_mode)
+    return snapshot
+
+
 GRASPGEN_BATCH = 1000
 GRASPGEN_POINTS = 2048
 GRASPGEN_DEPLOYMENT = "ascend_310p"

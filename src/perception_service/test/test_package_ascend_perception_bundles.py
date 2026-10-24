@@ -1,8 +1,13 @@
+import hashlib
 import json
 
 import pytest
 
-from inference_manifest import load_inference_manifest
+from inference_manifest import (
+    load_inference_manifest,
+    validate_deployment_artifact_integrity,
+    verify_deployment_artifacts,
+)
 from perception_service.package_ascend_perception_bundles import _specs, package_bundle
 from perception_service.semantic_model_adapters import SigLIP2ImageAdapter
 
@@ -26,6 +31,7 @@ def test_compiled_ascend_bundle_specs_validate(tmp_path):
         assert manifest_path.is_file()
         for deployment in spec.deployments:
             validated = load_inference_manifest(manifest_path.parent, deployment.name)
+            validate_deployment_artifact_integrity(validated)
             assert validated.deployment.target.soc == deployment.soc
             assert set(validated.deployment.artifacts) == {artifact.role for artifact in deployment.artifacts}
         if family == "grounding_dino":
@@ -40,6 +46,39 @@ def test_compiled_ascend_bundle_specs_validate(tmp_path):
                 "/input_proj.3/input_proj.3.1/Add:0:src3",
             ]
             assert validated.deployment.bindings["flatten"].outputs[0].runtime_name == "/Concat_4:0:visual"
+
+
+def test_nested_integrity_report_name_is_a_versioned_asset(tmp_path):
+    spec = _specs()["sam2"]
+    _write_sources(tmp_path, spec)
+    root = tmp_path / spec.name
+    asset = root / "assets/inference_integrity.json"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"original asset")
+    package_bundle(tmp_path, spec)
+    first = load_inference_manifest(root, spec.deployments[0].name)
+    sidecar = root / "assets/artifact-digests.json"
+    assert (
+        json.loads(sidecar.read_text())["assets/inference_integrity.json"]
+        == hashlib.sha256(b"original asset").hexdigest()
+    )
+
+    verify_deployment_artifacts(root, spec.deployments[0].name)
+    package_bundle(tmp_path, spec)
+    unchanged = load_inference_manifest(root, spec.deployments[0].name)
+    assert unchanged.manifest.bundle.revision == first.manifest.bundle.revision
+    assert not (root / "inference_integrity.json").exists()
+    assert "inference_integrity.json" not in json.loads(sidecar.read_text())
+
+    asset.write_bytes(b"changed asset")
+    package_bundle(tmp_path, spec)
+    changed = load_inference_manifest(root, spec.deployments[0].name)
+    assert changed.manifest.bundle.revision == first.manifest.bundle.revision + 1
+    assert changed.fingerprint != first.fingerprint
+    assert (
+        json.loads(sidecar.read_text())["assets/inference_integrity.json"]
+        == hashlib.sha256(b"changed asset").hexdigest()
+    )
 
 
 def test_packager_rejects_existing_legacy_bundles(tmp_path):
@@ -113,3 +152,24 @@ def test_compiled_ascend_bundle_revisions_follow_artifact_content(tmp_path):
     assert changed.bundle.revision == first.bundle.revision + 1
     assert changed.deployments["ascend_310p"].revision == first.deployments["ascend_310p"].revision + 1
     assert changed.deployments["ascend_310b"].revision == first.deployments["ascend_310b"].revision
+
+
+@pytest.mark.parametrize("state", ["verified", "mismatch"])
+def test_repackaging_does_not_reuse_a_previous_deployments_report(tmp_path, state):
+    from inference_manifest import verify_deployment_artifacts
+
+    spec = _specs()["sam2"]
+    _write_sources(tmp_path, spec)
+    root = package_bundle(tmp_path, spec).parent
+    deployment = spec.deployments[0]
+    artifact = deployment.artifacts[0]
+    old = load_inference_manifest(root, deployment.name)
+    if state == "mismatch":
+        (root / artifact.destination).write_bytes(b"tampered")
+    assert verify_deployment_artifacts(root, deployment.name).state == state
+    (tmp_path / artifact.source).write_bytes(b"new model generation")
+    package_bundle(tmp_path, spec)
+    new = load_inference_manifest(root, deployment.name)
+    assert new.deployment.revision == old.deployment.revision + 1
+    assert new.integrity_status.state == "declared"
+    validate_deployment_artifact_integrity(new)

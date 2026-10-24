@@ -52,7 +52,7 @@ def resolve_bundle_path(bundle_root: Path, relative_path: str) -> Path:
 
     normalized = normalize_bundle_path(relative_path)
     try:
-        root = bundle_root.resolve(strict=True)
+        root = _resolve_existing_path(bundle_root)
     except OSError as exc:
         raise ManifestPathError(f"Unable to resolve bundle root {bundle_root}: {exc}") from exc
     if not root.is_dir():
@@ -60,7 +60,7 @@ def resolve_bundle_path(bundle_root: Path, relative_path: str) -> Path:
 
     candidate = root.joinpath(*normalized.split("/"))
     try:
-        resolved = candidate.resolve(strict=True)
+        resolved = _resolve_existing_path(candidate)
     except FileNotFoundError as exc:
         if candidate.is_symlink():
             raise ManifestPathError(f"broken symlink in bundle path {normalized!r}") from exc
@@ -75,8 +75,36 @@ def resolve_bundle_path(bundle_root: Path, relative_path: str) -> Path:
     return resolved
 
 
+def _resolve_existing_path(path: Path) -> Path:
+    try:
+        return path.resolve(strict=True)
+    except RuntimeError as exc:
+        # Python 3.10/3.11 use RuntimeError instead of OSError(ELOOP).
+        raise ManifestPathError(f"Unable to resolve bundle path {str(path)!r}: {exc}") from exc
+
+
 def resolve_bundle_file(bundle_root: Path, relative_path: str) -> Path:
     resolved = resolve_bundle_path(bundle_root, relative_path)
     if not resolved.is_file():
         raise ManifestPathError(f"bundle path is not a regular file: {relative_path!r}")
     return resolved
+
+
+def depends_on_file_replacement(path: Path, targets: set[Path], *, excluded_target: Path | None = None) -> bool:
+    """Check a file's symlink chain against entries that will be replaced.
+
+    Targets must be file entries with resolved parents. Writers must reject
+    directory targets first: resolving parents here assumes they stay intact.
+    Hardlinks to another entry survive atomic replacement and are not aliases
+    for this purpose. Callers must exclude concurrent path mutations.
+    An excluded target is skipped without ending traversal of its symlink chain.
+    """
+    _resolve_existing_path(path)
+    while True:
+        entry = _resolve_existing_path(path.parent) / path.name
+        if entry != excluded_target and entry in targets:
+            return True
+        if not entry.is_symlink():
+            return False
+        target = entry.readlink()
+        path = target if target.is_absolute() else entry.parent / target

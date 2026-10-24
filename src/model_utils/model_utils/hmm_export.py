@@ -8,12 +8,13 @@ import re
 from collections.abc import Mapping
 from pathlib import Path
 
-from inference_manifest import DeviceLink
+from inference_manifest import DeviceLink, PublishedArtifactIndex
 from model_utils.inference_manifest_export import (
     RuntimeABI,
     RuntimeTensor,
     artifact_bindings,
     compiled_deployment,
+    load_published_artifact_index,
     package_deployment_artifact,
     read_tcim_abi,
     upsert_deployment,
@@ -136,6 +137,7 @@ def write_pi05_hmm_deployment(
         raise ValueError("PI0.5 vision and prefill hidden sizes do not match")
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
+    published = load_published_artifact_index(root)
     execution, artifacts, bindings, image_semantics = _package_vision_roles(
         root,
         cameras,
@@ -144,6 +146,7 @@ def write_pi05_hmm_deployment(
         backend="hmm",
         deployment_name=deployment_name,
         vision_layout=vision_layout,
+        published=published,
     )
     artifacts["embedding"] = (
         package_deployment_artifact(
@@ -152,6 +155,7 @@ def write_pi05_hmm_deployment(
             backend="hmm",
             deployment_name=deployment_name,
             role="embedding",
+            published=published,
         ),
         "pt",
     )
@@ -228,7 +232,7 @@ def write_pi05_hmm_deployment(
         output_semantics={"action_out_proj_out": "action"},
     )
     for role in _PI05_ROLES:
-        artifacts[role] = _package_hmm_role(root, role, role_artifacts[role][0], deployment_name)
+        artifacts[role] = _package_hmm_role(root, role, role_artifacts[role][0], deployment_name, published)
     execution.extend(("embedding", *_PI05_ROLES))
     links = tuple(
         DeviceLink(
@@ -247,6 +251,7 @@ def write_pi05_hmm_deployment(
         target_soc=target_soc,
         target_runtime=target_runtime,
         artifacts=artifacts,
+        published=published,
         execution=execution,
         bindings=bindings,
         device_links=links,
@@ -321,6 +326,7 @@ def write_smolvla_hmm_deployment(
         _require_compatible(prefill_outputs[consumer.name], consumer, f"SmolVLA cache {consumer.name}")
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
+    published = load_published_artifact_index(root)
     execution, artifacts, bindings, image_semantics = _package_vision_roles(
         root,
         cameras,
@@ -329,6 +335,7 @@ def write_smolvla_hmm_deployment(
         backend="hmm",
         deployment_name=deployment_name,
         vision_layout=vision_layout,
+        published=published,
     )
     artifacts.update(
         {
@@ -339,6 +346,7 @@ def write_smolvla_hmm_deployment(
                     backend="hmm",
                     deployment_name=deployment_name,
                     role="embedding",
+                    published=published,
                 ),
                 "pt",
             ),
@@ -349,11 +357,12 @@ def write_smolvla_hmm_deployment(
                     backend="hmm",
                     deployment_name=deployment_name,
                     role="state_projection",
+                    published=published,
                 ),
                 "pt",
             ),
-            "prefill": _package_hmm_role(root, "prefill", role_artifacts["prefill"][0], deployment_name),
-            "action": _package_hmm_role(root, "action", role_artifacts["action"][0], deployment_name),
+            "prefill": _package_hmm_role(root, "prefill", role_artifacts["prefill"][0], deployment_name, published),
+            "action": _package_hmm_role(root, "action", role_artifacts["action"][0], deployment_name, published),
         }
     )
     embedding_abi = RuntimeABI(
@@ -432,6 +441,7 @@ def write_smolvla_hmm_deployment(
         target_soc=target_soc,
         target_runtime=target_runtime,
         artifacts=artifacts,
+        published=published,
         execution=execution,
         bindings=bindings,
         device_links=links,
@@ -496,6 +506,7 @@ def _package_vision_roles(
     backend: str,
     deployment_name: str,
     vision_layout: str,
+    published: PublishedArtifactIndex,
 ) -> tuple[list[str], dict[str, tuple[Path, str]], dict, list[str]]:
     execution: list[str] = []
     artifacts: dict[str, tuple[Path, str]] = {}
@@ -513,6 +524,7 @@ def _package_vision_roles(
                 backend=backend,
                 deployment_name=deployment_name,
                 role=role,
+                published=published,
                 force_copy=True,
             ),
             "hmm",
@@ -526,7 +538,9 @@ def _package_vision_roles(
     return execution, artifacts, bindings, image_semantics
 
 
-def _package_hmm_role(root: Path, role: str, source: str | Path, deployment_name: str) -> tuple[Path, str]:
+def _package_hmm_role(
+    root: Path, role: str, source: str | Path, deployment_name: str, published: PublishedArtifactIndex
+) -> tuple[Path, str]:
     return (
         package_deployment_artifact(
             root,
@@ -534,6 +548,7 @@ def _package_hmm_role(root: Path, role: str, source: str | Path, deployment_name
             backend="hmm",
             deployment_name=deployment_name,
             role=role,
+            published=published,
         ),
         "hmm",
     )

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from inference_manifest import load_inference_manifest
+from inference_manifest import load_inference_manifest, validate_deployment_artifact_integrity
 from voice_tts_service import package_zipvoice_310p as packager
 
 
@@ -44,6 +44,7 @@ def test_packager_creates_valid_scalar_abi_bundle_from_verified_delivery(tmp_pat
     manifest_path = packager.package_bundle(source, destination)
     validated = load_inference_manifest(destination, "ascend_310p")
 
+    validate_deployment_artifact_integrity(validated)
     assert manifest_path == destination / "inference_manifest.json"
     assert validated.deployment.target.soc == "Ascend310P1"
     assert validated.deployment.bindings["text_encoder"].inputs[1].shape == ()

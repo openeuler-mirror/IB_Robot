@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, physical_device
 from inference_service.backends import STATIC_BACKEND_DESCRIPTORS, BackendRegistry, RuntimeContext
 from inference_service.backends.errors import BackendLoadError
 from inference_service.backends.registry import _validate_onnx
@@ -490,6 +490,38 @@ def test_onnx_session_rejects_unavailable_provider(tmp_path) -> None:
     session = OnnxRuntimeModelSession(ort_loader=lambda: _NoCudaOrt)
     with pytest.raises(BackendLoadError, match="execution provider 'CUDAExecutionProvider' is unavailable"):
         session.load(RuntimeContext(validated))
+
+
+@pytest.mark.parametrize(
+    "settings,provider,device",
+    [
+        ({}, "CPUExecutionProvider", "local/cpu"),
+        ({"device": " CUDA "}, "CUDAExecutionProvider", "local/cuda:0"),
+        ({"device": "cuda", "provider": " CPU "}, "CPUExecutionProvider", "local/cpu"),
+        ({"provider": "CUDAExecutionProvider"}, "CUDAExecutionProvider", "local/cuda:0"),
+    ],
+)
+def test_onnx_session_and_identity_share_provider_resolution(tmp_path, settings, provider, device):
+    manifest = _stateless_manifest()
+    manifest["deployments"]["onnx_cpu"]["runtime_profile"]["profile"] = settings
+    context = _context(tmp_path, manifest)
+    graph = _FakeGraph(("input",), ("prob",), lambda feed: [np.zeros(1, dtype=np.float32)])
+    ort = _fake_ort({str(tmp_path / "artifacts/model.onnx"): graph})
+    observed = []
+    original = ort.InferenceSession
+
+    def record_provider(*args, **kwargs):
+        observed.extend(kwargs["providers"])
+        return original(*args, **kwargs)
+
+    ort.InferenceSession = record_provider
+    session = OnnxRuntimeModelSession(ort_loader=lambda: ort)
+    try:
+        session.load(context)
+        assert observed == [provider]
+        assert physical_device(context.validated_manifest) == device
+    finally:
+        session.close()
 
 
 def test_onnx_session_rejects_unbound_graph_inputs(tmp_path) -> None:

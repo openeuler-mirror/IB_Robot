@@ -226,7 +226,7 @@ def test_state_links_reject_invalid_contracts(mutation, expected) -> None:
 
 
 def test_missing_manifest_fails_before_bundle_metadata_loading(tmp_path):
-    with pytest.raises(ManifestValidationError, match=r"Unable to read JSON file.*inference_manifest.json"):
+    with pytest.raises(ManifestValidationError, match=r"bundle_manifest_required:.*inference_manifest.json"):
         load_inference_manifest(tmp_path, "cpu")
 
 

@@ -24,7 +24,6 @@ the service contract, so neither is enrolled in it.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -37,7 +36,6 @@ from inference_manifest import (
     AscendRuntimeProfile,
     BundleFile,
     CompiledDeployment,
-    DeploymentArtifact,
     DeploymentTarget,
     DeviceLink,
     Digest,
@@ -45,6 +43,7 @@ from inference_manifest import (
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
+    PublishedArtifactIndex,
     RoleRuntimeProfile,
     SemanticIdentity,
     SemanticTensor,
@@ -52,7 +51,10 @@ from inference_manifest import (
     TorchDeployment,
     TorchRuntimeProfile,
     canonical_bundle_digest,
+    inherit_deployment_version,
+    integrity_report_path,
     load_inference_manifest,
+    sha256_file,
     write_inference_manifest,
 )
 from model_utils.acl_abi_inspection import write_acl_om_abi
@@ -70,6 +72,11 @@ from model_utils.graspgen_contract import (
 )
 from model_utils.inference_manifest_export import read_runtime_abi
 
+from .bundle_publication import (
+    classify_om_artifacts,
+    copy_and_finalize_artifact_roles,
+    preflight_publication,
+)
 from .graspgen_adapter import GRASPGEN_POSTPROCESSING, GRASPGEN_PREPROCESSING, GraspGenAdapter
 
 # The four-dimensional grouped-feature tensors are NCHW; ACL does not always report a
@@ -114,12 +121,13 @@ class RoleArtifact:
     bindings: ArtifactBindings
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+# Source key -> (adapter key, bundle destination). All asset writers and the
+# preflight write set derive from this mapping.
+_TORCH_ASSETS = {
+    "config": ("gripper_config", "assets/graspgen_config.yml"),
+    "generator_checkpoint": ("generator_checkpoint", "assets/generator_checkpoint.pth"),
+    "discriminator_checkpoint": ("discriminator_checkpoint", "assets/discriminator_checkpoint.pth"),
+}
 
 
 def require_contract_version(onnx_manifest: Mapping[str, object]) -> None:
@@ -236,30 +244,31 @@ def _adapter_assets(onnx_manifest: Mapping[str, object], *, grasp_batch_size: in
         "point_count": point_count,
         "geometry": graspgen_geometry(),
         "torch_module_loader": "perception_service.torch_model_loaders:load_graspgen",
-        "gripper_config": "assets/graspgen_config.yml",
-        "generator_checkpoint": "assets/generator_checkpoint.pth",
-        "discriminator_checkpoint": "assets/discriminator_checkpoint.pth",
+        **{adapter_key: path for adapter_key, path in _TORCH_ASSETS.values()},
     }
 
 
-def _copy_torch_assets(root: Path, onnx_manifest: Mapping[str, object]) -> None:
+def _torch_asset_sources(onnx_manifest: Mapping[str, object]) -> dict[str, Path]:
     source = onnx_manifest.get("source")
     if not isinstance(source, Mapping):
         raise ValueError("GraspGen ONNX manifest must declare source config and checkpoints")
-    destinations = {
-        "config": root / "assets/graspgen_config.yml",
-        "generator_checkpoint": root / "assets/generator_checkpoint.pth",
-        "discriminator_checkpoint": root / "assets/discriminator_checkpoint.pth",
-    }
-    for name, destination in destinations.items():
+    sources = {}
+    for name, (_adapter_key, path) in _TORCH_ASSETS.items():
         raw_path = source.get(name)
         if not isinstance(raw_path, str) or not raw_path.strip():
             raise ValueError(f"GraspGen ONNX manifest source.{name} must be a non-empty path")
         source_path = Path(raw_path).expanduser().resolve()
         if not source_path.is_file():
             raise FileNotFoundError(f"GraspGen Torch source asset is unavailable: {source_path}")
+        sources[path] = source_path
+    return sources
+
+
+def _copy_torch_assets(root: Path, sources: Mapping[str, Path]) -> None:
+    for path, source_path in sources.items():
+        destination = root / path
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.is_file() or _sha256(source_path) != _sha256(destination):
+        if not destination.is_file() or sha256_file(source_path) != sha256_file(destination):
             destination.write_bytes(source_path.read_bytes())
 
 
@@ -316,25 +325,11 @@ def write_graspgen_ascend_bundle(
         name = next(iter(json.loads(manifest_path.read_text(encoding="utf-8"))["deployments"]))
         existing = load_inference_manifest(root, name).manifest
 
-    adapter_path = root / "assets" / "adapter.json"
-    adapter_path.parent.mkdir(parents=True, exist_ok=True)
-    adapter_path.write_text(json.dumps(assets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    _copy_torch_assets(root, onnx_manifest)
-    for artifact in roles:
-        destination = root / artifact.destination
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if not destination.is_file() or _sha256(artifact.source) != _sha256(destination):
-            destination.write_bytes(artifact.source.read_bytes())
-
-    files = tuple(
-        BundleFile(path=str(path.relative_to(root))) for path in sorted((root / "assets").rglob("*")) if path.is_file()
+    previous = existing.deployments.get(deployment_name) if existing is not None else None
+    published = PublishedArtifactIndex(root, existing)
+    publication = classify_om_artifacts(
+        root, {artifact.role: (artifact.destination, artifact.source) for artifact in roles}, published
     )
-    structure_changed = existing is not None and (
-        existing.bundle.name != root.name or existing.bundle.files != files or existing.model != model
-    )
-    bundle_uuid = existing.bundle.uuid if existing is not None else str(uuid4())
-    bundle_revision = existing.bundle.revision + int(structure_changed) if existing is not None else 1
-
     deployment = CompiledDeployment(
         execution_contract=ExecutionContract(
             state_scope="request",
@@ -346,17 +341,47 @@ def write_graspgen_ascend_bundle(
             target=DeploymentTarget(soc=soc_version, runtime="acl"),
             profile=AscendRuntimeProfile(device_id=0),
         ),
-        artifacts={artifact.role: DeploymentArtifact(path=artifact.destination, format="om") for artifact in roles},
+        artifacts=publication.artifacts,
         execution=GRASPGEN_EXECUTION,
         bindings={artifact.role: artifact.bindings for artifact in roles},
         device_links=_DEVICE_LINKS,
     )
-    previous = existing.deployments.get(deployment_name) if existing is not None else None
-    if isinstance(previous, CompiledDeployment):
-        changed = previous.model_dump(mode="json", exclude={"uuid", "revision"}) != deployment.model_dump(
-            mode="json", exclude={"uuid", "revision"}
-        )
-        deployment = deployment.model_copy(update={"uuid": previous.uuid, "revision": previous.revision + int(changed)})
+    asset_sources = _torch_asset_sources(onnx_manifest)
+    adapter_relative = "assets/adapter.json"
+    asset_writes = (adapter_relative, *(path for _, path in _TORCH_ASSETS.values()))
+    preserved, publications = preflight_publication(
+        root,
+        published,
+        {deployment_name: publication},
+        {deployment_name, "torch_cuda"},
+        asset_writes=asset_writes,
+        retained_assets=(
+            str(path.relative_to(root))
+            for path in (root / "assets").rglob("*")
+            if path.is_file() and str(path.relative_to(root)) not in asset_writes
+        ),
+        asset_sources=asset_sources,
+    )
+
+    adapter_path = root / adapter_relative
+    adapter_path.parent.mkdir(parents=True, exist_ok=True)
+    adapter_path.write_text(json.dumps(assets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _copy_torch_assets(root, asset_sources)
+    deployment = copy_and_finalize_artifact_roles(
+        root,
+        deployment,
+        publications[deployment_name],
+    )
+    deployment = inherit_deployment_version(deployment, previous)
+
+    files = tuple(
+        BundleFile(path=str(path.relative_to(root))) for path in sorted((root / "assets").rglob("*")) if path.is_file()
+    )
+    structure_changed = existing is not None and (
+        existing.bundle.name != root.name or existing.bundle.files != files or existing.model != model
+    )
+    bundle_uuid = existing.bundle.uuid if existing is not None else str(uuid4())
+    bundle_revision = existing.bundle.revision + int(structure_changed) if existing is not None else 1
 
     torch_deployment = TorchDeployment(
         execution_contract=ExecutionContract(
@@ -390,7 +415,7 @@ def write_graspgen_ascend_bundle(
         ),
         model=model,
         deployments={
-            **(existing.deployments if existing is not None else {}),
+            **preserved,
             "torch_cuda": torch_deployment,
             deployment_name: deployment,
         },
@@ -405,6 +430,7 @@ def write_graspgen_ascend_bundle(
         else:
             write_inference_manifest(manifest_path, existing)
         raise
+    integrity_report_path(root).unlink(missing_ok=True)
     return manifest_path
 
 

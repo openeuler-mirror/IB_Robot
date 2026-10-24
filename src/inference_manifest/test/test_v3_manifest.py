@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -19,14 +20,19 @@ from inference_manifest import (
     ManifestValidationError,
     ModelIdentity,
     ModelRuntimeSpec,
+    PublishedArtifactIndex,
     RoleRuntimeProfile,
     RoleRuntimeSpec,
     RuntimeInstanceProjection,
     TorchRuntimeProfile,
     canonical_bundle_digest,
     deployment_fingerprint,
+    finalize_deployment_artifacts,
+    inherit_deployment_version,
     load_inference_manifest,
+    load_inference_manifest_metadata,
     runtime_profile_fingerprint,
+    validate_deployment_artifact_integrity,
     validate_manifest_schema,
     verify_deployment_artifacts,
     write_inference_manifest,
@@ -34,6 +40,66 @@ from inference_manifest import (
 
 BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
 DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
+
+
+@pytest.mark.parametrize("other_target", [False, True])
+def test_replacement_dependency_exclusion_still_checks_the_remaining_chain(tmp_path, other_target):
+    from inference_manifest.paths import depends_on_file_replacement
+
+    artifact = tmp_path / "artifact.om"
+    artifact.write_bytes(b"model")
+    middle = tmp_path / "middle.om"
+    middle.symlink_to(artifact.name)
+    own = tmp_path / "own.om"
+    own.symlink_to(middle.name)
+    source = tmp_path / "source.om"
+    source.symlink_to(own.name)
+    targets = {own, artifact} if other_target else {own}
+
+    assert depends_on_file_replacement(source, targets)
+    assert depends_on_file_replacement(source, targets, excluded_target=own) is other_target
+    # An independent directory entry keeps its inode when a target is replaced.
+    hardlink = tmp_path / "hardlink.om"
+    hardlink.hardlink_to(artifact)
+    assert not depends_on_file_replacement(hardlink, targets, excluded_target=own)
+
+
+@pytest.mark.parametrize("digest", ["", "abc", "A" * 64, None, 123])
+def test_bind_artifact_digest_rejects_invalid_sha256(digest):
+    from inference_manifest import DeploymentArtifact, bind_artifact_digest
+
+    artifact = DeploymentArtifact(path="model.om", format="om")
+    with pytest.raises(ValueError):
+        bind_artifact_digest(artifact, digest, "model")
+    assert artifact.sha256 is None
+
+
+def test_published_index_distinguishes_undeclared_content_from_caller_evidence(tmp_path, monkeypatch):
+    import inference_manifest.integrity as integrity
+
+    path = tmp_path / "model.om"
+    path.write_bytes(b"model")
+    reads = []
+    original = integrity._sha256_file
+
+    def read(candidate):
+        reads.append(candidate)
+        return original(candidate)
+
+    monkeypatch.setattr(integrity, "_sha256_file", read)
+    published = PublishedArtifactIndex(tmp_path, None)
+    assert published.verify_declared_digest(path) is None
+    assert reads == []
+    expected = hashlib.sha256(b"model").hexdigest()
+    assert published.read_and_verify_digest(path) == expected
+    assert reads == [path]
+    with pytest.raises(ManifestIntegrityError, match="changed while checking"):
+        published._accept_computed_digest(path, "0" * 64)
+
+    fresh = PublishedArtifactIndex(tmp_path, None)
+    assert fresh._accept_computed_digest(path, expected) == expected
+    assert fresh.read_and_verify_digest(path) == expected
+    assert reads == [path]
 
 
 def test_manifest_rejects_runtime_capability_claims(tmp_path):
@@ -116,6 +182,93 @@ def _request_deployment(*, device_id: int = 0, artifact: bool = False) -> dict:
     return value
 
 
+@pytest.mark.parametrize("loader", [load_inference_manifest, load_inference_manifest_metadata])
+@pytest.mark.parametrize(
+    "entry",
+    ["missing_root", "raw_file", "unpackaged", "manifest_directory", "dangling_manifest", "manifest_fifo"],
+)
+def test_bundle_required_before_reading_model_files(tmp_path, monkeypatch, loader, entry):
+    root = tmp_path / "model"
+    if entry == "raw_file":
+        root.write_bytes(b"unpackaged weights")
+    elif entry != "missing_root":
+        root.mkdir()
+        (root / "model.safetensors").write_bytes(b"unpackaged weights")
+        manifest = root / "inference_manifest.json"
+        if entry == "manifest_directory":
+            manifest.mkdir()
+        elif entry == "dangling_manifest":
+            manifest.symlink_to("absent.json")
+        elif entry == "manifest_fifo":
+            os.mkfifo(manifest)
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("An invalid bundle entry must fail before opening model files")
+
+    monkeypatch.setattr("inference_manifest.loader.load_json_strict", unexpected_read)
+    with pytest.raises(ManifestValidationError, match="bundle_manifest_required") as error:
+        loader(root, "test")
+    assert str(root / "inference_manifest.json") in str(error.value)
+
+
+@pytest.mark.parametrize("loader", [load_inference_manifest, load_inference_manifest_metadata])
+@pytest.mark.parametrize("empty_path", ["", " ", "\t\n"])
+def test_empty_bundle_path_cannot_use_a_manifest_from_working_directory(tmp_path, monkeypatch, loader, empty_path):
+    write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, _request_deployment()))
+    monkeypatch.chdir(tmp_path)
+    assert loader(".", "test").deployment_name == "test"
+    with pytest.raises(ManifestValidationError, match="bundle_manifest_required"):
+        loader(empty_path, "test")
+
+
+def test_publication_index_rechecks_changed_source_after_cached_verification(tmp_path):
+    path = tmp_path / "model.om"
+    path.write_bytes(b"model")
+    manifest = InferenceManifest.model_validate(_bundle(tmp_path, _request_deployment(artifact=True)))
+    published = PublishedArtifactIndex(tmp_path, manifest)
+    assert published.verify_declared_digest(path) == hashlib.sha256(b"model").hexdigest()
+    path.write_bytes(b"damaged publication")
+    with pytest.raises(ManifestIntegrityError, match="artifact_digest_mismatch.*retained artifact"):
+        published.verify_declared_digest(path)
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+def test_finalization_rejects_changes_during_hashing_with_and_without_index(tmp_path, monkeypatch, indexed):
+    import inference_manifest.integrity as integrity
+
+    path = tmp_path / "model.om"
+    path.write_bytes(b"model")
+    deployment = Deployment.model_validate(_request_deployment(artifact=True))
+    original = integrity._sha256_file
+
+    def hash_then_change(candidate):
+        digest = original(candidate)
+        candidate.write_bytes(b"changed during content hashing")
+        return digest
+
+    monkeypatch.setattr(integrity, "_sha256_file", hash_then_change)
+    published = PublishedArtifactIndex(tmp_path, None) if indexed else None
+    context = "model.om" if indexed else "role='model'"
+    with pytest.raises(
+        ManifestIntegrityError, match=f"artifact_integrity_unverified.*changed while hashing.*{context}"
+    ):
+        finalize_deployment_artifacts(tmp_path, deployment, published=published)
+
+
+def test_publication_index_rejects_conflicting_digests_for_hardlinked_declarations(tmp_path):
+    path = tmp_path / "model.om"
+    path.write_bytes(b"model")
+    alias = tmp_path / "alias.om"
+    alias.hardlink_to(path)
+    value = _bundle(tmp_path, _request_deployment(artifact=True))
+    other = copy.deepcopy(value["deployments"]["test"])
+    other["artifacts"]["model"].update(path="alias.om", sha256="0" * 64)
+    value["deployments"]["other"] = other
+    published = PublishedArtifactIndex(tmp_path, InferenceManifest.model_validate(value))
+    with pytest.raises(ManifestIntegrityError, match="artifact_digest_mismatch.*conflicting"):
+        published.verify_declared_digest(path)
+
+
 def test_extra_parameters_are_generic_json_and_change_deployment_identity(tmp_path):
     raw = _request_deployment()
     value = _bundle(tmp_path, raw)
@@ -145,6 +298,52 @@ def test_extra_parameters_identity_is_independent_of_key_order():
     first = Deployment.model_validate({**_request_deployment(), "extra_parameters": {"a": 1, "b": {"x": True}}})
     second = Deployment.model_validate({**_request_deployment(), "extra_parameters": {"b": {"x": True}, "a": 1}})
     assert deployment_fingerprint(3, "bundle", "test", first) == deployment_fingerprint(3, "bundle", "test", second)
+
+
+def test_packaging_finalization_hashes_final_bytes_without_mutating_candidate(tmp_path):
+    artifact = tmp_path / "model.om"
+    artifact.write_bytes(b"final compiled bytes")
+    candidate = Deployment.model_validate(_request_deployment(artifact=True))
+    candidate = candidate.model_copy(
+        update={"artifacts": {"model": candidate.artifacts["model"].model_copy(update={"sha256": None})}}
+    )
+    finalized = finalize_deployment_artifacts(tmp_path, candidate)
+    assert finalized.artifacts["model"].sha256 == hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert candidate.artifacts["model"].sha256 is None
+    assert finalized.uuid == candidate.uuid
+    assert finalized.revision == candidate.revision
+    artifact.unlink()
+    with pytest.raises(ManifestIntegrityError, match="artifact_integrity_unverified.*model.om"):
+        finalize_deployment_artifacts(tmp_path, candidate)
+
+
+def test_packaging_finalization_hashes_hardlinked_declarations_once(tmp_path, monkeypatch):
+    import inference_manifest.integrity as integrity
+
+    artifact = tmp_path / "model.om"
+    artifact.write_bytes(b"shared model")
+    alias = tmp_path / "alias.om"
+    alias.hardlink_to(artifact)
+    raw = _request_deployment(artifact=True)
+    raw["artifacts"]["model"]["sha256"] = hashlib.sha256(b"shared model").hexdigest()
+    raw["artifacts"]["alias"] = {
+        "path": "alias.om",
+        "format": "om",
+        "sha256": hashlib.sha256(b"shared model").hexdigest(),
+    }
+    deployment = Deployment.model_validate(raw)
+    hashed = []
+    original = integrity._sha256_file
+
+    def counted(path):
+        hashed.append(path)
+        return original(path)
+
+    monkeypatch.setattr(integrity, "_sha256_file", counted)
+    finalized = finalize_deployment_artifacts(tmp_path, deployment)
+
+    assert len(hashed) == 1
+    assert finalized.artifacts["model"].sha256 == finalized.artifacts["alias"].sha256
 
 
 def test_schema_v2_and_legacy_identity_are_rejected(tmp_path: Path):
@@ -495,6 +694,33 @@ def test_profile_projection_and_fingerprint_separation():
     assert spec.target_runtime == "acl"
 
 
+@pytest.mark.parametrize("old,new", [(False, 0), (0, False), (True, 1), (1, True)])
+def test_revision_distinguishes_json_boolean_and_number(old, new):
+    previous = Deployment.model_validate({**_request_deployment(), "extra_parameters": {"nested": [old]}})
+    candidate = previous.model_copy(update={"extra_parameters": {"nested": [new]}})
+    assert inherit_deployment_version(candidate, previous).revision == previous.revision + 1
+
+
+def test_finalization_rejects_modified_retained_artifact(tmp_path):
+    (tmp_path / "model.om").write_bytes(b"tampered")
+    candidate = Deployment.model_validate(_request_deployment(artifact=True))
+    with pytest.raises(ManifestIntegrityError, match="retained artifact"):
+        finalize_deployment_artifacts(tmp_path, candidate)
+
+
+def test_deployment_revision_inheritance_uses_one_identity_comparison():
+    previous = Deployment.model_validate(_request_deployment())
+    unchanged = previous.model_copy(update={"revision": previous.revision + 3})
+    inherited = inherit_deployment_version(unchanged, previous)
+    assert inherited.uuid == previous.uuid
+    assert inherited.revision == previous.revision
+
+    changed = previous.model_copy(update={"extra_parameters": {"threshold": 0.5}})
+    revised = inherit_deployment_version(changed, previous)
+    assert revised.uuid == previous.uuid
+    assert revised.revision == previous.revision + 1
+
+
 def test_artifact_integrity_is_explicit_and_persisted(tmp_path: Path):
     (tmp_path / "model.om").write_bytes(b"model")
     value = _bundle(tmp_path, _request_deployment(artifact=True))
@@ -514,3 +740,217 @@ def test_artifact_integrity_is_explicit_and_persisted(tmp_path: Path):
     assert load_inference_manifest(tmp_path, "test").integrity_status.state == "mismatch"
     with pytest.raises(ManifestIntegrityError, match="artifact_digest_mismatch"):
         load_inference_manifest(tmp_path, "test", verify_on_demand=True)
+
+
+def test_on_demand_verification_rejects_manifest_replaced_after_load(tmp_path, monkeypatch):
+    import inference_manifest.loader as loader
+
+    (tmp_path / "model.om").write_bytes(b"model")
+    deployment_a = _request_deployment(artifact=True)
+    manifest_a = _bundle(tmp_path, deployment_a)
+    write_inference_manifest(tmp_path / "inference_manifest.json", manifest_a)
+    manifest_b = copy.deepcopy(manifest_a)
+    manifest_b["deployments"]["test"]["revision"] = 2
+    original_load = loader.load_json_strict
+    reads = 0
+
+    def read_a_then_publish_b(path):
+        nonlocal reads
+        result = original_load(path)
+        reads += 1
+        if reads == 1:
+            write_inference_manifest(tmp_path / "inference_manifest.json", manifest_b)
+        return result
+
+    monkeypatch.setattr(loader, "load_json_strict", read_a_then_publish_b)
+    with pytest.raises(ManifestIntegrityError, match="deployment changed before verification"):
+        load_inference_manifest(tmp_path, "test", verify_on_demand=True)
+    assert reads == 1
+
+
+def test_runtime_artifact_verification_is_read_only_and_detects_changed_bytes(tmp_path):
+    (tmp_path / "model.om").write_bytes(b"model")
+    write_inference_manifest(
+        tmp_path / "inference_manifest.json", _bundle(tmp_path, _request_deployment(artifact=True))
+    )
+    validated = load_inference_manifest(tmp_path, "test")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()}
+    validate_deployment_artifact_integrity(validated)
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir() if path.is_file()} == before
+    (tmp_path / "model.om").write_bytes(b"changed")
+    with pytest.raises(ManifestIntegrityError, match="artifact_digest_mismatch"):
+        validate_deployment_artifact_integrity(validated)
+    (tmp_path / "model.om").unlink()
+    validate_deployment_artifact_integrity(validated, verify_content=False)
+
+
+@pytest.mark.parametrize("entrypoint", ["finalize", "readonly", "report"])
+def test_compiled_symlink_loop_uses_integrity_error_contract(tmp_path, entrypoint):
+    artifact = tmp_path / "model.om"
+    artifact.write_bytes(b"model")
+    write_inference_manifest(
+        tmp_path / "inference_manifest.json", _bundle(tmp_path, _request_deployment(artifact=True))
+    )
+    validated = load_inference_manifest(tmp_path, "test")
+    artifact.unlink()
+    artifact.symlink_to("model.om")
+    with pytest.raises(ManifestIntegrityError, match="artifact_integrity_unverified"):
+        if entrypoint == "finalize":
+            finalize_deployment_artifacts(tmp_path, validated.deployment)
+        elif entrypoint == "readonly":
+            validate_deployment_artifact_integrity(validated)
+        else:
+            verify_deployment_artifacts(tmp_path, "test")
+    assert not (tmp_path / "inference_integrity.json").exists()
+
+
+def test_path_resolution_runtime_error_does_not_depend_on_interpreter_wording(tmp_path, monkeypatch):
+    from inference_manifest.errors import ManifestPathError
+    from inference_manifest.paths import resolve_bundle_file
+
+    error = RuntimeError("alternate interpreter path-resolution failure")
+
+    def fail_resolve(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    with pytest.raises(ManifestPathError) as caught:
+        resolve_bundle_file(tmp_path, "model.om")
+    assert caught.value.__cause__ is error
+
+
+@pytest.mark.parametrize("digests", [[], [True], [False], [True, False]])
+def test_metadata_load_and_remote_integrity_check_agree_on_declarations(tmp_path, digests):
+    raw = _request_deployment()
+    raw["artifacts"] = {
+        f"role{index}": {
+            "path": f"absent{index}.om",
+            "format": "om",
+            **({"sha256": "0" * 64} if declared else {}),
+        }
+        for index, declared in enumerate(digests)
+    }
+    write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, raw))
+    validated = load_inference_manifest_metadata(tmp_path, "test")
+    declared = bool(digests) and all(digests)
+    assert validated.integrity_status.state == ("declared" if declared else "unverified")
+    assert validated.integrity_status.artifact_digests == {
+        f"role{index}": "0" * 64 for index, present in enumerate(digests) if present
+    }
+    assert validated.integrity_status.details == {}
+    if declared:
+        validate_deployment_artifact_integrity(validated, verify_content=False)
+    else:
+        with pytest.raises(ManifestIntegrityError, match="artifact_integrity_unverified") as error:
+            validate_deployment_artifact_integrity(validated, verify_content=False)
+        for index, present in enumerate(digests):
+            if not present:
+                assert f"role{index}" in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "backend,runtime",
+    [
+        ("torch", "torch"),
+        ("ascend", "acl"),
+        ("rknn", "rknn-lite2"),
+        ("onnx", "onnxruntime"),
+        ("hmm", "hmm"),
+        ("hisilicon", "hisilicon-worker"),
+        ("tensorrt", "tensorrt"),
+    ],
+)
+@pytest.mark.parametrize("verify_content", [False, True])
+def test_empty_compiled_artifacts_are_unverified_but_native_torch_is_allowed(
+    tmp_path, backend, runtime, verify_content
+):
+    raw = _request_deployment()
+    raw["runtime_profile"] = {
+        "backend": backend,
+        "target": {"runtime": runtime},
+        "profile": {"device": "cpu"} if backend == "torch" else {"device_id": 0} if backend == "ascend" else {},
+    }
+    write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, raw))
+    validated = load_inference_manifest(tmp_path, "test")
+    if backend == "torch":
+        validate_deployment_artifact_integrity(validated, verify_content=verify_content)
+    else:
+        with pytest.raises(ManifestIntegrityError, match="artifact_integrity_unverified"):
+            validate_deployment_artifact_integrity(validated, verify_content=verify_content)
+    assert verify_deployment_artifacts(tmp_path, "test").state == "unverified"
+
+
+@pytest.mark.parametrize("mutation", ["missing_digest", "mismatch"])
+def test_read_only_and_report_verification_share_failure_classification(tmp_path, mutation):
+    raw = _request_deployment(artifact=True)
+    if mutation == "missing_digest":
+        raw["artifacts"]["model"].pop("sha256")
+    (tmp_path / "model.om").write_bytes(b"changed" if mutation == "mismatch" else b"model")
+    write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, raw))
+    validated = load_inference_manifest(tmp_path, "test")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    code = "artifact_digest_mismatch" if mutation == "mismatch" else "artifact_integrity_unverified"
+    with pytest.raises(ManifestIntegrityError, match=code):
+        validate_deployment_artifact_integrity(validated)
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+    report = verify_deployment_artifacts(tmp_path, "test")
+    with pytest.raises(ManifestIntegrityError, match=code):
+        report.require_verified()
+    if mutation == "mismatch":
+        with pytest.raises(ManifestIntegrityError, match=code):
+            load_inference_manifest(tmp_path, "test", verify_on_demand=True)
+    else:
+        assert report.details["missing_declared_digests"] == ["model"]
+        (tmp_path / "model.om").unlink()
+        with pytest.raises(ManifestIntegrityError, match=code):
+            validate_deployment_artifact_integrity(validated, verify_content=False)
+
+
+@pytest.mark.parametrize("change", ["legacy", "revision", "uuid", "sha256"])
+def test_reports_only_cover_the_exact_deployment_declaration(tmp_path, change):
+    (tmp_path / "model.om").write_bytes(b"model")
+    raw = _request_deployment(artifact=True)
+    write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, raw))
+    verify_deployment_artifacts(tmp_path, "test")
+    if change == "legacy":
+        report = tmp_path / "inference_integrity.json"
+        value = json.loads(report.read_text())
+        value.pop("deployment_identity")
+        report.write_text(json.dumps(value))
+    else:
+        if change == "revision":
+            raw["revision"] += 1
+        elif change == "uuid":
+            raw["uuid"] = BUNDLE_UUID
+        else:
+            raw["artifacts"]["model"]["sha256"] = "0" * 64
+        write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, raw))
+    assert load_inference_manifest(tmp_path, "test").integrity_status.state == "declared"
+
+
+@pytest.mark.parametrize("partial", [False, True])
+def test_strict_missing_digest_rejects_without_reading_but_report_collects_content(tmp_path, monkeypatch, partial):
+    import inference_manifest.integrity as integrity
+
+    raw = _request_deployment(artifact=True)
+    raw["artifacts"]["model"].pop("sha256")
+    if partial:
+        raw["artifacts"]["extra"] = {"path": "extra.om", "format": "om", "sha256": "0" * 64}
+        (tmp_path / "extra.om").write_bytes(b"extra")
+    (tmp_path / "model.om").write_bytes(b"model")
+    write_inference_manifest(tmp_path / "inference_manifest.json", _bundle(tmp_path, raw))
+    validated = load_inference_manifest(tmp_path, "test")
+    reads = []
+    original = integrity._sha256_file
+
+    def count(path):
+        reads.append(path)
+        return original(path)
+
+    monkeypatch.setattr(integrity, "_sha256_file", count)
+    with pytest.raises(ManifestIntegrityError, match="artifact_integrity_unverified"):
+        validate_deployment_artifact_integrity(validated)
+    assert reads == []
+    report = verify_deployment_artifacts(tmp_path, "test")
+    assert set(report.artifact_digests) == set(raw["artifacts"])
+    assert len(reads) == len(raw["artifacts"])

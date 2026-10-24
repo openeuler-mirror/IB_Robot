@@ -34,6 +34,7 @@ from model_utils.inference_manifest_export import (
     artifact_bindings,
     compiled_deployment,
     copy_policy_metadata_bundle,
+    load_published_artifact_index,
     package_deployment_artifact,
     read_runtime_abi,
     upsert_deployment,
@@ -335,6 +336,7 @@ def write_smolvla_rknn_deployment(
     _validate_smolvla_rknn_abis(config, cameras, vision_abi, prefill_abi, action_abi)
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
+    published = load_published_artifact_index(root)
     execution: list[str] = []
     artifacts: dict[str, tuple[Path, str]] = {}
     bindings = {}
@@ -345,6 +347,7 @@ def write_smolvla_rknn_deployment(
         backend="rknn",
         deployment_name=deployment_name,
         role="vision",
+        published=published,
         force_copy=True,
     )
     vision_roles: list[str] = []
@@ -367,6 +370,7 @@ def write_smolvla_rknn_deployment(
         backend="rknn",
         deployment_name=deployment_name,
         role="embedding",
+        published=published,
     )
     state_projection_artifact = package_deployment_artifact(
         root,
@@ -374,6 +378,7 @@ def write_smolvla_rknn_deployment(
         backend="rknn",
         deployment_name=deployment_name,
         role="state_projection",
+        published=published,
     )
     prefill_artifact = package_deployment_artifact(
         root,
@@ -381,6 +386,7 @@ def write_smolvla_rknn_deployment(
         backend="rknn",
         deployment_name=deployment_name,
         role="prefill",
+        published=published,
     )
     action_artifact = package_deployment_artifact(
         root,
@@ -388,6 +394,7 @@ def write_smolvla_rknn_deployment(
         backend="rknn",
         deployment_name=deployment_name,
         role="action",
+        published=published,
     )
     artifacts.update(
         {
@@ -470,6 +477,7 @@ def write_smolvla_rknn_deployment(
         target_soc=target_soc,
         target_runtime=target_runtime,
         artifacts=artifacts,
+        published=published,
         execution=execution,
         bindings=bindings,
         artifact_share_groups={role: "vision" for role in vision_roles},

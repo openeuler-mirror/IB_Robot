@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 from dataclasses import dataclass
@@ -15,7 +14,6 @@ from inference_manifest import (
     AscendRuntimeProfile,
     BundleFile,
     CompiledDeployment,
-    DeploymentArtifact,
     DeploymentTarget,
     DeviceLink,
     Digest,
@@ -24,13 +22,23 @@ from inference_manifest import (
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
+    PublishedArtifactIndex,
     RoleRuntimeProfile,
     SemanticIdentity,
     SemanticTensor,
     TensorBinding,
     canonical_bundle_digest,
+    inherit_deployment_version,
+    integrity_report_path,
     load_inference_manifest,
+    sha256_file,
     write_inference_manifest,
+)
+
+from .bundle_publication import (
+    classify_om_artifacts,
+    copy_and_finalize_artifact_roles,
+    preflight_publication,
 )
 
 
@@ -511,19 +519,11 @@ def _specs() -> dict[str, BundleSpec]:
     }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _copy(source: Path, destination: Path) -> None:
     if not source.is_file():
         raise FileNotFoundError(f"required Ascend bundle source is missing: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.is_file() or _sha256(source) != _sha256(destination):
+    if not destination.is_file() or sha256_file(source) != sha256_file(destination):
         shutil.copy2(source, destination)
 
 
@@ -539,13 +539,77 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     root = models_root / spec.name
     root.mkdir(parents=True, exist_ok=True)
     manifest_path = root / "inference_manifest.json"
-    digest_path = root / "assets/artifact-digests.json"
+    adapter_relative = "assets/adapter.json"
+    digest_relative = "assets/artifact-digests.json"
+    digest_path = root / digest_relative
     previous_digests = json.loads(digest_path.read_text(encoding="utf-8")) if digest_path.is_file() else {}
     existing = None
     if manifest_path.is_file():
         name = next(iter(json.loads(manifest_path.read_text(encoding="utf-8"))["deployments"]))
         existing = load_inference_manifest(root, name).manifest
-    adapter = root / "assets/adapter.json"
+    available = []
+    publications = {}
+    sources = {}
+    for deployment in spec.deployments:
+        artifact_sources = tuple(
+            _packaged_source(models_root, root, artifact.source, artifact.destination)
+            for artifact in deployment.artifacts
+        )
+        if all(source is not None for source in artifact_sources):
+            sources[deployment.name] = artifact_sources
+            available.append(deployment)
+    if not available:
+        raise FileNotFoundError(f"no complete Ascend deployment candidates are available for {spec.name}")
+
+    published = PublishedArtifactIndex(root, existing)
+    deployments = {}
+    for deployment in available:
+        publication = classify_om_artifacts(
+            root,
+            {
+                artifact.role: (artifact.destination, source)
+                for artifact, source in zip(deployment.artifacts, sources[deployment.name], strict=True)
+            },
+            published,
+        )
+        publications[deployment.name] = publication
+        value = CompiledDeployment(
+            execution_contract=_request_contract(),
+            runtime_profile=RoleRuntimeProfile(
+                backend="ascend",
+                target=DeploymentTarget(soc=deployment.soc, runtime="acl"),
+                profile=AscendRuntimeProfile(device_id=0),
+            ),
+            artifacts=publication.artifacts,
+            execution=tuple(artifact.role for artifact in deployment.artifacts),
+            bindings={artifact.role: artifact.bindings for artifact in deployment.artifacts},
+            device_links=deployment.device_links,
+        )
+        deployments[deployment.name] = value
+
+    asset_sources = {}
+    for source, destination in spec.assets:
+        source_path = _packaged_source(models_root, root, source, destination)
+        if source_path is None:
+            raise FileNotFoundError(f"required Ascend bundle source is missing: {models_root / source}")
+        asset_sources[destination] = source_path
+
+    # Validate all retained roles across deployments before touching published files.
+    asset_writes = (adapter_relative, digest_relative, *asset_sources)
+    _, publications = preflight_publication(
+        root,
+        published,
+        publications,
+        set(existing.deployments) if existing is not None else set(),
+        asset_writes=asset_writes,
+        retained_assets=(
+            str(path.relative_to(root))
+            for path in (root / "assets").rglob("*")
+            if path.is_file() and str(path.relative_to(root)) not in asset_writes
+        ),
+        asset_sources=asset_sources,
+    )
+    adapter = root / adapter_relative
     adapter.parent.mkdir(parents=True, exist_ok=True)
     adapter_identity = {
         "interface": "tensor_model",
@@ -554,42 +618,28 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
         "preprocessing": spec.preprocessing,
         "postprocessing": spec.postprocessing,
     }
-    adapter.write_text(
-        json.dumps(
-            adapter_identity,
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    for source, destination in spec.assets:
-        source_path = _packaged_source(models_root, root, source, destination)
+    adapter.write_text(json.dumps(adapter_identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    for destination, source_path in asset_sources.items():
         destination_path = root / destination
-        if source_path is None:
-            raise FileNotFoundError(f"required Ascend bundle source is missing: {models_root / source}")
         if source_path != destination_path:
             _copy(source_path, destination_path)
+    for deployment in available:
+        value = deployments[deployment.name]
+        value = copy_and_finalize_artifact_roles(root, value, publications[deployment.name])
+        previous = existing.deployments.get(deployment.name) if existing else None
+        deployments[deployment.name] = inherit_deployment_version(value, previous)
 
-    available = []
-    for deployment in spec.deployments:
-        artifact_sources = tuple(
-            _packaged_source(models_root, root, artifact.source, artifact.destination)
-            for artifact in deployment.artifacts
-        )
-        if all(source is not None for source in artifact_sources):
-            for artifact, source in zip(deployment.artifacts, artifact_sources, strict=True):
-                destination = root / artifact.destination
-                if source != destination:
-                    _copy(source, destination)
-            available.append(deployment)
-    if not available:
-        raise FileNotFoundError(f"no complete Ascend deployment candidates are available for {spec.name}")
-
+    artifact_digests = {
+        artifact.path: artifact.sha256
+        for deployment in deployments.values()
+        for artifact in deployment.artifacts.values()
+    }
     digests = {
-        str(path.relative_to(root)): _sha256(path)
+        str(path.relative_to(root)): artifact_digests.get(str(path.relative_to(root))) or sha256_file(path)
         for path in sorted(root.rglob("*"))
-        if path.is_file() and path.name not in {"artifact-digests.json", "inference_manifest.json"}
+        if path.is_file()
+        and path.name not in {digest_path.name, manifest_path.name}
+        and path != integrity_report_path(root)
     }
     digest_path.write_text(json.dumps(digests, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     files = tuple(
@@ -617,39 +667,6 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     )
     bundle_uuid = existing.bundle.uuid if existing else str(uuid4())
     bundle_revision = existing.bundle.revision + int(structure_changed) if existing else 1
-    deployments = {}
-    for deployment in available:
-        previous = existing.deployments.get(deployment.name) if existing else None
-        value = CompiledDeployment(
-            execution_contract=_request_contract(),
-            runtime_profile=RoleRuntimeProfile(
-                backend="ascend",
-                target=DeploymentTarget(soc=deployment.soc, runtime="acl"),
-                profile=AscendRuntimeProfile(device_id=0),
-            ),
-            artifacts={
-                artifact.role: DeploymentArtifact(path=artifact.destination, format="om")
-                for artifact in deployment.artifacts
-            },
-            execution=tuple(artifact.role for artifact in deployment.artifacts),
-            bindings={artifact.role: artifact.bindings for artifact in deployment.artifacts},
-            device_links=deployment.device_links,
-        )
-        if isinstance(previous, CompiledDeployment):
-            artifact_changed = any(
-                previous_digests.get(artifact.destination) != digests[artifact.destination]
-                for artifact in deployment.artifacts
-            )
-            contract_changed = previous.model_dump(exclude={"uuid", "revision"}) != value.model_dump(
-                exclude={"uuid", "revision"}
-            )
-            value = value.model_copy(
-                update={
-                    "uuid": previous.uuid,
-                    "revision": previous.revision + int(artifact_changed or contract_changed),
-                }
-            )
-        deployments[deployment.name] = value
 
     manifest = InferenceManifest(
         schema_version=3,
@@ -670,6 +687,7 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     write_inference_manifest(manifest_path, manifest)
     for deployment in deployments:
         load_inference_manifest(root, deployment)
+    integrity_report_path(root).unlink(missing_ok=True)
     return manifest_path
 
 

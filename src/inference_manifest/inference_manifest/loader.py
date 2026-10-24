@@ -27,6 +27,7 @@ from inference_manifest.models import (
     SemanticTensor,
     TensorBinding,
     ValidatedDeployment,
+    _runtime_profiles,
 )
 from inference_manifest.paths import normalize_unique_paths, resolve_bundle_file
 from inference_manifest.schema import validate_manifest_schema
@@ -55,7 +56,12 @@ def load_inference_manifest(
         require_native_weights=None,
     )
     if verify_on_demand:
-        report = verify_deployment_artifacts(validated.bundle_root, deployment_name, mode="verify_on_demand")
+        report = verify_deployment_artifacts(
+            validated.bundle_root,
+            deployment_name,
+            mode="verify_on_demand",
+            expected_deployment=validated.deployment,
+        )
         if report.state == "mismatch":
             raise ManifestIntegrityError(
                 f"artifact_digest_mismatch for deployment {deployment_name!r}: {report.mismatch_details}"
@@ -93,6 +99,17 @@ def _load_inference_manifest(
 ) -> ValidatedDeployment:
     root = Path(bundle_root)
     manifest_path = root / MANIFEST_FILENAME
+    guidance = (
+        "Model startup requires a bundle directory containing inference_manifest.json. "
+        "Package the model with the project's exporter/packager and select a named deployment; "
+        "unpackaged model files are not supported."
+    )
+    try:
+        has_manifest = bool(str(bundle_root).strip()) and root.is_dir() and manifest_path.is_file()
+    except OSError as exc:
+        raise ManifestValidationError(f"bundle_manifest_required: {guidance} Path: {manifest_path}. {exc}") from exc
+    if not has_manifest:
+        raise ManifestValidationError(f"bundle_manifest_required: {guidance} Path: {manifest_path}")
     raw = load_json_strict(manifest_path)
     if not isinstance(raw, dict):
         raise ManifestValidationError(f"Inference manifest must be a JSON object: {manifest_path}")
@@ -128,7 +145,7 @@ def _load_inference_manifest(
         require_native_weights = is_policy and any(
             profile.backend == "torch"
             for candidate in manifest.deployments.values()
-            for profile in _deployment_profiles(candidate)
+            for profile in _runtime_profiles(candidate.runtime_profile, candidate.role_runtime_profiles)
         )
 
     if verify_all_bundle_files:
@@ -224,14 +241,6 @@ def _load_inference_manifest(
         runtime_profile_fingerprint=profile_fingerprint,
         policy=policy,
     )
-
-
-def _deployment_profiles(deployment: Deployment) -> tuple[Any, ...]:
-    if deployment.role_runtime_profiles:
-        return tuple(deployment.role_runtime_profiles.values())
-    if deployment.runtime_profile is not None:
-        return (deployment.runtime_profile,)
-    return ()
 
 
 def _parse_typed_manifest(raw: dict[str, Any], manifest_path: Path) -> InferenceManifest:

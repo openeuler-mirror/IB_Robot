@@ -731,6 +731,12 @@ class ONNXRuntimeProfile(BackendRuntimeProfile):
     optimization_level: StrictString | None = None
     device: StrictString | None = None
 
+    @property
+    def execution_provider(self) -> str:
+        """Canonical provider name for physical-device identity."""
+        requested = (self.provider or self.device or "cpu").strip()
+        return {"cpu": "CPUExecutionProvider", "cuda": "CUDAExecutionProvider"}.get(requested.lower(), requested)
+
 
 class TensorRTRuntimeProfile(BackendRuntimeProfile):
     backend_name: ClassVar[str] = "tensorrt"
@@ -857,6 +863,16 @@ class RoleRuntimeProfile(StrictFrozenModel):
         instance_metadata: Mapping[str, Any] | None = None,
     ) -> RuntimeInstanceProjection:
         return self.profile.runtime_instance_projection(self.runtime_abi, instance_metadata)
+
+
+def _runtime_profiles(
+    runtime_profile: RoleRuntimeProfile | None,
+    role_runtime_profiles: Mapping[str, RoleRuntimeProfile] | None,
+) -> tuple[RoleRuntimeProfile, ...]:
+    """Collect validated profiles; composite and single-model forms are exclusive."""
+    if role_runtime_profiles:
+        return tuple(role_runtime_profiles.values())
+    return (runtime_profile,) if runtime_profile is not None else ()
 
 
 class ArtifactBindings(StrictFrozenModel):

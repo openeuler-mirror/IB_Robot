@@ -11,6 +11,7 @@ from inference_manifest import DeviceLink
 from model_utils.inference_manifest_export import (
     artifact_bindings,
     compiled_deployment,
+    load_published_artifact_index,
     package_deployment_artifact,
     read_runtime_abi,
     read_tcim_abi,
@@ -36,6 +37,7 @@ def package_compiled_deployment(
     if not isinstance(roles, dict):
         raise ValueError("Packaging spec requires a roles object")
 
+    published = load_published_artifact_index(root)
     artifacts: dict[str, tuple[str | Path, str]] = {}
     bindings = {}
     for role in execution:
@@ -58,6 +60,7 @@ def package_compiled_deployment(
                 backend=backend,
                 deployment_name=deployment_name,
                 role=role,
+                published=published,
             ),
             artifact_format,
         )
@@ -90,6 +93,7 @@ def package_compiled_deployment(
                 backend=backend,
                 deployment_name=deployment_name,
                 role=role,
+                published=published,
             ),
             artifact_format,
         )
@@ -103,6 +107,7 @@ def package_compiled_deployment(
         target_soc=target_soc,
         target_runtime=target_runtime,
         artifacts=artifacts,
+        published=published,
         execution=execution,
         bindings=bindings,
         device_links=tuple(DeviceLink.model_validate(link) for link in links),

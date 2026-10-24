@@ -324,6 +324,27 @@ ros2 run perception_service package_ascend_perception_bundles \
 并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720/` 和
 `models/sam2.1_hiera_tiny_prompt_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
 
+普通、Ascend 和 GraspGen 打包入口均按文件身份识别保留 OM，软链接或硬链接到已发布文件的候选
+必须匹配旧 SHA-256；摘要不符时在写入前拒绝。普通入口仅允许首次发布省略未提供的可选 deployment，
+已发布 OM 丢失且编译源不可用时不会静默删除部署。三条入口通过 `classify_om_artifacts()`
+统一分类产物，从具名结果派生保留角色、预检目标与复制源，复用公共 `sha256_file()` 读取资产。
+预检对调用方声明的保留资产及旧 manifest 中未安排重写的资产复用 bundle 文件路径校验，
+在资产读取和写入前拒绝路径越界、缺失、断链或非普通文件，错误为带路径原因的
+`ManifestIntegrityError`。允许 bundle 内部软链接；待创建或重新生成的 asset 写入目标与
+manifest 等输出元数据不因此被要求预先存在。
+三个入口也将首次发布前已经存在、且将收录进 bundle 的额外资产纳入预检。
+OM 导入及 asset 写入目标在写前校验 bundle 边界（包括尚不存在的叶子），asset 写入目标
+彼此的软／硬链接别名会被拒绝；不支持同时原地更新同一文件的多个 asset 目标。
+预检拒绝互为父子的文件目标和非目录父路径。已有文件目标必须是普通文件。
+FIFO 和 socket 在任何内容写入前失败。
+三条入口共享复制与摘要终结流程，对未复制的
+相同内容复用本次比较摘要，复制后仍计算最终文件摘要。跨角色或 deployment 的源文件也按整个
+旧 manifest 验证摘要；目标更新使用独立临时文件加替换，不会改写保留目标共享的 inode。
+三个入口在 manifest 发布与加载校验成功后删除旧完整性报告。
+恢复原始字节不改变 deployment UUID/revision，也不继承修复前的 mismatch。
+保留文件不能依赖将删除的报告。需要新报告时，显式调用 `verify_deployment_artifacts()`。
+同一 bundle 只支持单一写入者；三个入口不提供 bundle 写锁。
+
 SAM2 的 operation 是 v3 manifest 的 bundle 级模型身份，不是 deployment 属性：
 `models/sam2.1_hiera_tiny/` 只承载 `sam2/automatic`，可以在该语义下提供 CPU、CUDA 或 Ascend named
 deployment；`models/sam2.1_hiera_tiny_prompt_ascend/` 承载抓取所需的 `sam2/prompt`。两者可以复用同一

@@ -11,7 +11,7 @@ def _repository_root() -> Path:
 
 
 def _released_manifest_paths(root: Path) -> tuple[Path, ...]:
-    excluded = {"build", "install", "log", ".git", "libs", "third_party"}
+    excluded = {"build", "install", "log", ".git", "libs", "third_party", "tmp", "venv", ".venv", "_work"}
     paths = []
     for path in root.rglob("inference_manifest.json"):
         relative = path.relative_to(root)
@@ -19,6 +19,19 @@ def _released_manifest_paths(root: Path) -> tuple[Path, ...]:
             continue
         paths.append(path)
     return tuple(sorted(paths))
+
+
+def test_inventory_excludes_temporary_and_conversion_workspaces(tmp_path):
+    published = tmp_path / "models/released/inference_manifest.json"
+    for path in (
+        published,
+        tmp_path / "tmp/upload/inference_manifest.json",
+        tmp_path / "models/_work/model/exporter/inference_manifest.json",
+        tmp_path / "venv/share/example/inference_manifest.json",
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}")
+    assert _released_manifest_paths(tmp_path) == (published,)
 
 
 def test_released_inference_manifests_load_as_v3_metadata() -> None:

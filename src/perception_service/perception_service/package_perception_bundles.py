@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from inference_manifest import (
+    ARTIFACT_INTEGRITY_UNVERIFIED,
     ArtifactBindings,
     AscendRuntimeProfile,
     BundleFile,
@@ -22,7 +21,9 @@ from inference_manifest import (
     ExecutionContract,
     InferenceManifest,
     ManifestBundle,
+    ManifestIntegrityError,
     ModelDescriptor,
+    PublishedArtifactIndex,
     RoleRuntimeProfile,
     SemanticIdentity,
     SemanticTensor,
@@ -30,10 +31,19 @@ from inference_manifest import (
     TorchDeployment,
     TorchRuntimeProfile,
     canonical_bundle_digest,
+    inherit_deployment_version,
+    integrity_report_path,
     load_inference_manifest,
+    load_inference_manifest_metadata,
+    sha256_file,
     write_inference_manifest,
 )
 
+from .bundle_publication import (
+    classify_om_artifacts,
+    copy_and_finalize_artifact_roles,
+    preflight_publication,
+)
 from .ram_plus_adapter import RAM_PLUS_POSTPROCESSING, RAM_PLUS_PREPROCESSING
 from .semantic_model_adapters import GroundingDINOAdapter, SAM2Adapter, SigLIP2ImageAdapter
 
@@ -288,14 +298,6 @@ def _specs() -> dict[str, BundleSpec]:
     }
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _asset_paths(root: Path) -> tuple[str, ...]:
     return tuple(
         sorted(
@@ -306,46 +308,80 @@ def _asset_paths(root: Path) -> tuple[str, ...]:
     )
 
 
-def _promote_compiled_artifact(root: Path, compiled: CompiledSpec) -> Path | None:
+def _compiled_artifact_source(root: Path, compiled: CompiledSpec) -> Path | None:
     artifact = root / compiled.artifact
     source = root.parent / "_work" / root.name / compiled.source
-    if source.is_file():
-        artifact.parent.mkdir(parents=True, exist_ok=True)
-        if not artifact.is_file() or _sha256(source) != _sha256(artifact):
-            shutil.copy2(source, artifact)
-    return artifact if artifact.is_file() else None
+    return source if source.is_file() else artifact if artifact.is_file() else None
 
 
 def package_bundle(root: Path, spec: BundleSpec) -> Path:
     root.mkdir(parents=True, exist_ok=True)
-    if spec.model_type == "grounding_dino":
-        (root / "assets" / "GroundingDINO_SwinT_OGC.py").unlink(missing_ok=True)
+    manifest_path = root / "inference_manifest.json"
+    existing = None
+    if manifest_path.is_file():
+        existing = load_inference_manifest_metadata(
+            root, next(iter(json.loads(manifest_path.read_text())["deployments"]))
+        ).manifest
     for relative in spec.required_paths:
         if not (root / relative).is_file():
             raise FileNotFoundError(f"required {spec.model_type} bundle asset is missing: {root / relative}")
 
-    adapter_path = root / "assets" / "adapter.json"
+    torch_deployments = {"torch_cpu": "cpu", "torch_cuda": "cuda"}
+    published = PublishedArtifactIndex(root, existing)
+    compiled_artifacts = {compiled.deployment: _compiled_artifact_source(root, compiled) for compiled in spec.compiled}
+    candidates = {}
+    publications = {}
+    for compiled in spec.compiled:
+        source = compiled_artifacts[compiled.deployment]
+        previous = existing.deployments.get(compiled.deployment) if existing else None
+        if source is None and previous is not None:
+            raise ManifestIntegrityError(
+                f"{ARTIFACT_INTEGRITY_UNVERIFIED}: published deployment {compiled.deployment!r} "
+                f"is missing artifact {compiled.artifact!r} and its compiler source"
+            )
+        if source is not None:
+            publication = classify_om_artifacts(root, {"model": (compiled.artifact, source)}, published)
+            publications[compiled.deployment] = publication
+            candidate = _ascend_deployment(
+                target_soc=compiled.target_soc,
+                artifacts=publication.artifacts,
+                bindings={"model": compiled.bindings},
+            )
+            candidates[compiled.deployment] = candidate
+
+    adapter_relative = "assets/adapter.json"
+    digest_relative = "assets/artifact-digests.json"
+    removed_assets = ("assets/GroundingDINO_SwinT_OGC.py",) if spec.model_type == "grounding_dino" else ()
+    asset_writes = (adapter_relative, digest_relative, *removed_assets)
+    preserved, publications = preflight_publication(
+        root,
+        published,
+        publications,
+        set(candidates) | set(torch_deployments),
+        asset_writes=asset_writes,
+        retained_assets=set(spec.required_paths) | (set(_asset_paths(root)) - set(asset_writes)),
+    )
+
+    # Every retained artifact and alias dependency passed before any files changed.
+    for relative in removed_assets:
+        (root / relative).unlink(missing_ok=True)
+    adapter_path = root / adapter_relative
     adapter_path.parent.mkdir(parents=True, exist_ok=True)
     adapter_path.write_text(json.dumps(spec.adapter, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-    compiled_artifacts = {compiled.deployment: _promote_compiled_artifact(root, compiled) for compiled in spec.compiled}
-    digest_path = root / "assets" / "artifact-digests.json"
-    asset_paths = tuple(path for path in _asset_paths(root) if path != "assets/artifact-digests.json")
-    digests = {path: _sha256(root / path) for path in asset_paths}
+    digest_path = root / digest_relative
+    asset_paths = tuple(path for path in _asset_paths(root) if path != digest_relative)
+    digests = {path: sha256_file(root / path) for path in asset_paths}
     for compiled in spec.compiled:
-        artifact = compiled_artifacts[compiled.deployment]
-        if artifact is not None:
-            digests[compiled.artifact] = _sha256(artifact)
+        source = compiled_artifacts[compiled.deployment]
+        if source is not None:
+            candidate = candidates[compiled.deployment]
+            candidate = copy_and_finalize_artifact_roles(root, candidate, publications[compiled.deployment])
+            candidates[compiled.deployment] = candidate
+            digests[compiled.artifact] = candidate.artifacts["model"].sha256
     previous_digests = digest_path.read_text(encoding="utf-8") if digest_path.is_file() else ""
     digest_document = json.dumps(digests, indent=2, sort_keys=True) + "\n"
     digest_path.write_text(digest_document, encoding="utf-8")
 
-    manifest_path = root / "inference_manifest.json"
-    existing = None
-    if manifest_path.is_file():
-        existing = load_inference_manifest(
-            root, next(iter(json.loads(manifest_path.read_text())["deployments"]))
-        ).manifest
     files = tuple(BundleFile(path=path) for path in _asset_paths(root))
     structure_changed = existing is not None and (
         existing.bundle.name != spec.name
@@ -355,12 +391,11 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
     )
     bundle_uuid = existing.bundle.uuid if existing is not None else str(uuid4())
     bundle_revision = existing.bundle.revision + int(structure_changed) if existing is not None else 1
-    deployments = dict(existing.deployments) if existing is not None else {}
-    for name, device in (("torch_cpu", "cpu"), ("torch_cuda", "cuda")):
+    deployments = dict(preserved)
+    for name, device in torch_deployments.items():
         candidate = _torch_deployment(device)
-        previous = deployments.get(name)
-        if previous is not None:
-            candidate = candidate.model_copy(update={"uuid": previous.uuid, "revision": previous.revision})
+        previous = existing.deployments.get(name) if existing is not None else None
+        candidate = inherit_deployment_version(candidate, previous)
         deployments[name] = candidate
     for compiled in spec.compiled:
         name = compiled.deployment
@@ -368,22 +403,9 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
         if compiled_artifact is None:
             deployments.pop(name, None)
         else:
-            candidate = _ascend_deployment(
-                target_soc=compiled.target_soc,
-                artifacts={"model": DeploymentArtifact(path=compiled.artifact, format="om")},
-                bindings={"model": compiled.bindings},
-            )
-            previous = deployments.get(name)
-            if isinstance(previous, CompiledDeployment):
-                previous_digest = ""
-                if previous_digests:
-                    previous_digest = json.loads(previous_digests).get(compiled.artifact, "")
-                candidate = candidate.model_copy(
-                    update={
-                        "uuid": previous.uuid,
-                        "revision": previous.revision + int(previous_digest != digests[compiled.artifact]),
-                    }
-                )
+            candidate = candidates[name]
+            previous = existing.deployments.get(name) if existing is not None else None
+            candidate = inherit_deployment_version(candidate, previous)
             deployments[name] = candidate
     manifest = InferenceManifest(
         schema_version=3,
@@ -404,6 +426,7 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
     write_inference_manifest(manifest_path, manifest)
     for deployment in sorted(deployments):
         load_inference_manifest(root, deployment)
+    integrity_report_path(root).unlink(missing_ok=True)
     return manifest_path
 
 

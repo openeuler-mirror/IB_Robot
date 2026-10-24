@@ -4,18 +4,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import stat
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
+from os import stat_result
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple, Protocol
 
-from pydantic import Field, model_validator
+from pydantic import Field, TypeAdapter, model_validator
 
-from inference_manifest.errors import ManifestIntegrityError, ManifestValidationError
+from inference_manifest.errors import ManifestIntegrityError, ManifestPathError, ManifestValidationError
 from inference_manifest.json_utils import load_json_strict
 from inference_manifest.models import (
     BundleFile,
     Deployment,
+    DeploymentArtifact,
     InferenceManifest,
     ModelDescriptor,
     ModelIdentity,
@@ -25,6 +28,7 @@ from inference_manifest.models import (
     StrictFrozenModel,
     StrictString,
     _json_safe,
+    _runtime_profiles,
     _without_provider_identity,
 )
 from inference_manifest.paths import normalize_unique_paths, resolve_bundle_file
@@ -35,6 +39,7 @@ _REGENERATE_GUIDANCE = (
 _INTEGRITY_FILENAME = "inference_integrity.json"
 _DEFAULT_VERIFIER = "inference_manifest/0.1.0"
 ARTIFACT_DIGEST_MISMATCH = "artifact_digest_mismatch"
+ARTIFACT_INTEGRITY_UNVERIFIED = "artifact_integrity_unverified"
 
 ArtifactIntegrityMode = Literal["declared_only", "verify_on_install", "verify_on_demand"]
 ArtifactIntegrityState = Literal["declared", "verified", "mismatch", "unverified"]
@@ -130,10 +135,11 @@ class IntegrityReport(ArtifactIntegrityStatus):
     """Persisted result of install-time or on-demand artifact verification."""
 
     deployment_name: str
+    deployment_identity: Sha256 | None = None
 
     def require_verified(self) -> IntegrityReport:
         if self.state != "verified":
-            code = self.error_code or "artifact_integrity_unverified"
+            code = self.error_code or ARTIFACT_INTEGRITY_UNVERIFIED
             raise ManifestIntegrityError(f"{code} for deployment {self.deployment_name!r}")
         return self
 
@@ -455,15 +461,17 @@ def semantic_identity_fingerprint(identity: SemanticIdentity) -> str:
     return hashlib.sha256(canonical_semantic_identity_json(identity).encode("utf-8")).hexdigest()
 
 
-def _report_path(bundle_root: Path) -> Path:
-    return bundle_root / _INTEGRITY_FILENAME
+def integrity_report_path(bundle_root: str | Path) -> Path:
+    """Return the root report entry without following a possible leaf symlink."""
+    return Path(bundle_root) / _INTEGRITY_FILENAME
 
 
-def _declared_integrity_status(deployment: Deployment) -> ArtifactIntegrityStatus:
+def _declared_integrity_status(deployment: Deployment, *, include_missing: bool = False) -> ArtifactIntegrityStatus:
     declared = {
         role: artifact.sha256 for role, artifact in sorted(deployment.artifacts.items()) if artifact.sha256 is not None
     }
-    if deployment.artifacts and len(declared) == len(deployment.artifacts):
+    missing = sorted(deployment.artifacts.keys() - declared.keys())
+    if deployment.artifacts and not missing:
         state: Literal["declared", "unverified"] = "declared"
     else:
         state = "unverified"
@@ -471,6 +479,7 @@ def _declared_integrity_status(deployment: Deployment) -> ArtifactIntegrityStatu
         mode="declared_only",
         state=state,
         artifact_digests=declared,
+        details={"missing_declared_digests": missing} if include_missing and missing else {},
     )
 
 
@@ -478,7 +487,7 @@ def read_integrity_report(bundle_root: str | Path, deployment_name: str | None =
     """Read an adjacent verifier report, if one exists."""
 
     root = Path(bundle_root).resolve(strict=True)
-    path = _report_path(root)
+    path = integrity_report_path(root)
     if not path.exists():
         return None
     try:
@@ -497,7 +506,25 @@ def integrity_status_for_deployment(
     deployment: Deployment,
 ) -> ArtifactIntegrityStatus:
     report = read_integrity_report(bundle_root, deployment_name)
-    return report if report is not None else _declared_integrity_status(deployment)
+    if report is not None and report.deployment_identity == _report_deployment_identity(deployment):
+        return report
+    return _declared_integrity_status(deployment)
+
+
+def _report_deployment_identity(deployment: Deployment) -> str:
+    """Bind reports to the full declaration, including lineage and artifact SHA values."""
+    payload = deployment.model_dump(mode="json", exclude_none=True)
+    return hashlib.sha256(_canonical_json(payload).encode("utf-8")).hexdigest()
+
+
+def inherit_deployment_version(candidate: Deployment, previous: Deployment | None) -> Deployment:
+    """Preserve lineage and increment revision exactly when the declaration changes."""
+    if previous is None:
+        return candidate
+    changed = _canonical_json(candidate.model_dump(mode="json", exclude={"uuid", "revision"})) != _canonical_json(
+        previous.model_dump(mode="json", exclude={"uuid", "revision"})
+    )
+    return candidate.model_copy(update={"uuid": previous.uuid, "revision": previous.revision + int(changed)})
 
 
 def _sha256_file(path: Path) -> str:
@@ -508,8 +535,316 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_file(path: Path) -> str:
+    """Return the SHA-256 digest of a file using the shared chunked reader."""
+    return _sha256_file(path)
+
+
+_SHA256_ADAPTER = TypeAdapter(Sha256)
+
+
+def bind_artifact_digest(artifact: DeploymentArtifact, digest: str, role: str) -> DeploymentArtifact:
+    """Bind a computed digest, rejecting changed bytes for retained evidence."""
+    digest = _SHA256_ADAPTER.validate_python(digest)
+    if artifact.sha256 is not None and artifact.sha256 != digest:
+        raise ManifestIntegrityError(
+            f"{ARTIFACT_DIGEST_MISMATCH}: retained artifact role={role!r} path={artifact.path!r}"
+        )
+    return artifact.model_copy(update={"sha256": digest})
+
+
+class _FileState(NamedTuple):
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+    @classmethod
+    def from_stat(cls, info: stat_result) -> _FileState:
+        return cls(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _file_state(path: Path) -> _FileState:
+    return _FileState.from_stat(path.stat())
+
+
+def _cached_file_digest(path: Path, cache: dict[_FileState, str], *, context: str) -> str:
+    """Reuse a stable file's digest within the caller's publication phase."""
+    state = _file_state(path)
+    if state not in cache:
+        digest = _sha256_file(path)
+        if _file_state(path) != state:
+            raise ManifestIntegrityError(f"{ARTIFACT_INTEGRITY_UNVERIFIED}: artifact changed while hashing{context}")
+        cache[state] = digest
+    return cache[state]
+
+
+def _read_artifact_digests(
+    bundle_root: str | Path, deployment: Deployment, published: PublishedArtifactIndex | None = None
+) -> dict[str, str]:
+    """Hash each unique file identity once while resolving every declaration."""
+    digests: dict[_FileState, str] = {}
+    actual = {}
+    for role, artifact in sorted(deployment.artifacts.items()):
+        try:
+            path = resolve_bundle_file(Path(bundle_root), artifact.path)
+            if published is not None:
+                actual[role] = published.read_and_verify_digest(path)
+                continue
+            actual[role] = _cached_file_digest(path, digests, context=f" role={role!r}")
+        except (ManifestPathError, OSError) as exc:
+            raise ManifestIntegrityError(
+                f"{ARTIFACT_INTEGRITY_UNVERIFIED}: role={role!r} path={artifact.path!r}: {exc}"
+            ) from exc
+    return actual
+
+
+class PublishedArtifactIndex:
+    """Index old declarations and cache content for one coordinated publication.
+
+    Sources may name another role or deployment, or a symbolic/hardlink alias.
+    The declaration index snapshots file identities before writes; it is not an
+    index of the evolving manifest. Cached content is reusable only while the
+    identity, size, mtime and ctime match, and is checked on every digest lookup.
+
+    After preflight proves disjoint targets and protects retained/source paths,
+    callers may keep using this index for untouched files while atomically
+    replacing other directory entries. Never use it to validate newly copied
+    destinations: finalize those independently, without this index. In-place
+    artifact writes or retargeting indexed aliases invalidate this contract.
+    Discard the index when publication ends; a new publication rebuilds it.
+    Callers must exclude concurrent writers for the entire publication.
+    ``manifest`` is the same declaration snapshot used to build this index.
+    """
+
+    def __init__(self, bundle_root: Path, manifest: InferenceManifest | None):
+        self.manifest = manifest
+        self._digests: dict[tuple[int, int], set[str]] = {}
+        self._actual: dict[_FileState, str] = {}
+        if manifest is not None:
+            for deployment_name, deployment in manifest.deployments.items():
+                for role, artifact in deployment.artifacts.items():
+                    if artifact.sha256 is None:
+                        continue
+                    try:
+                        info = (bundle_root / artifact.path).stat()
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        raise ManifestIntegrityError(
+                            f"{ARTIFACT_INTEGRITY_UNVERIFIED}: published artifact "
+                            f"deployment={deployment_name!r} role={role!r} path={artifact.path!r}: {exc}"
+                        ) from exc
+                    if stat.S_ISREG(info.st_mode):
+                        self._digests.setdefault((info.st_dev, info.st_ino), set()).add(artifact.sha256)
+
+    def declared_digest(self, path: Path) -> str | None:
+        """Return old evidence without reading content; reject conflicting claims."""
+        info = path.stat()
+        digests = self._digests.get((info.st_dev, info.st_ino), set())
+        if len(digests) > 1:
+            raise ManifestIntegrityError(f"{ARTIFACT_DIGEST_MISMATCH}: conflicting retained artifact digests: {path}")
+        return next(iter(digests), None)
+
+    def _digest_unchecked(self, path: Path) -> str:
+        """Return and cache actual content without accepting or rejecting old claims."""
+        return _cached_file_digest(path, self._actual, context=f": {path}")
+
+    def read_and_verify_digest(self, path: Path) -> str:
+        """Read content (or reuse its state cache) and check any old declaration.
+
+        Without an old declaration, still compute and return actual content.
+        A cache entry is valid only for the same file identity and stat state.
+        """
+        expected = self.declared_digest(path)
+        actual = self._digest_unchecked(path)
+        if expected is not None and actual != expected:
+            raise ManifestIntegrityError(f"{ARTIFACT_DIGEST_MISMATCH}: retained artifact source={str(path)!r}")
+        return actual
+
+    def _accept_computed_digest(self, path: Path, actual: str) -> str:
+        """Check a supplied digest against old evidence/cache without reading bytes.
+
+        The caller must ensure the digest describes this path's current bytes
+        and coordinate writers between computation and this call. With neither
+        an old declaration nor cached content, the supplied digest is trusted
+        and cached; this method does not independently verify file content.
+        """
+        actual = _SHA256_ADAPTER.validate_python(actual)
+        expected = self.declared_digest(path)
+        state = _file_state(path)
+        cached = self._actual.get(state)
+        if cached is not None and cached != actual:
+            raise ManifestIntegrityError(f"{ARTIFACT_INTEGRITY_UNVERIFIED}: artifact changed while checking: {path}")
+        if expected is not None and expected != actual:
+            raise ManifestIntegrityError(f"{ARTIFACT_DIGEST_MISMATCH}: retained artifact source={str(path)!r}")
+        self._actual[state] = actual
+        return actual
+
+    def verify_declared_digest(self, path: Path) -> str | None:
+        """Verify existing evidence, returning None without reading if undeclared.
+
+        When evidence exists, read content (or use its state cache) and compare.
+        None means no old declaration, not verified content; copied outputs
+        still require finalization at their final paths before publication.
+        """
+        expected = self.declared_digest(path)
+        if expected is None:
+            return None
+        return self.read_and_verify_digest(path)
+
+    def _verify_matching_content(self, source: Path, destination: Path) -> bool:
+        """Compare undeclared history, reusing stable content digests.
+
+        Reuse either side's cached digest only for its current file state.
+        Only use digest comparison when both sides are cached. Otherwise compare
+        block by block and stop at the first difference, even if one side is cached. Equal bytes
+        share a streaming digest; check both file states and old evidence before
+        accepting the match. Final publication still verifies copied targets.
+        """
+        before = _file_state(source), _file_state(destination)
+        if all(state in self._actual for state in before):
+            actual = self._actual[before[0]]
+            matches = actual == self._actual[before[1]]
+        else:
+            digest = hashlib.sha256()
+            with source.open("rb") as left, destination.open("rb") as right:
+                while True:
+                    chunk = left.read(64 * 1024)
+                    if chunk != right.read(64 * 1024):
+                        return False
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            actual = digest.hexdigest()
+            matches = True
+        if before != (_file_state(source), _file_state(destination)):
+            raise ManifestIntegrityError(f"{ARTIFACT_INTEGRITY_UNVERIFIED}: artifact changed while comparing")
+        if not matches:
+            return False
+        self._accept_computed_digest(source, actual)
+        self._accept_computed_digest(destination, actual)
+        return True
+
+    def reusable_digest(self, source: Path, destination: Path) -> str | None:
+        """Return verified equal content, or None for an unusable destination.
+
+        Callers validate regular-file paths and choose permission/replacement
+        policies. Corrupt sources and conflicting destination declarations
+        raise; a damaged destination with one old claim is not reusable.
+        This is preparation evidence, never final verification after a copy.
+        """
+        self.verify_declared_digest(source)
+        declared = self.declared_digest(destination)
+        try:
+            if declared is None and not source.samefile(destination):
+                if not self._verify_matching_content(source, destination):
+                    return None
+                return self.read_and_verify_digest(source)
+            actual = self.read_and_verify_digest(source)
+            if declared is not None and actual != declared:
+                return None
+            return actual if self.read_and_verify_digest(destination) == actual else None
+        except ManifestIntegrityError:
+            return None
+
+
+class ArtifactDeployment(Protocol):
+    @property
+    def deployment(self) -> Deployment: ...
+
+    @property
+    def bundle_root(self) -> Path: ...
+
+
+def _inspect_deployment_artifacts(
+    bundle_root: Path,
+    deployment: Deployment,
+    *,
+    verify_content: bool = True,
+) -> ArtifactIntegrityStatus:
+    """Read-only core shared by strict runtime checks and persisted reports."""
+    declared = _declared_integrity_status(deployment, include_missing=True)
+    if not verify_content:
+        return declared
+    actual_digests = _read_artifact_digests(bundle_root, deployment)
+    mismatches: list[ArtifactDigestMismatch] = []
+    for role, artifact in sorted(deployment.artifacts.items()):
+        if artifact.sha256 is not None and artifact.sha256 != actual_digests[role]:
+            mismatches.append(
+                ArtifactDigestMismatch(
+                    role=role, path=artifact.path, expected=artifact.sha256, actual=actual_digests[role]
+                )
+            )
+    state: ArtifactIntegrityState = "verified"
+    if mismatches:
+        state = "mismatch"
+    elif declared.state == "unverified":
+        state = "unverified"
+    return ArtifactIntegrityStatus(
+        mode="verify_on_demand",
+        state=state,
+        artifact_digests=actual_digests,
+        mismatches=tuple(mismatches),
+        details={
+            **declared.details,
+            **({"code": ARTIFACT_DIGEST_MISMATCH} if mismatches else {}),
+        },
+    )
+
+
+def validate_deployment_artifact_integrity(
+    validated_manifest: ArtifactDeployment, *, verify_content: bool = True
+) -> None:
+    """Require declared/verified compiled artifacts without writing a report.
+
+    Empty artifacts are allowed only for Torch profiles, whose weights are
+    declared as bundle assets. Other backends must declare compiled artifacts.
+    Remote checks require digests but do not access local artifact files.
+    Failures use ManifestIntegrityError and the publication verifier's codes.
+    """
+    root = validated_manifest.bundle_root
+    deployment = validated_manifest.deployment
+    profiles = _runtime_profiles(deployment.runtime_profile, deployment.role_runtime_profiles)
+    if not deployment.artifacts and profiles and all(profile.backend == "torch" for profile in profiles):
+        return
+    declared = _declared_integrity_status(deployment, include_missing=True)
+    if declared.state == "unverified":
+        raise ManifestIntegrityError(f"{ARTIFACT_INTEGRITY_UNVERIFIED}: {declared.details or 'no compiled artifacts'}")
+    result = _inspect_deployment_artifacts(
+        root,
+        deployment,
+        verify_content=verify_content,
+    )
+    if result.state not in {"verified", "declared"}:
+        code = result.error_code or ARTIFACT_INTEGRITY_UNVERIFIED
+        raise ManifestIntegrityError(f"{code}: {result.mismatch_details or result.details or 'no compiled artifacts'}")
+
+
+def finalize_deployment_artifacts(
+    bundle_root: str | Path, deployment: Deployment, *, published: PublishedArtifactIndex | None = None
+) -> Deployment:
+    """Bind a packaging candidate to its final artifact bytes before publication.
+
+    Exporters call this after copying/compiler output and before comparing
+    deployment revisions. New artifacts omit sha256; retained artifacts keep
+    their previous digest, which is verified rather than refreshed. Loading and
+    writing an existing manifest also preserve evidence of content tampering.
+
+    Supply the publication index for pre-write retained candidates, including
+    candidates missing their old SHA, to recover evidence and share reads across
+    deployments. Omit it for independently copied final destinations.
+    """
+    digests = _read_artifact_digests(bundle_root, deployment, published)
+    artifacts = {
+        role: bind_artifact_digest(artifact, digests[role], role) for role, artifact in deployment.artifacts.items()
+    }
+    return deployment.model_copy(update={"artifacts": artifacts})
+
+
 def _write_integrity_report(bundle_root: Path, report: IntegrityReport) -> None:
-    path = _report_path(bundle_root)
+    path = integrity_report_path(bundle_root)
     path.write_text(
         json.dumps(report.model_dump(mode="json", exclude_none=True), ensure_ascii=False, indent=2, sort_keys=True)
         + "\n",
@@ -523,6 +858,7 @@ def verify_deployment_artifacts(
     *,
     mode: Literal["verify_on_install", "verify_on_demand"] = "verify_on_install",
     verifier: str = _DEFAULT_VERIFIER,
+    expected_deployment: Deployment | None = None,
 ) -> IntegrityReport:
     """Hash selected deployment artifacts and persist an adjacent integrity report.
 
@@ -551,6 +887,10 @@ def verify_deployment_artifacts(
         deployment = manifest.deployments[deployment_name]
     except KeyError as exc:
         raise ManifestValidationError(f"Deployment {deployment_name!r} is not present in {manifest_path}") from exc
+    if expected_deployment is not None and _report_deployment_identity(deployment) != _report_deployment_identity(
+        expected_deployment
+    ):
+        raise ManifestIntegrityError(f"{ARTIFACT_INTEGRITY_UNVERIFIED}: deployment changed before verification")
     verify_bundle_digest(
         manifest.bundle.uuid,
         manifest.bundle.revision,
@@ -559,44 +899,14 @@ def verify_deployment_artifacts(
         manifest.bundle.digest.value,
     )
 
-    actual_digests: dict[str, str] = {}
-    mismatches: list[ArtifactDigestMismatch] = []
-    missing_digests: list[str] = []
-    for role, artifact in sorted(deployment.artifacts.items()):
-        path = resolve_bundle_file(root, artifact.path)
-        actual = _sha256_file(path)
-        actual_digests[role] = actual
-        if artifact.sha256 is None:
-            missing_digests.append(role)
-        elif actual != artifact.sha256:
-            mismatches.append(
-                ArtifactDigestMismatch(
-                    role=role,
-                    path=artifact.path,
-                    expected=artifact.sha256,
-                    actual=actual,
-                )
-            )
-
-    now = datetime.now(timezone.utc)
-    if mismatches:
-        state: Literal["verified", "mismatch", "unverified"] = "mismatch"
-    elif missing_digests or not deployment.artifacts:
-        state = "unverified"
-    else:
-        state = "verified"
+    result = _inspect_deployment_artifacts(root, deployment)
     report = IntegrityReport(
+        **result.model_dump(exclude={"mode", "verified_at", "verifier"}),
         deployment_name=deployment_name,
+        deployment_identity=_report_deployment_identity(deployment),
         mode=mode,
-        state=state,
-        artifact_digests=actual_digests,
-        verified_at=now if state == "verified" else None,
+        verified_at=datetime.now(timezone.utc) if result.state == "verified" else None,
         verifier=verifier,
-        mismatches=tuple(mismatches),
-        details={
-            **({"missing_declared_digests": missing_digests} if missing_digests else {}),
-            **({"code": ARTIFACT_DIGEST_MISMATCH} if mismatches else {}),
-        },
     )
     _write_integrity_report(root, report)
     return report

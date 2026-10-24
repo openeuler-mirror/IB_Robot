@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -11,7 +10,14 @@ from uuid import uuid4
 
 import numpy as np
 
-from inference_manifest import BundleFile, canonical_bundle_digest, write_inference_manifest
+from inference_manifest import (
+    BundleFile,
+    InferenceManifest,
+    canonical_bundle_digest,
+    finalize_deployment_artifacts,
+    sha256_file,
+    write_inference_manifest,
+)
 
 TEXT_OM = "output/om_bucket/text_encoder_t256_p29_f3072.om"
 FLOW_OM = "output/om_bucket/fm_decoder_f1537_mask_noif_mixed_linux_aarch64.om"
@@ -39,13 +45,10 @@ def _require_source(root: Path, relative: str) -> Path:
     if not path.is_file():
         raise FileNotFoundError(f"required ZipVoice source asset is unavailable: {path}")
     expected = EXPECTED_SHA256[relative]
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    if digest.hexdigest() != expected:
+    digest = sha256_file(path)
+    if digest != expected:
         raise ValueError(
-            f"ZipVoice source asset checksum mismatch for {relative}: expected {expected}, actual {digest.hexdigest()}"
+            f"ZipVoice source asset checksum mismatch for {relative}: expected {expected}, actual {digest}"
         )
     return path
 
@@ -225,7 +228,15 @@ def package_bundle(source: Path, destination: Path) -> Path:
         "request_prompt_supported": False,
     }
     (destination / "assets/zipvoice_310p.json").write_text(json.dumps(runtime, indent=2) + "\n", encoding="utf-8")
-    manifest = _build_manifest(destination, str(uuid4()), str(uuid4()))
+    manifest = InferenceManifest.model_validate(_build_manifest(destination, str(uuid4()), str(uuid4())))
+    manifest = manifest.model_copy(
+        update={
+            "deployments": {
+                name: finalize_deployment_artifacts(destination, deployment)
+                for name, deployment in manifest.deployments.items()
+            }
+        }
+    )
     return write_inference_manifest(destination / "inference_manifest.json", manifest)
 
 

@@ -27,10 +27,6 @@ from inference_service.backends.types import (
 from inference_service.model_sessions.base import ModelSession
 from inference_service.unified_runtime import ExecutionContext, LoadRollback, ModelRequest
 
-_CANONICAL_PROVIDERS = {
-    "cpu": "CPUExecutionProvider",
-    "cuda": "CUDAExecutionProvider",
-}
 _GRAPH_OPTIMIZATION_LEVELS = ("disable_all", "basic", "extended", "all")
 
 
@@ -274,11 +270,10 @@ class OnnxRuntimeModelSession(ModelSession):
         return deployment
 
     def _providers(self, ort: Any, profile: ONNXRuntimeProfile) -> list[str]:
-        requested = (profile.provider or profile.device or "cpu").strip()
-        provider = _CANONICAL_PROVIDERS.get(requested.lower(), requested)
+        provider = profile.execution_provider
         if not provider.endswith("ExecutionProvider"):
             raise BackendLoadError(
-                f"ONNX Runtime profile has unknown execution provider {requested!r}",
+                f"ONNX Runtime profile has unknown execution provider {provider!r}",
                 code="invalid_runtime_profile",
             )
         try:

@@ -64,7 +64,7 @@ def _artifact(root: Path, name: str) -> Path:
     return path
 
 
-def test_write_pi05_hmm_deployment_uses_tcim_abis_and_output_cache_links(tmp_path):
+def test_write_pi05_hmm_deployment_uses_tcim_abis_and_output_cache_links(tmp_path, monkeypatch):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     config = _bundle(bundle, "pi05")
@@ -134,6 +134,16 @@ def test_write_pi05_hmm_deployment_uses_tcim_abis_and_output_cache_links(tmp_pat
         ),
     }
 
+    import model_utils.inference_manifest_export as exporter
+
+    scans = []
+    original = exporter.PublishedArtifactIndex.__init__
+
+    def scan(self, root, manifest):
+        scans.append(manifest)
+        original(self, root, manifest)
+
+    monkeypatch.setattr(exporter.PublishedArtifactIndex, "__init__", scan)
     manifest_path = write_hmm_deployment(
         bundle,
         config,
@@ -142,6 +152,7 @@ def test_write_pi05_hmm_deployment_uses_tcim_abis_and_output_cache_links(tmp_pat
         embedding_path=embedding,
         role_artifacts=role_artifacts,
     )
+    assert len(scans) <= 2
     validated = load_inference_manifest(bundle, "hmm")
 
     assert manifest_path == bundle / "inference_manifest.json"

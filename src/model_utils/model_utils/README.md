@@ -30,12 +30,17 @@ Exporter / packager 负责：
 1. 读取 compiler/runtime ABI。
 2. 为每个 runtime tensor 生成 semantic、name/index、dtype、shape 和 image layout binding。
 3. 将运行时 artifact 固化到唯一 generation 目录，禁止原地覆盖。
-4. 为 bundle/deployment 分配稳定 UUID，并在发布变更时自动增加 revision。
+4. 为最终 artifact 绑定 SHA-256，为 bundle/deployment 分配稳定 UUID，并在发布变更时自动增加 revision。
 5. 仅根据 Manifest 结构计算轻量 bundle digest 和 deployment fingerprint。
 6. 使用生产 strict loader 验证路径、metadata、bindings 和 ABI 契约。
 
-不要手工编辑 identity、revision、digest 或 bindings。Runtime 不读取模型文件计算内容 SHA；正式
-artifact 更新必须经过 packager。
+不要手工编辑 identity、revision、digest 或 bindings。普通加载不扫描内容 SHA，显式完整性校验才读取
+artifact；正式 artifact 更新必须经过 packager。通用打包入口复用已发布文件时继承并验证旧摘要，
+包括以自身、符号链接或硬链接作为输入；独立的新输入可以发布新 generation，但不能去重到已知损坏的
+旧 generation 后重新认可旧文件。
+通用 `upsert_deployment()` 在计算摘要及写入前，拒绝候选或保留 artifact 对
+`inference_manifest.json` 目录项的直接引用和符号链接链依赖；否则原子发布会使刚绑定的 SHA
+立即过期。指向旧 manifest inode 的独立硬链接不受原子替换影响，仍可作为普通文件使用。
 
 导出器默认把可重建的 ONNX、compiler output 和 ABI metadata 放在 bundle 外的
 `models/_work/<bundle>/<backend>/`。最终 manifest 只引用打包到
@@ -513,8 +518,11 @@ bundle 不含任何 LeRobot 资产（没有 `config.json` / `policy_preprocessor
 
 Packager 会把运行时 artifact 复制到唯一 generation，并在 manifest 中记录
 bundle-relative path。发布和部署时应手动传输完整 bundle 目录；板端不需要保留 `--om-dir`
-或 `--om-abi-dir` 指向的构建输入。schema v3 不对大文件记录或启动时计算 SHA-256；identity
-由 UUID、revision 和轻量结构摘要组成。
+或 `--om-abi-dir` 指向的构建输入。打包时记录 artifact SHA-256，普通加载不自动扫描大文件；
+可通过完整性 API 显式复验。部署版本与轻量结构身份仍由 Manifest 维护。
+通用 compiler 入口在复制前按源文件身份核验整个旧 manifest 的摘要，跨角色或 deployment
+复用及软／硬链接不能绕过旧证据。一次 deployment 构造共享旧声明解析和文件身份索引，
+同一候选被多个 deployment 引用时复用检查只哈希一次，发布前仍验证最终文件。
 
 ## HMM Packaging
 
