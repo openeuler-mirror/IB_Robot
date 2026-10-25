@@ -1,9 +1,26 @@
 # Sensor calibration profile with manual base teleoperation for the current LeKiwi installation.
+#
+# Migrated onto the LeKiwi runtime (openspec lekiwi-application-migration
+# task 1.5): the runtime profile lekiwi_robot/profiles/lekiwi_lidar.yaml owns
+# the base-only chassis, controllers and the MID-360; the front RealSense
+# below is the deployment addition handed to the runtime through the
+# peripherals fragment, and FAST-LIO runs under the runtime with the policy
+# declared here. Manual base teleoperation during capture is admitted through
+# the contract /cmd_vel channel: the launch-time admission step selects
+# base_navigation and opens the navigation gate (navigation.open_gate_on_startup)
+# after the runtime is ready.
+#
 # This profile intentionally uses the ROS installation's realsense2_camera package.
 robot:
   name: lekiwi_sensor_calib
   type: lekiwi
   robot_type: lekiwi
+
+  runtime:
+    provider: lekiwi_robot
+    profile: lekiwi_lidar
+    # require_model stays unset: the front camera below is deployment
+    # inventory passed to the runtime as the peripherals fragment.
 
   default_control_mode: teleop
   mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
@@ -20,9 +37,7 @@ robot:
     teleop:
       description: "Sensor calibration profile with manual base teleoperation"
       description_cn: "支持手动底盘遥操作的传感器标定配置"
-      controllers:
-        - joint_state_broadcaster
-        - base_velocity_controller
+      runtime_mode: base_navigation
       inference:
         enabled: false
         force_disable: true
@@ -33,40 +48,16 @@ robot:
         control_frequency: 10.0
 
   simulation:
-    platform: gazebo
+    platform: sdk
     scene: null
 
-  ros2_control:
-    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
-    port: /dev/ttyACM0
-    velocity_joints: ["7", "8", "9"]
-    base_vel_max_rad: 4.602
-    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
-    controllers_config: $(find lekiwi_hardware)/config/lekiwi_base_controllers.yaml
-    xacro_mappings:
-      base_only: true
-
   peripherals:
-    - type: lidar
-      name: mid360
-      driver: livox_mid360
-      frame_id: livox_frame
-      lidar_ip: 192.168.1.139
-      host_ip: 192.168.1.5
-      pointcloud_topic: /livox/lidar
-      imu_topic: /livox/imu
-      user_config_path: $(find livox_ros_driver2)/config/MID360_config.json
-      xfer_format: 1
-      multi_topic: 0
-      data_src: 0
-      publish_freq: 10.0
-      output_data_type: 0
-      cmdline_input_bd_code: livox0000000001
-      respawn: true
-
+    # Deployment opt-in on top of the profile's MID-360 and front RealSense:
+    # the profile declares the camera and its driver (disabled by default);
+    # this entry enables it for base-to-camera extrinsic calibration.
     - type: camera
       name: front
-      driver: realsense
+      enabled: true
       driver_camera_name: front
       serial_number: ""
       width: 640
@@ -90,36 +81,17 @@ robot:
 
   navigation:
     enabled: true
+    open_gate_on_startup: true
+    # FAST-LIO policy for the runtime provider; topics, frames and params come
+    # from the runtime profile. FAST-LIO owns the odom -> base_link transform.
+    fast_lio:
+      enabled: true
+      planar_output: false
+      publish_tf: true
     nav2_bringup:
       enabled: false
     slam_toolbox:
       enabled: false
-    cmd_vel_bridge:
-      enabled: true
-      wheel_radius: 0.05
-      base_radius: 0.125
-      max_radps: 4.602
-      publish_tf: false
-      publish_odom: false
-      control_frequency: 50.0
-      cmd_timeout: 0.5
-      cmd_vel_topic: /cmd_vel
-      joint_states_topic: /joint_states
-      odom_topic: /odom
-    fast_lio:
-      enabled: true
-      params_file: $(find robot_config)/config/navigation/fast_lio_mid360.yaml
-      lidar_topic: /livox/lidar
-      imu_topic: /livox/imu
-      raw_odom_topic: /fast_lio/odometry_raw
-      output_topic: /odometry/filtered
-      source_odom_frame: camera_init
-      source_body_frame: body
-      odom_frame: odom
-      base_frame: base_link
-      publish_tf: true
-      planar_output: false
-      respawn: true
 
   recording:
     enabled: false

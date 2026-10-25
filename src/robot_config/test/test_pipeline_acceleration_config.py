@@ -2,37 +2,20 @@
 
 The task-executor node tests moved to task_dispatch with the
 ``task_executor`` entry (openspec change
-``migrate-business-launch-builders``); this file keeps the moveit profile
-and cmd_vel bridge assertions for the retained robot_config builders.
+``migrate-business-launch-builders``); the base-bridge launch assertion
+moved to robot_navigation with the navigation builder (same change), and
+the cmd_vel bridge param tests went away with the bridge itself (openspec
+lekiwi-application-migration task 2.2). This file keeps the moveit profile
+assertions for the provider-less hand-eye configuration.
 """
 
 from pathlib import Path
 
 import pytest
 
-from robot_config.launch_builders.cmd_vel import generate_cmd_vel_nodes
 from robot_config.loader import load_robot_config_dict
 
 CONFIG = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
-
-
-def _launch_parameter_value(node, name: str):
-    for raw_key, raw_value in node._Node__parameters[0].items():
-        key = "".join(getattr(item, "text", str(item)) for item in raw_key)
-        if key != name:
-            continue
-        if not isinstance(raw_value, tuple):
-            return raw_value
-        text = "".join(getattr(item, "text", str(item)) for item in raw_value).strip()
-        if text.endswith("\n..."):
-            text = text[:-4].rstrip()
-        if text in {"True", "False"}:
-            return text == "True"
-        try:
-            return float(text)
-        except ValueError:
-            return text
-    raise KeyError(name)
 
 
 # Drives a robot config whose perception services reference a gitignored model
@@ -55,40 +38,3 @@ def test_310p_profile_uses_feedback_and_tf_completion_barrier() -> None:
     assert config["motion_mode"]["navigation_enabled_on_startup"] is False
     assert config["grasp_execution"]["contact_realign"]["settle_sec"] == 0.0
     assert config["grasp_execution"]["pose_diagnostics"]["settle_sec"] == 0.0
-
-
-# Drives a robot config whose perception services reference a gitignored model
-# bundle; without scripts/download_models.py the config cannot load. A missing
-# download is not a defect, so skip rather than fail. See root conftest.py.
-@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
-def test_310p_profile_keeps_base_bridge_online_but_command_gated() -> None:
-    config = load_robot_config_dict(CONFIG)
-
-    node = generate_cmd_vel_nodes(
-        config["navigation"],
-        motion_mode_config=config["motion_mode"],
-    )[0]
-
-    assert node.node_package == "robot_navigation"
-    assert node.node_executable == "cmd_vel_bridge_node"
-    assert _launch_parameter_value(node, "motion_mode_enabled") is True
-    assert _launch_parameter_value(node, "navigation_enabled_on_startup") is False
-    assert _launch_parameter_value(node, "navigation_enabled_topic") == "motion_mode/navigation_enabled"
-    assert _launch_parameter_value(node, "navigation_mode_ack_topic") == "motion_mode/base_navigation_enabled"
-
-
-# Drives a robot config whose perception services reference a gitignored model
-# bundle; without scripts/download_models.py the config cannot load. A missing
-# download is not a defect, so skip rather than fail. See root conftest.py.
-@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
-def test_sim_profile_keeps_motion_mode_bridge_online() -> None:
-    config = load_robot_config_dict(CONFIG)
-
-    node = generate_cmd_vel_nodes(
-        config["navigation"],
-        motion_mode_config=config["motion_mode"],
-        use_sim=True,
-    )[0]
-
-    assert _launch_parameter_value(node, "use_sim_time") is True
-    assert _launch_parameter_value(node, "navigation_enabled_on_startup") is False

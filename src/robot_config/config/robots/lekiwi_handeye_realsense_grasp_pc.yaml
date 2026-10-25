@@ -1,5 +1,13 @@
 # LeKiwi mobile-manipulator grasp configuration with one gripper-mounted RealSense (PC / NVIDIA GPU).
 #
+# UNSUPPORTED for base drive (openspec lekiwi-application-migration task
+# 1.5, design A5): superseded by the lekiwi_nav_grasp stages on the LeKiwi
+# runtime; a PC/CUDA deployment of those stages is future application
+# configuration, not runtime work. The generic cmd_vel bridge was removed,
+# so this provider-less configuration no longer has a base velocity path;
+# it remains loadable as a test fixture for its grasp, contract and
+# perception configuration.
+#
 # Hardware assumptions:
 # - LeKiwi omnidirectional base (joints 7/8/9) with SO-101 follower arm (joints 1-6)
 #   driven by the unified LeKiwiSystemHardware plugin
@@ -426,19 +434,8 @@ robot:
       enabled: false
     ekf_rtabmap:
       enabled: false
-    cmd_vel_bridge:
-      enabled: true
-      wheel_radius: 0.05
-      base_radius: 0.125
-      max_radps: 4.602
-      odom_frame: odom
-      base_frame: base_link
-      publish_tf: false
-      control_frequency: 50.0
-      cmd_timeout: 0.5
-      cmd_vel_topic: /cmd_vel
-      joint_states_topic: /joint_states
-      odom_topic: /odom
+    # No cmd_vel_bridge: the generic bridge was removed (task 2.2) and this
+    # configuration is unsupported for base drive (see the header).
     robot_navigation:
       enabled: false
     rviz:

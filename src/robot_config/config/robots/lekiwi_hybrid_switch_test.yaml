@@ -135,8 +135,8 @@ robot:
       sensor_calibration:
         artifacts:
           base_to_front_camera: ""
-      motion_mode:
-        navigation_enabled_on_startup: true
+      # The parent hybrid stage's navigation.open_gate_on_startup applies; no
+      # motion_mode override is needed (the block is runtime-owned and gone).
       semantic_mapping:
         enabled: false
         query_only: true

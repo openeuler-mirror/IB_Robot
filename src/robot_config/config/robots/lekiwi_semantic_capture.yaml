@@ -1,4 +1,13 @@
 # LeKiwi MID-360 and D435i capture for offline semantic mapping.
+#
+# UNSUPPORTED for base drive (openspec lekiwi-application-migration task
+# 1.5, design A5): the generic cmd_vel bridge was removed, so this
+# provider-less configuration has no base velocity path. Sensor
+# capture sessions run on the migrated lekiwi_sensor_calib
+# (MID-360 + fixed front camera on the LeKiwi runtime); lidar-only
+# capture runs on the lekiwi_lidar mapping stage. This configuration
+# remains loadable as a fixture for the semantic_mapping package's
+# own launches and tests.
 robot:
   name: lekiwi_semantic_capture
   type: lekiwi
@@ -110,19 +119,8 @@ robot:
 
   navigation:
     enabled: true
-    cmd_vel_bridge:
-      enabled: true
-      publish_odom: false
-      publish_tf: false
-      wheel_radius: 0.05
-      base_radius: 0.125
-      max_radps: 4.602
-      odom_frame: odom
-      base_frame: base_link
-      control_frequency: 50.0
-      cmd_timeout: 0.5
-      joint_states_topic: /joint_states
-      odom_topic: /wheel/odom
+    # No cmd_vel_bridge: the generic bridge was removed (task 2.2) and this
+    # configuration is unsupported for base drive (see the header).
     static_tfs: []
     fast_lio:
       enabled: true

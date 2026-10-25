@@ -668,25 +668,47 @@ moveit:
 `pose_diagnostics.settle_sec` 可设为 `0.0`；相机与夹爪稳定等待不在此屏障覆盖范围内。仿真启动会
 清空硬件心跳话题，只保留关节与 TF 屏障。
 
-LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令授权 SSOT：
+### LeKiwi 配置与底盘门控
 
-```yaml
-motion_mode:
-  enabled: true
-  navigation_enabled_on_startup: false
-  navigation_enabled_topic: motion_mode/navigation_enabled
-  navigation_mode_ack_topic: motion_mode/base_navigation_enabled
-  set_navigation_enabled_service: motion_mode/set_navigation_enabled
-  manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
-  navigation_controllers: [base_velocity_controller]
-  manipulation_control_mode: moveit_planning
-  navigation_control_mode: base_navigation
-  transition_timeout_s: 2.0
-```
+LeKiwi 的底盘与机械臂由 `lekiwi_robot` runtime 负责（`runtime.provider: lekiwi_robot`）。受支持的
+LeKiwi 配置及其状态：
 
-默认抓取模式激活机械臂/夹爪控制器并把底盘控制器保持 inactive。任务切换只调用上述服务；
-MoveIt Gateway 按顺序停止当前运动域、切换 controller manager 中的 active/inactive 控制器集合，并等待
-底盘 bridge 的零速确认。硬件节点不重启，且 1～6 轴与 7～9 轴始终互斥。
+| 配置 | 状态 | 说明 |
+|---|---|---|
+| `lekiwi_lidar` | 受支持（runtime provider，profile `lekiwi_lidar`） | MID-360 建图/导航，纯底盘 |
+| `lekiwi_nav_grasp` | 受支持（runtime provider，profile `lekiwi_nav_grasp`） | 移动抓取 + 导航 + hybrid |
+| `lekiwi_hybrid_switch_test`、`lekiwi_nav_grasp_sound_real` | 受支持（经 `base_config: lekiwi_nav_grasp` 继承） | overlay |
+| `lekiwi_sensor_calib` | 受支持（runtime provider） | `lekiwi_calibration` 工作流启动它 |
+| `lekiwi_handeye_realsense_grasp`、`lekiwi_handeye_realsense_grasp_pc` | 不支持（底盘已关闭，仅保留供测试加载） | 改用 `lekiwi_nav_grasp` 的 `grasp` stage |
+| `lekiwi_realsense_mapping`、`lekiwi_realsense_navigation`、`lekiwi_semantic_capture` | 不支持（底盘已关闭） | 改用 `lekiwi_lidar` / `lekiwi_nav_grasp` 的对应 stage |
+| `lekiwi_rtp_distributed` | 不支持（动作空间未迁移） | 底盘动作直写轮速控制器、绕过 runtime 门控；runtime 底盘动作契约由后续变更定义 |
+| `lekiwi` | 不可启动，刻意保留 | 缺少 `sts_hardware_interface` 插件与驱动；仍是 `sim_controllers`、EKF 导航块和 `imu_sensor_broadcaster` 的唯一测试夹具 |
+
+绑定 runtime provider 的配置不再声明 `motion_mode`、`ros2_control`、`navigation.cmd_vel_bridge` 或
+`navigation_enabled_on_startup`；加载时出现这些字段会报错并指出字段名和替代来源。底盘通过 runtime 的
+公共通道驱动：
+
+- 速度只走 `/cmd_vel`（`geometry_msgs/Twist`），runtime 仅在 `base_navigation` 模式且导航门打开时接收，
+  超过 `base.cmd_vel.staleness_s` 未收到指令即置零，速度包络由 runtime profile 发布。
+- runtime 启动时导航门关闭。stage 用 `navigation.open_gate_on_startup` 声明意图，启动后由
+  `robot_navigation navigation_admission` 切到 stage 的 runtime 模式、调用
+  `/motion_mode/set_navigation_enabled` 并等待 `/motion_mode/base_navigation_enabled` 确认；任何一步失败都会
+  终止启动。
+- `/runtime/stop` 的停止锁存优先于导航门，需 `SetRuntimeMode("idle")` 才能解除。
+- 启用碰撞监测（`dyn_avoid_enabled`）的 stage 中，Nav2 链路为 controller → `/cmd_vel_nav` → velocity
+  smoother → `/cmd_vel_smoothed` → collision monitor → `/cmd_vel`。
+
+**手柄（`lekiwi_gamepad`，`joy_teleop`）**：`lekiwi_lidar` 与 `lekiwi_nav_grasp` 声明了该设备，在接手柄的主机上把
+`teleoperation.active_device` 设为 `lekiwi_gamepad` 即可启用。启动时会对照 runtime 绑定的 `base.cmd_vel`
+校验：话题和消息类型一致、有 deadman、各轴 scale 不超过发布的限速、服务命令只能是 `/runtime/stop`。
+注意两点：
+
+- 手柄与碰撞监测的输出共用 `/cmd_vel`，**启用碰撞监测的 stage 中手柄指令不经过碰撞监测**（迁移前手柄与
+  Nav2 共用碰撞监测输入，顺带被过滤）。模式、导航门、停止锁存、超时置零和速度包络仍约束每条手柄指令。
+- 松开 deadman 只在手柄是唯一指令来源时让底盘停下；Nav2 目标仍在执行时，操作员的停止手段是 B 键
+  （`/runtime/stop`，锁存）或取消导航。
+
+机械臂遥操作（`motion.arm.*`）尚未接入 LeKiwi runtime，由后续变更提供。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与

@@ -1,10 +1,16 @@
 # LeKiwi Mobile Manipulator - Evaluation Configuration
 # Single Source of Truth for LeKiwi RealSense navigation.
 #
+# UNSUPPORTED for base drive (openspec lekiwi-application-migration task
+# 1.5, design A5): legacy evaluation configuration; the maintained
+# navigation paths are the lekiwi_lidar navigation stage and the
+# lekiwi_nav_grasp hybrid stage on the LeKiwi runtime. The generic
+# cmd_vel bridge was removed, so this provider-less configuration has
+# no base velocity path; it remains loadable as a test fixture.
+#
 # This config enables RealSense navigation to load robot configuration from YAML
 # instead of hardcoding LeKiwiClientConfig(remote_ip=..., id=...).
 # Actions are dispatched via ROS topics to ros2_control controllers.
-
 robot:
   name: lekiwi_realsense_navigation
   type: lekiwi
@@ -175,19 +181,8 @@ robot:
       ekf:
         config_file: "$(find robot_config)/config/lekiwi/navigation/ekf_minimal.yaml"
 
-    cmd_vel_bridge:
-      enabled: true
-      wheel_radius: 0.05
-      base_radius: 0.125
-      max_radps: 4.602  # Max wheel angular velocity (rad/s), matches base_vel_max_rad
-      odom_frame: odom
-      base_frame: base_link
-      publish_tf: false
-      control_frequency: 50.0
-      cmd_timeout: 0.5
-      cmd_vel_topic: /cmd_vel
-      joint_states_topic: /joint_states
-      odom_topic: /odom
+    # No cmd_vel_bridge: the generic bridge was removed (task 2.2) and this
+    # configuration is unsupported for base drive (see the header).
 
     robot_navigation:
       enabled: true

@@ -256,32 +256,31 @@ def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
     assert "120.0" in _text(deferred_spawners[0]._Node__arguments)
 
 
-# Drives a robot config whose perception services reference a gitignored model
-# bundle; without scripts/download_models.py the config cannot load. A missing
-# download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
-def test_hybrid_real_hardware_spawner_keeps_arm_state_stream_active():
+def test_hybrid_arm_state_stream_is_a_runtime_profile_broadcaster():
+    """lekiwi_nav_grasp delegates the ros2_control chain to the runtime.
+
+    The hybrid stage's old spawner test asserted that
+    arm_joint_state_broadcaster stays active while base_velocity_controller
+    owns the base. Under the provider (openspec
+    lekiwi-application-migration task 1.2) that guarantee moved to the runtime
+    profile: broadcasters are always-on, mode controllers are scoped, and the
+    application configuration restates none of it.
+    """
     config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_nav_grasp.yaml"
+    profile_path = Path(__file__).resolve().parents[3] / "src/robots/lekiwi/lekiwi_robot/profiles/lekiwi_nav_grasp.yaml"
     robot_config = load_robot_config_dict(config_path)
+    profile = __import__("yaml").safe_load(profile_path.read_text(encoding="utf-8"))
 
-    _nodes, controller_names, deferred_spawners, _robot_description = generate_ros2_control_nodes(
-        robot_config,
-        use_sim=False,
-        auto_start_controllers="true",
-        controller_startup_timeout=120.0,
-    )
-
-    assert controller_names == [
-        "joint_state_broadcaster",
-        "arm_joint_state_broadcaster",
-        "base_velocity_controller",
+    assert "ros2_control" not in robot_config
+    assert profile["ros2_control"]["broadcasters"] == ["joint_state_broadcaster", "arm_joint_state_broadcaster"]
+    assert profile["modes"]["base_navigation"]["controllers"] == ["base_velocity_controller"]
+    assert profile["modes"]["trajectory"]["controllers"] == [
+        "arm_trajectory_controller",
+        "gripper_trajectory_controller",
     ]
-    assert len(deferred_spawners) == 1
-    arguments = [_text(argument) for argument in deferred_spawners[0]._Node__arguments]
-    inactive_controllers = [
-        arguments[index + 1] for index, argument in enumerate(arguments) if argument == "--inactive-controller"
-    ]
-    assert inactive_controllers == ["arm_trajectory_controller", "gripper_trajectory_controller"]
+    for mode in robot_config["control_modes"].values():
+        assert "controllers" not in mode
 
 
 def test_controller_startup_processes_are_serialized():

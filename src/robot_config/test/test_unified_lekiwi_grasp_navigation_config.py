@@ -49,13 +49,12 @@ def test_unified_profile_preserves_arm_base_hardware_and_motion_ownership():
     config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))["robot"]
 
     assert config["joints"]["all"] == ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
-    assert config["ros2_control"]["controllers_config"].endswith("lekiwi_controllers.yaml")
-    assert "base_only" not in config["ros2_control"].get("xacro_mappings", {})
-    assert config["motion_mode"]["manipulation_controllers"] == [
-        "arm_trajectory_controller",
-        "gripper_trajectory_controller",
-    ]
-    assert config["motion_mode"]["navigation_controllers"] == ["base_velocity_controller"]
+    # The ros2_control chain and the controller-switch handshake are
+    # runtime-owned (openspec lekiwi-application-migration tasks 1.2/3.1):
+    # no application restatement is allowed to survive the migration.
+    assert "ros2_control" not in config
+    assert "motion_mode" not in config
+    assert "cmd_vel_bridge" not in config["navigation"]
 
     peripherals = {item["name"]: item for item in config["peripherals"]}
     # runtime-owned-audio-io: the speaker peripheral replaces the former
@@ -129,15 +128,14 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert hybrid["grasp_execution"]["ik"]["worker_count"] == 1
     assert hybrid["grasp_execution"]["ik"]["verification_position_tolerance_m"] == 0.001
     assert hybrid["grasp_execution"]["ik"]["verification_orientation_tolerance_deg"] == 1.0
-    assert hybrid["control_modes"]["base_navigation"]["controllers"] == [
-        "joint_state_broadcaster",
-        "arm_joint_state_broadcaster",
-        "base_velocity_controller",
-    ]
-    assert set(hybrid["control_modes"]["moveit_planning"]["inactive_controllers"]) == {"base_velocity_controller"}
-    assert hybrid["motion_mode"]["manipulation_control_mode"] == "moveit_planning"
-    assert hybrid["motion_mode"]["navigation_control_mode"] == "base_navigation"
-    assert hybrid["motion_mode"]["navigation_enabled_on_startup"] is True
+    assert hybrid["control_modes"]["base_navigation"]["runtime_mode"] == "base_navigation"
+    assert "controllers" not in hybrid["control_modes"]["base_navigation"]
+    assert hybrid["control_modes"]["moveit_planning"]["runtime_mode"] == "trajectory"
+    assert "inactive_controllers" not in hybrid["control_modes"]["moveit_planning"]
+    # The pre-migration motion_mode handshake is gone; the hybrid stage
+    # declares the boot-time admission intent instead (design A3/A5).
+    assert "motion_mode" not in hybrid
+    assert hybrid["navigation"]["open_gate_on_startup"] is True
 
     assert grasp["nav_stage"] == "grasp"
     assert grasp["navigation"]["enabled"] is False
@@ -148,8 +146,8 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert mapping["navigation"]["fast_lio"]["enabled"] is True
     assert mapping["navigation"]["slam_toolbox"]["enabled"] is True
     assert mapping["navigation"]["nav2_bringup"]["enabled"] is False
-    assert mapping["navigation"]["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel"
-    assert mapping["motion_mode"]["navigation_enabled_on_startup"] is True
+    assert "cmd_vel_bridge" not in mapping["navigation"]
+    assert mapping["navigation"]["open_gate_on_startup"] is True
     assert mapping["embodied"]["skill_catalog_profile"] == ""
     assert mapping["perception_services"]["services"] == []
     assert mapping["grasp_execution"]["enabled"] is False
@@ -158,10 +156,8 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert mapping["contract"]["actions"] == []
     assert [item["name"] for item in mapping["peripherals"]] == ["respeaker", "front", "mid360"]
     assert "peripheral_names" not in mapping
-    assert mapping["control_modes"]["base_navigation"]["controllers"] == [
-        "joint_state_broadcaster",
-        "base_velocity_controller",
-    ]
+    assert mapping["control_modes"]["base_navigation"]["runtime_mode"] == "base_navigation"
+    assert "controllers" not in mapping["control_modes"]["base_navigation"]
 
     assert navigation["nav_stage"] == "navigation"
     assert navigation["default_control_mode"] == "base_navigation"
@@ -177,9 +173,11 @@ def test_unified_profile_resolves_grasp_mapping_and_navigation_stages():
     assert navigation["navigation"]["fast_lio"]["enabled"] is True
     assert navigation["navigation"]["slam_toolbox"]["enabled"] is False
     assert navigation["navigation"]["nav2_bringup"]["use_amcl"] is True
-    assert navigation["navigation"]["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel_safe"
+    assert "cmd_vel_bridge" not in navigation["navigation"]
     assert navigation["navigation"]["command_server"]["enabled"] is True
-    assert navigation["motion_mode"]["navigation_enabled_on_startup"] is True
+    assert navigation["navigation"]["command_server"]["stop_velocity_topic"] == "/cmd_vel"
+    assert navigation["navigation"]["open_gate_on_startup"] is True
+    assert "motion_mode" not in navigation
 
 
 # Drives a robot config whose perception services reference a gitignored model
@@ -295,16 +293,25 @@ def test_unified_profile_launches_wrist_and_front_realsense_drivers():
 # bundle; without scripts/download_models.py the config cannot load. A missing
 # download is not a defect, so skip rather than fail. See root conftest.py.
 @pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720")
-def test_hybrid_startup_mode_and_navigation_gate_must_match():
+def test_hybrid_startup_gate_is_rejected_as_runtime_owned():
+    """The hybrid startup-match rule went with navigation_enabled_on_startup.
+
+    Under a provider the loader rejects the field outright (design A5): the
+    stage declares navigation.open_gate_on_startup and a launch-time admission
+    step opens the gate through the contract service after the runtime is
+    ready.
+    """
     hybrid = load_robot_config_dict(CONFIG_PATH)
+    assert "motion_mode" not in hybrid
 
-    navigation_startup = deepcopy(hybrid)
-    navigation_startup["default_control_mode"] = "base_navigation"
-    navigation_startup["motion_mode"]["navigation_enabled_on_startup"] = True
-    assert validate_motion_mode_config(navigation_startup) == []
-
-    navigation_startup["motion_mode"]["navigation_enabled_on_startup"] = False
-    assert any("must match default_control_mode" in error for error in validate_motion_mode_config(navigation_startup))
+    restated = deepcopy(hybrid)
+    restated["motion_mode"] = {"navigation_enabled_on_startup": True}
+    errors = validate_motion_mode_config(restated)
+    assert any(
+        "motion_mode.navigation_enabled_on_startup is runtime-owned" in error
+        and "navigation.open_gate_on_startup" in error
+        for error in errors
+    )
 
 
 # Drives a robot config whose perception services reference a gitignored model

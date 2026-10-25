@@ -102,7 +102,10 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert config["navigation"]["enabled"] is True
     assert config["navigation"]["nav2_bringup"]["enabled"] is False
     assert config["navigation"]["ekf_rtabmap"]["enabled"] is False
-    assert config["navigation"]["cmd_vel_bridge"]["enabled"] is True
+    # The generic cmd_vel bridge was removed (openspec
+    # lekiwi-application-migration task 2.2); this configuration is recorded
+    # unsupported for base drive.
+    assert "cmd_vel_bridge" not in config["navigation"]
     assert config["navigation"]["robot_navigation"]["enabled"] is False
     assert grasp_execution["camera"]["rgb_topic"] == "/camera/wrist/image_raw"
     assert grasp_execution["state_wait"] == {

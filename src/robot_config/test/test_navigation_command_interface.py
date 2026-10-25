@@ -48,7 +48,9 @@ def test_lidar_navigation_stage_enables_command_adapter_on_dynamic_chain():
         "cancel_service_name": "/navigation/cancel_current",
         "nav2_action_name": "/navigate_to_pose",
         "nav2_result_timeout": 300.0,
-        "stop_velocity_topic": "/cmd_vel_safe",
+        # Stops share the admitted /cmd_vel channel with the collision-monitor
+        # output (openspec lekiwi-application-migration task 3.2).
+        "stop_velocity_topic": "/cmd_vel",
         "cancel_response_timeout": 2.0,
     }
     assert "command_server" not in config["nav_stages"]["mapping"]["navigation"]

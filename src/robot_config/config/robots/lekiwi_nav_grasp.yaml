@@ -8,25 +8,35 @@
 #   SO-101 gripper and one fixed to the LeKiwi base for semantic mapping
 # - a ReSpeaker microphone array connected to the 310P board for speech direction
 # - during grasp execution the base is held still; only arm + gripper move
-# - navigation owns only base joints 7/8/9; motion_mode enforces mutual exclusion
+# - navigation owns only base joints 7/8/9; the runtime mode machine enforces
+#   mutual exclusion (no application-side controller switching)
 #
 # Cameras are named by role: "wrist" is parented to the gripper and "front" is
 # parented to base_link. The USB connection location does not define the mount.
+#
+# The LeKiwi runtime (runtime.provider below) owns the chassis, controller
+# activation, motion services and the navigation gate. Base commands are
+# admitted on the contract /cmd_vel channel once the base_navigation mode is
+# active and the gate is open; stages that drive the base from boot declare
+# navigation.open_gate_on_startup, applied through the contract gate service
+# after the runtime is ready.
 
 robot:
   name: lekiwi_handeye_realsense_grasp_lidar
   type: lekiwi
   robot_type: lekiwi
 
-  # Runtime provider selection (lekiwi-runtime-migration task 5.2, first stage).
-  # Motion services come from the robot runtime: generic launch ships no
-  # planner, so a moveit control mode without a provider fails fast.
+  # Runtime provider selection (lekiwi-runtime-migration task 5.2; application
+  # half completed by lekiwi-application-migration). Motion services, the
+  # chassis and controller activation come from the robot runtime: generic
+  # launch ships no planner, so a moveit control mode without a provider fails
+  # fast.
   #
-  # require_model is deliberately NOT set yet. Setting it additionally demands
-  # that ros2_control, peripherals and control_modes.*.controllers move into the
-  # runtime profile; that ownership transfer is the remaining part of task 5.2
-  # and is not done here. Binding the provider first restores motion planning
-  # without pretending the hardware fields have already moved.
+  # require_model stays deliberately unset: the peripherals below are the
+  # deployment inventory handed to the runtime as the peripherals fragment
+  # (D12 data passthrough), and nav_stages select sensor subsets from it via
+  # peripheral_names. require_model's all-or-nothing peripherals rule does not
+  # fit stage subsets; hardware facts themselves live in the runtime profile.
   runtime:
     provider: lekiwi_robot
     profile: lekiwi_nav_grasp
@@ -57,40 +67,9 @@ robot:
       - "9"
     all: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
-  moveit:
-    arm_group_name: arm
-    base_link: base
-    ee_link: gripper
-    shoulder_link: shoulder
-    # MoveIt consumes only arm/gripper joints; the full /joint_states remains
-    # available to navigation and dataset consumers.
-    joint_state_topic: /arm_joint_state_broadcaster/joint_states
-    # Return as soon as a post-terminal hardware read, converged joint sample,
-    # and the corresponding robot_state_publisher TF are all observable.
-    motion_status_hold_s: 0.0
-    motion_feedback_timeout_s: 0.3
-    motion_feedback_tolerance_rad: 0.12
-    motion_require_tf_sync: true
-    # LeKiWi read failures now return ERROR, so a fresh JointState can only
-    # follow a complete hardware read; no separate heartbeat topic is needed.
-    motion_hardware_feedback_topic: ""
-
-  # Controllers and hardware stay loaded across tasks. This control-plane gate
-  # changes which subsystem may accept new commands and switches active controller
-  # ownership atomically; arm/gripper and base command domains remain disjoint.
-  motion_mode:
-    enabled: true
-    navigation_enabled_on_startup: false
-    navigation_enabled_topic: motion_mode/navigation_enabled
-    navigation_mode_ack_topic: motion_mode/base_navigation_enabled
-    set_navigation_enabled_service: motion_mode/set_navigation_enabled
-    controller_switch_service: controller_manager/switch_controller
-    manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
-    navigation_controllers: [base_velocity_controller]
-    transition_timeout_s: 5.0
-    bridge_heartbeat_timeout_s: 5.0
-    manipulation_control_mode: moveit_planning
-    navigation_control_mode: base_navigation
+  # MoveIt model facts (frames, arm group, motion feedback policy) come from
+  # the runtime profile's motion section and the public model description;
+  # application code must not restate them.
 
   skill_required_control_mode: "moveit_planning"
   semantic_mapping:
@@ -677,10 +656,7 @@ robot:
     teleop:
       description: "Human teleoperation mode for calibration pose setup"
       description_cn: "用于标定姿态设置的人工遥操作模式"
-      controllers:
-        - joint_state_broadcaster
-        - arm_position_controller
-        - gripper_position_controller
+      runtime_mode: stream
       inference:
         enabled: false
       executor:
@@ -692,13 +668,7 @@ robot:
     moveit_planning:
       description: "MoveIt trajectory planning mode for hand-eye precheck"
       description_cn: "用于手眼前置检查的 MoveIt 轨迹规划模式"
-      controllers:
-        - joint_state_broadcaster
-        - arm_joint_state_broadcaster
-        - arm_trajectory_controller
-        - gripper_trajectory_controller
-      inactive_controllers:
-        - base_velocity_controller
+      runtime_mode: trajectory
       inference:
         enabled: false
       executor:
@@ -713,12 +683,7 @@ robot:
     base_navigation:
       description: "Autonomous navigation with MID-360 localization"
       description_cn: "使用 MID-360 定位的自主导航模式"
-      controllers:
-        - joint_state_broadcaster
-        - base_velocity_controller
-      inactive_controllers:
-        - arm_trajectory_controller
-        - gripper_trajectory_controller
+      runtime_mode: base_navigation
       inference:
         enabled: false
       executor:
@@ -727,9 +692,11 @@ robot:
         queue_size: 100
         control_frequency: 50.0
 
-  # Navigation is stage-resolved below. The base block is deliberately disabled;
-  # a grasp-only launch can still request a low-level bridge explicitly without
-  # starting Nav2, SLAM, or the command server.
+  # Navigation is stage-resolved below. The base block is deliberately
+  # disabled; a stage opts in explicitly. FAST-LIO wiring is application-side
+  # data for the generic builder; under the runtime provider the stage policy
+  # (enabled/planar_output) is handed to the runtime as the deployment
+  # fragment and merges over the profile's identical chain.
   navigation:
     enabled: false
     static_tfs: []
@@ -766,20 +733,6 @@ robot:
       map_update_interval: 1.0
       min_laser_range: 0.10
       max_laser_range: 8.0
-    cmd_vel_bridge:
-      enabled: false
-      publish_odom: false
-      publish_tf: false
-      wheel_radius: 0.05
-      base_radius: 0.125
-      max_radps: 4.602
-      odom_frame: odom
-      base_frame: base_link
-      control_frequency: 50.0
-      cmd_timeout: 0.5
-      cmd_vel_topic: /cmd_vel
-      joint_states_topic: /joint_states
-      odom_topic: /wheel/odom
     ekf_rtabmap:
       enabled: false
     robot_navigation:
@@ -827,22 +780,14 @@ robot:
             node_name: grasp_segment_detections
             runtime_options:
               device_id: 0
-      motion_mode:
-        navigation_enabled_on_startup: false
-        manipulation_control_mode: moveit_planning
-        navigation_control_mode: base_navigation
       embodied:
         enabled: false
         skill_catalog_profile: lekiwi_handeye_realsense_grasp
       navigation:
         enabled: false
-        cmd_vel_bridge:
-          enabled: false
     mapping:
       default_control_mode: base_navigation
       peripheral_names: [respeaker, speaker, front, mid360]
-      motion_mode:
-        navigation_enabled_on_startup: true
       # Legacy navigation-mapping stage stays lean: online semantic mapping and
       # all model services are off; use the default hybrid stage for mapping.
       semantic_mapping:
@@ -862,6 +807,7 @@ robot:
         skill_catalog_profile: ""
       navigation:
         enabled: true
+        open_gate_on_startup: true
         fast_lio:
           enabled: true
           planar_output: false
@@ -872,17 +818,10 @@ robot:
           enabled: false
           use_amcl: false
           dyn_avoid_enabled: false
-        cmd_vel_bridge:
-          enabled: true
-          publish_odom: false
-          publish_tf: false
-          cmd_vel_topic: /cmd_vel
     navigation:
       default_control_mode: base_navigation
       skill_required_control_mode: base_navigation
       peripheral_names: [respeaker, speaker, front, mid360]
-      motion_mode:
-        navigation_enabled_on_startup: true
       # Legacy localization-navigation stage stays lean: online semantic
       # mapping and all model services are off.
       semantic_mapping:
@@ -910,6 +849,7 @@ robot:
           gripper_settle_sec: 1.5
       navigation:
         enabled: true
+        open_gate_on_startup: true
         fast_lio:
           enabled: true
           planar_output: true
@@ -927,26 +867,15 @@ robot:
           cancel_service_name: /navigation/cancel_current
           nav2_action_name: /navigate_to_pose
           nav2_result_timeout: 300.0
-          stop_velocity_topic: /cmd_vel_safe
+          # Stops reach the base through the same admitted /cmd_vel channel as
+          # the planner (collision-monitor output under dyn_avoid).
+          stop_velocity_topic: /cmd_vel
           cancel_response_timeout: 2.0
-        cmd_vel_bridge:
-          enabled: true
-          publish_odom: false
-          publish_tf: false
-          cmd_vel_topic: /cmd_vel_safe
     hybrid:
       default_control_mode: base_navigation
       skill_required_control_mode: moveit_planning
       mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
       peripheral_names: [respeaker, speaker, wrist, front, mid360]
-      motion_mode:
-        navigation_enabled_on_startup: true
-      control_modes:
-        base_navigation:
-          controllers:
-            - joint_state_broadcaster
-            - arm_joint_state_broadcaster
-            - base_velocity_controller
       # Online semantic mapping and all eight model services (two grasp, four
       # semantic, two HRI) are inherited from the top level. The default
       # hybrid runtime is query-only until dynamic semantic mapping is
@@ -977,6 +906,7 @@ robot:
           gripper_settle_sec: 1.5
       navigation:
         enabled: true
+        open_gate_on_startup: true
         fast_lio:
           enabled: true
           planar_output: true
@@ -994,13 +924,10 @@ robot:
           cancel_service_name: /navigation/cancel_current
           nav2_action_name: /navigate_to_pose
           nav2_result_timeout: 300.0
-          stop_velocity_topic: /cmd_vel_safe
+          # Stops reach the base through the same admitted /cmd_vel channel as
+          # the planner (collision-monitor output under dyn_avoid).
+          stop_velocity_topic: /cmd_vel
           cancel_response_timeout: 2.0
-        cmd_vel_bridge:
-          enabled: true
-          publish_odom: false
-          publish_tf: false
-          cmd_vel_topic: /cmd_vel_safe
 
   placement_execution:
     enabled: true
@@ -1189,31 +1116,10 @@ robot:
         position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
         orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
 
-  ros2_control:
-    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
-    port: /dev/ttyACM0
-    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
-    # Arm + gripper joints driven as position (matches the SO101 stack).
-    joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Omni base wheel joints driven as velocity (LeKiwi-only).
-    velocity_joints: ["7", "8", "9"]
-    # Max base velocity in rad/s; matches base_vel_max_raw=3000 of STS3215.
-    base_vel_max_rad: 4.602
-    # Semantic rest pose for upper layers; hardware activation holds the measured position.
-    reset_positions:
-      "1": 0.0
-      "2": -1.5854
-      "3": 1.5708
-      "4": 0.7854
-      "5": 0.0
-    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
-    controllers_config: $(find lekiwi_hardware)/config/lekiwi_controllers.yaml
-    controllers:
-      - joint_state_broadcaster
-      - arm_joint_state_broadcaster
-      - arm_trajectory_controller
-      - gripper_trajectory_controller
-      - base_velocity_controller
+  # The ros2_control chain (hardware plugin, serial port, calibration file,
+  # controller sets, reset poses, URDF) is owned by the runtime profile
+  # lekiwi_robot/profiles/lekiwi_nav_grasp.yaml; application configuration
+  # must not restate it.
 
   # Audio devices are runtime-owned: the respeaker microphone and the speaker
   # below are launched by the lekiwi_robot runtime as ALSA device owners on
@@ -1441,8 +1347,20 @@ robot:
 
   teleoperation:
     enabled: true
+    # Base gamepad on the runtime's /cmd_vel channel (joy_teleop). Set
+    # active_device to lekiwi_gamepad on the host the gamepad is attached to;
+    # the launch then checks the mapping against the runtime's bound base.cmd_vel
+    # limits. In stages that run the Nav2 collision monitor this input is not
+    # collision-filtered; the B button calls /runtime/stop.
     active_device: ""
-    devices: []
+    devices:
+      - name: "lekiwi_gamepad"
+        type: "joy_teleop"
+        input_device: "/dev/input/js0"
+        deadzone: 0.1
+        autorepeat_rate: 20.0
+        sticky_buttons: false
+        config_path: "$(find robot_config)/config/lekiwi/lekiwi_gamepad_base.yaml"
     safety:
       joint_limits:
         "1": {"min": -2.0693, "max": 2.0709}

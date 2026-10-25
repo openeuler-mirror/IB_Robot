@@ -1,3 +1,14 @@
+"""Navigation velocity-channel shape tests (robot_config's share).
+
+Upstream ``migrate-business-launch-builders`` split the former suite: the
+validator rejection cases follow the navigation module to its owning package
+(``robot_navigation/test/test_navigation_velocity_contract.py``), while the
+YAML-shape cases stay here with the robot configs. The bridge-topic cases
+were reworked by openspec lekiwi-application-migration tasks 2.2/3.2: the
+bridge and its topic indirection are gone, so every producer publishes onto
+the runtime's admitted /cmd_vel channel.
+"""
+
 from pathlib import Path
 
 import yaml
@@ -10,34 +21,16 @@ def _lidar_config() -> dict:
     return yaml.safe_load(path.read_text(encoding="utf-8"))["robot"]
 
 
-def test_lidar_stages_declare_their_bridge_input_topics():
+def test_lidar_stages_admit_base_velocity_on_the_contract_channel():
     config = _lidar_config()
 
     mapping = config["nav_stages"]["mapping"]["navigation"]
     navigation = config["nav_stages"]["navigation"]["navigation"]
 
-    assert mapping["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel"
-    assert navigation["cmd_vel_bridge"]["cmd_vel_topic"] == "/cmd_vel_safe"
-    assert navigation["command_server"]["stop_velocity_topic"] == "/cmd_vel_safe"
-
-
-def test_cmd_vel_builder_preserves_a_custom_non_dynamic_topic(monkeypatch):
-    from robot_config.launch_builders import cmd_vel
-
-    captured = {}
-
-    class _Node:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(cmd_vel, "Node", _Node)
-
-    nodes = cmd_vel.generate_cmd_vel_nodes(
-        {
-            "cmd_vel_bridge": {"enabled": True, "cmd_vel_topic": "/custom/cmd_vel"},
-            "nav2_bringup": {"dyn_avoid_enabled": False},
-        }
-    )
-
-    assert len(nodes) == 1
-    assert captured["parameters"][0]["cmd_vel_topic"] == "/custom/cmd_vel"
+    # The bridge and its topic indirection are gone: every producer (planner,
+    # collision monitor, command-server stops, teleop) publishes onto the
+    # runtime's admitted /cmd_vel channel (openspec
+    # lekiwi-application-migration tasks 2.2/3.2).
+    assert "cmd_vel_bridge" not in mapping
+    assert "cmd_vel_bridge" not in navigation
+    assert navigation["command_server"]["stop_velocity_topic"] == "/cmd_vel"

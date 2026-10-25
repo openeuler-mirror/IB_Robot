@@ -24,8 +24,11 @@ def test_lidar_profiles_keep_configured_tf_authorities_and_isolation():
     assert navigation["nav2_bringup"]["use_amcl"] is True
     assert mapping["fast_lio"].get("publish_tf", True) is True
     assert navigation["fast_lio"].get("publish_tf", True) is True
-    assert mapping["cmd_vel_bridge"]["publish_tf"] is False
-    assert navigation["cmd_vel_bridge"]["publish_tf"] is False
+    # The generic cmd_vel bridge is gone: FAST-LIO is the sole odom->base_link
+    # authority and the runtime base node owns the gated /cmd_vel channel
+    # (openspec lekiwi-application-migration task 2.2).
+    assert "cmd_vel_bridge" not in mapping
+    assert "cmd_vel_bridge" not in navigation
 
 
 def test_fast_lio_native_tf_topics_are_isolated_from_navigation_tf():
@@ -56,9 +59,13 @@ def test_navigation_stage_exposes_navigation_skills_but_mapping_stage_does_not(m
     assert robot_context_schema_version(mapping) == 1
     assert navigation["skill_required_control_mode"] == "base_navigation"
     assert navigation["default_control_mode"] == "base_navigation"
+    # Both base-driving modes select the runtime's base_navigation mode; they
+    # no longer restate controller activation sets.
     assert (
-        navigation["control_modes"]["base_navigation"]["controllers"]
-        == mapping["control_modes"]["teleop"]["controllers"]
+        navigation["control_modes"]["base_navigation"]["runtime_mode"]
+        == mapping["control_modes"]["teleop"]["runtime_mode"]
+        == "base_navigation"
     )
+    assert "controllers" not in navigation["control_modes"]["base_navigation"]
     assert robot_context_schema_version(navigation) == 2
     assert "base_navigation" in navigation["control_modes"]

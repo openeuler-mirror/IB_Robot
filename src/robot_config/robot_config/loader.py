@@ -378,6 +378,37 @@ def _provider_peripheral_entry_errors(peripherals: Any) -> list[str]:
     return errors
 
 
+def _validate_provider_owned_application_fields(robot_config: dict[str, Any], provider: str) -> list[str]:
+    """Reject pre-migration handshake and chassis data under a runtime provider.
+
+    The application half of the LeKiwi migration (openspec
+    lekiwi-application-migration, design A2/A3/A5): the ``motion_mode``
+    controller-switch handshake and the generic ``cmd_vel_bridge`` chassis
+    block are runtime-owned. A configuration bound to a provider must not
+    restate them; every key is named so the migration cannot silently keep a
+    stale copy (which is how ``lekiwi_nav_grasp`` kept its old handshake after
+    binding a provider).
+    """
+    errors: list[str] = []
+    motion_mode = robot_config.get("motion_mode")
+    if isinstance(motion_mode, dict) and motion_mode:
+        replacements = {
+            "manipulation_control_mode": "the stage skill_required_control_mode",
+            "navigation_control_mode": "the stage default_control_mode",
+            "navigation_enabled_on_startup": "navigation.open_gate_on_startup with the launch-time admission step",
+        }
+        for key in sorted(motion_mode):
+            hint = replacements.get(key, "the runtime profile modes and the contract gate names")
+            errors.append(f"motion_mode.{key} is runtime-owned under runtime.provider={provider!r}; use {hint}")
+    navigation = robot_config.get("navigation")
+    if isinstance(navigation, dict) and navigation.get("cmd_vel_bridge"):
+        errors.append(
+            f"navigation.cmd_vel_bridge is runtime-owned under runtime.provider={provider!r}; "
+            "the runtime base node owns cmd_vel projection, wheel odometry and navigation gating"
+        )
+    return errors
+
+
 def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
     """Validate the optional ``runtime.provider`` selection (robot-runtime-packaging).
 
@@ -419,6 +450,7 @@ def validate_runtime_provider_config(robot_config: dict[str, Any]) -> list[str]:
             for name, mode in (robot_config.get("control_modes") or {}).items():
                 if (mode or {}).get("controllers"):
                     errors.append(f"control_modes.{name}.controllers belongs in the runtime profile")
+        errors.extend(_validate_provider_owned_application_fields(robot_config, provider))
     else:
         from robot_config.utils import providerless_sim_platform_error
 
@@ -810,12 +842,6 @@ def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
             errors.append(f"motion_mode.{key} must be a control_modes member")
     if len(set(mode_names.values())) != len(mode_names):
         errors.append("motion_mode manipulation and navigation control modes must be distinct")
-    if robot_config.get("nav_stage") == "hybrid":
-        default_mode = str(robot_config.get("default_control_mode", "")).strip()
-        navigation_mode = mode_names.get("navigation_control_mode", "")
-        expected_navigation_enabled = default_mode == navigation_mode
-        if config.get("navigation_enabled_on_startup") is not expected_navigation_enabled:
-            errors.append("hybrid motion_mode.navigation_enabled_on_startup must match default_control_mode")
 
     for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
         _positive_number(config, key, "motion_mode", errors)
