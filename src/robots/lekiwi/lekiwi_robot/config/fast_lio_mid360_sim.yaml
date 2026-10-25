@@ -1,0 +1,64 @@
+/**:
+  ros__parameters:
+    # FAST-LIO simulation parameters for the simulated MID-360 (D6).
+    #
+    # Gazebo's gpu_lidar renders a whole frame at one simulation instant, so
+    # the cloud is an instantaneous frame: correct per-point time offsets are
+    # zero and the generic handler (lidar_type 5, any value outside 1-4)
+    # reads float32 x/y/z/intensity — not the VELO16 handler, which infers
+    # offsets from azimuth and needs a bounded uint16 ring. The lidar-IMU
+    # extrinsic is zero: the simulated IMU is co-located with the lidar (D5).
+    # The IMU streams SI units (m/s^2); FAST-LIO normalises by the initial
+    # mean acceleration magnitude, so no conversion is composed.
+    #
+    # Simulation-specific values, tuned on the D14 lidar-odometry gate route
+    # (openspec lekiwi-gazebo-runtime-platform D14, task 8.4):
+    #   - filter_size_surf/map 0.5 -> 0.15: the hardware values voxel the map
+    #     at half a metre — a 4 m room holds eight voxels across and the
+    #     scan-to-map match slides up to ~7 % along a straight drive (ATE
+    #     ~0.09 m, yaw error 2-5 deg per 90 deg turn). At 0.15 m the same
+    #     route measures ATE 0.006 m / yaw 0.06 deg.
+    #   - extrinsic_est_en false: the simulated lidar-IMU extrinsic is
+    #     exactly the identity given below, so estimating it online only
+    #     adds a drift degree of freedom.
+    #   - gyr_cov 0.1 -> 0.01: the simulated gyroscope is near-noiseless;
+    #     the hardware value makes the filter distrust it during turns.
+    feature_extract_enable: false
+    point_filter_num: 3
+    max_iteration: 3
+    filter_size_surf: 0.15
+    filter_size_map: 0.15
+    cube_side_length: 200.0
+    runtime_pos_log_enable: false
+    map_file_path: ""
+    common:
+      lid_topic: /livox/lidar
+      imu_topic: /livox/imu
+      time_sync_en: false
+      time_offset_lidar_to_imu: 0.0
+    preprocess:
+      lidar_type: 5
+      scan_line: 4
+      blind: 0.5
+      timestamp_unit: 3
+      scan_rate: 10
+    mapping:
+      acc_cov: 0.1
+      gyr_cov: 0.01
+      b_acc_cov: 0.0001
+      b_gyr_cov: 0.0001
+      fov_degree: 360.0
+      det_range: 20.0
+      extrinsic_est_en: false
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    publish:
+      path_en: false
+      effect_map_en: false
+      map_en: false
+      scan_publish_en: true
+      dense_publish_en: false
+      scan_bodyframe_pub_en: true
+    pcd_save:
+      pcd_save_en: false
+      interval: -1

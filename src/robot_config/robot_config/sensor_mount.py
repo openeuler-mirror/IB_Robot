@@ -73,10 +73,47 @@ def apply_mid360_mount(robot_config: dict[str, Any], mount: dict[str, Any]) -> d
     lidar_frame = mount["lidar_frame"]
     body_frame = mount["body_frame"]
     runtime = result.get("runtime") or {}
-    provider_owns_peripherals = bool(
-        isinstance(runtime, dict) and runtime.get("provider") and runtime.get("require_model")
-    )
-    if not provider_owns_peripherals:
+    provider = bool(isinstance(runtime, dict) and runtime.get("provider"))
+    if provider:
+        # One MID-360 mount (lekiwi-gazebo-runtime-platform D13): on the
+        # provider path the mount also drives the runtime's (lidar, mid360)
+        # peripheral entry — the public body -> livox_frame identity
+        # transform and the simulator attachment pose relative to base_link —
+        # so the fragment the runtime merges carries both pose keys. The
+        # entry is created when the application declares none (the migrated
+        # lekiwi_lidar) and updated in place when it does (lekiwi_nav_grasp),
+        # preserving the application's device settings.
+        peripherals = result.setdefault("peripherals", [])
+        entry = next(
+            (
+                item
+                for item in peripherals
+                if isinstance(item, dict) and item.get("type") == "lidar" and item.get("name") == "mid360"
+            ),
+            None,
+        )
+        if entry is None:
+            entry = {"type": "lidar", "name": "mid360"}
+            peripherals.append(entry)
+        entry["transform"] = {
+            "parent_frame": body_frame,
+            "x": 0.0,
+            "y": 0.0,
+            "z": 0.0,
+            "roll": 0.0,
+            "pitch": 0.0,
+            "yaw": 0.0,
+        }
+        entry.setdefault("simulation", {}).setdefault("gazebo", {})["transform"] = {
+            "parent_frame": mount["parent_frame"],
+            "x": translation[0],
+            "y": translation[1],
+            "z": translation[2],
+            "roll": rpy[0],
+            "pitch": rpy[1],
+            "yaw": rpy[2],
+        }
+    else:
         # runtime-peripheral-overrides D1 (revision 2): on the require_model
         # provider path the lidar mounting is runtime-owned; peripheral
         # entries are overrides, not device definitions to re-mount. The

@@ -22,7 +22,10 @@ def test_calibration_config_selects_the_lekiwi_runtime_with_a_front_camera_addit
     assert "ros2_control" not in config
 
     peripherals = {item["name"]: item for item in config["peripherals"]}
-    assert set(peripherals) == {"front"}
+    # The MID-360 mount forwards both pose keys into the runtime fragment
+    # (lekiwi-gazebo-runtime-platform D13): the front camera override joins
+    # the mount-created partial lidar entry.
+    assert set(peripherals) == {"front", "mid360"}
     camera = peripherals["front"]
     # runtime-peripheral-overrides: no driver key on the provider path — the
     # lekiwi_lidar profile declares the realsense driver; the entry only
@@ -36,6 +39,10 @@ def test_calibration_config_selects_the_lekiwi_runtime_with_a_front_camera_addit
     assert camera["enable_sync"] is False
     assert camera["initial_reset"] is False
     assert camera["transform"]["parent_frame"] == "base_link"
+    lidar = peripherals["mid360"]
+    assert lidar["type"] == "lidar"
+    assert lidar["transform"]["parent_frame"] == "body"
+    assert lidar["simulation"]["gazebo"]["transform"]["parent_frame"] == "base_link"
 
     navigation = config["navigation"]
     assert navigation["enabled"] is True

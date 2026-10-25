@@ -219,7 +219,9 @@ def test_deployment_fragment_carries_sensor_inventory_and_fast_lio_policy():
     finally:
         Path(fragment_path).unlink(missing_ok=True)
 
-    assert [item["name"] for item in fragment["peripherals"]] == ["front"]
+    # the front camera override plus the mount-created partial MID-360 entry
+    # (lekiwi-gazebo-runtime-platform D13) both reach the runtime fragment
+    assert [item["name"] for item in fragment["peripherals"]] == ["front", "mid360"]
     assert fragment["fast_lio"]["enabled"] is True
 
 

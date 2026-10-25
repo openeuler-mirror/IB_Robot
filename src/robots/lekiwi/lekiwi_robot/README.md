@@ -88,6 +88,53 @@ ros2 launch lekiwi_robot runtime.launch.py profile:=lekiwi_lidar [simulated:=tru
 `simulated:=true` keeps the production controller and hardware-adapter path
 and replaces only the serial bus with the SDK's simulated transport.
 
+## Gazebo simulation
+
+The Gazebo platform (`sim_platform:=gazebo`) stands in for the physical
+sensors: the runtime renders `gpu_lidar` and IMU sensors into the model at
+the MID-360 mount (`lekiwi_mid360_mount.yaml`), bridges them through
+`ros_gz`, and serves the advertised endpoints (`/livox/lidar`,
+`/livox/imu`) on simulation time. Use a fresh `GZ_PARTITION` (and
+`IBROBOT_GAZEBO_HEADLESS=1` without a display) so runs on a shared host stay
+isolated.
+
+The launch entries the verification runs use:
+
+```bash
+# provider alone (sensors, admission, wheels): task 2.5
+ros2 launch lekiwi_robot runtime.launch.py profile:=lekiwi_lidar \
+  sim_platform:=gazebo
+
+# composed through the robot_config entry: task 4.2
+ros2 launch robot_config robot.launch.py robot_config:=lekiwi_lidar \
+  use_sim:=true sim_platform:=gazebo
+
+# navigation (FAST-LIO + Nav2/AMCL): task 5.2 stages the lekiwi_lidar
+# profile and the navigation overlay side by side, then launches
+ros2 launch robot_config robot.launch.py config_path:=<staged>/lekiwi_navi_sim.yaml \
+  use_sim:=true sim_platform:=gazebo nav_stage:=navigation
+```
+
+TF ownership in simulation (one publisher per transform):
+
+| Transform | Owner |
+| --- | --- |
+| `odom → base_link` | wheel odometry (`base_node`), on simulation time; the FAST-LIO bridge publishes `/odometry/filtered` with `publish_tf: false` |
+| `map → odom` | AMCL (the navigation stage); never a static transform |
+| `base_link → livox_frame` | static TF from the Gazebo embodiment (the rendered model has no sensor link); camera frames stay on `robot_state_publisher` |
+| FAST-LIO's own TF | isolated on `/fast_lio/tf_raw` |
+
+The simulated IMU publishes SI units (m/s², rad/s); at rest it reads gravity
+(`|acc| ≈ 9.81` m/s² along +z of the sensor frame). Gazebo's pre-settle
+samples — the zero window before the physics starts and the landing impulse
+when the entity drops onto the ground — are held back by
+`robot_runtime/imu_settle_filter` until gravity has been stable for a full
+run, so FAST-LIO's gravity initialization only ever sees valid samples.
+
+`lekiwi_sensor_calib` (the MID-360 / camera extrinsic calibration workflow)
+needs the physical sensors and is not supported on Gazebo; the simulated
+sensors always sit exactly at the mount.
+
 Conformance and the independence gate:
 
 ```bash

@@ -19,6 +19,23 @@
   <xacro:arg name="simulated" default="false"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
   <xacro:arg name="mujoco_model" default=""/>
+  <!-- gz_ros2_control: always passed by render_gazebo_description (accepted
+       even when unused); sim_effort_state is accepted and ignored here: this
+       profile advertises no joint.current interface (D2). -->
+  <xacro:arg name="gz_ros2_control_parameters_file" default=""/>
+  <xacro:arg name="sim_effort_state" default="false"/>
+  <!-- Gazebo-only chassis treatment (D2): gated by use_sim AND the gz plugin
+       so the MuJoCo platform (a different sim_plugin) and every physical/SDK
+       render (use_sim false) keep their exact pre-change output. -->
+  <xacro:property name="gz_sim" value="${'$(arg use_sim)' == 'true' and '$(arg sim_plugin)' == 'gz_ros2_control/GazeboSimSystem'}"/>
+  <!-- Wheel joint axis under Gazebo: the SDK's mount angles (150/-90/30 deg)
+       are each wheel's POSITIVE-spin drive direction, which is antiparallel
+       to the URDF joints' +z rotation as simulated (positive rotation about
+       +z drives the base the opposite way). Flipping the axis under the gz
+       gate makes the simulated joint velocity/position convention match the
+       physical motors' — the same base_node kinematics then drive and
+       odometry-integrate identically on both executions (D3/D4). -->
+  <xacro:property name="wheel_axis_z" value="${-1 if gz_sim else 1}"/>
 
   <!-- Chassis geometry/control properties (does not emit links/joints) -->
   <xacro:include filename="$(find lekiwi_description)/urdf/base.common.xacro"/>
@@ -73,12 +90,23 @@
       </geometry>
       <material name="charcoal"/>
     </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
-      </geometry>
-    </collision>
+    <!-- Gazebo: cylinder collision (legacy macro sizes, D2) -->
+    <xacro:if value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="0.025"/>
+        </geometry>
+      </collision>
+    </xacro:if>
+    <xacro:unless value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+        </geometry>
+      </collision>
+    </xacro:unless>
     <inertial>
       <mass value="0.1"/>
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
@@ -94,12 +122,23 @@
       </geometry>
       <material name="charcoal"/>
     </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
-      </geometry>
-    </collision>
+    <!-- Gazebo: cylinder collision (legacy macro sizes, D2) -->
+    <xacro:if value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="0.025"/>
+        </geometry>
+      </collision>
+    </xacro:if>
+    <xacro:unless value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+        </geometry>
+      </collision>
+    </xacro:unless>
     <inertial>
       <mass value="0.1"/>
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
@@ -115,17 +154,56 @@
       </geometry>
       <material name="charcoal"/>
     </visual>
-    <collision>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <geometry>
-        <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
-      </geometry>
-    </collision>
+    <!-- Gazebo: cylinder collision (legacy macro sizes, D2) -->
+    <xacro:if value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="0.025"/>
+        </geometry>
+      </collision>
+    </xacro:if>
+    <xacro:unless value="${gz_sim}">
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="package://lekiwi_description/meshes/omni_wheel.stl"/>
+        </geometry>
+      </collision>
+    </xacro:unless>
     <inertial>
       <mass value="0.1"/>
       <inertia ixx="0.001" ixy="0.0" ixz="0.0" iyy="0.001" iyz="0.0" izz="0.001"/>
     </inertial>
   </link>
+
+  <!-- Anisotropic friction approximating the omni wheels on Gazebo (D2):
+       the validated legacy treatment — high friction along each wheel's
+       rolling direction (fdir1 in the wheel link frame), low friction along
+       the spin axis — repeated per wheel link. -->
+  <xacro:if value="${gz_sim}">
+    <gazebo reference="left_wheel_link">
+      <mu1>0.8</mu1>
+      <mu2>0.05</mu2>
+      <fdir1>0 1 0</fdir1>
+      <kp>10000000.0</kp>
+      <kd>10.0</kd>
+    </gazebo>
+    <gazebo reference="back_wheel_link">
+      <mu1>0.8</mu1>
+      <mu2>0.05</mu2>
+      <fdir1>0 1 0</fdir1>
+      <kp>10000000.0</kp>
+      <kd>10.0</kd>
+    </gazebo>
+    <gazebo reference="right_wheel_link">
+      <mu1>0.8</mu1>
+      <mu2>0.05</mu2>
+      <fdir1>0 1 0</fdir1>
+      <kp>10000000.0</kp>
+      <kd>10.0</kd>
+    </gazebo>
+  </xacro:if>
 
   <!-- ============================================ -->
   <!-- Chassis Joints                               -->
@@ -136,7 +214,7 @@
     <parent link="base_link"/>
     <child link="left_wheel_link"/>
     <origin xyz="${wheel_base_radius * cos(offset)} ${wheel_base_radius * sin(offset)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset}"/>
-    <axis xyz="0 0 1"/>
+    <axis xyz="0 0 ${wheel_axis_z}"/>
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
@@ -145,7 +223,7 @@
     <parent link="base_link"/>
     <child link="back_wheel_link"/>
     <origin xyz="${wheel_base_radius * cos(offset + theta)} ${wheel_base_radius * sin(offset + theta)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset + theta}"/>
-    <axis xyz="0 0 1"/>
+    <axis xyz="0 0 ${wheel_axis_z}"/>
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
@@ -154,7 +232,7 @@
     <parent link="base_link"/>
     <child link="right_wheel_link"/>
     <origin xyz="${wheel_base_radius * cos(offset - theta)} ${wheel_base_radius * sin(offset - theta)} ${wheel_base_offset_z}" rpy="0 ${pi/2} ${offset - theta}"/>
-    <axis xyz="0 0 1"/>
+    <axis xyz="0 0 ${wheel_axis_z}"/>
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
@@ -168,6 +246,20 @@
       <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
     </joint>
   </xacro:unless>
+
+  <!-- ============================================ -->
+  <!-- Gazebo (gz_ros2_control)                     -->
+  <!-- ============================================ -->
+  <!-- The gz system plugin reads the profile's controller parameters (D2);
+       no sensors here — the runtime generates them from the peripheral
+       inventory (D5). -->
+  <xacro:if value="${gz_sim}">
+    <gazebo>
+      <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+        <parameters>$(arg gz_ros2_control_parameters_file)</parameters>
+      </plugin>
+    </gazebo>
+  </xacro:if>
 
   <!-- ============================================ -->
   <!-- ros2_control                                 -->

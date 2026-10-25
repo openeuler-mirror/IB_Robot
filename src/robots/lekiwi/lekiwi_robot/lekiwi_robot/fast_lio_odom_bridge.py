@@ -58,7 +58,12 @@ class FastLioOdomBridge(Node):
         self._planar_output = bool(self.get_parameter("planar_output").value)
         self._max_future_skew_sec = float(self.get_parameter("max_future_skew_sec").value)
         self._publisher = self.create_publisher(Odometry, output_topic, 10)
-        self._broadcaster = TransformBroadcaster(self)
+        # The broadcaster is created only when this bridge actually owns the
+        # odom -> base_link transform (D4): with publish_tf=false a silent
+        # /tf advertiser would still show up as a second transform publisher
+        # on the graph, and the lidar-odometry gate asserts the wheel-odometry
+        # node is the only one.
+        self._broadcaster = TransformBroadcaster(self) if self._publish_tf else None
         self._subscription = self.create_subscription(Odometry, source_topic, self._on_odometry, 10)
         self._last_error = ""
 

@@ -309,11 +309,12 @@ def test_approved_calibration_still_applies_without_require_model(tmp_path, monk
     assert (transform["x"], transform["y"], transform["z"]) == (0.12, -0.34, 0.56)
 
 
-def test_mid360_mount_skips_peripheral_entries_for_require_model_providers(tmp_path):
-    """3.3 audit (sensor_mount): the mount's peripheral loop re-mounts lidar
-    entries; on the require_model provider path the mounting is runtime-owned,
-    so an override entry passes through verbatim while the navigation
-    provisioning (static TF, fast_lio frames) still applies."""
+def test_mid360_mount_updates_peripheral_entries_on_the_provider_path(tmp_path):
+    """lekiwi-gazebo-runtime-platform D13: on the provider path the mount
+    creates or updates the partial (lidar, mid360) entry — the public
+    body -> livox_frame identity transform plus the base_link-relative
+    simulator attachment pose — next to the navigation provisioning (static
+    TF, fast_lio frames). Device settings the entry carries survive."""
     from robot_config.loader import resolve_ros_path
 
     mount_file = Path(resolve_ros_path("$(find lekiwi_description)/config/lekiwi_mid360_mount.yaml"))
@@ -321,9 +322,9 @@ def test_mid360_mount_skips_peripheral_entries_for_require_model_providers(tmp_p
     entry = {"type": "lidar", "name": "mid360", "frame_id": "livox_frame", "publish_freq": 10.0}
     config = _write_config(
         tmp_path,
-        "require_model_mount.yaml",
+        "provider_mount.yaml",
         {
-            "name": "require_model_mount",
+            "name": "provider_mount",
             "runtime": {"provider": "so101_robot", "profile": "so101_single_arm", "require_model": True},
             "simulation": {"platform": "sdk"},
             "mid360_mount_file": str(mount_file),
@@ -331,7 +332,21 @@ def test_mid360_mount_skips_peripheral_entries_for_require_model_providers(tmp_p
         },
     )
     loaded = load_robot_config_dict(config, defer_interface_binding=True)
-    assert loaded["peripherals"] == [entry], "the override entry must not be re-mounted"
+    assert len(loaded["peripherals"]) == 1, "the existing entry is updated, not duplicated"
+    updated = loaded["peripherals"][0]
+    # device settings survive
+    assert updated["frame_id"] == "livox_frame" and updated["publish_freq"] == 10.0
+    # both D13 pose keys are set on the provider path
+    assert updated["transform"] == {
+        "parent_frame": "body",
+        "x": 0.0,
+        "y": 0.0,
+        "z": 0.0,
+        "roll": 0.0,
+        "pitch": 0.0,
+        "yaw": 0.0,
+    }
+    assert updated["simulation"]["gazebo"]["transform"]["parent_frame"] == "base_link"
     static_tfs = loaded["navigation"]["static_tfs"]
     assert any(item.get("child_frame") == "body" for item in static_tfs), "navigation provisioning still applies"
     fast_lio = loaded["navigation"]["fast_lio"]

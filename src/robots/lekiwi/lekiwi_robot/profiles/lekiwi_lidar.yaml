@@ -15,6 +15,13 @@ runtime:
   version: 0.1.0
 
 use_sim: false
+sim_platforms: [sdk, gazebo]
+sim_platform: sdk
+# The single source of the lidar pose (D13): the profile's transform defaults
+# below are derived from this mount; the application path (sensor_mount) keeps
+# them consistent through the deployment fragment.
+mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
+
 controller_manager: controller_manager
 joint_state_topic: /joint_states
 joints: ["7", "8", "9"]
@@ -92,6 +99,41 @@ peripherals:
   output_data_type: 0
   cmdline_input_bd_code: livox0000000001
   respawn: true
+  # D13: the public static TF of livox_frame and (below) the simulator
+  # attachment pose both default to the mount relative to base_link
+  # (lekiwi_mid360_mount.yaml: translation_m [-0.08, 0.0, 0.20],
+  # rpy_deg [0.0, 0.0, 90.0]). The application path replaces both through
+  # the deployment fragment: transform becomes the body -> livox_frame
+  # identity while the simulator pose stays the base_link-relative mount.
+  transform:
+    parent_frame: base_link
+    x: -0.08
+    y: 0.0
+    z: 0.2
+    roll: 0.0
+    pitch: 0.0
+    yaw: 1.5707963267948966
+  simulation:
+    gazebo:
+      transform:
+        parent_frame: base_link
+        x: -0.08
+        y: 0.0
+        z: 0.2
+        roll: 0.0
+        pitch: 0.0
+        yaw: 1.5707963267948966
+      # Simulated MID-360 sensor parameters (D1 starting values, tunable).
+      horizontal_samples: 900
+      vertical_samples: 32
+      vertical_min_deg: -7.0
+      vertical_max_deg: 52.0
+      range_min: 0.1
+      range_max: 40.0
+      update_rate: 10.0
+      # The MID-360's built-in IMU.
+      imu:
+        update_rate: 200.0
   scan_converter:
     enabled: true
     queue_size: 1
@@ -145,10 +187,13 @@ peripherals:
     yaw: 0.0
 
 # D12: lidar odometry chain defaults (lekiwi runtime composes fastlio_mapping
-# plus the odom bridge; deployment overrides merge on top).
+# plus the odom bridge; deployment overrides merge on top). sim_params_file
+# is the simulation parameter set the physics platforms launch with (D6);
+# the hardware file stays params_file.
 fast_lio:
   enabled: false
   params_file: $(find lekiwi_robot)/config/fast_lio_mid360.yaml
+  sim_params_file: $(find lekiwi_robot)/config/fast_lio_mid360_sim.yaml
   lidar_topic: /livox/lidar
   imu_topic: /livox/imu
   raw_odom_topic: /fast_lio/odometry_raw
@@ -157,6 +202,12 @@ fast_lio:
   source_body_frame: body
   odom_frame: odom
   base_frame: base_link
+  # The bridge's body-to-base extrinsic = the inverse of the MID-360 mount
+  # (lekiwi_description/config/lekiwi_mid360_mount.yaml: -0.08, 0, 0.2 m,
+  # +90 deg yaw). The provider path has no application mount loader to derive
+  # it, so the profile carries the mount-derived default (D13).
+  body_to_base_translation: [0.0, -0.08, -0.2]
+  body_to_base_rotation: [0.0, 0.0, -0.7071067811865476, 0.7071067811865476]
   publish_tf: true
   planar_output: false
   max_future_skew_sec: 0.1
