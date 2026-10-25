@@ -57,6 +57,19 @@ def test_shipped_profiles_resolve_and_publish_realizable_limits(path):
         assert declared[axis] <= bound, f"{path.name}: {axis}={declared[axis]} exceeds {bound:.4f}"
 
 
+@pytest.mark.parametrize("path", SHIPPED, ids=[p.stem for p in SHIPPED])
+def test_shipped_profiles_leave_motion_hardware_feedback_topic_empty(path):
+    # LeKiwiSystemHardware publishes no joint-current heartbeat; only
+    # So101SystemHardware publishes /so101_follower/joint_currents. A non-empty
+    # motion_hardware_feedback_topic makes the motion server's post-motion
+    # barrier wait for a heartbeat that never arrives, so every physical
+    # MoveToPose/MoveToConfiguration would time out and report EXECUTION_FAILED.
+    # LeKiwi read failures already surface as controller errors, so a shipped
+    # LeKiwi profile must not name a feedback topic its closure does not publish.
+    profile = load_profile(path)
+    assert not (profile.get("motion") or {}).get("motion_hardware_feedback_topic")
+
+
 def test_realizable_limits_follow_the_mount_geometry():
     # 4.602 rad/s x 0.05 m = 0.2301 m/s of wheel rim speed. Forward motion
     # loads the two front wheels at cos(30 deg), sideways motion loads the back

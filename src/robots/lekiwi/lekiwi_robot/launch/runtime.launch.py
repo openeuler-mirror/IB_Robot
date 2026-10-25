@@ -22,14 +22,16 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 from lekiwi_robot.base_profile import arm_motion_model, base_node_parameters, lidar_odometry_owns_tf
+from robot_runtime.interface_description import build_description
 from robot_runtime.launch_support import (
     motion_launch_arguments,
     peripheral_stack_actions,
+    render_robot_description,
     resolve_profile_argument,
     resolve_sim_selection,
     runtime_stack_actions,
 )
-from robot_runtime.peripherals import fast_lio_nodes, load_peripherals_file
+from robot_runtime.peripherals import fast_lio_nodes, load_peripherals_file, merge_peripherals
 from robot_runtime.profile import load_profile
 
 
@@ -46,8 +48,15 @@ def _launch_setup(context, *_args, **_kwargs):
     simulated = use_sim
     display = LaunchConfiguration("display").perform(context).strip().lower() in ("1", "true")
 
+    instance_id = LaunchConfiguration("instance_id").perform(context).strip()
+    if instance_id:
+        profile["runtime"]["instance_id"] = instance_id
     peripherals_file = LaunchConfiguration("peripherals").perform(context).strip()
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
+    # The profile stays raw: peripheral_stack_actions and runtime_stack_actions
+    # both apply the deployment file themselves (upstream contract). The merged
+    # list is computed once here only for the public interface description.
+    merged_peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
     fast_lio_config = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
     # Chassis geometry comes from the profile only; a missing key or a limit
     # the wheels cannot realize fails here, naming it (lekiwi_robot.base_profile).
@@ -77,8 +86,21 @@ def _launch_setup(context, *_args, **_kwargs):
                 }.items(),
             )
         )
+    # The whole robot (arm and wheels) is the public model: ros2_control and
+    # robot_state_publisher load it, and the facade derives the robot model and
+    # the teleoperation interfaces from the same rendering. The arm-only model
+    # above is what so101_motion plans against; it is not the public model.
+    robot_description = render_robot_description(profile, profile_path, simulated)
+    description = build_description(
+        {**profile, "fast_lio": fast_lio_config},
+        peripherals=merged_peripherals,
+        use_sim=simulated,
+        robot_description=robot_description,
+    )
     peripherals = [
-        *peripheral_stack_actions(profile, peripherals_file, simulated, sim_platform=sim_platform or ""),
+        *peripheral_stack_actions(
+            profile, peripherals_file, simulated, description=description, sim_platform=sim_platform or ""
+        ),
         *fast_lio_nodes(fast_lio_config, bridge_package="lekiwi_robot", use_sim=simulated),
     ]
     return [
@@ -87,7 +109,9 @@ def _launch_setup(context, *_args, **_kwargs):
             profile_path,
             simulated,
             peripherals_file,
-            LaunchConfiguration("instance_id").perform(context).strip(),
+            instance_id,
+            robot_description=robot_description,
+            interface_description=description,
             sim_platform=sim_platform or "",
         ),
         base_node,

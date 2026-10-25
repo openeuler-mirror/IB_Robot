@@ -110,6 +110,39 @@ peripherals:
     use_inf: true
     inf_epsilon: 1.0
     respawn: true
+- # The fixed front RealSense the sensor-calibration deployment enables
+  # (runtime-peripheral-overrides: the profile owns the driver and defaults
+  # to disabled; a robot configuration opts in with an enabled-true override
+  # entry, the same pattern as the speaker on lekiwi_nav_grasp).
+  type: camera
+  name: front
+  driver: realsense
+  enabled: false
+  driver_camera_name: front
+  serial_number: ''
+  width: 640
+  height: 480
+  fps: 30
+  color_format: RGB8
+  depth_format: Z16
+  streams:
+  - color
+  - depth
+  align_depth: false
+  enable_sync: false
+  initial_reset: false
+  enable_pointcloud: false
+  frame_id: camera_front_link
+  optical_frame_id: camera_front_optical_frame
+  skip_urdf_without_transform: true
+  transform:
+    parent_frame: base_link
+    x: 0.0
+    y: 0.0
+    z: 0.0
+    roll: 0.0
+    pitch: 0.0
+    yaw: 0.0
 
 # D12: lidar odometry chain defaults (lekiwi runtime composes fastlio_mapping
 # plus the odom bridge; deployment overrides merge on top).

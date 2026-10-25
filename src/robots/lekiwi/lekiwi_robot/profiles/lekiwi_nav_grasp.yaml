@@ -83,7 +83,14 @@ motion:
   motion_feedback_timeout_s: 0.3
   motion_feedback_tolerance_rad: 0.12
   motion_require_tf_sync: true
-  motion_hardware_feedback_topic: /so101_follower/joint_currents
+  # Empty on purpose: LeKiwiSystemHardware publishes no joint-current heartbeat
+  # (only So101SystemHardware publishes /so101_follower/joint_currents). A
+  # non-empty topic makes the motion server's post-motion barrier wait for a
+  # heartbeat that never arrives, so every physical MoveToPose /
+  # MoveToConfiguration would time out and report EXECUTION_FAILED. LeKiwi read
+  # failures already surface as controller errors; no separate heartbeat is
+  # needed.
+  motion_hardware_feedback_topic: ""
 
 base:
   wheel_joints: ["7", "8", "9"]
