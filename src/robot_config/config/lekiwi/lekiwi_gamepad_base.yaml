@@ -1,9 +1,17 @@
 # Gamepad -> LeKiwi base mapping for joy_teleop.
 #
-# Referenced from a `joy_teleop` teleoperation device (see
-# config/robots/lekiwi_rtp_distributed.yaml), which launches joy_node
-# alongside it. Publishes to /cmd_vel, which cmd_vel_bridge converts into
-# base_velocity_controller commands.
+# Referenced from a `joy_teleop` teleoperation device (lekiwi_lidar.yaml,
+# lekiwi_nav_grasp.yaml), which launches joy_node alongside it. Publishes the
+# runtime's public base channel /cmd_vel; the LeKiwi runtime admits it only in
+# the base_navigation mode with the navigation gate open, and projects it onto
+# the wheels. Under a runtime provider the launch checks this file against the
+# bound base.cmd_vel interface: topic, message type, a deadman, axis scales
+# within the published limits, and service commands limited to /runtime/stop.
+#
+# /cmd_vel is shared: in stages that run the Nav2 collision monitor, the
+# monitor also publishes it, and this gamepad is not collision-filtered.
+# Releasing the deadman stops the base only when the gamepad is the sole
+# producer; while a Nav2 goal is active, the stop button is the operator stop.
 #
 # Axis and button indices are for an Xbox Series X|S controller on the Linux
 # joystick driver. Other pads renumber them: check with
@@ -34,3 +42,15 @@ joy_teleop:
           axis: 3  # Right stick horizontal, yaw
           scale: 0.44
           offset: 0.0
+
+    # Stop: the runtime stop contract (HOLD: cancel, reject streaming
+    # commands, idle with joints holding). The stop latch overrides the
+    # navigation gate and stays engaged until SetRuntimeMode("idle") clears it,
+    # which is deliberately not bound to the gamepad.
+    runtime_stop:
+      type: service
+      interface_type: ibrobot_msgs/srv/StopRuntime
+      service_name: /runtime/stop
+      service_request:
+        policy: HOLD
+      buttons: [1]  # Xbox B
