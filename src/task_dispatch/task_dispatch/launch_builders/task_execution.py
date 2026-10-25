@@ -53,6 +53,12 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
     manipulation_control_mode = ""
     if isinstance(motion_mode, dict) and bool(motion_mode.get("enabled", False)):
         manipulation_control_mode = str(motion_mode.get("manipulation_control_mode", "")).strip()
+    elif robot_config.get("nav_stage") == "hybrid":
+        # Runtime-provider hybrid stages carry no motion_mode block (the mode
+        # machine is the runtime's); the manipulation mode the executor must
+        # stay online for is the stage's skill mode -- a hybrid stage drives by
+        # default but serves manipulation skills.
+        manipulation_control_mode = str(robot_config.get("skill_required_control_mode", "") or "").strip()
     manipulation_mode_config = control_modes.get(manipulation_control_mode, {})
 
     # Task executor is relevant for moveit-based modes with task_dispatch enabled

@@ -225,11 +225,11 @@ def generate_embodied_nodes(
         "active_control_mode": active_control_mode,
         "skill_required_control_mode": robot_config.get("skill_required_control_mode", ""),
         "supported_control_modes_json": json.dumps(list(supported_control_modes)),
-        "motion_mode_service": str(
-            robot_config.get("motion_mode", {}).get(
-                "set_navigation_enabled_service", "motion_mode/set_navigation_enabled"
-            )
-        ),
+        # The navigation gate service is a contract name owned by the runtime:
+        # the pre-migration motion_mode key is rejected under a provider, and
+        # its relative default only coincided with the contract name in the
+        # root namespace (openspec lekiwi-application-migration A3).
+        "motion_mode_service": RUNTIME.NAVIGATION_ENABLE_SERVICE,
         "skill_gateway_status_service": embodied_config.get(
             "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
         ),

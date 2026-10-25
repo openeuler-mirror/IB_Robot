@@ -413,7 +413,10 @@ def test_hybrid_profile_projects_runtime_control_mode_switching_parameters(publi
         "moveit_planning",
         "base_navigation",
     ]
-    assert _decode_launch_string(params["motion_mode_service"]) == "motion_mode/set_navigation_enabled"
+    # The gate service is the runtime contract's absolute name; the
+    # pre-migration relative motion_mode key only coincided with it in the
+    # root namespace (openspec lekiwi-application-migration A3).
+    assert _decode_launch_string(params["motion_mode_service"]) == "/motion_mode/set_navigation_enabled"
     assert _decode_launch_string(params["semantic_map_target_service"]) == "/semantic_mapping/get_objects"
     assert params["semantic_map_stand_off_distance_m"] == 0.3
 

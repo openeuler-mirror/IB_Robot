@@ -158,3 +158,37 @@ def test_task_executor_gripper_stroke_has_one_owner_and_is_unknown_without_both_
     # Missing either position: unknown, the executor keeps its fixed 1 s.
     assert stroke({}, {"gripper_open_position": 1.0}) == pytest.approx((0.0, 1.0))
     assert stroke({}, None) == pytest.approx((0.0, 1.0))
+
+
+# --- hybrid-derivation tests (openspec lekiwi-application-migration 3.1) --------
+# Migrated from robot_config's lekiwi-application-migration suite: provider
+# hybrid stages carry no motion_mode block, so the manipulation mode the
+# executor must stay online for is derived from the stage's skill mode.
+
+
+def _lekiwi_config(name: str, **kwargs):
+    path = Path(get_package_share_directory("robot_config")) / "config" / "robots" / f"{name}.yaml"
+    return load_robot_config_dict(path, defer_interface_binding=True, **kwargs)
+
+
+# Drives a robot config whose perception services reference a gitignored model
+# bundle; without scripts/download_models.py the config cannot load. A missing
+# download is not a defect, so skip rather than fail. See root conftest.py.
+@pytest.mark.model_bundle("yolox_x_640")
+def test_hybrid_task_executor_derives_the_manipulation_mode_from_the_skill_mode(monkeypatch) -> None:
+    import task_dispatch.launch_builders.task_execution as task_execution_builder
+
+    hybrid = _lekiwi_config("lekiwi_nav_grasp", nav_stage="hybrid")
+    monkeypatch.setattr(task_execution_builder, "get_package_prefix", lambda _name: "/opt/ros/humble")
+
+    node = generate_task_executor_node(hybrid, hybrid["default_control_mode"])
+
+    assert node is not None
+    assert node.node_executable == "task_executor_node"
+
+
+def test_navigation_stage_launches_no_task_executor_for_base_only_skills() -> None:
+    navigation = _lekiwi_config("lekiwi_lidar", nav_stage="navigation")
+    assert navigation["skill_required_control_mode"] == "base_navigation"
+
+    assert generate_task_executor_node(navigation, "base_navigation") is None
