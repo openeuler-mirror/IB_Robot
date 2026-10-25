@@ -1,105 +1,41 @@
+# Navigation simulation overlay on the migrated LeKiwi lidar configuration
+# (openspec lekiwi-gazebo-runtime-platform D10).
+#
+# base_config selects the shipped production lekiwi_lidar.yaml; every
+# override below sits INSIDE nav_stages.navigation, so the stage merge (which
+# happens after the base/overlay merge) applies them to the production
+# navigation stage: the Gazebo platform with the nav_room scene and its spawn
+# pose, the simulation map and Nav2 parameters (AMCL starts at the spawn pose
+# and broadcasts the single map -> odom), deterministic localisation, and no
+# voice/embodied/RViz surfaces. FAST-LIO, the scan converter, the collision
+# monitor and the navigation admission stay exactly as in production — the
+# loader resolves sibling bases only, so tests stage this overlay next to the
+# shipped configuration (the staging helper does that).
 robot:
-  name: lekiwi
-  type: lekiwi
-  robot_type: lekiwi
+  base_config: lekiwi_lidar
 
-  gazebo_world_name: nav_test
-  world_file: $(find robot_navigation)/config/test/nav_test.world
-  initial_pose_x: -1.5
-  initial_pose_y: -1.5
-  initial_pose_z: 0.01
-
-  joints:
-    base:
-      - left_wheel_joint
-      - back_wheel_joint
-      - right_wheel_joint
-    all:
-      - left_wheel_joint
-      - back_wheel_joint
-      - right_wheel_joint
-
-  default_control_mode: base_navigation
-  controller_startup_timeout:
-    sim: 120.0
-    hardware: 30.0
-
-  control_modes:
-    base_navigation:
-      description: "LeKiwi navigation simulation E2E test"
-      controllers:
-        - joint_state_broadcaster
-        - base_controller
-      sim_controllers:
-        - joint_state_broadcaster
-        - base_controller
-      inference:
-        enabled: false
-      executor:
-        type: topic
-        mode: base_navigation
-
-  voice_asr:
-    enabled: false
-
-  simulation:
-    platform: gazebo
-
-  ros2_control:
-    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
-    port: /dev/null
-    urdf_path: $(find lekiwi_description)/urdf/lekiwi_sim.urdf.xacro
-    controllers_config: $(find lekiwi_hardware)/config/lekiwi_sim_controllers.yaml
-    xacro_mappings:
-      serial_port: /dev/null
-      use_mock: true
-      i2c_bus: 1
-      i2c_addr: 28
-      axis_remap: P1
-      sensor_mode: NDOF
-
-  peripherals: []
-
-  navigation:
-    enabled: true
-    static_tfs:
-      - name: map_to_odom
-        parent_frame: map
-        child_frame: odom
-        translation: [-1.5, -1.5, 0.0]
-        rotation: [0.0, 0.0, 0.0]
-
-    nav2_bringup:
-      enabled: true
-      map_file: $(find robot_navigation)/config/maps/sim_map.yaml
-      params_file: $(find robot_navigation)/config/nav2_sim_params.yaml
-
-    ekf_rtabmap:
-      enabled: false
-
-    cmd_vel_bridge:
-      enabled: false
-
-    robot_navigation:
-      enabled: true
-      enable_voice_control: true
-      keywords_file: ""
-      global_frame: map
-      enable_feedback: true
-      trigger_evaluation: false
-      destinations:
-        point_a:
-          x: 1.0
-          y: 1.0
-          theta: 0.0
-        point_b:
-          x: -1.0
-          y: 1.0
-          theta: 0.0
-        origin:
+  nav_stages:
+    navigation:
+      simulation:
+        platform: gazebo
+        scene: nav_room
+        robot_spawn:
           x: -1.5
           y: -1.5
-          theta: 0.0
+          z: 0.05
+          yaw: 0.0
 
-    rviz:
-      enabled: false
+      navigation:
+        nav2_bringup:
+          map_file: $(find robot_navigation)/config/maps/sim_map.yaml
+          params_file: $(find robot_navigation)/config/nav2_params_sim.yaml
+          auto_global_localization: false
+
+      voice_asr:
+        enabled: false
+
+      embodied:
+        enabled: false
+
+      rviz:
+        enabled: false

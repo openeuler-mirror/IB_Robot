@@ -1,0 +1,39 @@
+# Lidar-odometry gate overlay on the migrated LeKiwi lidar configuration
+# (openspec lekiwi-gazebo-runtime-platform D14.3).
+#
+# Same staging rule as the D10 navigation overlay: base_config selects the
+# shipped production lekiwi_lidar.yaml, every override sits INSIDE
+# nav_stages.navigation, and the loader resolves sibling bases only — so the
+# gate stages this overlay next to the robot_config-shipped base before
+# launching. The content mirrors lekiwi_navi_sim.yaml (the gate drives the
+# same composed navigation stage); this copy exists because the gate lives
+# in robot_navigation and must not depend on robot_config's test assets: it
+# is test data, not a shipped configuration.
+robot:
+  base_config: lekiwi_lidar
+
+  nav_stages:
+    navigation:
+      simulation:
+        platform: gazebo
+        scene: nav_room
+        robot_spawn:
+          x: -1.5
+          y: -1.5
+          z: 0.05
+          yaw: 0.0
+
+      navigation:
+        nav2_bringup:
+          map_file: $(find robot_navigation)/config/maps/sim_map.yaml
+          params_file: $(find robot_navigation)/config/nav2_params_sim.yaml
+          auto_global_localization: false
+
+      voice_asr:
+        enabled: false
+
+      embodied:
+        enabled: false
+
+      rviz:
+        enabled: false

@@ -15,6 +15,9 @@ setup(
         ("share/sim_models", ["package.xml"]),
         # empty scene (static world files, no meshes)
         ("share/sim_models/scenes/empty", glob("scenes/empty/*")),
+        # nav_room scene (lekiwi-gazebo-runtime-platform D8): room-level
+        # navigation world + layout; static, no meshes
+        ("share/sim_models/scenes/nav_room", glob("scenes/nav_room/*.yaml") + glob("scenes/nav_room/*.template")),
         # pick_banana scene: layout + templates (NOT meshes — separate entry below)
         (
             "share/sim_models/scenes/pick_banana",

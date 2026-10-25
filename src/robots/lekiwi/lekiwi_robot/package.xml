@@ -61,6 +61,11 @@
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>robot_runtime</test_depend>
+  <!-- Test dependencies stay inside the runtime's member set: the
+       independence gate (scripts/verify_runtime_independence.sh) audits the
+       whole closure, test dependencies included. Tests that launch the
+       generic application entry live in the generic packages (the
+       lidar-odometry gate is robot_navigation/test). -->
 
   <export>
     <build_type>ament_python</build_type>

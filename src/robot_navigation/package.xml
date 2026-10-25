@@ -68,6 +68,22 @@
   <!-- The migrated launch-builder tests import robot_config's loader and
        registry (openspec change ``migrate-business-launch-builders``). -->
   <test_depend>robot_config</test_depend>
+  <!-- LeKiwi lidar-odometry gate (test/test_lidar_odometry_gate.py, openspec
+       lekiwi-gazebo-runtime-platform D14.3): the gate launches the composed
+       robot_config navigation stage with this package's Nav2 chain on the
+       lekiwi_robot runtime's Gazebo platform, inside a sim_models scene, with
+       fast_lio bridged over ros_gz_sim/ros_gz_bridge. It lives here, not in
+       lekiwi_robot, so the runtime's dependency closure stays free of
+       generic packages (scripts/verify_runtime_independence.sh). -->
+  <test_depend>ament_index_python</test_depend>
+  <test_depend>python3-matplotlib</test_depend>
+  <test_depend>lekiwi_robot</test_depend>
+  <test_depend>sim_models</test_depend>
+  <test_depend>fast_lio</test_depend>
+  <test_depend>ros_gz_sim</test_depend>
+  <test_depend>ros_gz_bridge</test_depend>
+  <test_depend>tf2_msgs</test_depend>
+  <test_depend>rosgraph_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

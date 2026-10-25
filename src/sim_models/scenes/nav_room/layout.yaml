@@ -1,0 +1,71 @@
+# Scene: nav_room
+# Task: room-level navigation on the LeKiwi lidar runtime
+# (lekiwi-gazebo-runtime-platform D8).
+#
+# The walls and obstacles are those of
+# robot_navigation/config/test/nav_test.world, so the navigation map
+# robot_navigation/config/maps/sim_map.yaml stays valid for this scene.
+
+scene_name: nav_room
+description: "Enclosed 4m x 4m room with two obstacles for navigation tests"
+
+# Robot spawn (D7/D8): the z default lifts the LeKiwi wheels just above the
+# ground plane (wheel lowest point 0.0406 m below base_link).
+robot_spawn:
+  x: -1.5
+  y: -1.5
+  z: 0.05
+  yaw: 0.0
+
+# Static collision geometry of the scene (lekiwi-gazebo-runtime-platform
+# D14.7): the four walls and two obstacles, nothing else — no ground plane,
+# lights or robot. Convention every simulator template of this scene must
+# satisfy, including a second backend's (a future nav_room.xml.template):
+#   - one entry per static model, `name` equal to the model's SDF name;
+#   - `primitive: box` with `size: [x, y, z]` (full extents, not half);
+#   - `primitive: cylinder` with `size: [radius, length]`;
+#   - `pose: [x, y, z, roll, pitch, yaw]` — the model's world pose.
+# Every template must carry exactly this geometry (the scene consistency
+# test compares template against layout, naming the element and both values
+# on mismatch), and the gate-route clearance test reads the same list.
+static_geometry:
+  - name: wall_north
+    primitive: box
+    size: [4.2, 0.1, 1.0]
+    pose: [0.0, 2.0, 0.5, 0.0, 0.0, 0.0]
+  - name: wall_south
+    primitive: box
+    size: [4.2, 0.1, 1.0]
+    pose: [0.0, -2.0, 0.5, 0.0, 0.0, 0.0]
+  - name: wall_east
+    primitive: box
+    size: [0.1, 4.2, 1.0]
+    pose: [2.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+  - name: wall_west
+    primitive: box
+    size: [0.1, 4.2, 1.0]
+    pose: [-2.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+  - name: obstacle_box
+    primitive: box
+    size: [0.4, 0.4, 0.5]
+    pose: [0.0, 0.0, 0.25, 0.0, 0.0, 0.0]
+  - name: obstacle_cylinder
+    primitive: cylinder
+    size: [0.2, 0.6]
+    pose: [1.0, -0.5, 0.3, 0.0, 0.0, 0.0]
+
+# The lidar-odometry gate route (lekiwi-gazebo-runtime-platform D14.5):
+# west half of the room, 7.0 m of translation, two in-place turns, two
+# lateral segments, closed. ONE definition shared by the route-clearance
+# test (this package) and robot_navigation's lidar-odometry gate
+# (test_depend on sim_models) so the two can never drift apart. Commands stay below the
+# velocity smoother limits (0.13 / 0.11 / 0.44, robot_navigation
+# nav2_params_sim.yaml); translation speeds are SIGNED (segment 6 drives
+# body -y) — the clearance test uses the magnitude, the gate the sign.
+gate_route:
+  - {segment: 1, kind: forward, start: [-1.5, -1.5], end: [-0.7, -1.5], yaw_deg: [0.0, 0.0], speed: 0.10}
+  - {segment: 2, kind: rotate, point: [-0.7, -1.5], yaw_deg: [0.0, 90.0], speed: 0.35}
+  - {segment: 3, kind: forward, start: [-0.7, -1.5], end: [-0.7, 1.2], yaw_deg: [90.0, 90.0], speed: 0.10}
+  - {segment: 4, kind: lateral, start: [-0.7, 1.2], end: [-1.5, 1.2], yaw_deg: [90.0, 90.0], speed: 0.08}
+  - {segment: 5, kind: rotate, point: [-1.5, 1.2], yaw_deg: [90.0, 0.0], speed: 0.35}
+  - {segment: 6, kind: lateral, start: [-1.5, 1.2], end: [-1.5, -1.5], yaw_deg: [0.0, 0.0], speed: -0.08}

@@ -678,7 +678,7 @@ ros2 launch robot_navigation ekf_rtabmap_launch.py
 
 ### 2. robot_navigation standalone 测试
 
-这些测试不启动完整机器人、Gazebo 或 Nav2 bringup，适合 Ubuntu 和 openEuler 都执行。
+除 LeKiwi 激光里程计门禁外，这些测试不启动完整机器人、Gazebo 或 Nav2 bringup，适合 Ubuntu 和 openEuler 都执行。
 导航 launch builder 的单元测试（`test/test_navigation_launch_builder.py`、
 `test/test_nav2_builder.py`、`test/test_provider_navigation_ownership.py`、
 `test/test_navigation_velocity_contract.py`）已随 `launch_builders/` 从 robot_config 迁入本包
@@ -690,6 +690,16 @@ colcon test --packages-select robot_navigation --base-paths src --event-handlers
 ```
 
 预期结果：`robot_navigation` 单元测试与软件闭环 E2E 通过。
+
+`test/test_lidar_odometry_gate.py` 是 LeKiwi 的 FAST-LIO 精度门禁（openspec change
+`lekiwi-gazebo-runtime-platform` D14），说明见 `lekiwi_robot` README 的「Lidar-odometry regression gate」一节。
+该门禁通过 `robot_config` 的通用入口启动 Gazebo 与 Nav2，所以放在本包，不放在 `lekiwi_robot`：运行时包的
+测试依赖也计入 `scripts/verify_runtime_independence.sh` 的依赖闭包审计。Ubuntu 上默认执行；openEuler 上或设置
+`NAV_TEST_PROFILE=minimal` 时跳过。只跑该门禁：
+
+```bash
+NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation --base-paths src --event-handlers console_direct+ --pytest-args -k lidar_odometry_gate
+```
 
 ### 3. robot_config minimal 测试
 
@@ -1078,6 +1088,8 @@ robot_navigation/
 │   ├── test_voice_control.py      # 语音控制 pytest 测试
 │   ├── test_cmd_vel_bridge.py     # cmd_vel 桥接 pytest 测试（IK/FK/里程计）
 │   ├── test_nav2_goal_client.py   # Nav2 Goal 客户端 pytest 测试
+│   ├── test_lidar_odometry_gate.py  # LeKiwi FAST-LIO 精度门禁（Gazebo）
+│   ├── config/lekiwi_lio_sim.yaml # 门禁 overlay（测试数据，不安装）
 │   └── e2e/
 │       ├── mock_servers.py        # Mock Trigger/Action 服务
 │       └── test_pipeline_software.py   # 软件闭环 E2E（无物理仿真）

@@ -94,9 +94,12 @@ The Gazebo platform (`sim_platform:=gazebo`) stands in for the physical
 sensors: the runtime renders `gpu_lidar` and IMU sensors into the model at
 the MID-360 mount (`lekiwi_mid360_mount.yaml`), bridges them through
 `ros_gz`, and serves the advertised endpoints (`/livox/lidar`,
-`/livox/imu`) on simulation time. Use a fresh `GZ_PARTITION` (and
-`IBROBOT_GAZEBO_HEADLESS=1` without a display) so runs on a shared host stay
-isolated.
+`/livox/imu`) on simulation time. Use a fresh `IGN_PARTITION` **and** the
+same value in `GZ_PARTITION` (plus `IBROBOT_GAZEBO_HEADLESS=1` without a
+display) so runs on a shared host stay isolated: this Fortress install
+(`ign gazebo`, gz-transport11) reads only `IGN_PARTITION` and ignores
+`GZ_PARTITION`, while newer gz reads `GZ_PARTITION` — setting both covers
+either stack.
 
 The launch entries the verification runs use:
 
@@ -134,6 +137,66 @@ run, so FAST-LIO's gravity initialization only ever sees valid samples.
 `lekiwi_sensor_calib` (the MID-360 / camera extrinsic calibration workflow)
 needs the physical sensors and is not supported on Gazebo; the simulated
 sensors always sit exactly at the mount.
+
+### Lidar-odometry regression gate (D14)
+
+`robot_navigation/test/test_lidar_odometry_gate.py` is the committed FAST-LIO
+accuracy gate for this runtime. It lives in `robot_navigation`, not here:
+it launches the generic application entry, and this package may not declare
+test dependencies on generic packages (the independence gate below audits
+the whole dependency closure, test dependencies included). It runs the
+production navigation stage (staged from the gate's own
+`test/config/lekiwi_lio_sim.yaml` overlay) in the shipped
+`nav_room` scene and, with no Nav2 goal active, drives a scripted closed
+route on **`/cmd_vel_nav`** — the production chain's entry point — so the
+velocity smoother and the collision monitor stay in the loop
+(`controller → /cmd_vel_nav → velocity smoother → /cmd_vel_smoothed →
+collision monitor → /cmd_vel`). The gate checks that `/cmd_vel` is published
+only by the collision monitor and by Nav2's behavior server (its recovery
+behaviors write the channel directly, bypassing the smoother and the
+monitor — a property of the shipped chain; with no goal active the
+behavior server stays silent, and the gate's message-level pairing proves
+the monitor is the only publisher that actually drives the base). Every
+non-zero command must be relayed unchanged.
+
+The route (west half of the room, 7.0 m of translation, two in-place turns,
+two lateral segments, closed; commanded at vx 0.10 / vy 0.08 / wz 0.35 —
+below the smoother limits):
+
+| # | Command | From → to (x, y, yaw) |
+| --- | --- | --- |
+| 1 | forward 0.8 m | (−1.5, −1.5, 0°) → (−0.7, −1.5, 0°) |
+| 2 | rotate +90° | → (−0.7, −1.5, 90°) |
+| 3 | forward 2.7 m | → (−0.7, 1.2, 90°) |
+| 4 | lateral +y 0.8 m (body) | → (−1.5, 1.2, 90°) |
+| 5 | rotate −90° | → (−1.5, 1.2, 0°) |
+| 6 | lateral −y 2.7 m (body) | → (−1.5, −1.5, 0°) |
+
+Segments close on simulator ground-truth progress (each stops commanding at
+the velocity smoother's stopping distance), and every metric is measured in
+simulation time. FAST-LIO's `/odometry/filtered`, aligned to ground truth at
+the route start, is scored against the committed thresholds
+`min(cap, max(2 × worst of five measured runs, floor))`; the spec caps are
+ATE RMSE ≤ 0.10 m, max error ≤ 0.20 m, final error ≤ 0.15 m, final yaw error
+≤ 3°. Wheel odometry (`/odom`) and AMCL (`/amcl_pose`) are printed and
+loosely bounded, never part of the FAST-LIO verdict. Health during the
+route: `/odometry/filtered` must carry at least 95 % of the `/livox/lidar`
+frames FAST-LIO consumed over the same simulation-time span (the whole
+drive, final settle included), with no adjacent stamp gap above 0.35 s —
+Gazebo's `gpu_lidar` occasionally renders an empty scan, which FAST-LIO
+skips; the fraction floor absorbs those, the gap bound catches a real
+stall; no `fastlio_mapping` death or respawn,
+no odometry sample stamped ahead of the latest `/clock` received before it (the odom bridge's own rejection log must stay empty), and the TF ownership table above holds
+on the live graph. Plots and raw samples go to the test's log directory.
+
+```bash
+NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation \
+  --pytest-args -k lidar_odometry_gate
+```
+
+The gate skips with a reason listing every missing capability on platforms
+without ground truth, profile support, lidar simulation or a scene template
+(today: everything except Gazebo, e.g. MuJoCo).
 
 Conformance and the independence gate:
 
