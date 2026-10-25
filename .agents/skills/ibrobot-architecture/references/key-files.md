@@ -76,7 +76,7 @@
 
 | Path | Note |
 |------|------|
-| `fast_lio`, `fast_calib`, `livox_ros_driver2`, `omni_wheel_controller` | git submodules (LiDAR odometry / calibration / driver / wheel controller) |
+| `fast_lio`, `fast_calib`, `livox_ros_driver2` | git submodules (LiDAR odometry / calibration / driver) |
 | `pymoveit2`, `rosclaw` | git submodules (vendored) |
 | `workflows` | CI gate definition (Jenkins shared library), **not** a ROS package |
 

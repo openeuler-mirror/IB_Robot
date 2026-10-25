@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!-- Minimal URDF for the sim_controllers fixture (D11): self-contained, no
+     retired LeKiwi asset, just enough structure to render a robot. -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="sim_controllers_fixture">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0"/>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+  </link>
+  <link name="left_wheel_link"/>
+  <joint name="left_wheel_joint" type="continuous">
+    <parent link="base_link"/>
+    <child link="left_wheel_link"/>
+    <axis xyz="0 1 0"/>
+    <origin xyz="0 0.1 0"/>
+  </joint>
+</robot>

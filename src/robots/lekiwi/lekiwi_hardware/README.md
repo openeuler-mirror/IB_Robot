@@ -48,7 +48,7 @@ lekiwi_hardware/
 ├── package.xml                          # ROS2 包清单
 ├── lekiwi_hardware_plugin.xml           # pluginlib 插件注册
 ├── config/
-│   └── lekiwi_controllers.yaml          # 控制器配置
+│   └── lekiwi_base_controllers.yaml    # 控制器配置
 ├── include/lekiwi_hardware/
 │   ├── lekiwi_conversions.hpp           # 坐标转换纯函数（header-only）
 │   └── lekiwi_system_hardware.hpp       # 硬件接口头文件
@@ -158,25 +158,17 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_rea
 
 ## 控制器配置
 
-`config/lekiwi_controllers.yaml` 定义了 7 个控制器：
+`config/lekiwi_base_controllers.yaml` 定义了底盘运行时的 2 个控制器：
 
 | 控制器 | 类型 | 控制关节 | 模式 |
 |--------|------|----------|------|
-| `arm_position_controller` | `JointGroupPositionController` | 1-5 | 位置 |
-| `gripper_position_controller` | `JointGroupPositionController` | 6 | 位置 |
-| `arm_trajectory_controller` | `JointTrajectoryController` | 1-5 | MoveIt 轨迹 |
-| `gripper_trajectory_controller` | `JointTrajectoryController` | 6 | MoveIt 轨迹 |
 | `base_velocity_controller` | `JointGroupVelocityController` | 7-9 | 速度 |
 | `joint_state_broadcaster` | `JointStateBroadcaster` | 1-9 | 状态发布 |
-| `arm_joint_state_broadcaster` | `JointStateBroadcaster` | 1-6 | MoveIt 专用本地状态 |
 
 控制器管理器更新频率：**100 Hz**，状态发布频率：**100 Hz**。
 
-`moveit_planning` 启动时，两个状态 broadcaster 与臂/夹爪 trajectory controller 为 active，
-`base_velocity_controller` 仅加载并配置为 inactive。Gateway 切换到导航模式时通过
-`controller_manager/switch_controller` 停用臂/夹爪 controller，再启用底盘 controller；切回机械臂前
-先等待 bridge 清零确认。MoveIt 从
-`/arm_joint_state_broadcaster/joint_states` 读取仅含 1-6 号关节的状态，完整 `/joint_states` 继续供导航和记录使用。
+`base_velocity_controller` 在 `base_navigation` 模式为 active，承载 `cmd_vel` 投影到底盘关节速度；
+`joint_state_broadcaster` 全程发布 `/joint_states`（含 1-9 号关节），供导航与记录使用。
 
 ## 关节映射
 

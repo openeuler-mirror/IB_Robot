@@ -22,8 +22,11 @@ ROBOT_CONFIG_SHARE = Path(get_package_share_directory("robot_config"))
 
 def test_recording_topics_follow_contract_and_peripherals():
     """Migrated from robot_config's config suite: topics come from the
-    contract, the peripherals and the ros2_control joint states."""
-    config_path = ROBOT_CONFIG_SHARE / "config" / "robots" / "lekiwi.yaml"
+    contract, the peripherals and the ros2_control joint states.
+
+    Generic behaviour (D11): moved from the retired ``lekiwi.yaml`` onto
+    robot_config's minimal fixture."""
+    config_path = ROBOT_CONFIG_SHARE / "test" / "config" / "minimal_sim_controllers.yaml"
     robot_config = load_robot_config_dict(config_path)
     topics = get_recording_topics(robot_config)
 

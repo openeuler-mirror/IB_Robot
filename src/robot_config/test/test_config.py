@@ -896,20 +896,6 @@ def test_dict_contract_builder_allows_empty_topic_for_peripheral_observation():
     assert contract.observations[0].type == "sensor_msgs/msg/Image"
 
 
-def test_load_lekiwi_config_dict():
-    config_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi.yaml"
-    robot_config = load_robot_config_dict(config_path)
-
-    assert robot_config["name"] == "lekiwi"
-    assert robot_config["ros2_control"]["urdf_path"] == "$(find lekiwi_description)/urdf/base.urdf.xacro"
-    assert robot_config["control_modes"]["teleop"]["controllers"] == [
-        "joint_state_broadcaster",
-        "imu_sensor_broadcaster",
-        "base_controller",
-    ]
-    assert robot_config["navigation"]["default_mode"] == "full"
-
-
 def test_validate_valid_config():
     """Test validation of valid configuration."""
     config = RobotConfig(

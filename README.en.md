@@ -89,7 +89,6 @@ IB_Robot/                           # Main Workspace
 │   ├── robots/lekiwi/              # LeKiwi runtime suite (sdk/hardware/description/calibration/robot)
 │   ├── robots/feetech/             # Feetech servo SDK
 │   ├── hardware_mock/              # Hardware mock interface
-│   ├── omni_wheel_controller/      # Omni-wheel controller plugin
 │   ├── pymoveit2/                  # [Submodule] MoveIt2 Python interface
 │   ├── rosclaw/                    # [Submodule] OpenClaw social control integration
 │   ├── sim_models/                 # Simulation scene models (Gazebo/MuJoCo)

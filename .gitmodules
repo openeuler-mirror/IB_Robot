@@ -10,11 +10,6 @@
 [submodule "src/rosclaw"]
 	path = src/rosclaw
 	url = https://gitcode.com/ib_robot/rosclaw.git
-[submodule "src/omni_wheel_controller"]
-	path = src/omni_wheel_controller
-	url = https://gitcode.com/ib_robot/omni_wheel_controller.git
-	branch = main
-	ignore = dirty
 [submodule "libs/Livox-SDK2"]
 	path = libs/Livox-SDK2
 	url = https://atomgit.com/ib_robot/Livox-SDK2.git

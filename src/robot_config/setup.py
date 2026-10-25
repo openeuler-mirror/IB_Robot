@@ -24,11 +24,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
-        (
-            "share/" + package_name + "/test/e2e",
-            glob("test/e2e/gt_odom_node.py") + glob("test/e2e/cmd_vel_relay.py"),
-        ),
-        ("share/" + package_name + "/test/config", glob("test/config/*.yaml")),
+        ("share/" + package_name + "/test/config", glob("test/config/*.yaml") + glob("test/config/*.urdf.xacro")),
     ]
     + _package_data_files("config"),
     install_requires=["setuptools", "pyyaml", "inference_manifest"],

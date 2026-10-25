@@ -49,6 +49,11 @@ log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 # never derived from the closure under audit.
 # ---------------------------------------------------------------------------
 CONTRACT_PACKAGES=(ibrobot_msgs robot_runtime)
+# Packages the contract packages themselves depend on. robot_runtime
+# exec_depends sim_models for its MuJoCo scene composition (828762f9), so every
+# runtime closure contains it. Temporary: #191 moves the simulation code out of
+# robot_runtime, after which this entry must be removed.
+CONTRACT_DEPENDENCIES=(sim_models)
 SO101_RUNTIME_MEMBERS=(
   so101_robot so101_sdk so101_hardware so101_description so101_motion so101_suite
   feetech_sdk
@@ -83,7 +88,7 @@ THIRD_PARTY_ALLOWED=(pymoveit2 aimdk_msgs livox_ros_driver2 fast_lio fast_calib)
 CORE_EXCLUDED_SUFFIXES=("_robot" "_sdk" "_hardware" "_motion" "_suite")
 CORE_EXCLUDED_PACKAGES=(
   so101_description moveit lekiwi_description lekiwi_calibration
-  livox_ros_driver2 fast_lio fast_calib omni_wheel_controller rosclaw pymoveit2
+  livox_ros_driver2 fast_lio fast_calib rosclaw pymoveit2
 )
 CORE_BUILD_PACKAGES=(
   robot_config embodied_bringup manipulation_execution skill_library skill_catalog
@@ -187,7 +192,7 @@ runtime_gate() {
   esac
   profile="${profile:-$default_profile}"
 
-  local allowlist=("${CONTRACT_PACKAGES[@]}" "${members[@]}" "${THIRD_PARTY_ALLOWED[@]}")
+  local allowlist=("${CONTRACT_PACKAGES[@]}" "${CONTRACT_DEPENDENCIES[@]}" "${members[@]}" "${THIRD_PARTY_ALLOWED[@]}")
 
   log_info "runtime gate: computing dependency closure of ${robot_pkg}"
   local closure

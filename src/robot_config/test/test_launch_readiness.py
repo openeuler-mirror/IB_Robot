@@ -749,8 +749,14 @@ def test_tracing_keeps_startup_error_when_cleanup_raises(monkeypatch, tmp_path, 
     assert os.environ.get("IB_TRACE_ENABLED") == previous_flag
 
 
-def test_lekiwi_sim_uses_sim_controller_override():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi.yaml"
+def test_sim_controllers_override_drops_hardware_only_controllers():
+    """Simulation replaces the mode's controller set with sim_controllers.
+
+    Generic behaviour (D11): moved from the retired ``lekiwi.yaml`` onto the
+    minimal fixture — the hardware-only ``imu_sensor_broadcaster`` is absent
+    from the simulation set.
+    """
+    config_path = Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
     robot_config = load_robot_config_dict(config_path)
 
     _nodes, controller_names, _deferred_spawners, _robot_description = generate_ros2_control_nodes(
@@ -799,7 +805,12 @@ def test_launch_setup_enables_navigation_when_requested(monkeypatch):
 
     monkeypatch.setattr(robot_launch, "build_launch_registry", build_with_synthetic_navigation)
     context = LaunchContext()
-    context.launch_configurations["robot_config"] = "lekiwi"
+    # D11: the retired lekiwi.yaml was a plain legacy config here; the
+    # minimal fixture serves the same role without the retired asset
+    context.launch_configurations["robot_config"] = "sim_controllers_fixture"
+    context.launch_configurations["config_path"] = str(
+        Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
+    )
     context.launch_configurations["use_sim"] = "false"
     context.launch_configurations["auto_start_controllers"] = "false"
     context.launch_configurations["control_mode"] = "teleop"
@@ -902,7 +913,12 @@ def test_one_registration_extends_production_entry_end_to_end(monkeypatch):
 
     def _launch(extension_mode):
         context = LaunchContext()
-        context.launch_configurations["robot_config"] = "lekiwi"
+        # D11: the retired lekiwi.yaml was a plain legacy config here; the
+        # minimal fixture serves the same role without the retired asset
+        context.launch_configurations["robot_config"] = "sim_controllers_fixture"
+        context.launch_configurations["config_path"] = str(
+            Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
+        )
         context.launch_configurations["use_sim"] = "false"
         # auto_start_controllers=true arms the REAL controller readiness
         # barrier (the controller group spawner) of this hardware launch.
@@ -1113,10 +1129,14 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(monkeypatch, tmp
 
 
 def test_launch_loader_preserves_config_path_for_runtime_consumers():
-    robot_config = robot_launch.load_robot_config("lekiwi")
+    """Generic behaviour (D11): moved from the retired ``lekiwi.yaml`` onto
+    the minimal fixture — the loader records the resolved config path so the
+    runtime consumers can find sibling assets."""
+    config_path = Path(__file__).resolve().parent / "config" / "minimal_sim_controllers.yaml"
+    robot_config = robot_launch.load_robot_config("sim_controllers_fixture", str(config_path))
 
-    assert robot_config["name"] == "lekiwi"
-    assert robot_config["_config_path"].endswith("config/robots/lekiwi.yaml")
+    assert robot_config["name"] == "sim_controllers_fixture"
+    assert robot_config["_config_path"] == str(config_path)
 
 
 def test_inference_execution_mode_cli_override_targets_one_pipeline():

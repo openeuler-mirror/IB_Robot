@@ -155,7 +155,7 @@ src/
 ├── hardware_mock/           # Contract-driven mock backend (no real hardware)
 ├── sim_models/              # Scene assets + scene compiler (Gazebo/MuJoCo)
 ├── attention_viz/           # ACT attention weight visualization
-├── fast_lio/ fast_calib/ livox_ros_driver2/ omni_wheel_controller/  # (git submodules)
+├── fast_lio/ fast_calib/ livox_ros_driver2/  # (git submodules)
 ├── pymoveit2/ rosclaw/      # (git submodules, vendored)
 └── workflows/               # CI gate definition (Jenkins), not a ROS package
 ```

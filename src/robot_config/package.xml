@@ -44,7 +44,6 @@
   <exec_depend>pointcloud_to_laserscan</exec_depend>
   <exec_depend>livox_ros_driver2</exec_depend>
   <exec_depend>fast_lio</exec_depend>
-  <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <!-- ALSA audio device owners for the provider-less legacy audio_io entry
        (runtime-owned-audio-io). Delete both once every deployment sets
