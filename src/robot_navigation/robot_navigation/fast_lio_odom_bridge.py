@@ -10,7 +10,8 @@ from rclpy.node import Node
 from tf2_ros import TransformBroadcaster
 
 from robot_navigation.fast_lio_odom_contract import (
-    compose_pose,
+    base_pose_from_body_pose,
+    invert_transform,
     project_planar_pose,
     transform_twist,
     validate_odometry_sample,
@@ -43,7 +44,8 @@ class FastLioOdomBridge(Node):
         self._rotation = tuple(float(value) for value in self.get_parameter("body_to_base_rotation").value)
         if len(self._translation) != 3 or len(self._rotation) != 4:
             raise ValueError("FAST-LIO body-to-base transform requires 3 translation and 4 quaternion values")
-        compose_pose((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), self._translation, self._rotation)
+        # rejects non-finite or zero-norm transforms up front
+        invert_transform(self._translation, self._rotation)
 
         source_topic = str(self.get_parameter("source_topic").value)
         output_topic = str(self.get_parameter("output_topic").value)
@@ -92,7 +94,9 @@ class FastLioOdomBridge(Node):
 
         self._last_error = ""
         output = deepcopy(message)
-        position, orientation = compose_pose(
+        # the base pose is the body pose conjugated by the mount (a yawed
+        # mount must not yaw the odometry frame with it)
+        position, orientation = base_pose_from_body_pose(
             (pose.position.x, pose.position.y, pose.position.z),
             (pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w),
             self._translation,

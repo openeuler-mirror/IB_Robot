@@ -65,6 +65,45 @@ def compose_pose(
     return output_position, _normalize(_multiply(orientation, child_rotation))
 
 
+def invert_transform(
+    translation: tuple[float, ...], quaternion: tuple[float, ...]
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """The inverse of a rigid transform given as (translation, xyzw quaternion)."""
+    rotation = _normalize(quaternion)
+    inverse_rotation = (-rotation[0], -rotation[1], -rotation[2], rotation[3])
+    return tuple(-value for value in _rotate(inverse_rotation, translation)), inverse_rotation
+
+
+def base_pose_from_body_pose(
+    position: tuple[float, ...],
+    orientation: tuple[float, ...],
+    body_to_base_translation: tuple[float, ...],
+    body_to_base_rotation: tuple[float, ...],
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """The ``odom -> base_link`` pose for FAST-LIO's ``camera_init -> body`` pose.
+
+    FAST-LIO reports the body (= lidar/IMU) pose in the ``camera_init`` frame
+    the body itself defined at startup, and the body sits at the sensor mount
+    relative to the base (``body_to_base`` = the mount's inverse). The base
+    pose in the base's own startup frame is the body pose conjugated by the
+    mount — a right-composition alone would leave the result parented in the
+    sensor-rotated ``camera_init`` frame, so a yawed mount (the MID-360 sits
+    at +90 degrees) would yaw the whole odometry frame with it.
+    """
+    pose_orientation = _normalize(orientation)
+    body_to_base_orientation = _normalize(body_to_base_rotation)
+    # P o X: the base's pose in the camera_init frame
+    camera_init_position, camera_init_orientation = compose_pose(
+        position, pose_orientation, body_to_base_translation, body_to_base_orientation
+    )
+    # M o (P o X) with M the mount (the inverse of body_to_base)
+    mount_translation, mount_orientation = invert_transform(body_to_base_translation, body_to_base_orientation)
+    base_position = tuple(
+        mount_translation[index] + value for index, value in enumerate(_rotate(mount_orientation, camera_init_position))
+    )
+    return base_position, _normalize(_multiply(mount_orientation, camera_init_orientation))
+
+
 def project_planar_pose(
     position: tuple[float, ...], orientation: tuple[float, ...]
 ) -> tuple[tuple[float, ...], tuple[float, ...]]:

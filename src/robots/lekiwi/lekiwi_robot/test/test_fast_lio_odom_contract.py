@@ -5,7 +5,9 @@ import math
 import pytest
 
 from lekiwi_robot.fast_lio_odom_contract import (
+    base_pose_from_body_pose,
     compose_pose,
+    invert_transform,
     project_planar_pose,
     transform_twist,
     validate_odometry_sample,
@@ -42,16 +44,71 @@ def test_fast_lio_timestamp_far_in_the_future_is_rejected():
     )
 
 
-def test_body_to_base_extrinsic_is_composed_with_lio_pose():
-    position, orientation = compose_pose(
+def test_identity_body_to_base_keeps_the_lio_pose():
+    position, orientation = base_pose_from_body_pose(
         (1.0, 2.0, 0.0),
         (0.0, 0.0, 0.0, 1.0),
-        (0.0, 0.0, -0.3),
-        (0.0, 0.0, -math.sqrt(0.5), math.sqrt(0.5)),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
     )
 
-    assert position == pytest.approx((1.0, 2.0, -0.3))
-    assert orientation == pytest.approx((0.0, 0.0, -math.sqrt(0.5), math.sqrt(0.5)))
+    assert position == pytest.approx((1.0, 2.0, 0.0))
+    assert orientation == pytest.approx((0.0, 0.0, 0.0, 1.0))
+
+
+def test_yawed_mount_keeps_the_odometry_frame_base_aligned():
+    """The MID-360 mount regression: a +90 degree sensor mount.
+
+    The base pose is the body pose conjugated by the mount. With the real
+    mount (8 cm forward, 20 cm up, +90 deg yaw) a pure base translation or
+    rotation must come back exactly as the base motion — a right-composition
+    alone would leave the pose parented in the sensor-rotated camera_init
+    frame (the translation would come out rotated -90 degrees).
+    """
+    half = math.sqrt(0.5)
+    # body_to_base = the mount's inverse (lekiwi_mid360_mount.yaml)
+    body_to_base_translation = (0.0, -0.08, -0.2)
+    body_to_base_rotation = (0.0, 0.0, -half, half)
+
+    # the robot translated +1 m along base x: FAST-LIO's body pose is that
+    # translation rotated into the sensor frame (P = M^-1 o O o M)
+    position, orientation = base_pose_from_body_pose(
+        (0.0, -1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+        body_to_base_translation,
+        body_to_base_rotation,
+    )
+    assert position == pytest.approx((1.0, 0.0, 0.0), abs=1e-12)
+    assert orientation == pytest.approx((0.0, 0.0, 0.0, 1.0), abs=1e-12)
+
+    # the robot rotated 90 deg in place
+    position, orientation = base_pose_from_body_pose(
+        (-0.08, -0.08, 0.0),
+        (0.0, 0.0, half, half),
+        body_to_base_translation,
+        body_to_base_rotation,
+    )
+    assert position == pytest.approx((0.0, 0.0, 0.0), abs=1e-12)
+    assert orientation == pytest.approx((0.0, 0.0, half, half), abs=1e-12)
+
+
+def test_invert_transform_round_trips_a_rigid_transform():
+    translation = (-0.08, 0.0, 0.2)
+    rotation = (0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5))
+    inverse_translation, inverse_rotation = invert_transform(translation, rotation)
+
+    position, orientation = compose_pose(
+        *compose_pose((1.0, -2.0, 0.5), (0.1, -0.2, 0.3, 0.9), translation, rotation),
+        inverse_translation,
+        inverse_rotation,
+    )
+    assert position == pytest.approx((1.0, -2.0, 0.5))
+    assert orientation == pytest.approx(_normalize_quaternion((0.1, -0.2, 0.3, 0.9)))
+
+
+def _normalize_quaternion(quaternion):
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    return tuple(value / norm for value in quaternion)
 
 
 def test_planar_projection_removes_height_roll_and_pitch():
