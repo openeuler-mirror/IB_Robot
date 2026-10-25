@@ -271,6 +271,56 @@ def test_gazebo_world_only_falls_back_to_the_scene_layout_spawn():
     assert spawn_pose == (0.0, 0.30, -0.03, 0.0)
 
 
+def _gz_server_args(actions) -> str:
+    """The gz_args string of the single ros_gz_sim server include."""
+    from launch.actions import IncludeLaunchDescription
+
+    include = next(action for action in actions if isinstance(action, IncludeLaunchDescription))
+    (gz_args,) = [
+        value
+        for key, value in include.launch_arguments
+        if str(key[0].text if hasattr(key[0], "text") else key) == "gz_args"
+    ]
+    return str(gz_args[0].text if hasattr(gz_args[0], "text") else gz_args)
+
+
+def test_gazebo_world_only_without_scene_uses_the_empty_scene_world():
+    """No scene configured: the generic fallback is the sim_models empty scene.
+
+    ``simulation.robot_spawn`` is ignored (spawn only applies with a scene)
+    and no ``initial_pose_*`` is written back to the config.
+    """
+    adapter = get_sim_backend("gazebo")
+    config = {
+        "name": "test_robot",
+        "gazebo_world_name": "demo",
+        "simulation": {
+            "platform": "gazebo",
+            "robot_spawn": {"x": 0.25, "y": -0.1, "z": -0.03, "yaw": 0.7},
+        },
+    }
+    actions, world_name, spawn_pose = adapter.start_world_only(config)
+    assert world_name == "demo"
+    assert spawn_pose == (0.0, 0.0, 0.0, 0.0)
+    for key in ("initial_pose_x", "initial_pose_y", "initial_pose_z"):
+        assert key not in config
+    assert "sim_models_empty.world" in _gz_server_args(actions)
+
+
+def test_gazebo_world_only_unknown_scene_falls_back_to_the_empty_scene_world():
+    """A configured scene that fails to load falls back to the empty scene world."""
+    adapter = get_sim_backend("gazebo")
+    config = {
+        "name": "test_robot",
+        "gazebo_world_name": "demo",
+        "simulation": {"platform": "gazebo", "scene": "no_such_scene"},
+    }
+    actions, world_name, spawn_pose = adapter.start_world_only(config)
+    assert world_name == "demo"
+    assert spawn_pose == (0.0, 0.0, 0.0, 0.0)
+    assert "sim_models_empty.world" in _gz_server_args(actions)
+
+
 def test_provider_gazebo_simulation_startup_carries_world_and_pose():
     from robot_config.launch_builders.simulation import build_simulation
     from robot_config.launch_registry.registry import LaunchBuildContext

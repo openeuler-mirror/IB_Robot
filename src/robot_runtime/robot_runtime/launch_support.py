@@ -43,6 +43,11 @@ from robot_runtime.gazebo import (
     bridge_config_node,
     camera_bridge_entries,
     camera_sensor_urdf,
+    imu_bridge_entries,
+    imu_settle_filter_nodes,
+    lidar_bridge_entries,
+    lidar_finite_filter_nodes,
+    lidar_imu_sensor_urdf,
 )
 from robot_runtime.interface_description import build_description
 from robot_runtime.path_subst import resolve_path
@@ -51,6 +56,8 @@ from robot_runtime.peripherals import (
     load_peripherals_file,
     merge_peripherals,
     peripheral_nodes,
+    peripheral_tf_nodes_for_absent_frames,
+    scan_converter_nodes,
     synthetic_perception_nodes,
 )
 from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
@@ -339,6 +346,7 @@ def render_gazebo_description(
     profile: dict[str, Any],
     profile_path: Path,
     *,
+    peripherals: list | None = None,
     spawn_pose: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> str:
     """Render the profile's xacro for the Gazebo platform (D5, D7b).
@@ -346,9 +354,11 @@ def render_gazebo_description(
     ``use_sim`` selects the ros2_control simulation plugin (gz
     ``GazeboSimSystem``), the SDK flag stays off, the gz plugin reads the
     profile's controllers parameter file and the effort state interface is
-    exposed for the simulated joint-current publisher (D6b). Camera sensors
-    are injected for the effective peripherals, meshes resolve to absolute
-    ``file://`` URIs and the SDK/hardware descriptions are untouched.
+    exposed for the simulated joint-current publisher (D6b). Camera, lidar
+    and IMU sensors are injected for the effective peripherals — pass the
+    resolved inventory (D5 inventory-first); the profile's own peripherals
+    apply when omitted — meshes resolve to absolute ``file://`` URIs and the
+    SDK/hardware descriptions are untouched.
     """
     description = profile.get("description") or {}
     if not description.get("xacro"):
@@ -372,14 +382,16 @@ def render_gazebo_description(
     for key, value in (profile.get("hardware") or {}).get("xacro_args", {}).items():
         xacro_args[str(key)] = xacro_value(value)
     robot_description = render_xacro(resolve_path(description["xacro"]), xacro_args)
-    cameras_xml = camera_sensor_urdf(
-        profile.get("peripherals") or [],
+    effective = merge_peripherals(profile.get("peripherals"), []) if peripherals is None else peripherals
+    sensors_xml = camera_sensor_urdf(
+        effective,
         platform="gazebo",
         spawn_pose=spawn_pose,
         frame_contract=True,
     )
-    if cameras_xml:
-        robot_description = robot_description.replace("</robot>", cameras_xml + "\n</robot>", 1)
+    sensors_xml += lidar_imu_sensor_urdf(effective, platform="gazebo")
+    if sensors_xml:
+        robot_description = robot_description.replace("</robot>", sensors_xml + "\n</robot>", 1)
     return _resolve_package_uris(robot_description)
 
 
@@ -446,16 +458,29 @@ def gazebo_embodiment_actions(
 ) -> list:
     """The provider's Gazebo embodiment (D2/D5): no ``ros2_control_node``.
 
-    robot_state_publisher on sim time; a minimal empty world plus ``/clock``
-    bridge when no world is supplied (standalone verification); ``create``
-    waits for the world clock, then spawns the entity at the given pose
-    (including yaw); controller spawners target the in-simulator controller
-    manager after ``create`` exits; the facade, the camera bridge and the
-    simulated joint-current publisher complete the embodiment. The world,
+    The effective peripheral inventory (profile defaults merged with the
+    deployment fragment, disabled removed) is resolved once, before anything
+    else, and drives everything downstream: the sensor generation inside the
+    rendered description (when this call renders it), the bridge entries and
+    the static transforms for sensor frames absent from the rendered model
+    (D5 inventory-first). robot_state_publisher runs on sim time; a minimal
+    empty world plus ``/clock`` bridge when no world is supplied (standalone
+    verification); ``create`` waits for the world clock, then spawns the
+    entity at the given pose (including yaw); controller spawners target the
+    in-simulator controller manager after ``create`` exits; the facade and
+    the simulated joint-current publisher complete the embodiment. The world,
     when supplied by generic launch, is not started or bridged here.
     """
+    # D5 inventory-first: one effective inventory for sensors, bridges,
+    # derived processors and the interface description.
+    peripherals = merge_peripherals(
+        profile.get("peripherals"),
+        (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
+    )
     if robot_description is None:
-        robot_description = render_gazebo_description(profile, profile_path, spawn_pose=spawn_pose)
+        robot_description = render_gazebo_description(
+            profile, profile_path, peripherals=peripherals, spawn_pose=spawn_pose
+        )
     ros2_control = profile.get("ros2_control") or {}
     if not ros2_control.get("controllers_config"):
         raise RuntimeProfileError(
@@ -464,10 +489,6 @@ def gazebo_embodiment_actions(
     broadcasters, active, inactive = profile_controllers(profile)
     controller_manager = str(profile["controller_manager"])
     model_name = str(profile["runtime"]["name"])
-    peripherals = merge_peripherals(
-        profile.get("peripherals"),
-        (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
-    )
 
     actions: list[Any] = [
         Node(
@@ -585,10 +606,25 @@ def gazebo_embodiment_actions(
         if periph.get("type") == "camera"
         for entry in camera_bridge_entries(periph, full_streams=True)
     ]
-    if camera_entries:
+    lidar_imu_entries = [
+        entry for periph in peripherals for entry in (*lidar_bridge_entries(periph), *imu_bridge_entries(periph))
+    ]
+    sensor_entries = camera_entries + lidar_imu_entries
+    if sensor_entries:
         actions.append(
-            bridge_config_node(camera_entries, Path(tempfile.gettempdir()) / "ibrobot_runtime_camera_bridge.yaml")
+            bridge_config_node(sensor_entries, Path(tempfile.gettempdir()) / "ibrobot_runtime_sensor_bridge.yaml")
         )
+    # The finite-point filter serves the advertised cloud endpoints of the
+    # 3D lidars (D5: the bridge hands the raw gz cloud to the internal
+    # topic, the filter republishes the finite points on the endpoint); the
+    # IMU settle filter holds the raw IMU back until the physics has settled
+    # (zero window and landing impulse dropped), then relays it verbatim.
+    actions.extend(lidar_finite_filter_nodes(peripherals))
+    actions.extend(imu_settle_filter_nodes(peripherals))
+    # Static TF only for sensor frames the rendered model does not contain
+    # (the lidar/IMU frames); camera frames stay owned by RSP through their
+    # rendered links (D5, D13).
+    actions.extend(peripheral_tf_nodes_for_absent_frames(peripherals, robot_description))
     return actions
 
 
@@ -887,16 +923,29 @@ def peripheral_stack_actions(
 
     Physical drivers + static TF on real hardware; synthetic perception
     publishers on the same topics on the SDK simulation platform. Under a
-    physics platform the camera streams come from the simulator's sensors and
-    bridges (embodiment, D6), so only the host audio devices remain here.
-    Audio devices are host devices, so their ALSA owners run in EVERY
-    execution (the legacy robot_config audio_io entry also launched them
-    under simulation).
+    physics platform the camera and lidar streams come from the simulator's
+    sensors and bridges (embodiment, D6), so only the host audio devices
+    remain here — plus the derived scan converter, which runs on simulation
+    time when its source (FAST-LIO's registered body cloud) runs on the
+    platform (D5). Audio devices are host devices, so their ALSA owners run
+    in EVERY execution (the legacy robot_config audio_io entry also launched
+    them under simulation).
     """
     fragment = load_peripherals_file(peripherals_file) if peripherals_file else {}
     peripherals = merge_peripherals(profile.get("peripherals"), fragment.get("peripherals"))
     if simulated and sim_platform in PHYSICS_SIM_PLATFORMS:
-        return audio_nodes(peripherals)
+        fast_lio = {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
+        scan_converters = (
+            [
+                node
+                for periph in peripherals
+                if periph.get("type") == "lidar"
+                for node in scan_converter_nodes(periph, use_sim=True)
+            ]
+            if fast_lio.get("enabled", False)
+            else []
+        )
+        return [*audio_nodes(peripherals), *scan_converters]
     if simulated:
         effective = {**profile, "fast_lio": {**(profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}}
         return [

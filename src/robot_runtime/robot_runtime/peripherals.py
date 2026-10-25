@@ -42,6 +42,7 @@ from robot_runtime.interface_description import (
     peripheral_interfaces,
 )
 from robot_runtime.path_subst import resolve_path
+from robot_runtime.profile import PHYSICS_SIM_PLATFORMS
 
 logger = logging.getLogger("robot_runtime.peripherals")
 
@@ -564,6 +565,50 @@ def _camera_nodes(periph: dict[str, Any], use_sim: bool) -> list[Node]:
     return nodes
 
 
+def scan_converter_nodes(periph: dict[str, Any], use_sim: bool) -> list[Node]:
+    """The pointcloud_to_laserscan converter for one lidar's scan block (D5).
+
+    Split out of the MID-360 driver composition so physics platforms can run
+    it on simulation time against FAST-LIO's registered body cloud — the same
+    source as on hardware — when that source runs there. Composed unchanged
+    with the physical driver (same node, name, parameters and remappings).
+    """
+    scan_converter = periph.get("scan_converter", {})
+    if not scan_converter.get("enabled", False):
+        return []
+    scan_params = {
+        "target_frame": scan_converter.get("target_frame", periph.get("frame_id", "livox_frame")),
+        "transform_tolerance": scan_converter.get("transform_tolerance", 0.01),
+        "min_height": scan_converter.get("min_height", -0.2),
+        "max_height": scan_converter.get("max_height", 0.5),
+        "angle_min": scan_converter.get("angle_min", -3.14159265),
+        "angle_max": scan_converter.get("angle_max", 3.14159265),
+        "angle_increment": scan_converter.get("angle_increment", 0.00872665),
+        "scan_time": scan_converter.get("scan_time", 0.1),
+        "range_min": scan_converter.get("range_min", 0.1),
+        "range_max": scan_converter.get("range_max", 20.0),
+        "use_inf": scan_converter.get("use_inf", True),
+        "inf_epsilon": scan_converter.get("inf_epsilon", 1.0),
+        "use_sim_time": use_sim,
+    }
+    if "queue_size" in scan_converter:
+        scan_params["queue_size"] = int(scan_converter["queue_size"])
+    return [
+        Node(
+            package="pointcloud_to_laserscan",
+            executable="pointcloud_to_laserscan_node",
+            name=f"{periph['name']}_pointcloud_to_laserscan",
+            parameters=[scan_params],
+            remappings=[
+                ("cloud_in", str(scan_converter.get("pointcloud_topic", "/cloud_registered_body"))),
+                ("scan", str(scan_converter.get("scan_topic", "/scan"))),
+            ],
+            output="screen",
+            respawn=bool(scan_converter.get("respawn", True)),
+        )
+    ]
+
+
 def _livox_mid360_nodes(periph: dict[str, Any], use_sim: bool) -> list[Node]:
     config_path = resolve_path(periph["user_config_path"])
     with open(config_path, encoding="utf-8") as config_file:
@@ -606,40 +651,7 @@ def _livox_mid360_nodes(periph: dict[str, Any], use_sim: bool) -> list[Node]:
             respawn=bool(periph.get("respawn", True)),
         )
     ]
-
-    scan_converter = periph.get("scan_converter", {})
-    if scan_converter.get("enabled", False):
-        scan_params = {
-            "target_frame": scan_converter.get("target_frame", periph.get("frame_id", "livox_frame")),
-            "transform_tolerance": scan_converter.get("transform_tolerance", 0.01),
-            "min_height": scan_converter.get("min_height", -0.2),
-            "max_height": scan_converter.get("max_height", 0.5),
-            "angle_min": scan_converter.get("angle_min", -3.14159265),
-            "angle_max": scan_converter.get("angle_max", 3.14159265),
-            "angle_increment": scan_converter.get("angle_increment", 0.00872665),
-            "scan_time": scan_converter.get("scan_time", 0.1),
-            "range_min": scan_converter.get("range_min", 0.1),
-            "range_max": scan_converter.get("range_max", 20.0),
-            "use_inf": scan_converter.get("use_inf", True),
-            "inf_epsilon": scan_converter.get("inf_epsilon", 1.0),
-            "use_sim_time": use_sim,
-        }
-        if "queue_size" in scan_converter:
-            scan_params["queue_size"] = int(scan_converter["queue_size"])
-        nodes.append(
-            Node(
-                package="pointcloud_to_laserscan",
-                executable="pointcloud_to_laserscan_node",
-                name=f"{periph['name']}_pointcloud_to_laserscan",
-                parameters=[scan_params],
-                remappings=[
-                    ("cloud_in", str(scan_converter.get("pointcloud_topic", "/cloud_registered_body"))),
-                    ("scan", str(scan_converter.get("scan_topic", "/scan"))),
-                ],
-                output="screen",
-                respawn=bool(scan_converter.get("respawn", True)),
-            )
-        )
+    nodes.extend(scan_converter_nodes(periph, use_sim))
     return nodes
 
 
@@ -778,6 +790,33 @@ def _peripheral_tf_nodes(periph: dict[str, Any]) -> list[Node]:
     return nodes
 
 
+def _urdf_link_names(robot_description: str) -> set[str]:
+    import re
+
+    return set(re.findall(r"<link\s+name=\"([^\"]+)\"", robot_description))
+
+
+def peripheral_tf_nodes_for_absent_frames(
+    peripherals: list[dict[str, Any]] | None, robot_description: str
+) -> list[Node]:
+    """Static TF for sensor frames the rendered model does not contain (D5).
+
+    On a physics platform the rendered model owns the frames it contains (the
+    simulated camera links RSP publishes); peripheral frames it does NOT
+    contain — the lidar/IMU frames whose sensors attach by
+    ``<gazebo reference>`` without new links — keep exactly one parent
+    through the runtime's static transform (D13).
+    """
+    links = _urdf_link_names(robot_description)
+    nodes: list[Node] = []
+    for periph in merge_peripherals(peripherals, []):
+        frame_id = periph.get("frame_id")
+        if not frame_id or str(frame_id) in links:
+            continue
+        nodes.extend(_peripheral_tf_nodes(periph))
+    return nodes
+
+
 def peripheral_nodes(peripherals: list[dict[str, Any]] | None, use_sim: bool) -> list[Node]:
     """Physical driver nodes + static TF for a peripheral list (empty in sim)."""
     if use_sim:
@@ -813,13 +852,30 @@ def peripheral_nodes(peripherals: list[dict[str, Any]] | None, use_sim: bool) ->
     return nodes
 
 
-def fast_lio_nodes(config: dict[str, Any], *, bridge_package: str, use_sim: bool) -> list[Node]:
-    """Lidar odometry chain: fastlio_mapping + the odom bridge (robot-side host package)."""
-    if not config.get("enabled", False) or use_sim:
+def fast_lio_nodes(config: dict[str, Any], *, bridge_package: str, use_sim: bool, sim_platform: str = "") -> list[Node]:
+    """Lidar odometry chain: fastlio_mapping + the odom bridge (robot-side host package).
+
+    Hardware composes both on wall time; the SDK platform composes nothing
+    (synthetic perception owns the surface there); a physics platform
+    composes both on simulation time with the simulation parameter file
+    (``sim_params_file`` — a missing key fails naming it, D6), and the bridge
+    never publishes TF there: wheel odometry owns ``odom -> base_link`` (D4).
+    """
+    if not config.get("enabled", False):
+        return []
+    physics = use_sim and sim_platform in PHYSICS_SIM_PLATFORMS
+    if use_sim and not physics:
         return []
     params_file = config.get("params_file", "")
     if not params_file:
         raise ValueError("fast_lio.params_file is required")
+    if physics:
+        sim_params_file = config.get("sim_params_file", "")
+        if not sim_params_file:
+            raise ValueError("fast_lio.sim_params_file is required on a physics simulation platform")
+        mapping_parameters: list[Any] = [resolve_path(sim_params_file), {"use_sim_time": True}]
+    else:
+        mapping_parameters = [resolve_path(params_file), {"use_sim_time": False}]
 
     raw_odom_topic = config.get("raw_odom_topic", "/fast_lio/odometry_raw")
     mapping = Node(
@@ -827,7 +883,7 @@ def fast_lio_nodes(config: dict[str, Any], *, bridge_package: str, use_sim: bool
         executable="fastlio_mapping",
         name="fast_lio",
         output="screen",
-        parameters=[resolve_path(params_file), {"use_sim_time": False}],
+        parameters=mapping_parameters,
         remappings=[
             ("/Odometry", raw_odom_topic),
             ("/livox/lidar", config.get("lidar_topic", "/livox/lidar")),
@@ -853,9 +909,11 @@ def fast_lio_nodes(config: dict[str, Any], *, bridge_package: str, use_sim: bool
                 "output_base_frame": config.get("base_frame", "base_link"),
                 "body_to_base_translation": config.get("body_to_base_translation", [0.0, 0.0, 0.0]),
                 "body_to_base_rotation": config.get("body_to_base_rotation", [0.0, 0.0, 0.0, 1.0]),
-                "publish_tf": bool(config.get("publish_tf", True)),
+                # simulation: exactly one odom -> base_link publisher (D4)
+                "publish_tf": False if physics else bool(config.get("publish_tf", True)),
                 "planar_output": bool(config.get("planar_output", False)),
                 "max_future_skew_sec": float(config.get("max_future_skew_sec", 0.1)),
+                **({"use_sim_time": True} if physics else {}),
             }
         ],
     )

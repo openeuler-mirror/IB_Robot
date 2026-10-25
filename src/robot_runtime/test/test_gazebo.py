@@ -5,22 +5,35 @@ Covers openspec ``so101-gazebo-runtime-transport`` tasks 2.1, 2.3b, 2.3c and
 contract (frames, streams, spawn compensation), the effective peripheral
 inventory (disabled cameras absent everywhere) and the simulated joint
 current.
+
+``lekiwi-gazebo-runtime-platform`` D5 adds the simulated lidar/IMU sensors
+and bridges, the one-inventory rule across rendering/bridging/advertisement,
+peripheral static TF ownership on the platform, and the derived scan
+converter's platform composition matrix.
 """
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 
 import pytest
 import yaml
 from launch_ros.actions import Node
+from sensor_msgs.msg import Imu, PointCloud2, PointField
 
 from robot_runtime.gazebo import (
     advertised_camera_frame,
     camera_bridge_entries,
     camera_sensor_urdf,
+    imu_bridge_entries,
+    imu_sensor_sdf,
+    lidar_bridge_entries,
+    lidar_imu_sensor_urdf,
+    lidar_sensor_sdf,
     resolve_camera_pose,
+    resolve_sensor_pose,
 )
 from robot_runtime.interface_description import (
     InterfaceDescriptionError,
@@ -35,6 +48,7 @@ from robot_runtime.launch_support import (
     runtime_stack_actions,
     simulated_joint_current_actions,
 )
+from robot_runtime.peripherals import peripheral_tf_nodes_for_absent_frames
 
 # ---------------------------------------------------------------------------
 # Shared fixtures: a minimal robot-agnostic profile the launch helpers accept
@@ -156,6 +170,64 @@ FRONT = {
         }
     },
     "transform": {"parent_frame": "base", "x": 0.0, "y": 0.0, "z": 0.0},
+}
+
+# A MID-360 lidar in the LeKiwi profile's shape (D1/D13 pose keys).
+MID360 = {
+    "type": "lidar",
+    "name": "mid360",
+    "driver": "livox_mid360",
+    "frame_id": "livox_frame",
+    "pointcloud_topic": "/livox/lidar",
+    "imu_topic": "/livox/imu",
+    "xfer_format": 1,
+    "publish_freq": 10.0,
+    "transform": {
+        "parent_frame": "base_link",
+        "x": -0.08,
+        "y": 0.0,
+        "z": 0.2,
+        "roll": 0.0,
+        "pitch": 0.0,
+        "yaw": 1.5707963267948966,
+    },
+    "simulation": {
+        "gazebo": {
+            "transform": {
+                "parent_frame": "base_link",
+                "x": -0.08,
+                "y": 0.0,
+                "z": 0.2,
+                "roll": 0.0,
+                "pitch": 0.0,
+                "yaw": 1.5707963267948966,
+            },
+            "horizontal_samples": 900,
+            "vertical_samples": 32,
+            "vertical_min_deg": -7.0,
+            "vertical_max_deg": 52.0,
+            "range_min": 0.1,
+            "range_max": 40.0,
+            "update_rate": 10.0,
+            "imu": {"update_rate": 200.0},
+        }
+    },
+    "scan_converter": {
+        "enabled": True,
+        "pointcloud_topic": "/cloud_registered_body",
+        "scan_topic": "/scan",
+        "target_frame": "body",
+    },
+}
+
+# A planar lidar (ldlidar) on its scan endpoint.
+LDLIDAR = {
+    "type": "lidar",
+    "name": "ldlidar",
+    "driver": "ldlidar",
+    "frame_id": "laser_frame",
+    "scan_topic": "/scan",
+    "transform": {"parent_frame": "base_link", "x": 0.0, "y": 0.0, "z": 0.1},
 }
 
 
@@ -751,3 +823,488 @@ def test_advertised_camera_frames_is_the_single_source_of_the_convention():
         "camera_wrist_frame",
         "camera_wrist_frame",
     )
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-gazebo-runtime-platform D5: simulated lidar and IMU sensors
+# ---------------------------------------------------------------------------
+
+
+def test_lidar_sensor_attaches_by_reference_at_the_mounted_pose():
+    urdf = lidar_imu_sensor_urdf([MID360])
+    # attached to the resolved parent link, no URDF link/joint for the frame
+    assert '<gazebo reference="base_link">' in urdf
+    assert '<link name="livox_frame">' not in urdf and "livox_frame_joint" not in urdf
+    # the advertised frame stamps the bridged messages; the gz topic is named
+    # after the peripheral
+    assert "<gz_frame_id>livox_frame</gz_frame_id>" in urdf
+    assert "<topic>/mid360_lidar</topic>" in urdf
+    # the mount is the sensor pose (D13: simulation.gazebo.transform)
+    assert "<pose>-0.08 0.0 0.2 0.0 0.0 1.5707963267948966</pose>" in urdf
+    # D1 sensor parameters render into the scan pattern
+    assert "<samples>900</samples>" in urdf and "<samples>32</samples>" in urdf
+    assert "<min>0.1</min>" in urdf and "<max>40.0</max>" in urdf
+    assert "<update_rate>10.0</update_rate>" in urdf
+    assert 'sensor type="gpu_lidar" name="mid360_lidar"' in urdf
+
+
+def test_integrated_imu_is_colocated_with_the_lidar():
+    urdf = lidar_imu_sensor_urdf([MID360])
+    assert 'sensor type="imu" name="mid360_imu"' in urdf
+    assert "<topic>/mid360_imu</topic>" in urdf
+    # same frame, same pose and the IMU-specific rate (D5)
+    imu_block = urdf[urdf.index('name="mid360_imu"') : urdf.index('name="mid360_imu"') + 400]
+    assert "<gz_frame_id>livox_frame</gz_frame_id>" in imu_block
+    assert "<pose>-0.08 0.0 0.2 0.0 0.0 1.5707963267948966</pose>" in imu_block
+    assert "<update_rate>200.0</update_rate>" in imu_block
+
+
+def test_planar_lidar_renders_one_vertical_sample():
+    urdf = lidar_imu_sensor_urdf([LDLIDAR])
+    assert 'sensor type="gpu_lidar" name="ldlidar_lidar"' in urdf
+    assert "<topic>/ldlidar_lidar</topic>" in urdf
+    # vertical samples 1 = planar scan
+    assert "<samples>1</samples>" in urdf
+    assert "<min_angle>0.0</min_angle>" in urdf
+    # no integrated IMU for this driver
+    assert 'sensor type="imu"' not in urdf
+
+
+def test_standalone_imu_peripheral_gets_its_own_sensor():
+    periph = {
+        "type": "imu",
+        "name": "base_imu",
+        "frame_id": "imu_frame",
+        "imu_topic": "/imu/data",
+        "transform": {"parent_frame": "base_link", "x": 0.0, "y": 0.0, "z": 0.08},
+        "simulation": {"gazebo": {"update_rate": 100.0}},
+    }
+    urdf = lidar_imu_sensor_urdf([periph])
+    assert 'sensor type="imu" name="base_imu_imu"' in urdf
+    assert "<gz_frame_id>imu_frame</gz_frame_id>" in urdf
+    assert "<topic>/base_imu_imu</topic>" in urdf
+    assert "<update_rate>100.0</update_rate>" in urdf
+    assert "<pose>0.0 0.0 0.08 0.0 0.0 0.0</pose>" in urdf
+
+
+def test_lidar_and_imu_bridge_entries_target_the_advertised_endpoints():
+    entries = [*lidar_bridge_entries(MID360), *imu_bridge_entries(MID360)]
+    # both sensor streams land on internal raw topics: no-hit beams arrive
+    # as ±inf (the finite filter serves the cloud endpoint) and the IMU's
+    # pre-settle samples are all-zero (the settle filter serves the IMU
+    # endpoint) — D5
+    assert entries == [
+        {
+            "ros_topic_name": "/mid360_lidar/raw",
+            "gz_topic_name": "/mid360_lidar/points",
+            "ros_type_name": "sensor_msgs/msg/PointCloud2",
+            "gz_type_name": "gz.msgs.PointCloudPacked",
+            "direction": "GZ_TO_ROS",
+            "lazy": False,
+        },
+        {
+            "ros_topic_name": "/mid360_imu/raw",
+            "gz_topic_name": "/mid360_imu",
+            "ros_type_name": "sensor_msgs/msg/Imu",
+            "gz_type_name": "gz.msgs.IMU",
+            "direction": "GZ_TO_ROS",
+            "lazy": False,
+        },
+    ]
+    # a planar lidar bridges the LaserScan on its scan endpoint
+    assert lidar_bridge_entries(LDLIDAR) == [
+        {
+            "ros_topic_name": "/scan",
+            "gz_topic_name": "/ldlidar_lidar",
+            "ros_type_name": "sensor_msgs/msg/LaserScan",
+            "gz_type_name": "gz.msgs.LaserScan",
+            "direction": "GZ_TO_ROS",
+            "lazy": False,
+        }
+    ]
+    assert imu_bridge_entries(LDLIDAR) == []
+    # drivers the simulator does not stand in for bridge nothing
+    other = {**MID360, "driver": "some_vendor_lidar"}
+    assert lidar_bridge_entries(other) == [] and imu_bridge_entries(other) == []
+
+
+def test_lidar_injection_follows_LIDAR_SIM_PLATFORMS_for_every_physics_platform():
+    """D14.2 guard: for every physics platform the lidar injection is non-empty
+    exactly when the platform simulates lidar (the capability the gate reads
+    and the render path consult cannot drift apart)."""
+    from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS
+
+    for platform in PHYSICS_SIM_PLATFORMS:
+        urdf = lidar_imu_sensor_urdf([MID360], platform=platform)
+        assert bool(urdf) == (platform in LIDAR_SIM_PLATFORMS), (
+            f"{platform}: lidar injection is {'non-empty' if urdf else 'empty'} but the platform is "
+            f"{'in' if platform in LIDAR_SIM_PLATFORMS else 'not in'} LIDAR_SIM_PLATFORMS"
+        )
+
+
+def test_sensor_pose_prefers_the_simulation_transform():
+    periph = {
+        "type": "lidar",
+        "name": "l",
+        "driver": "livox_mid360",
+        "transform": {"parent_frame": "body", "x": 0.0, "y": 0.0, "z": 0.0},
+        "simulation": {"gazebo": {"transform": {"parent_frame": "base_link", "x": 1.0, "y": 2.0, "z": 3.0}}},
+    }
+    assert resolve_sensor_pose(periph, "gazebo") == {"parent_frame": "base_link", "x": 1.0, "y": 2.0, "z": 3.0}
+    # without the simulation section the public transform applies
+    assert resolve_sensor_pose({"transform": {"parent_frame": "body", "x": 9.0}}, "gazebo") == {
+        "parent_frame": "body",
+        "x": 9.0,
+    }
+    assert resolve_sensor_pose({}, "gazebo") == {}
+
+
+def test_lidar_sensor_uses_the_sensor_sdf_directly():
+    """The per-peripheral builders are the robot-agnostic primitives (D5)."""
+    block = lidar_sensor_sdf(MID360)
+    assert block.startswith("\n") is False or block.strip() != ""
+    assert '<gazebo reference="base_link">' in block and 'name="mid360_lidar"' in block
+    imu_block = imu_sensor_sdf(MID360)
+    assert 'name="mid360_imu"' in imu_block and "<update_rate>200.0</update_rate>" in imu_block
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-gazebo-runtime-platform D5: one effective inventory everywhere
+# ---------------------------------------------------------------------------
+
+
+def _lidar_profile(tmp_path, peripherals):
+    profile = _profile(tmp_path, peripherals=peripherals)
+    profile["fast_lio"] = {"enabled": False, "params_file": "/tmp/fl.yaml"}
+    return profile
+
+
+def test_render_gazebo_description_accepts_the_effective_inventory(tmp_path):
+    profile = _lidar_profile(tmp_path, [TOP, MID360])
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert 'name="mid360_lidar"' in urdf and 'name="mid360_imu"' in urdf
+    assert 'name="top_camera"' in urdf
+    # the same render comes out when the caller resolved the inventory
+    explicit = render_gazebo_description(
+        profile, tmp_path / "robot.xacro", peripherals=merge_peripherals(profile["peripherals"], [])
+    )
+    assert explicit == urdf
+
+
+def test_fragment_changes_the_inventory_everywhere(tmp_path):
+    """Disable, add, rename and re-mount through a fragment: render, bridge
+    entries and advertised interfaces all reflect the same effective
+    inventory (runtime-simulation-platform D5)."""
+    base_profile = _lidar_profile(tmp_path, [TOP, MID360])
+    fragment = tmp_path / "fragment.yaml"
+
+    # remount + rename the endpoint through the fragment
+    fragment.write_text(
+        yaml.safe_dump(
+            {
+                "peripherals": [
+                    {
+                        "type": "lidar",
+                        "name": "mid360",
+                        "pointcloud_topic": "/livox/renamed",
+                        "simulation": {"gazebo": {"transform": {"parent_frame": "base_link", "x": 0.5, "yaw": 0.25}}},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    from robot_runtime.peripherals import load_peripherals_file
+
+    merged = merge_peripherals(base_profile["peripherals"], load_peripherals_file(str(fragment)).get("peripherals"))
+    effective = {**base_profile, "peripherals": merged}
+    urdf = render_gazebo_description(effective, tmp_path / "robot.xacro")
+    # the sensor moved to the fragment's mount (key-wise deep merge: the
+    # unspecified z keeps the profile's 0.2) and the bridge follows the
+    # renamed ROS endpoint
+    assert "<pose>0.5 0.0 0.2 0.0 0.0 0.25</pose>" in urdf
+    bridge = [entry for periph in merged for entry in (*lidar_bridge_entries(periph), *imu_bridge_entries(periph))]
+    # the renamed endpoint is served by the finite filter from the raw topic,
+    # the IMU endpoint by the settle filter (both internal raw topics)
+    assert {entry["ros_topic_name"] for entry in bridge} == {"/mid360_lidar/raw", "/mid360_imu/raw"}
+    description = build_description(effective, peripherals=merged, use_sim=True, sim_platform="gazebo")
+    assert description["interfaces"]["lidar.mid360.points"]["endpoint"] == "/livox/renamed"
+    assert description["interfaces"]["lidar.mid360.points"]["message_type"] == "sensor_msgs/msg/PointCloud2"
+
+    # disabling through the fragment removes the sensor, the bridge entry and
+    # the advertisement alike
+    fragment.write_text(
+        yaml.safe_dump({"peripherals": [{"type": "lidar", "name": "mid360", "disabled": True}]}), encoding="utf-8"
+    )
+    merged = merge_peripherals(base_profile["peripherals"], load_peripherals_file(str(fragment)).get("peripherals"))
+    effective = {**base_profile, "peripherals": merged}
+    urdf = render_gazebo_description(effective, tmp_path / "robot.xacro")
+    assert "mid360_lidar" not in urdf and "mid360_imu" not in urdf
+    assert not [entry for periph in merged for entry in (*lidar_bridge_entries(periph), *imu_bridge_entries(periph))]
+    description = build_description(effective, peripherals=merged, use_sim=True, sim_platform="gazebo")
+    assert not any(key.startswith("lidar.mid360.") for key in description["interfaces"])
+
+
+def test_camera_only_provider_keeps_the_exact_pre_change_surface(tmp_path):
+    """SO-101-shaped input (cameras only): no lidar/IMU content appears and
+    the bridge stays camera-only (camera behaviour unchanged, D5)."""
+    profile = _profile(tmp_path)  # TOP, WRIST, FRONT
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    assert "gpu_lidar" not in urdf and 'sensor type="imu"' not in urdf
+    actions = gazebo_embodiment_actions(profile, tmp_path / "robot.xacro", robot_description=urdf, gazebo_world="demo")
+    bridge = _by_executable([a for a in actions if isinstance(a, Node)], "bridge_node")
+    config = yaml.safe_load(Path(_params(bridge)["config_file"]).read_text(encoding="utf-8"))
+    assert {entry["ros_type_name"] for entry in config} == {"sensor_msgs/msg/Image", "sensor_msgs/msg/CameraInfo"}
+    assert all(entry["ros_topic_name"].startswith("/camera/") for entry in config)
+
+
+def test_sensor_frames_absent_from_the_model_get_the_runtime_static_tf(tmp_path):
+    """D5/D13: the runtime publishes static TF only for peripheral frames the
+    rendered model does not contain; camera frames keep their single
+    model-derived publisher (RSP)."""
+    profile = _lidar_profile(tmp_path, [TOP, MID360])
+    urdf = render_gazebo_description(profile, tmp_path / "robot.xacro")
+    # the lidar frame is absent from the model, the camera frames are present
+    assert '<link name="livox_frame">' not in urdf
+    assert '<link name="camera_top_frame">' in urdf
+    nodes = peripheral_tf_nodes_for_absent_frames(profile["peripherals"], urdf)
+    tf_nodes = [node for node in nodes if node._Node__node_executable == "static_transform_publisher"]
+    assert len(tf_nodes) == 1, "exactly the lidar frame gets a runtime static TF"
+    args = tf_nodes[0]._Node__arguments
+    assert args[args.index("--frame-id") + 1] == "base_link"
+    assert args[args.index("--child-frame-id") + 1] == "livox_frame"
+    # a camera-only profile composes no static TF at all: every camera frame
+    # is owned by RSP through the rendered links
+    camera_only = render_gazebo_description(_profile(tmp_path), tmp_path / "robot.xacro")
+    assert peripheral_tf_nodes_for_absent_frames(_profile(tmp_path)["peripherals"], camera_only) == []
+
+
+def test_lidar_tf_follows_the_mount_parent_from_the_fragment(tmp_path):
+    """The application path remounts livox_frame under ``body`` (D13): the
+    runtime static TF uses the fragment's public transform parent while the
+    simulator attachment pose stays the base_link-relative mount."""
+    profile = _lidar_profile(tmp_path, [MID360])
+    fragment = tmp_path / "fragment.yaml"
+    fragment.write_text(
+        yaml.safe_dump(
+            {
+                "peripherals": [
+                    {
+                        "type": "lidar",
+                        "name": "mid360",
+                        "transform": {"parent_frame": "body", "x": 0.0, "y": 0.0, "z": 0.0},
+                        "simulation": {
+                            "gazebo": {"transform": {"parent_frame": "base_link", "x": -0.08, "z": 0.2, "yaw": 1.5708}}
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    from robot_runtime.peripherals import load_peripherals_file
+
+    merged = merge_peripherals(profile["peripherals"], load_peripherals_file(str(fragment)).get("peripherals"))
+    urdf = render_gazebo_description({**profile, "peripherals": merged}, tmp_path / "robot.xacro")
+    # the sensor still attaches to base_link at the mount
+    assert '<gazebo reference="base_link">' in urdf
+    nodes = peripheral_tf_nodes_for_absent_frames(merged, urdf)
+    tf_nodes = [node for node in nodes if node._Node__node_executable == "static_transform_publisher"]
+    assert len(tf_nodes) == 1
+    args = tf_nodes[0]._Node__arguments
+    assert args[args.index("--frame-id") + 1] == "body"
+    assert args[args.index("--child-frame-id") + 1] == "livox_frame"
+
+
+def test_gazebo_embodiment_composes_the_sensor_bridge_and_tf(tmp_path):
+    profile = _lidar_profile(tmp_path, [TOP, MID360])
+    fragment = tmp_path / "fragment.yaml"
+    fragment.write_text(yaml.safe_dump({"fast_lio": {"enabled": True, "sim_params_file": "/tmp/s.yaml"}}))
+    actions = gazebo_embodiment_actions(profile, tmp_path / "robot.xacro", str(fragment), gazebo_world="demo")
+    nodes = [a for a in actions if isinstance(a, Node)]
+    bridge = _by_executable(nodes, "bridge_node")
+    entries = yaml.safe_load(Path(_params(bridge)["config_file"]).read_text(encoding="utf-8"))
+    topics = {entry["ros_topic_name"] for entry in entries}
+    assert "/camera/top/image_raw" in topics
+    # the raw gz streams are internal; the filters serve the endpoints
+    assert "/mid360_lidar/raw" in topics and "/mid360_imu/raw" in topics
+    assert Path(_params(bridge)["config_file"]).name == "ibrobot_runtime_sensor_bridge.yaml"
+    # the finite filter: raw in, advertised endpoint out (D5)
+    filter_node = _by_executable(nodes, "finite_cloud_filter")
+    filter_params = _params(filter_node)
+    assert filter_params["input_topic"] == "/mid360_lidar/raw"
+    assert filter_params["output_topic"] == "/livox/lidar"
+    # the IMU settle filter: raw in, advertised endpoint out (D5)
+    imu_filter = _by_executable(nodes, "imu_settle_filter")
+    imu_params = _params(imu_filter)
+    assert imu_params["input_topic"] == "/mid360_imu/raw"
+    assert imu_params["output_topic"] == "/livox/imu"
+    # the lidar frame's static TF is part of the embodiment
+    tf = [node for node in nodes if node._Node__node_executable == "static_transform_publisher"]
+    assert len(tf) == 1 and tf[0]._Node__node_name == "static_tf_mid360"
+
+
+def test_finite_cloud_filter_drops_nonfinite_points_only():
+    """D5: no-hit beams arrive as ±inf; the advertised cloud stays finite."""
+    import struct
+
+    from robot_runtime.finite_cloud_filter import filter_finite_points
+
+    def cloud(rows):
+        message = PointCloud2()
+        message.header.frame_id = "livox_frame"
+        message.header.stamp.sec = 7
+        message.width = len(rows)
+        message.height = 1
+        message.point_step = 16
+        message.fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        message.data = b"".join(struct.pack("<ffff", *row) for row in rows)
+        return message
+
+    finite_rows = [(1.0, 2.0, 3.0, 10.0), (0.5, -0.5, 0.25, 5.0)]
+    raw = cloud(
+        [*finite_rows, (float("inf"), 1.0, 1.0, 3.0), (1.0, float("nan"), 1.0, 3.0), (-float("inf"), 0.0, 0.0, 1.0)]
+    )
+    filtered = filter_finite_points(raw)
+    assert filtered.width == 2 and filtered.height == 1
+    assert filtered.header.frame_id == "livox_frame" and filtered.header.stamp.sec == 7
+    assert [struct.unpack_from("<ffff", bytes(filtered.data), i * 16) for i in range(2)] == finite_rows
+    assert [field.name for field in filtered.fields] == ["x", "y", "z", "intensity"]
+    # an already-finite cloud passes through untouched
+    clean = cloud(finite_rows)
+    assert filter_finite_points(clean) is clean
+
+
+def test_lidar_finite_filter_nodes_cover_the_3d_lidar_only():
+    from robot_runtime.gazebo import lidar_finite_filter_nodes
+
+    nodes = lidar_finite_filter_nodes([TOP, MID360, LDLIDAR])
+    assert [node._Node__node_name for node in nodes] == ["mid360_finite_cloud_filter"]
+
+
+def test_imu_settle_filter_holds_back_pre_settle_samples():
+    """D5: the simulator's pre-settle IMU samples never reach the endpoint."""
+    from robot_runtime.imu_settle_filter import GRAVITY_MAX, GRAVITY_MIN, SettleGate, is_settle_sample
+
+    def imu(acc, gyro=0.0):
+        message = Imu()
+        message.header.frame_id = "livox_frame"
+        message.header.stamp.sec = 3
+        message.linear_acceleration.z = acc
+        message.angular_velocity.x = gyro
+        return message
+
+    # all-zero: the pre-settle artifact (gravity must appear on a real IMU)
+    assert is_settle_sample(imu(0.0)) is True
+    # gravity (with or without spin): a valid sample
+    assert is_settle_sample(imu(9.8, 0.17)) is False
+    # free fall is physical (acc 0) as long as it spins
+    assert is_settle_sample(imu(0.0, 0.17)) is False
+
+    # the observed Gazebo transient: a zero window, one landing impulse
+    # (measured at ~45 g), then the resting gravity
+    gate = SettleGate(run_length=3)
+    assert [gate.accept(m) for m in (imu(0.0), imu(0.0), imu(0.0))] == [False, False, False]
+    # the landing impulse is not gravity: it does not advance the gate
+    assert gate.accept(imu(441.997)) is False
+    assert not gate.settled
+    # three consecutive gravity-plausible samples open the gate on the last
+    assert [gate.accept(imu(9.8)) for _ in range(3)] == [False, False, True]
+    assert gate.settled
+    # open gate: everything passes, including motion dynamics
+    assert gate.accept(imu(441.997)) is True
+    assert gate.accept(imu(0.0, 0.17)) is True
+
+    # an implausible sample resets the run: a short gravity blip does not open
+    gate = SettleGate(run_length=3)
+    gate.accept(imu(9.8))
+    gate.accept(imu(9.8))
+    gate.accept(imu(0.0))  # zero window resumes mid-settle
+    assert gate.accept(imu(9.8)) is False
+    assert gate.accept(imu(9.8)) is False
+    assert gate.accept(imu(9.8)) is True
+
+    # the gravity window is orientation independent (tilt keeps |acc| ~ g)
+    assert GRAVITY_MIN < 9.80665 < GRAVITY_MAX
+    tilted = Imu()
+    tilted.linear_acceleration.x = 9.80665 * math.cos(math.radians(75))
+    tilted.linear_acceleration.z = 9.80665 * math.sin(math.radians(75))
+    assert SettleGate(run_length=1).accept(tilted) is True
+
+
+def test_imu_settle_filter_nodes_cover_simulated_imus():
+    from robot_runtime.gazebo import imu_settle_filter_nodes
+
+    nodes = imu_settle_filter_nodes([TOP, MID360, LDLIDAR])
+    assert [node._Node__node_name for node in nodes] == ["mid360_imu_settle_filter"]
+    params = _params(nodes[0])
+    assert params["input_topic"] == "/mid360_imu/raw"
+    assert params["output_topic"] == "/livox/imu"
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-gazebo-runtime-platform D5: derived scan converter composition
+# ---------------------------------------------------------------------------
+
+
+def _scan_matrix_profile(tmp_path):
+    profile = _lidar_profile(tmp_path, [MID360])
+    # the hardware branch composes the physical driver: give it the minimal
+    # user config the driver composer rewrites
+    user_config = tmp_path / "MID360_config.json"
+    user_config.write_text(json.dumps({"MID360": {"host_net_info": {}}, "lidar_configs": [{}]}), encoding="utf-8")
+    profile["peripherals"] = [
+        {**periph, "user_config_path": str(user_config), "host_ip": "192.168.1.5", "lidar_ip": "192.168.1.139"}
+        if periph.get("type") == "lidar"
+        else periph
+        for periph in profile["peripherals"]
+    ]
+    profile["fast_lio"] = {
+        "enabled": False,
+        "params_file": "/tmp/fl.yaml",
+        "sim_params_file": "/tmp/fl_sim.yaml",
+    }
+    return profile
+
+
+def test_scan_converter_composition_matrix(tmp_path):
+    """Hardware composes the converter with the driver; sdk keeps synthetic
+    perception as the single /scan producer; a physics platform composes it
+    on sim time only when its source (FAST-LIO) runs (D5)."""
+    profile = _scan_matrix_profile(tmp_path)
+
+    def executables(actions):
+        return [a._Node__node_executable for a in actions if isinstance(a, Node)]
+
+    # hardware: the converter rides with the physical driver
+    hardware = peripheral_stack_actions(profile, "", False, sim_platform="")
+    assert "livox_ros_driver2_node" in executables(hardware)
+    assert "pointcloud_to_laserscan_node" in executables(hardware)
+
+    # sdk: no converter, even with FAST-LIO enabled (synthetic /scan)
+    sdk = peripheral_stack_actions(profile, "", True, sim_platform="sdk")
+    assert "pointcloud_to_laserscan_node" not in executables(sdk)
+    assert "synthetic_perception" in executables(sdk)
+
+    # gazebo with FAST-LIO off: no converter, no synthetic /scan either
+    gazebo_off = peripheral_stack_actions(profile, "", True, sim_platform="gazebo")
+    assert "pointcloud_to_laserscan_node" not in executables(gazebo_off)
+    assert "synthetic_perception" not in executables(gazebo_off)
+
+    # gazebo with FAST-LIO on (fragment): the converter runs on sim time
+    fragment = tmp_path / "fragment.yaml"
+    fragment.write_text(
+        yaml.safe_dump({"fast_lio": {"enabled": True, "sim_params_file": "/tmp/fl_sim.yaml"}}), encoding="utf-8"
+    )
+    gazebo_on = peripheral_stack_actions(profile, str(fragment), True, sim_platform="gazebo")
+    converters = [
+        a for a in gazebo_on if isinstance(a, Node) and a._Node__node_executable == "pointcloud_to_laserscan_node"
+    ]
+    assert len(converters) == 1
+    assert _params(converters[0])["use_sim_time"] is True
+    assert converters[0]._Node__node_name == "mid360_pointcloud_to_laserscan"

@@ -19,6 +19,7 @@ from robot_runtime.interface_description import (
     description_sim_platform,
     load_description,
     merge_peripherals,
+    peripheral_interfaces,
     validate_description,
     write_description,
 )
@@ -288,6 +289,77 @@ def test_depth_and_livox_wire_types(profile):
     interfaces = build_description(profile)["interfaces"]
     assert "camera.front.color" not in interfaces and "camera.front.aligned_depth" not in interfaces
     assert interfaces["lidar.mid360.points"]["message_type"] == "sensor_msgs/msg/PointCloud2"
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-gazebo-runtime-platform D5/D6: the lidar contract on Gazebo
+# ---------------------------------------------------------------------------
+
+
+def _lidar_profile(enabled_scan=True, fast_lio=None):
+    return {
+        "runtime": {"name": "test_robot", "version": "1.0.0"},
+        "capabilities": {},
+        "joints": ["1"],
+        "peripherals": [
+            {
+                "type": "lidar",
+                "name": "mid360",
+                "driver": "livox_mid360",
+                "xfer_format": 1,
+                "frame_id": "livox_frame",
+                "pointcloud_topic": "/livox/lidar",
+                "imu_topic": "/livox/imu",
+                **({"scan_converter": {"enabled": enabled_scan, "scan_topic": "/scan"}} if enabled_scan else {}),
+            }
+        ],
+        "fast_lio": fast_lio or {},
+    }
+
+
+def test_gazebo_advertises_the_point_cloud_regardless_of_xfer_format():
+    profile = _lidar_profile(enabled_scan=False)
+    gazebo = build_description(profile, use_sim=True, sim_platform="gazebo")["interfaces"]
+    # the physical driver's CustomMsg transfer cannot be produced by the
+    # simulator: the cloud is advertised as PointCloud2 (D5)
+    assert gazebo["lidar.mid360.points"]["message_type"] == "sensor_msgs/msg/PointCloud2"
+    assert gazebo["lidar.mid360.imu"]["message_type"] == "sensor_msgs/msg/Imu"
+    # hardware and sdk keep the driver's wire format
+    hardware = build_description(profile, use_sim=False)["interfaces"]
+    assert hardware["lidar.mid360.points"]["message_type"] == "livox_ros_driver2/msg/CustomMsg"
+    sdk = build_description(profile, use_sim=True, sim_platform="sdk")["interfaces"]
+    assert sdk["lidar.mid360.points"]["message_type"] == "livox_ros_driver2/msg/CustomMsg"
+
+
+def test_gazebo_scan_advertised_iff_its_source_runs():
+    """The scan's source is FAST-LIO's registered body cloud: on Gazebo the
+    scan is advertised only when lidar odometry runs (D5); hardware and sdk
+    keep the scan_converter-driven advertisement."""
+    off = build_description(_lidar_profile(fast_lio={"enabled": False}), use_sim=True, sim_platform="gazebo")
+    assert not any(key.startswith("lidar.mid360.scan") for key in off["interfaces"])
+
+    on = build_description(
+        _lidar_profile(fast_lio={"enabled": True, "sim_params_file": "/tmp/s.yaml"}),
+        use_sim=True,
+        sim_platform="gazebo",
+    )
+    assert on["interfaces"]["lidar.mid360.scan"]["endpoint"] == "/scan"
+    # its source stream is advertised with it
+    assert on["interfaces"]["localization.cloud"]["endpoint"] == "/cloud_registered_body"
+
+    for use_sim, sim_platform in ((False, None), (True, "sdk")):
+        other = build_description(
+            _lidar_profile(fast_lio={"enabled": False}), use_sim=use_sim, sim_platform=sim_platform
+        )
+        assert other["interfaces"]["lidar.mid360.scan"]["endpoint"] == "/scan", (use_sim, sim_platform)
+
+
+def test_gazebo_scan_rule_covers_every_lidar_with_the_converter_enabled():
+    profile = _lidar_profile(fast_lio={"enabled": False})
+    interfaces = peripheral_interfaces(profile["peripherals"], sim_platform="gazebo", scan_source_runs=False)
+    assert not any(key.startswith("lidar.mid360.scan") for key in interfaces)
+    interfaces = peripheral_interfaces(profile["peripherals"], sim_platform="gazebo", scan_source_runs=True)
+    assert interfaces["lidar.mid360.scan"]["endpoint"] == "/scan"
 
 
 class FakeNode:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import textwrap
 
 import launch_ros.actions
@@ -16,6 +17,7 @@ from robot_runtime.peripherals import (
     merge_peripherals,
     perception_capabilities,
     peripheral_nodes,
+    scan_converter_nodes,
     synthetic_perception_nodes,
 )
 
@@ -170,6 +172,138 @@ def test_fast_lio_nodes_disabled_or_sim_compose_nothing():
         fast_lio_nodes({"enabled": True, "params_file": "/tmp/x.yaml"}, bridge_package="lekiwi_robot", use_sim=True)
         == []
     )
+    # the sdk platform (explicitly) composes nothing either
+    assert (
+        fast_lio_nodes(
+            {"enabled": True, "params_file": "/tmp/x.yaml"},
+            bridge_package="lekiwi_robot",
+            use_sim=True,
+            sim_platform="sdk",
+        )
+        == []
+    )
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-gazebo-runtime-platform D6: FAST-LIO on a physics platform
+# ---------------------------------------------------------------------------
+
+
+def _params_of(node):
+    params = {}
+    for entry in node._Node__parameters or []:
+        if isinstance(entry, dict):
+            params.update({_text(key): _value(value) for key, value in entry.items()})
+    return params
+
+
+def _text(value):
+    return "".join(item.text if hasattr(item, "text") else str(item) for item in value)
+
+
+def _value(value):
+    if isinstance(value, tuple | list):
+        if value and all(not hasattr(item, "text") and not isinstance(item, tuple | list) for item in value):
+            return list(value)
+        if any(isinstance(item, tuple | list) for item in value):
+            return [_value(item) for item in value]
+        return yaml.safe_load(_text(value)) if value else []
+    return value
+
+
+def test_fast_lio_physics_platform_runs_the_simulation_parameters_on_sim_time(tmp_path):
+    sim_params = tmp_path / "fast_lio_sim.yaml"
+    nodes = fast_lio_nodes(
+        {"enabled": True, "params_file": "/tmp/x.yaml", "sim_params_file": str(sim_params)},
+        bridge_package="lekiwi_robot",
+        use_sim=True,
+        sim_platform="gazebo",
+    )
+    assert _node_specs(nodes) == [
+        ("fast_lio", "fastlio_mapping"),
+        ("lekiwi_robot", "fast_lio_odom_bridge"),
+    ]
+    mapping, bridge = nodes
+    mapping_params = _params_of(mapping)
+    assert mapping_params["use_sim_time"] is True
+    # the simulation parameter file replaces the hardware one (D6)
+    assert any(
+        _text(getattr(entry, "param_file", []) or []) == str(sim_params)
+        for entry in mapping._Node__parameters
+        if type(entry).__name__ == "ParameterFile"
+    ), mapping._Node__parameters
+    bridge_params = _params_of(bridge)
+    assert bridge_params["use_sim_time"] is True
+    # wheel odometry owns odom -> base_link in simulation (D4)
+    assert bridge_params["publish_tf"] is False
+
+
+def test_fast_lio_hardware_keeps_the_wall_time_chain():
+    nodes = fast_lio_nodes(
+        {"enabled": True, "params_file": "/tmp/x.yaml", "publish_tf": True, "sim_params_file": "/tmp/unused.yaml"},
+        bridge_package="lekiwi_robot",
+        use_sim=False,
+        sim_platform="",
+    )
+    mapping, bridge = nodes
+    assert _params_of(mapping)["use_sim_time"] is False
+    assert _params_of(bridge)["publish_tf"] is True
+    assert "use_sim_time" not in _params_of(bridge)
+
+
+def test_fast_lio_physics_platform_without_sim_params_fails_naming_the_key():
+    with pytest.raises(ValueError, match="fast_lio.sim_params_file is required"):
+        fast_lio_nodes(
+            {"enabled": True, "params_file": "/tmp/x.yaml"},
+            bridge_package="lekiwi_robot",
+            use_sim=True,
+            sim_platform="gazebo",
+        )
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-gazebo-runtime-platform D5: the split-out scan converter builder
+# ---------------------------------------------------------------------------
+
+
+def test_scan_converter_nodes_match_the_driver_composition(tmp_path):
+    user_config = tmp_path / "MID360_config.json"
+    user_config.write_text(json.dumps({"MID360": {"host_net_info": {}}, "lidar_configs": [{}]}), encoding="utf-8")
+    periph = {
+        "type": "lidar",
+        "name": "mid360",
+        "driver": "livox_mid360",
+        "frame_id": "livox_frame",
+        "user_config_path": str(user_config),
+        "host_ip": "192.168.1.5",
+        "lidar_ip": "192.168.1.139",
+        "scan_converter": {
+            "enabled": True,
+            "queue_size": 1,
+            "pointcloud_topic": "/cloud_registered_body",
+            "scan_topic": "/scan",
+            "target_frame": "body",
+            "min_height": -0.05,
+            "max_height": 0.5,
+            "range_max": 8.0,
+        },
+    }
+    nodes = scan_converter_nodes(periph, use_sim=False)
+    assert _node_specs(nodes) == [("pointcloud_to_laserscan", "pointcloud_to_laserscan_node")]
+    params = _params_of(nodes[0])
+    assert params["target_frame"] == "body"
+    assert params["min_height"] == -0.05
+    assert params["range_max"] == 8.0
+    assert params["queue_size"] == 1
+    assert params["use_sim_time"] is False
+    remappings = {_text(source): _text(target) for source, target in nodes[0]._Node__remappings}
+    assert remappings == {"cloud_in": "/cloud_registered_body", "scan": "/scan"}
+    # the physical driver composition includes the same converter
+    driver_nodes = peripheral_nodes([periph], use_sim=False)
+    assert any(node._Node__node_name == "mid360_pointcloud_to_laserscan" for node in driver_nodes)
+    # a disabled scan block composes nothing
+    assert scan_converter_nodes({**periph, "scan_converter": {"enabled": False}}, use_sim=True) == []
+    assert scan_converter_nodes({"name": "l"}, use_sim=True) == []
 
 
 # ---------------------------------------------------------------------------

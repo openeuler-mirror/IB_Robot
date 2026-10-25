@@ -32,6 +32,8 @@ setup(
             "joint_current_publisher = robot_runtime.joint_current_publisher:main",
             "topic_relay = robot_runtime.topic_relay:main",
             "synthetic_perception = robot_runtime.synthetic_perception:main",
+            "finite_cloud_filter = robot_runtime.finite_cloud_filter:main",
+            "imu_settle_filter = robot_runtime.imu_settle_filter:main",
             "runtime_interfaces = robot_runtime.interface_description:main",
         ],
     },

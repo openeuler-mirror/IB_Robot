@@ -135,7 +135,7 @@ def generate_peripheral_sim_bridges(
     Args:
         peripherals: List of peripheral dicts from robot_config["peripherals"].
         model_name:  Gazebo model name (robot_config["name"]).
-        world_name:  Gazebo world name, default "demo" (matches simulation.world).
+        world_name:  Gazebo world name, default "demo" (matches the sim_models scene worlds).
 
     Returns:
         List with one bridge_node Node action, or [] if no known peripherals.

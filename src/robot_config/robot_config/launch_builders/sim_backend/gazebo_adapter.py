@@ -127,30 +127,27 @@ class GazeboAdapter(SimBackendAdapter):
     def _resolve_world_and_spawn(self, robot_config: dict) -> tuple[str, dict]:
         """Resolve the world file and the robot spawn pose (shared by both modes).
 
-        Scene override: if simulation.scene is set, replace the default world
-        with the sim_models template (resolves mesh paths to absolute URIs).
-        The spawn pose comes from ``simulation.robot_spawn`` with the scene
-        layout as fallback (the legacy precedence); x/y/z are written back as
-        ``initial_pose_{x,y,z}`` for the provider-less create arguments. The
-        pose may additionally carry ``yaw`` (consumed by the world-only mode's
-        provider hand-off; the provider-less create keeps x/y/z only).
+        The world is a sim_models scene: ``simulation.scene`` when set,
+        otherwise the ``empty`` scene (the generic fallback). A configured
+        scene that fails to load falls back to ``empty`` with a warning; an
+        unresolvable ``empty`` scene fails the launch.
+        Only a configured scene sets a spawn pose: ``simulation.robot_spawn``
+        with the scene layout as fallback (the legacy precedence); x/y/z are
+        written back as ``initial_pose_{x,y,z}`` for the provider-less create
+        arguments. The pose may additionally carry ``yaw`` (consumed by the
+        world-only mode's provider hand-off; the provider-less create keeps
+        x/y/z only).
         """
-        world_file = robot_config.get("world_file", "")
-        if not world_file:
-            world_file = "$(find robot_config)/config/worlds/simulation.world"
-        elif not world_file.startswith("$("):
-            world_file = f"$(find robot_config)/config/worlds/{world_file}"
+        from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
 
-        world_path = resolve_ros_path(world_file)
         spawn: dict = {}
-        _scene_name = robot_config.get("simulation", {}).get("scene")
-        if _scene_name:
+        world_path = ""
+        scene_name = robot_config.get("simulation", {}).get("scene")
+        if scene_name:
             try:
-                from sim_models.scene_compiler import get_gazebo_world_path, get_scene_layout
-
-                world_path = str(get_gazebo_world_path(_scene_name))
-                logger.info(f"sim_models scene '{_scene_name}' → {world_path}")
-                layout = get_scene_layout(_scene_name)
+                world_path = str(get_gazebo_world_path(scene_name))
+                logger.info(f"sim_models scene '{scene_name}' → {world_path}")
+                layout = get_scene_layout(scene_name)
                 spawn = copy.deepcopy(
                     robot_config.get("simulation", {}).get("robot_spawn", {}) or layout.get("robot_spawn", {})
                 )
@@ -159,13 +156,15 @@ class GazeboAdapter(SimBackendAdapter):
                     if axis in spawn:
                         robot_config[key] = spawn[axis]
                         logger.info(f"scene robot_spawn.{axis} = {spawn[axis]}")
-            except ImportError:
-                logger.warning("sim_models not installed; ignoring simulation.scene")
             except Exception as e:
-                logger.warning(f"scene '{_scene_name}' load failed: {e}; falling back to default world")
-
-        if not Path(world_path).exists():
-            logger.info(f"WARNING: World file not found at {world_path}")
+                logger.warning(f"scene '{scene_name}' load failed: {e}; falling back to the empty scene world")
+                spawn = {}
+                world_path = ""
+        if not world_path:
+            # No scene configured (or the configured scene failed to load):
+            # the generic fallback world is the sim_models ``empty`` scene.
+            world_path = str(get_gazebo_world_path("empty"))
+            logger.info(f"sim_models scene 'empty' → {world_path}")
         return world_path, spawn
 
     def start_world_only(self, robot_config: dict) -> tuple[list, str, tuple[float, float, float, float]]:
@@ -263,7 +262,7 @@ class GazeboAdapter(SimBackendAdapter):
         # ---- World file resolution (scene override + robot spawn) ----
         world_path, _spawn = self._resolve_world_and_spawn(robot_config)
 
-        # Must match <world name="..."> inside the loaded .world/.sdf (simulation.world uses "demo").
+        # Must match <world name="..."> inside the loaded .world/.sdf (the sim_models scene worlds use "demo").
         # ros_gz_sim create: if -world is omitted, it picks worlds_msg.data(0) from /gazebo/worlds
         # (order not guaranteed) — entity can end up in the wrong world. Always pass -world explicitly.
         gazebo_world_name = robot_config.get("gazebo_world_name", "demo")
@@ -314,11 +313,9 @@ class GazeboAdapter(SimBackendAdapter):
         )
 
         # ---- Gazebo server + GUI (must be listed before spawn; see below) ----
-        if Path(world_path).exists():
-            gz_args = f"{_headless_prefix()}-r {world_path}"
-        else:
-            logger.info("Using empty Gazebo world (world file not found)")
-            gz_args = _headless_prefix().strip()
+        # The world path always exists: _resolve_world_and_spawn generates it
+        # or raises (a missing empty scene fails the launch, no bare server).
+        gz_args = f"{_headless_prefix()}-r {world_path}"
 
         clock_ready_waiter = Node(
             package="robot_config",

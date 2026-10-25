@@ -2,7 +2,7 @@
 <!-- pick_banana Gazebo world — generated from pick_banana.world.template.
      Mesh paths placeholder: {{MESHES_DIR}} is replaced at launch time by
      sim_models.scene_compiler.get_gazebo_world_path("pick_banana").
-     Physics/plugins/ground-plane are identical to simulation.world (world name="demo").
+     Physics/plugins/ground-plane are identical to the empty scene template (world name="demo").
 -->
 <sdf version="1.9">
   <world name="demo">
@@ -28,6 +28,12 @@
       filename="gz-sim-sensors-system"
       name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <!-- runtime-generated IMU sensors need the IMU system to publish -->
+    <plugin
+      filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
     </plugin>
 
     <light type="directional" name="sun">

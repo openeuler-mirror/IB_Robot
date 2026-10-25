@@ -22,7 +22,7 @@ from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
 from robot_runtime.gazebo import advertised_camera_frames
-from robot_runtime.profile import SIM_PLATFORMS
+from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
 
 
 class InterfaceDescriptionError(ValueError):
@@ -343,8 +343,19 @@ def _topic(endpoint, message_type, capability, direction="publish", **metadata):
 
 
 def peripheral_interfaces(
-    peripherals: list[dict] | None, *, sim_platform: str | None = None, camera_rate_hz: float | None = None
+    peripherals: list[dict] | None,
+    *,
+    sim_platform: str | None = None,
+    camera_rate_hz: float | None = None,
+    scan_source_runs: bool = True,
 ) -> dict[str, dict]:
+    """Project the peripheral surface.
+
+    ``sim_platform`` adjusts streams the platform cannot produce (the gz
+    camera gaps, the lidar wire type). ``scan_source_runs`` says whether the
+    derived scan's source (FAST-LIO's registered body cloud) runs on the
+    selected platform; a physics platform without it advertises no scan (D5).
+    """
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
     merged = merge_peripherals(peripherals, [])
@@ -558,9 +569,12 @@ def peripheral_interfaces(
                 types = {0: "sensor_msgs/msg/PointCloud2", 1: "livox_ros_driver2/msg/CustomMsg"}
                 if transfer not in types:
                     raise InterfaceDescriptionError(f"lidar {name}: unsupported xfer_format {transfer}")
+                # The simulator publishes a plain point cloud; the physical
+                # driver's CustomMsg transfer cannot be produced (D5).
+                cloud_type = "sensor_msgs/msg/PointCloud2" if sim_platform == "gazebo" else types[transfer]
                 interfaces[f"lidar.{name}.points"] = _topic(
                     periph.get("pointcloud_topic", "/livox/lidar"),
-                    types[transfer],
+                    cloud_type,
                     "perception.lidar",
                     frame_id=periph.get("frame_id", "livox_frame"),
                     rate_hz=periph.get("publish_freq", 10.0),
@@ -575,7 +589,7 @@ def peripheral_interfaces(
                 interfaces[f"lidar.{name}.points"]["qos"]["reliability"] = "reliable"
                 interfaces[f"lidar.{name}.imu"]["qos"]["reliability"] = "reliable"
                 scan = periph.get("scan_converter") or {}
-                if scan.get("enabled"):
+                if scan.get("enabled") and scan_source_runs:
                     interfaces[f"lidar.{name}.scan"] = _topic(
                         scan.get("scan_topic", "/scan"),
                         "sensor_msgs/msg/LaserScan",
@@ -775,6 +789,12 @@ def build_description(
             _mujoco_camera_rate({**profile, "peripherals": peripherals or profile.get("peripherals") or []})
             if sim_platform == "mujoco"
             else None
+        ),
+        # The derived scan's source (FAST-LIO's registered body cloud) runs
+        # on a physics platform only when lidar odometry itself runs there;
+        # without it no scan is advertised or published (D5).
+        scan_source_runs=(
+            bool((profile.get("fast_lio") or {}).get("enabled")) if sim_platform in PHYSICS_SIM_PLATFORMS else True
         ),
     )
     # Audio peripherals derive the interaction.audio_* capability entries. A

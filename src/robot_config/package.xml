@@ -62,6 +62,9 @@
 
   <!-- Gazebo simulation -->
   <exec_depend>gz_ros2_control</exec_depend>
+  <!-- Every Gazebo world the generic launch runs comes from sim_models scenes
+       (the empty scene is the fallback when simulation.scene is unset). -->
+  <exec_depend>sim_models</exec_depend>
 
   <!-- MuJoCo simulation. 0.1.2 floor (upgrade-mujoco-ros2-control-0-1 D1);
        rosdep does not enforce versions, the runtime check is the guard. -->

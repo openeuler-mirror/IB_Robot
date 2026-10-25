@@ -1,5 +1,5 @@
 <?xml version="1.0" ?>
-<!-- Empty Gazebo world for sim_models (same physics/plugins as simulation.world, no scene objects) -->
+<!-- Empty Gazebo world — the generic fallback when no simulation.scene is set (no scene objects) -->
 <sdf version="1.9">
   <world name="demo">
     <physics name="1ms" type="ignored">
@@ -23,6 +23,12 @@
       filename="gz-sim-sensors-system"
       name="gz::sim::systems::Sensors">
       <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <!-- runtime-generated IMU sensors need the IMU system to publish -->
+    <plugin
+      filename="gz-sim-imu-system"
+      name="gz::sim::systems::Imu">
     </plugin>
 
     <light type="directional" name="sun">

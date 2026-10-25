@@ -51,6 +51,14 @@ must pass.
   `FreeJointStatePublisherPlugin` instance publishing every dynamic body's
   live pose on `/sim/<scene>/free_joint_states` for the scene task's
   object observation.
+- **Simulated sensors** (`gazebo.py`): on the Gazebo platform the runtime
+  stands in for the declared camera, lidar and IMU peripherals — it renders
+  the sensors into the model at the peripheral's mount, bridges the gz
+  streams onto the advertised ROS endpoints, and serves those endpoints
+  through small normalizers: the finite-point cloud filter (Gazebo reports
+  no-hit beams as ±inf) and the IMU settle filter (the pre-settle zero
+  window and landing impulse never reach the endpoint). The derived scan
+  converter composes on simulation time when its source runs there.
 - **Conformance suite** (`test/test_conformance.py`): the executable contract.
 
 ## Prohibited

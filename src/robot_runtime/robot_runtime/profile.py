@@ -54,6 +54,14 @@ SIM_PLATFORMS = ("sdk", "gazebo", "mujoco")
 #: creation, gz bridges) keep the literal platform.
 PHYSICS_SIM_PLATFORMS = ("gazebo", "mujoco")
 
+#: Physics platforms whose sensor injection stands in for a lidar
+#: (lekiwi-gazebo-runtime-platform D14.2): the rendering path consults this
+#: next to the driver check (``LIDAR_SIM_DRIVERS``) before injecting a lidar
+#: sensor, and the lidar-odometry gate reads it as the "the runtime simulates
+#: lidar here" capability — a platform outside it renders no lidar, so the
+#: constant cannot drift from production behaviour.
+LIDAR_SIM_PLATFORMS = ("gazebo",)
+
 _REQUIRED_TOP_LEVEL = ("runtime", "modes", "capabilities", "joints")
 _REQUIRED_RUNTIME = ("name", "version")
 _REQUIRED_STOP_BOUNDS = ("cancel_bound_s", "idle_bound_s", "torque_off_bound_s")
