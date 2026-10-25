@@ -1,27 +1,30 @@
 # robot_navigation
 
-机器人导航包，集成了语音识别、Nav2 导航、全向轮底盘桥接和定位融合功能。
+机器人导航包，集成了语音识别、Nav2 导航、导航准入和定位融合功能。
 
 ## 导航 Profile
 
-本包同时提供 RealSense/RTAB-Map 链路和 MID-360 LiDAR 链路，以下描述按 profile 与 stage 区分：
+> **底盘归 LeKiwi runtime 所有。** 通用 `cmd_vel_bridge_node` 已删除：底盘几何、轮速投影、里程计和
+> `odom -> base_link`（无 FAST-LIO 时）都由 `lekiwi_robot` runtime 提供。受支持的导航配置是
+> `lekiwi_lidar` 与 `lekiwi_nav_grasp`；RealSense 配置（`lekiwi_realsense_mapping`、
+> `lekiwi_realsense_navigation`）已标记为不支持，底盘关闭，下文 RealSense 章节仅作历史参考。
+> 配置支持状态与门控模型见 `robot_config/README.md` 的“LeKiwi 配置与底盘门控”。
 
-| Profile | `map -> odom` | `odom -> base_link` | 主要速度链 |
+| Stage | `map -> odom` | `odom -> base_link` | 速度链 |
 |---|---|---|---|
-| RealSense mapping | RTAB-Map | cmd_vel bridge | `/cmd_vel -> bridge` |
-| RealSense navigation | RTAB-Map localization | EKF | `/cmd_vel -> bridge` |
-| MID-360 mapping | SLAM Toolbox | FAST-LIO odom bridge | `/cmd_vel -> bridge` |
-| MID-360 navigation | AMCL | FAST-LIO odom bridge | `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> bridge` |
+| MID-360 mapping | SLAM Toolbox | FAST-LIO odom bridge | `/cmd_vel -> runtime base_node` |
+| MID-360 navigation / hybrid（`dyn_avoid_enabled`） | AMCL | FAST-LIO odom bridge | controller `-> /cmd_vel_nav ->` velocity smoother `-> /cmd_vel_smoothed ->` collision monitor `-> /cmd_vel ->` runtime base_node |
 
-本文中 RTAB-Map、EKF、DWB 和“不启动 AMCL”的章节仅适用于 RealSense navigation profile；RealSense
-mapping 由 cmd_vel bridge 发布 `odom -> base_link`。LiDAR profile 以 `lekiwi_lidar.yaml` 的 resolved stage 配置为准。
+runtime 只在 `base_navigation` 模式且导航门打开时接收 `/cmd_vel`。runtime 启动时门关闭；声明
+`navigation.open_gate_on_startup` 的 stage 由 `navigation_admission` 在 runtime 就绪后切换模式并开门。
+手柄同样发布 `/cmd_vel`，在启用碰撞监测的 stage 中不经过碰撞监测。
 
 ## 功能特性
 
 - **语音控制**: 基于 `voice_asr_service` (sherpa-onnx 本地 ASR) + `voice_control` 关键词匹配的语音导航
 - **导航控制**: Nav2 导航 Goal 客户端，支持语音触发导航，到达后自动触发机械臂推理
 - **全向局部控制**: 提供 Nav2 MPPI `Omni` 候选 profile，实机门禁通过前默认保留 DWB
-- **底盘桥接**: `cmd_vel_bridge_node` 通过 IK/FK 将标准 `/cmd_vel` 桥接到 ros2_control 全向轮速度指令 (rad/s)，并发布里程计
+- **导航准入**: `navigation_admission` 在 runtime 就绪后选择 stage 的 runtime 模式并通过契约服务打开导航门
 - **定位融合**: EKF (robot_localization) 融合底盘里程计速度，RTAB-Map 视觉 SLAM 提供全局定位修正
 - **建图保存**: `save_rtabmap_map` 包装 Nav2 map_saver，将 `/rtabmap/map` 默认保存为 `rtabmap.yaml/rtabmap.pgm`
 - **任务联动**: 语音 → 导航 → 到达 → 触发 action_dispatcher 评估，形成完整任务链
@@ -80,7 +83,7 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 |------|------|--------|
 | `voice_control` | 语音关键词匹配 + 导航桥接 (sherpa-onnx 本地 ASR) | `robot_navigation.voice_control` |
 | `nav2_goal_client` | Nav2 导航 Goal 客户端 + 评估触发 | `robot_navigation.nav2_goal_client` |
-| `cmd_vel_bridge_node` | cmd_vel → ros2_control 桥接 + 里程计发布 | `robot_navigation.cmd_vel_bridge_node` |
+| `navigation_admission` | 启动时切换 runtime 模式并打开导航门（一次性） | `robot_navigation.navigation_admission` |
 | `fast_lio_odom_bridge` | 规范化 FAST-LIO odometry 与 TF | `robot_navigation.fast_lio_odom_bridge` |
 | `navigation_lifecycle_coordinator` | 在 warm-up 后启动 Nav2 lifecycle | `robot_navigation.navigation_lifecycle_coordinator` |
 | `navigation_command_server` | 提供原子导航 Action 与取消服务 | `robot_navigation.navigation_command_server` |

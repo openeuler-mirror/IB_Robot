@@ -1,12 +1,39 @@
 import copy
 import hashlib
 import itertools
+
+# LeKiwi chassis geometry, owned by the runtime profile
+# (lekiwi_robot/profiles/lekiwi_lidar.yaml) since the generic cmd_vel bridge
+# was removed (openspec lekiwi-application-migration task 2.2). Pinned here so
+# this core package's envelope feasibility check needs no robot package.
+import math
 from pathlib import Path
 
 import pytest
 import yaml
 
-from robot_navigation.cmd_vel_bridge_node import _body_to_wheel_radps
+WHEEL_RADIUS = 0.05
+BASE_RADIUS = 0.125
+MAX_RADPS = 4.602
+_MOUNT_ANGLES_DEG = (240.0, 0.0, 120.0)
+
+
+def _body_to_wheel_radps(vx, vy, wz, wheel_radius, base_radius, max_radps):
+    """Reference omni projection: rows [cos(a), sin(a), base_radius] / wheel_radius."""
+    wheels = [
+        (
+            vx * math.cos(math.radians(angle) - math.pi / 2)
+            + vy * math.sin(math.radians(angle) - math.pi / 2)
+            + wz * base_radius
+        )
+        / wheel_radius
+        for angle in _MOUNT_ANGLES_DEG
+    ]
+    peak = max(abs(value) for value in wheels)
+    if peak > max_radps and peak > 0.0:
+        wheels = [value * (max_radps / peak) for value in wheels]
+    return wheels
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = PACKAGE_ROOT.parents[1]
@@ -66,7 +93,11 @@ def test_navigation_lifecycle_coordinator_retries_slow_310p_bringup():
 
 def _envelope():
     robot = _load(ROBOT_CONFIG)["robot"]
-    return robot["navigation"]["motion_envelope"], robot["navigation"]["cmd_vel_bridge"]
+    return robot["navigation"]["motion_envelope"], {
+        "wheel_radius": WHEEL_RADIUS,
+        "base_radius": BASE_RADIUS,
+        "max_radps": MAX_RADPS,
+    }
 
 
 def _strip_controller_choices(profile):

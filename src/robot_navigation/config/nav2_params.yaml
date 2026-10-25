@@ -376,8 +376,18 @@ collision_monitor:
     use_sim_time: False
     base_frame_id: base_link
     odom_frame_id: odom
-    cmd_vel_in_topic: /cmd_vel
-    cmd_vel_out_topic: /cmd_vel_safe
+    # Task 3.2 (openspec lekiwi-application-migration): the collision monitor
+    # is the last hop onto the runtime's /cmd_vel channel. The controller
+    # publishes /cmd_vel_nav (stock Nav2 remap; the velocity smoother is
+    # dropped from the chain while the monitor runs), and the filtered output
+    # drives the base through the runtime's mode- and gate-admitted channel.
+    # Task 3.2 (openspec lekiwi-application-migration): with the collision
+    # monitor active, the velocity smoother's output is remapped to
+    # /cmd_vel_smoothed and the monitor is the last hop onto the runtime's
+    # admitted /cmd_vel channel (controller -> /cmd_vel_nav -> velocity
+    # smoother -> /cmd_vel_smoothed -> collision monitor -> /cmd_vel).
+    cmd_vel_in_topic: /cmd_vel_smoothed
+    cmd_vel_out_topic: /cmd_vel
     transform_tolerance: 0.5
     source_timeout: 0.5
     base_shift_correction: true

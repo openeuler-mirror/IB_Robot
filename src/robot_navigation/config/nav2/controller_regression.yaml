@@ -3,7 +3,7 @@ schema_version: 1
 baseline:
   real:
     profile: nav2_params_dwb.yaml
-    sha256: 3627e9f18b9a1ea6fbb3df8c25b86ed414374f2c44fc5dedef37815ac0fc5191
+    sha256: 38a388fd691c251f904101ec139ef22723db1ffa19be6d6b486b3de78291b79a
   simulation:
     profile: nav2_sim_params_dwb.yaml
     sha256: c15682c21098a4ce27f55f82cbc9c91d2e7dc14bcd40502fde717ead6dbb312a

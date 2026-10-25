@@ -18,7 +18,6 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     # Get directories
     pkg_dir = FindPackageShare(package="robot_navigation").find("robot_navigation")
-    nav2_bringup_dir = FindPackageShare(package="nav2_bringup").find("nav2_bringup")
 
     # Launch configurations
     use_sim_time = LaunchConfiguration("use_sim_time")
@@ -126,7 +125,13 @@ def generate_launch_description():
         scoped=True,
         actions=[
             IncludeLaunchDescription(
-                PythonLaunchDescriptionSource(os.path.join(nav2_bringup_dir, "launch", "navigation_launch.py")),
+                # Our adaptation of nav2_bringup's navigation_launch.py (Apache-2.0,
+                # upstream header kept): with the collision monitor active it
+                # remaps the velocity smoother's output to cmd_vel_smoothed so
+                # the monitor is the single publisher on the base /cmd_vel
+                # channel (task 3.2: controller -> /cmd_vel_nav -> velocity_
+                # smoother -> /cmd_vel_smoothed -> collision monitor -> /cmd_vel).
+                PythonLaunchDescriptionSource(os.path.join(pkg_dir, "launch", "navigation_launch.py")),
                 launch_arguments={
                     "namespace": namespace,
                     "use_sim_time": use_sim_time,
@@ -138,6 +143,7 @@ def generate_launch_description():
                     "use_respawn": use_respawn,
                     "container_name": "nav2_container",
                     "log_level": log_level,
+                    "use_collision_monitor": use_collision_monitor,
                 }.items(),
             )
         ],

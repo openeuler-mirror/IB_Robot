@@ -12,7 +12,7 @@
        ``migrate-business-launch-builders``): launch_builders/navigation.py
        contributes the navigation entry to robot_config's launch registry
        through the ibrobot.launch_builders entry point group and imports
-       robot_config's retained helpers (cmd_vel / fast_lio / static_tf /
+       robot_config's retained helpers (fast_lio / static_tf /
        runtime provider lookup) at build time. The dependency is one way:
        robot_config does not depend on this package. -->
   <depend>robot_config</depend>
@@ -49,6 +49,8 @@
   <exec_depend>nav2_mppi_controller</exec_depend>
   <exec_depend>nav2_rviz_plugins</exec_depend>
   <exec_depend>ibrobot_msgs</exec_depend>
+  <!-- Navigation admission client: contract names + RuntimeStatus -->
+  <exec_depend>robot_runtime</exec_depend>
   <exec_depend>robot_localization</exec_depend>
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>robot_state_publisher</exec_depend>

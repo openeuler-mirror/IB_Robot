@@ -10,8 +10,8 @@ robot_config change. The content is a verbatim migration of the former
 are the module paths (self-import, and the sibling sub-builders nav2 /
 localization / navigation_command / voice_nav, which moved into this
 package too). The shared helpers stay in robot_config and keep being
-imported from there (``cmd_vel`` / ``fast_lio`` / ``static_tf`` / the
-runtime provider lookup).
+imported from there (``fast_lio`` / ``static_tf`` / the runtime provider
+lookup).
 
 Supports two navigation architectures selected by config structure:
 
@@ -23,13 +23,18 @@ Supports two navigation architectures selected by config structure:
    Full navigation stack with sub-builders:
    - static_tf: static TF publishers
    - localization: RTAB-Map + EKF
-   - nav2: Nav2 bringup
-   - cmd_vel: cmd_vel bridge
+   - nav2: Nav2 bringup (collision monitor output lands on the admitted
+     /cmd_vel channel; the velocity smoother is dropped while it runs)
+   - admission: launch-time mode/gate admission for provider stages that
+     declare navigation.open_gate_on_startup
    - voice_nav: Nav2 goal client + FunASR
 """
 
 from typing import Any
 
+from launch.actions import EmitEvent, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.launch_registry.builder_support import resolve_with_navigation
@@ -129,7 +134,6 @@ def _generate_real_navigation(
     if "nav_stage" in robot_config:
         _validate_global_localization_provider(robot_config["nav_stage"], navigation_config)
     _validate_navigation_velocity_contract(robot_config, navigation_config)
-    _validate_provider_velocity_path(robot_config, navigation_config)
 
     logger.info("Navigation enabled, generating nodes...")
     nodes = []
@@ -141,7 +145,8 @@ def _generate_real_navigation(
     # publishers.
     from robot_config.launch_builders.runtime import runtime_provider
 
-    if runtime_provider(robot_config):
+    provider = runtime_provider(robot_config)
+    if provider:
         logger.info("runtime.provider configured: FAST-LIO left to the robot runtime")
     else:
         from robot_config.launch_builders.fast_lio import generate_fast_lio_nodes
@@ -149,7 +154,6 @@ def _generate_real_navigation(
         nodes.extend(generate_fast_lio_nodes(navigation_config, use_sim=use_sim))
 
     # Lazy imports for sub-builders (only needed in real-hardware mode)
-    from robot_config.launch_builders.cmd_vel import generate_cmd_vel_nodes
     from robot_config.launch_builders.static_tf import generate_static_tf_nodes
     from robot_navigation.launch_builders.localization import generate_localization_nodes
     from robot_navigation.launch_builders.nav2 import generate_nav2_nodes
@@ -162,25 +166,48 @@ def _generate_real_navigation(
     # 2. Localization (RTAB-Map + EKF)
     nodes.extend(generate_localization_nodes(navigation_config, use_sim=use_sim))
 
-    # 3. Nav2 bringup
+    # 3. Nav2 bringup (the collision monitor routes onto the runtime channel)
     nodes.extend(generate_nav2_nodes(navigation_config, use_sim=use_sim))
     nodes.extend(generate_navigation_command_nodes(navigation_config, use_sim=use_sim))
 
-    # 4. CmdVel bridge (needs to know if EKF is running)
-    ekf_rtabmap_config = navigation_config.get("ekf_rtabmap", {})
-    ekf_node_config = ekf_rtabmap_config.get("ekf", {})
-    ekf_enabled = ekf_rtabmap_config.get("enabled", False) and ekf_node_config.get("enabled", True) and not use_sim
-    nodes.extend(
-        generate_cmd_vel_nodes(
-            navigation_config,
-            motion_mode_config=robot_config.get("motion_mode", {}),
-            ekf_enabled=ekf_enabled,
-            use_sim=use_sim,
-            # Lets the builder skip the bridge under a runtime provider, whose
-            # base node already owns cmd_vel; without it both drove the wheels.
-            robot_config=robot_config,
+    # 4. Launch-time navigation admission (openspec
+    #    lekiwi-application-migration A3/A5): a stage declaring
+    #    navigation.open_gate_on_startup may drive the base from boot. The
+    #    runtime boots idle with the gate closed, so an admission client
+    #    selects the stage's runtime mode and opens the gate through the
+    #    contract services after the runtime is ready; a rejected or timed-out
+    #    admission shuts the launch down instead of leaving a stage that
+    #    silently cannot move.
+    if provider and navigation_config.get("open_gate_on_startup", False):
+        mode_name = str(robot_config.get("default_control_mode", "") or "")
+        runtime_mode = str(
+            ((robot_config.get("control_modes") or {}).get(mode_name) or {}).get("runtime_mode", "")
+        ).strip()
+        if not runtime_mode:
+            raise ValueError(
+                f"navigation.open_gate_on_startup requires control_modes.{mode_name!r}.runtime_mode "
+                "to name the runtime mode this stage drives the base in"
+            )
+        admission = Node(
+            package="robot_navigation",
+            executable="navigation_admission",
+            name="navigation_admission",
+            output="screen",
+            parameters=[{"runtime_mode": runtime_mode, "open_gate": True, "use_sim_time": use_sim}],
         )
-    )
+        nodes.append(admission)
+        nodes.append(
+            RegisterEventHandler(
+                OnProcessExit(
+                    target_action=admission,
+                    on_exit=lambda event, _context: (
+                        []
+                        if event.returncode == 0
+                        else [EmitEvent(Shutdown(reason=f"navigation admission failed (rc={event.returncode})"))]
+                    ),
+                )
+            )
+        )
 
     # 5. Voice-controlled navigation (Nav2 goal client + FunASR)
     nodes.extend(generate_voice_nav_nodes(navigation_config, use_sim=use_sim))
@@ -236,46 +263,31 @@ def _validate_global_localization_provider(nav_stage: str, navigation_config: di
 
 
 def _validate_navigation_velocity_contract(robot_config: dict[str, Any], navigation_config: dict[str, Any]) -> None:
-    """Reject only the LiDAR dynamic chain that would bypass Collision Monitor."""
-    if robot_config.get("name") != "lekiwi_lidar":
-        return
+    """Require the collision-monitor chain to land on the admitted base channel.
+
+    With ``dyn_avoid_enabled`` the Nav2 collision monitor must be the last hop
+    onto ``/cmd_vel`` (openspec lekiwi-application-migration task 3.2): the
+    controller publishes ``/cmd_vel_nav`` and the monitor's filtered output is
+    what the runtime admits. Any other velocity topic under dynamic avoidance
+    would either bypass the monitor or never reach the base. The
+    command server's stop topic shares the same channel so stops are admitted
+    like any other producer.
+    """
     nav2_config = navigation_config.get("nav2_bringup", {})
     if not nav2_config.get("dyn_avoid_enabled", False):
         return
 
-    bridge_topic = navigation_config.get("cmd_vel_bridge", {}).get("cmd_vel_topic", "/cmd_vel")
     stop_topic = navigation_config.get("command_server", {}).get("stop_velocity_topic", "/cmd_vel_safe")
-    if bridge_topic != "/cmd_vel_safe":
-        raise ValueError("dynamic LiDAR navigation must use cmd_vel_topic=/cmd_vel_safe")
-    if stop_topic != bridge_topic:
-        raise ValueError("dynamic LiDAR navigation stop_velocity_topic must match cmd_vel_topic")
-
-
-def _validate_provider_velocity_path(robot_config: dict[str, Any], navigation_config: dict[str, Any]) -> None:
-    """Refuse a provider stage whose collision-filtered velocity cannot reach the base.
-
-    Under a runtime provider the base is driven only through the runtime's
-    ``/cmd_vel`` channel (the generic bridge is skipped). The dynamic-avoidance
-    chain makes Nav2 publish ``/cmd_vel`` *unfiltered* and puts Collision
-    Monitor's output on ``/cmd_vel_safe``, which nothing forwards to the
-    runtime -- so launching it would let unfiltered planner output drive the
-    base. Routing Collision Monitor into the contract channel is the LeKiwi
-    application migration's job; until then such a stage fails here.
-    """
-    from robot_config.launch_builders.runtime import runtime_provider
-
-    provider = runtime_provider(robot_config)
-    nav2_config = navigation_config.get("nav2_bringup", {}) or {}
-    if not provider or not nav2_config.get("enabled", False) or not nav2_config.get("dyn_avoid_enabled", False):
-        return
-    stage = robot_config.get("nav_stage", "")
-    raise ValueError(
-        f"nav_stage '{stage}' enables the Nav2 collision monitor (nav2_bringup.dyn_avoid_enabled), whose filtered "
-        f"output /cmd_vel_safe does not reach the base under runtime.provider={provider!r}: the runtime admits base "
-        "commands only on /cmd_vel, where Nav2 publishes unfiltered. Disable dyn_avoid_enabled for this stage or "
-        "use a provider-less configuration until collision monitor output is routed into the runtime channel "
-        "(openspec lekiwi-application-migration, task 3.2)."
-    )
+    if stop_topic != "/cmd_vel":
+        raise ValueError(
+            "dynamic navigation stop_velocity_topic must be /cmd_vel so command-server stops reach the base "
+            "through the same admitted channel as the collision-monitor output"
+        )
+    if navigation_config.get("cmd_vel_bridge"):
+        raise ValueError(
+            "navigation.cmd_vel_bridge was removed; the runtime base node owns cmd_vel projection "
+            "(openspec lekiwi-application-migration task 2.2)"
+        )
 
 
 def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> list:

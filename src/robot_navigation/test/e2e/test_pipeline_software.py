@@ -1,10 +1,14 @@
 """Layer 1: Pure software E2E tests.
 
-3 real nodes (voice_control + nav2_goal_client + cmd_vel_bridge_node)
-connected via real ROS2 topics, with mock external action/service servers.
+2 real nodes (voice_control + nav2_goal_client) connected via real ROS2
+topics, with mock external action/service servers.
 
-Validates the complete data chain: voice text -> keyword match -> Nav2 goal
--> cmd_vel -> wheel IK -> joint_states FK -> odometry.
+Validates the data chain: voice text -> keyword match -> Nav2 goal.
+The cmd_vel -> wheel projection and the wheel odometry chain moved to the
+LeKiwi runtime (lekiwi_robot/base_node over lekiwi_sdk) when the generic
+cmd_vel bridge was removed (openspec lekiwi-application-migration 2.2);
+their coverage lives in the lekiwi_sdk tests and the LeKiwi runtime
+conformance suite.
 
 Usage:
     colcon test --packages-select robot_navigation --pytest-args -k "test_pipeline_software"
@@ -17,14 +21,9 @@ import time
 
 import pytest
 import rclpy
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
 from rclpy.executors import MultiThreadedExecutor
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray, String
-from tf2_ros import Buffer, TransformListener
+from std_msgs.msg import String
 
-from robot_navigation.cmd_vel_bridge_node import CmdVelBridgeNode, _body_to_wheel_radps
 from robot_navigation.nav2_goal_client import Nav2GoalClient
 from robot_navigation.voice_control import VoiceControl
 from test.e2e.mock_servers import (
@@ -64,10 +63,6 @@ DESTINATIONS_JSON = json.dumps(
         "point_b": {"x": 0.2, "y": 0.0, "theta": 0.0},
     }
 )
-
-WHEEL_RADIUS = 0.05
-BASE_RADIUS = 0.125
-MAX_RADPS = 4.602
 
 # Mock action server delay: keeps navigation "in progress" long enough
 # for cancel (TC1.3) and double-send (TC1.7) tests to work.
@@ -126,11 +121,6 @@ def pipeline(rclpy_init):
     goal_client.nav_stop_sub = goal_client.create_subscription(String, "/e2e/nav_stop", goal_client.stop_callback, 10)
     executor.add_node(goal_client)
 
-    # 3. cmd_vel_bridge_node: disable 50Hz timer, use manual control_loop
-    bridge = CmdVelBridgeNode()
-    bridge.destroy_timer(bridge.control_timer)
-    executor.add_node(bridge)
-
     # Spin executor in background thread
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
@@ -141,7 +131,6 @@ def pipeline(rclpy_init):
     yield {
         "voice": voice,
         "goal_client": goal_client,
-        "bridge": bridge,
         "mock_nav": mock_nav,
         "mock_eval": mock_eval,
         "mock_stop": mock_stop,
@@ -156,7 +145,6 @@ def pipeline(rclpy_init):
     mock_eval.destroy()
     mock_stop.destroy()
     mock_hotwords.destroy()
-    bridge.destroy_node()
     goal_client.destroy_node()
     voice.destroy_node()
 
@@ -205,17 +193,6 @@ def reset_pipeline(pipeline):
     mock_stop = pipeline["mock_stop"]
     with mock_stop._lock:
         mock_stop.calls.clear()
-
-    bridge = pipeline["bridge"]
-    bridge.target_vx = 0.0
-    bridge.target_vy = 0.0
-    bridge.target_vtheta = 0.0
-    bridge.last_cmd_time = None
-    bridge.odom_x = 0.0
-    bridge.odom_y = 0.0
-    bridge.odom_theta = 0.0
-    bridge.last_odom_time = None
-    bridge.wheel_feedback = None
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -321,118 +298,12 @@ class TestNavigationCancel:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# TC1.4: cmd_vel -> wheel commands IK correct
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestCmdVelToWheelCommands:
-    """TC1.4: cmd_vel published to /cmd_vel produces correct wheel IK commands."""
-
-    def test_wheel_commands_match_ik(self, pipeline, reset_pipeline):
-        bridge = pipeline["bridge"]
-
-        # Collect wheel command output
-        received = []
-        sub = bridge.create_subscription(
-            Float64MultiArray,
-            "/base_velocity_controller/commands",
-            lambda m: received.append(m),
-            10,
-        )
-        time.sleep(0.1)
-
-        # Send a cmd_vel
-        vx, vy, vtheta = 0.1, 0.1, 0.1
-        cmd_pub = bridge.create_publisher(Twist, "/cmd_vel", 10)
-        time.sleep(0.1)
-        twist = Twist()
-        twist.linear.x = vx
-        twist.linear.y = vy
-        twist.angular.z = vtheta
-        cmd_pub.publish(twist)
-
-        # Let the message propagate, then manually trigger control_loop
-        time.sleep(0.2)
-        bridge.control_loop()
-        time.sleep(0.2)
-        bridge.control_loop()
-
-        # Check wheel commands match expected IK
-        expected = _body_to_wheel_radps(vx, vy, vtheta, WHEEL_RADIUS, BASE_RADIUS, MAX_RADPS)
-        assert len(received) >= 1
-        actual = received[-1].data
-        for i in range(3):
-            assert actual[i] == pytest.approx(expected[i], abs=1e-6), (
-                f"Wheel {i}: expected {expected[i]}, got {actual[i]}"
-            )
-
-        bridge.destroy_subscription(sub)
-        bridge.destroy_publisher(cmd_pub)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# TC1.5: joint_states feedback -> /odom integration correct
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-class TestOdometryIntegration:
-    """TC1.5: joint_states feedback integrates to /odom and TF correctly."""
-
-    def test_odometry_from_joint_states(self, pipeline, reset_pipeline):
-        bridge = pipeline["bridge"]
-
-        # Reset odom state
-        bridge.odom_x = 0.0
-        bridge.odom_y = 0.0
-        bridge.odom_theta = 0.0
-
-        # Publish fake joint_states (forward motion: vx=0.1 m/s)
-        # Use IK to compute what wheel speeds would be for vx=0.1
-        vx = 0.1
-        wheel_speeds = _body_to_wheel_radps(vx, 0, 0, WHEEL_RADIUS, BASE_RADIUS, MAX_RADPS)
-        js_pub = bridge.create_publisher(JointState, "/joint_states", 10)
-        time.sleep(0.1)
-
-        # Set up odom subscriber
-        odom_msgs = []
-        odom_sub = bridge.create_subscription(Odometry, "/odom", lambda m: odom_msgs.append(m), 10)
-        time.sleep(0.1)
-
-        # Publish joint_states and trigger control_loop
-        js = JointState()
-        js.name = ["7", "8", "9"]
-        js.velocity = wheel_speeds
-        js_pub.publish(js)
-        assert _wait_until(lambda: bridge.wheel_feedback is not None, timeout=2.0)
-
-        # Trigger control_loop to process joint_states and update odom
-        bridge.control_loop()
-        time.sleep(0.1)
-        bridge.control_loop()
-        assert _wait_until(lambda: len(odom_msgs) >= 1, timeout=2.0)
-
-        # Verify odom was published
-        assert len(odom_msgs) >= 1
-        odom = odom_msgs[-1]
-        # After one tick with vx=0.1, odom should show forward motion
-        assert odom.pose.pose.position.x > 0.0 or odom.twist.twist.linear.x == pytest.approx(vx, abs=0.01)
-
-        # Verify TF published
-        tf_buffer = Buffer()
-        TransformListener(tf_buffer, bridge)
-        time.sleep(0.3)
-        # Run control_loop again to ensure TF is published
-        bridge.control_loop()
-        time.sleep(0.3)
-
-        # Check odom frame IDs
-        assert odom.header.frame_id == "odom"
-        assert odom.child_frame_id == "base_link"
-
-        bridge.destroy_subscription(odom_sub)
-        bridge.destroy_publisher(js_pub)
-
-
+# TC1.4 / TC1.5 (cmd_vel -> wheel IK, joint_states -> odometry) were removed
+# with the generic cmd_vel bridge (openspec lekiwi-application-migration
+# 2.2). The projection and odometry behavior now lives in the LeKiwi
+# runtime: equivalence was recorded in that change's baseline replay, and
+# runtime coverage runs in the lekiwi_sdk tests and the LeKiwi conformance
+# suite (base velocity, odometry, staleness, navigation gate).
 # ═══════════════════════════════════════════════════════════════════════════
 # TC1.6: Invalid voice text -> no goal sent
 # ═══════════════════════════════════════════════════════════════════════════
