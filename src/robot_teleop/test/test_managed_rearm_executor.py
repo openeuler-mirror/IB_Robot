@@ -19,8 +19,9 @@ from robot_teleop.teleop_node import TeleopNode
 
 @pytest.fixture
 def admission(monkeypatch):
-    monkeypatch.setenv("ROS_DOMAIN_ID", "174")
-    monkeypatch.setenv("ROS_LOCALHOST_ONLY", "1")
+    # ROS_DOMAIN_ID / ROS_LOCALHOST_ONLY come from the workspace-root conftest
+    # (per-process reservation); a fixture-level override would break that
+    # isolation under parallel colcon test runs.
     # Legacy VR unit tests install an action stub during collection.
     import ibrobot_msgs.action
     from ibrobot_msgs.action._arm_return_home import ArmReturnHome
@@ -175,3 +176,50 @@ def test_rearm_requires_new_source_sample_before_start(admission):
     assert not result.result().success
     assert "fresh leader input" in result.result().message
     assert state["starts"] == 0
+
+
+def test_rearm_excludes_queued_future_stamped_samples(admission):
+    # A sample whose stamp only leads the request clock by less than the skew
+    # tolerance may predate the rearm request, so it must not satisfy the
+    # fresh-input gate (issue #197 review).
+    node, peer, state, client, until, _status, _estop = admission
+
+    def seconds() -> float:
+        return peer.get_clock().now().nanoseconds * 1e-9
+
+    def stamped_message(position: list[float], stamp_s: float) -> JointState:
+        msg = JointState()
+        msg.header.stamp.sec = int(stamp_s)
+        msg.header.stamp.nanosec = int(round((stamp_s - int(stamp_s)) * 1e9))
+        msg.header.frame_id = "leader_radians_gripper_ratio_v1"
+        msg.name, msg.position = ["1", "6"], position
+        return msg
+
+    # Stop the fixture stream, drain it, then prove the injection publisher's
+    # matching and delivery with an accepted warm-up sample: a later dropped
+    # publish can then no longer masquerade as a rejection.
+    state["send_input"] = False
+    drained_at = time.monotonic() + 0.15
+    until(lambda: time.monotonic() >= drained_at, timeout=1.0)
+    inject = peer.create_publisher(JointState, "/test_rearm/input", 1)
+    inject.publish(stamped_message([0.11, 0.22], seconds()))
+    until(lambda: node.device.sample == {"1": 0.11, "6": 0.22})
+    assert node.device.last_invalid_reason == ""
+
+    request_at = seconds()
+    result = client.call_async(Trigger.Request())
+    until(lambda: node._rearm_pending)
+    observed_at = seconds()
+    # The correct barrier is request_time + tolerance; the pre-fix barrier was
+    # the request time itself. A stamp in between is future-leaning yet below
+    # the barrier: admitted by the old gate, rejected by the fixed one.
+    queued_stamp = (observed_at + request_at + 0.1) / 2
+    inject.publish(stamped_message([0.25, 0.5], queued_stamp))
+    until(lambda: node.device.last_invalid_reason == "non-increasing source timestamp")
+    assert state["starts"] == 0
+    state["send_input"] = True
+    until(lambda: state["starts"] == 1)
+    state["reply"].set_result((True, "admitted after barrier"))
+    until(result.done)
+    assert result.result().success
+    assert result.result().message == "admitted after barrier"

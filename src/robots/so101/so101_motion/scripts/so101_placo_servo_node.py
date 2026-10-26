@@ -78,6 +78,10 @@ if _THIS_DIR not in sys.path:
 from so101_placo_kinematics import SO101PlacoDiffIK  # noqa: E402
 
 _IDLE_RELEASE_TIMEOUT_S = 5.0
+# Sim-time clock-skew tolerance for the managed JointState freshness window:
+# under simulated time a feedback publisher's stamp can lead this node's
+# /clock-advancing clock by a few milliseconds (issue #197).
+_JOINT_STATE_SKEW_TOLERANCE_S = 0.1
 
 
 def _require_placo(logger) -> None:
@@ -796,12 +800,14 @@ class SO101PlacoServoNode(Node):
     def _on_joint_state(self, msg: JointState) -> None:
         if self.managed_teleop:
             now = self.get_clock().now().nanoseconds * 1e-9
+            # Tolerate sim-time clock skew; see _JOINT_STATE_SKEW_TOLERANCE_S.
+            age = now - self._stamp(msg.header.stamp)
             if (
                 len(msg.name) != len(msg.position)
                 or len(set(msg.name)) != len(msg.name)
                 or not set(self.arm_joint_names + self.gripper_joint_names).issubset(msg.name)
                 or not np.all(np.isfinite(msg.position))
-                or not 0 <= now - self._stamp(msg.header.stamp) <= self.home_joint_state_stale_s
+                or not -_JOINT_STATE_SKEW_TOLERANCE_S <= age <= self.home_joint_state_stale_s
             ):
                 return
         self._latest_js = msg

@@ -39,7 +39,8 @@ class LeaderTopicDevice(BaseTeleopDevice):
             reason = "duplicate joint names"
         elif set(msg.name) != set(self.mapping):
             reason = "joint names do not match mapping"
-        elif not 0 <= now - stamp <= self.timeout:
+        elif not -self.STAMP_SKEW_TOLERANCE_S <= now - stamp <= self.timeout:
+            # Tolerate sim-time clock skew; see STAMP_SKEW_TOLERANCE_S.
             reason = f"source timestamp outside freshness window (age={now - stamp:.3f}s)"
         elif stamp <= self.stamp:
             reason = "non-increasing source timestamp"
@@ -64,7 +65,7 @@ class LeaderTopicDevice(BaseTeleopDevice):
         if (
             self.sample is None
             or time.monotonic() - self.received > self.timeout
-            or not 0 <= source_age <= self.timeout
+            or not -self.STAMP_SKEW_TOLERANCE_S <= source_age <= self.timeout
         ):
             if not self._stale_logged:
                 received_age = f"{time.monotonic() - self.received:.3f}s" if self.sample is not None else "unavailable"
@@ -88,8 +89,11 @@ class LeaderTopicDevice(BaseTeleopDevice):
 
     def prepare_rearm(self):
         self.emergency_stop()
-        # Exclude queued DDS samples produced before this explicit request.
-        self.stamp = max(self.stamp, self._node.get_clock().now().nanoseconds * 1e-9)
+        # Exclude queued DDS samples produced before this explicit request:
+        # under the bounded clock-skew assumption a stamp at or below
+        # now + STAMP_SKEW_TOLERANCE_S may predate the request, so only
+        # strictly newer stamps count as "produced after".
+        self.stamp = max(self.stamp, self._node.get_clock().now().nanoseconds * 1e-9 + self.STAMP_SKEW_TOLERANCE_S)
 
     def disconnect(self):
         self.emergency_stop()

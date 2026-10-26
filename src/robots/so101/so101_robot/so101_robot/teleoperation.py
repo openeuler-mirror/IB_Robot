@@ -76,6 +76,9 @@ def generate_teleoperation_nodes(profile, descriptor, robot_description_dict, *,
     ]
     source = config.get("leader_source")
     if source:
+        # The leader source stamps its samples with its own node clock
+        # (leader_arm_pub's timer callback), so under physics simulation it
+        # must follow /clock like the mapper checking those stamps.
         nodes.append(
             Node(
                 package="so101_hardware",
@@ -92,6 +95,7 @@ def generate_teleoperation_nodes(profile, descriptor, robot_description_dict, *,
                         "gripper_joint": gripper[0] if gripper else "6",
                         "source_topic": "/inputs/so101_leader/state",
                         "publish_rate": float(source["publish_rate"]),
+                        "use_sim_time": bool(use_sim_time),
                     }
                 ],
             )

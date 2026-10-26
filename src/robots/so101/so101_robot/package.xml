@@ -45,6 +45,10 @@
   <!-- new launch-builder tests compose/inspect sim_models scenes -->
   <test_depend>sim_models</test_depend>
   <test_depend>robot_runtime</test_depend>
+  <!-- managed-teleop construction tests import the contract messages and load
+       the so101_motion servo script from the source tree -->
+  <test_depend>ibrobot_msgs</test_depend>
+  <test_depend>so101_motion</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

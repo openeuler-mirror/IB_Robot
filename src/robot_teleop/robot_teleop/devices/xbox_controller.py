@@ -330,7 +330,10 @@ CONTROLS:
             if self._managed:
                 now = self._node.get_clock().now().nanoseconds * 1e-9
                 stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-                if not 0 <= now - stamp <= self._input_stale_s or not all(math.isfinite(v) for v in msg.axes):
+                # Tolerate sim-time clock skew; see STAMP_SKEW_TOLERANCE_S.
+                if not -self.STAMP_SKEW_TOLERANCE_S <= now - stamp <= self._input_stale_s or not all(
+                    math.isfinite(v) for v in msg.axes
+                ):
                     return
             self._latest_joy = msg
             self._latest_joy_at = time.monotonic()
@@ -394,10 +397,11 @@ CONTROLS:
             if self._managed:
                 now = self._node.get_clock().now().nanoseconds * 1e-9
                 stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+                # Tolerate sim-time clock skew; see STAMP_SKEW_TOLERANCE_S.
                 if (
                     len(msg.name) != len(msg.position)
                     or not all(math.isfinite(v) for v in msg.position)
-                    or not 0 <= now - stamp <= self._input_stale_s
+                    or not -self.STAMP_SKEW_TOLERANCE_S <= now - stamp <= self._input_stale_s
                 ):
                     return
             self._latest_state_at = time.monotonic()

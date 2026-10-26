@@ -26,7 +26,9 @@ from so101_robot import teleoperation
 
 @pytest.fixture
 def runtime_node(tmp_path, monkeypatch, request):
-    monkeypatch.setenv("ROS_DOMAIN_ID", "182")
+    # ROS_DOMAIN_ID / ROS_LOCALHOST_ONLY come from the workspace-root conftest
+    # (per-process reservation); a fixture-level override would break that
+    # isolation under parallel colcon test runs.
     root = Path(__file__).resolve().parents[5]
     profile_path = root / "src/robots/so101/so101_robot/profiles/so101_single_arm.yaml"
     profile = yaml.safe_load(profile_path.read_text())
@@ -288,6 +290,71 @@ def test_sim_time_node_accepts_sim_stamped_feedback(runtime_node):
             assert node._latest_js is not None, f"sim-stamped feedback at t={sim_s} was dropped"
             assert node._latest_js.header.stamp.sec == int(sim_s)
             node._latest_js = None
+    finally:
+        node.prepare_shutdown()
+        executor.shutdown(timeout_sec=2.0)
+        peer.destroy_node()
+
+
+@pytest.mark.parametrize("runtime_node", [{"use_sim_time": True}], indirect=True)
+def test_sim_time_node_tolerates_clock_skew_in_feedback(runtime_node):
+    """Feedback stamps slightly leading the sim clock stay fresh (issue #197).
+
+    Under simulated time the /joint_states publisher's stamp can lead the
+    servo's /clock-advancing clock by a few milliseconds; the freshness
+    window must admit that bounded negative age and still reject stamps
+    beyond the skew tolerance.
+    """
+    from builtin_interfaces.msg import Time as TimeMsg
+    from rosgraph_msgs.msg import Clock
+
+    node, _module, _captured, _xml = runtime_node
+    peer = Node("sim_skew_test_peer")
+    executor = MultiThreadedExecutor(num_threads=4)
+    joints = peer.create_publisher(JointState, "/joint_states", 1)
+    clock = peer.create_publisher(Clock, "/clock", 1)
+    executor.add_node(peer)
+    executor.add_node(node)
+    try:
+        node.home_joint_state_stale_s = 0.2
+
+        def stamp_ns(sim_s: float) -> int:
+            return int(sim_s) * 1_000_000_000 + int(round((sim_s - int(sim_s)) * 1e9))
+
+        def advance_clock(sim_s: float) -> None:
+            message = Clock()
+            message.clock.sec = int(sim_s)
+            message.clock.nanosec = stamp_ns(sim_s) % 1_000_000_000
+            clock.publish(message)
+
+        def publish_feedback(sim_s: float) -> None:
+            msg = JointState()
+            msg.name = node.arm_joint_names + node.gripper_joint_names
+            msg.position = [0.1] * len(msg.name)
+            msg.header.stamp = TimeMsg(sec=int(sim_s), nanosec=stamp_ns(sim_s) % 1_000_000_000)
+            joints.publish(msg)
+
+        def feedback_observed() -> bool:
+            deadline = time.monotonic() + 1.0
+            while time.monotonic() < deadline and node._latest_js is None:
+                executor.spin_once(timeout_sec=0.05)
+            return node._latest_js is not None
+
+        # Sim clock at 10.0; feedback stamped 16 ms ahead is fresh.
+        advance_clock(10.0)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and node.get_clock().now().nanoseconds < stamp_ns(10.0):
+            executor.spin_once(timeout_sec=0.05)
+        publish_feedback(10.016)
+        assert feedback_observed(), "feedback leading the sim clock by 16 ms was dropped"
+        node._latest_js = None
+
+        # Feedback stamped 0.2 s ahead is beyond the skew tolerance.
+        publish_feedback(10.2)
+        observe_until = time.monotonic() + 0.3
+        while time.monotonic() < observe_until:
+            executor.spin_once(timeout_sec=0.05)
+        assert node._latest_js is None, "feedback leading the sim clock by 0.2 s was accepted"
     finally:
         node.prepare_shutdown()
         executor.shutdown(timeout_sec=2.0)

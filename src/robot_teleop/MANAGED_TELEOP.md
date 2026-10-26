@@ -36,6 +36,15 @@ and awaited rclpy Futures leave source/status subscriptions, E-stop, control
 timers and service replies runnable even with a SingleThreadedExecutor.
 Timeout or STOP fences late start replies; a late success requests another stop,
 and an older stop acknowledgement cannot acknowledge that newer request.
+Stamped inputs (leader samples, gamepad /joy, /joint_states) tolerate up to
+0.1 s of stamp lead — simulated clocks advance per /clock, so a publisher can
+lead a busy subscriber by a few milliseconds; stale and farther-future stamps
+are still rejected. Leader rearm admits only samples stamped strictly after
+the request time plus that tolerance, so a rearm waits at least ~0.1 s of ROS
+time. In simulation (MuJoCo/Gazebo) the mapper-side teleop nodes and the
+runtime's leader source all follow /clock; an off-host input source must
+share the mapper's clock domain (use_sim_time in simulation, time sync on
+hardware).
 Phone/gamepad callers retain the queued boolean backend `enable()` API and their
 operator deadman/release requirements; `enable_with_result()` is the final-result
 path used by the mapper service.

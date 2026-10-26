@@ -34,6 +34,14 @@ class BaseTeleopDevice(ABC):
         logger: Python logger for device messages
     """
 
+    # Sim-time clock-skew tolerance for ROS-stamp freshness windows (issue
+    # #197). Each node's ROS clock advances only as it processes /clock, so a
+    # publisher's stamp can lead a busy subscriber's clock by a few
+    # milliseconds (observed up to ~16 ms under MuJoCo). Freshness windows
+    # reject *stale* input, so a bounded negative age is admitted; mirrors
+    # action_dispatch's _status_skew_tolerance_s (issue #196 fix).
+    STAMP_SKEW_TOLERANCE_S = 0.1
+
     def __init__(self, config: dict, node=None):
         """
         Initialize the teleoperation device.

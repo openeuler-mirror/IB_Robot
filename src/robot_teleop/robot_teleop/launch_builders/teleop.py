@@ -69,7 +69,9 @@ def _is_finite_number(value: object) -> bool:
         return False
 
 
-def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = None) -> list[Node]:
+def generate_teleop_nodes(
+    robot_config: dict, robot_description_dict: dict = None, use_sim_time: bool | None = None
+) -> list[Node]:
     """
     Generate teleoperation nodes based on robot configuration.
 
@@ -85,6 +87,9 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     Args:
         robot_config: Robot configuration dictionary loaded from YAML
         robot_description_dict: Dictionary containing robot_description (URDF)
+        use_sim_time: Whether the generated application-side nodes must follow
+            /clock (simulated time). When None (the default), it falls back to
+            ``robot_description_dict.get("use_sim_time")``.
 
     Returns:
         List of Node actions for teleoperation
@@ -123,7 +128,9 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         base_device = _active_base_drive_device(teleop_config)
         if base_device is not None:
             return _generate_provider_base_drive_nodes(robot_config, base_device)
-        return _generate_public_teleop_nodes(robot_config)
+        return _generate_public_teleop_nodes(
+            robot_config, use_sim_time=_effective_use_sim_time(robot_description_dict, use_sim_time)
+        )
 
     validation_errors = validate_teleop_config(
         teleop_config,
@@ -839,7 +846,20 @@ def _generate_provider_base_drive_nodes(config: dict, device: dict) -> list[Node
     return _create_joy_teleop_nodes(device)
 
 
-def _generate_public_teleop_nodes(config):
+def _effective_use_sim_time(robot_description_dict: dict | None, use_sim_time: bool | None) -> bool:
+    """Resolve whether the generated application-side nodes must follow /clock.
+
+    The explicit argument wins (the launch context passes its prepared
+    ``node_use_sim_time`` — simulation with a backend that publishes /clock,
+    e.g. MuJoCo or Gazebo); without it, fall back to the description layer's
+    parameter dict, which carries ``use_sim_time`` in simulation.
+    """
+    if use_sim_time is not None:
+        return bool(use_sim_time)
+    return bool((robot_description_dict or {}).get("use_sim_time", False))
+
+
+def _generate_public_teleop_nodes(config, use_sim_time: bool = False):
     """Input deployment is separate; no robot-specific model or solver is loaded here."""
     import copy
 
@@ -918,6 +938,9 @@ def _generate_public_teleop_nodes(config):
                 ],
             }
         )
+        if use_sim_time:
+            # Sim time keeps the VR server's command stamps on /clock.
+            params["use_sim_time"] = True
         nodes.append(
             Node(package="robot_teleop", executable="vr_teleop", name="vr_teleop", output="screen", parameters=[params])
         )
@@ -933,6 +956,10 @@ def _generate_public_teleop_nodes(config):
         for key in ("latency_warn_s", "diagnostics_period_s", "rearm_timeout_s"):
             if key in device or key in teleop:
                 params[key] = float(device.get(key, teleop.get(key)))
+        if use_sim_time:
+            # The managed freshness windows compare /joint_states and /joy
+            # stamps against this node's clock (issue #197).
+            params["use_sim_time"] = True
         nodes.append(
             Node(
                 package="robot_teleop",
@@ -943,13 +970,19 @@ def _generate_public_teleop_nodes(config):
             )
         )
     if kind == "xbox_controller":
+        joy_params = {"dev": device["input_device"], "autorepeat_rate": 20.0}
+        if use_sim_time:
+            # joy_node stamps /joy with this->now() (its own node clock), so it
+            # must follow /clock in simulation or its stamps fall outside the
+            # teleop node's sim-time freshness window.
+            joy_params["use_sim_time"] = True
         nodes.append(
             Node(
                 package="joy",
                 executable="joy_node",
                 name="joy_node",
                 output="screen",
-                parameters=[{"dev": device["input_device"], "autorepeat_rate": 20.0}],
+                parameters=[joy_params],
                 remappings=[("joy", device["source_topic"])],
             )
         )
@@ -1508,7 +1541,14 @@ def build_teleop(context: LaunchBuildContext) -> BuildResult:
 
     control = context.control_startup
     robot_description = dict(control.robot_description) if control is not None else {}
-    nodes = generate_teleop_nodes(context.robot_config, robot_description)
+    # The provider path leaves control.robot_description empty, so the flag
+    # comes from the context: node_use_sim_time = use_sim AND the backend
+    # publishes /clock (MuJoCo/Gazebo yes, mock SDK transport no).
+    nodes = generate_teleop_nodes(
+        context.robot_config,
+        robot_description,
+        use_sim_time=context.node_use_sim_time,
+    )
     logger.info(f"Prepared {len(nodes)} teleop nodes")
     return BuildResult(actions=list(nodes))
 

@@ -164,16 +164,22 @@ def test_gazebo_platform_applies_a_peripheral_toggle_exactly_once(tmp_path):
 
 
 def test_teleop_executor_follows_the_platform_clock():
-    """The runtime-owned placo servo runs on sim time only on Gazebo (PR !515 P2).
+    """The runtime-owned teleop nodes run on sim time only on Gazebo (PR !515 P2).
 
     Managed mode compares the node clock against JointState stamps; a wall
-    clock under Gazebo drops every sim-stamped feedback sample.
+    clock under Gazebo drops every sim-stamped feedback sample. The leader
+    source stamps its samples with its own node clock, so it must follow the
+    same clock as the servo and the mapper checking those stamps (issue #197).
     """
     gazebo = _render({"use_sim": "true", "sim_platform": "gazebo"})
     servo = next(
         node for node in gazebo if isinstance(node, Node) and node._Node__node_executable == "so101_placo_servo_node.py"
     )
     assert _params(servo)["use_sim_time"] is True
+    leader_source = next(
+        node for node in gazebo if isinstance(node, Node) and node._Node__node_executable == "leader_arm_pub"
+    )
+    assert _params(leader_source)["use_sim_time"] is True
 
     physical = _render({"use_sim": "false"})
     servo = next(
@@ -182,6 +188,10 @@ def test_teleop_executor_follows_the_platform_clock():
         if isinstance(node, Node) and node._Node__node_executable == "so101_placo_servo_node.py"
     )
     assert _params(servo)["use_sim_time"] is False
+    leader_source = next(
+        node for node in physical if isinstance(node, Node) and node._Node__node_executable == "leader_arm_pub"
+    )
+    assert _params(leader_source)["use_sim_time"] is False
 
 
 def test_physical_selection_passes_no_platform_to_the_facade():

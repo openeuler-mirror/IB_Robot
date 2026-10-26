@@ -283,10 +283,76 @@ def test_leader_rearm_excludes_queued_pre_request_samples():
     queued.header.stamp.nanosec = 50_000_000
     device._on_sample(queued)
     assert device.get_joint_targets() == {}
-    node.now = 10.15
-    queued.header.stamp.nanosec = 150_000_000
+    node.now = 10.25  # past the skew-raised barrier (10.1 + tolerance)
+    queued.header.stamp.nanosec = 250_000_000
     device._on_sample(queued)
     assert device.get_joint_targets()
+
+
+def test_leader_rearm_barrier_excludes_queued_future_stamped_samples():
+    # A pre-request sample whose stamp leads the local clock by less than the
+    # skew tolerance must not cross the rearm barrier (issue #197 review):
+    # such a stamp may predate the request, so it cannot prove freshness.
+    node = Node()
+    device = LeaderTopicDevice(
+        {"joint_mapping": {"1": "1", "6": "6"}, "input_gripper_joint": "6", "input_stale_s": 0.2}, node
+    )
+    node.now = 10.0
+    device._on_sample(leader_message())
+    node.now = 10.05
+    device.prepare_rearm()  # barrier = 10.05 + 0.1 = 10.15
+    queued = leader_message()
+    queued.header.stamp.nanosec = 100_000_000  # stamp 10.1: leads the local clock, below the barrier
+    device._on_sample(queued)
+    assert device.sample is None
+    assert device.get_joint_targets() == {}
+    node.now = 10.2
+    fresh = leader_message()
+    fresh.header.stamp.nanosec = 200_000_000  # strictly beyond the barrier
+    device._on_sample(fresh)
+    assert device.get_joint_targets() == {"1": 0.25, "6": 0.75}
+
+
+@pytest.mark.parametrize("lead_s", [0.003, 0.016, 0.099])
+def test_ros_leader_accepts_stamp_leading_local_clock(lead_s):
+    # Sim-time skew: stamps leading the local clock within the tolerance are
+    # fresh, and a future-leaning self.stamp keeps later samples usable.
+    node = Node()
+    node.now = 10.0 - lead_s
+    device = LeaderTopicDevice(
+        {"joint_mapping": {"1": "1", "6": "6"}, "input_gripper_joint": "6", "input_stale_s": 0.2}, node
+    )
+    device._on_sample(leader_message())
+    assert device.get_joint_targets() == {"1": 0.25, "6": 0.75}
+    node.now = 10.0 - lead_s + 0.01
+    follower = leader_message([0.35, 0.45])
+    follower.header.stamp.nanosec = 10_000_000
+    device._on_sample(follower)
+    assert device.get_joint_targets() == {"1": 0.35, "6": 0.45}
+
+
+def test_ros_leader_rejects_future_stamp_beyond_skew_tolerance():
+    node = Node()
+    node.now = 10.0 - 0.101  # stamp leads the local clock by more than the tolerance
+    device = LeaderTopicDevice(
+        {"joint_mapping": {"1": "1", "6": "6"}, "input_gripper_joint": "6", "input_stale_s": 0.2}, node
+    )
+    device._on_sample(leader_message())
+    assert device.get_joint_targets() == {}
+    assert "source timestamp outside freshness window" in device.last_invalid_reason
+
+
+def test_ros_leader_skew_sample_does_not_wedge_later_stale_rejection():
+    # An accepted future-leaning stamp must not relax the stale bound.
+    node = Node()
+    node.now = 9.99
+    device = LeaderTopicDevice(
+        {"joint_mapping": {"1": "1", "6": "6"}, "input_gripper_joint": "6", "input_stale_s": 0.2}, node
+    )
+    device._on_sample(leader_message())
+    assert device.get_joint_targets() == {"1": 0.25, "6": 0.75}
+    node.now = 10.25
+    assert device.get_joint_targets() == {}
 
 
 class Backend:
@@ -458,6 +524,69 @@ def test_gamepad_command_stale_input_and_explicit_rearm(monkeypatch, mode):
     assert device.get_joint_targets()
 
 
+@pytest.mark.parametrize("lead_s", [0.016, 0.09])
+def test_gamepad_accepts_sim_clock_skew_and_enables(monkeypatch, lead_s):
+    # Sim-time skew: /joint_states and /joy stamps leading the node clock
+    # stay fresh, so the boot sync and the enable edge both succeed.
+    monkeypatch.setattr(XboxTeleopDevice, "_load_mapping", lambda *_: {})
+    monkeypatch.setattr(XboxTeleopDevice, "_print_usage", lambda *_args, **_kwargs: None)
+    node = Node()
+    node.now = 10.0 - lead_s
+    device = XboxTeleopDevice(
+        {
+            "managed_teleop": True,
+            "default_mode": "joint",
+            "arm_joint_names": ["1"],
+            "gripper_joint_names": ["6"],
+            "gripper_closed": -0.6,
+            "gripper_open": 1.6,
+        },
+        node,
+    )
+    device.servo_client = Backend()
+    device._joint_state_callback(leader_message([0.0, 0.5]))  # stamp 10.0 leads the local clock
+    assert device._first_state_received
+    joy = Joy()
+    joy.header.stamp.sec = 10
+    joy.axes = [0.5] * 8
+    joy.buttons = [0] * 6
+    device._process_joy_event(joy)
+    joy.buttons[0] = 1
+    device._process_joy_event(joy)
+    assert device.get_joint_targets()
+
+
+def test_gamepad_rejects_inputs_beyond_skew_tolerance(monkeypatch):
+    # Stamps beyond the skew tolerance are still rejected on both channels.
+    monkeypatch.setattr(XboxTeleopDevice, "_load_mapping", lambda *_: {})
+    monkeypatch.setattr(XboxTeleopDevice, "_print_usage", lambda *_args, **_kwargs: None)
+    node = Node()
+    node.now = 9.8  # stamps lead the local clock by 0.2 s > 0.1 s tolerance
+    device = XboxTeleopDevice(
+        {
+            "managed_teleop": True,
+            "default_mode": "joint",
+            "arm_joint_names": ["1"],
+            "gripper_joint_names": ["6"],
+            "gripper_closed": -0.6,
+            "gripper_open": 1.6,
+        },
+        node,
+    )
+    device.servo_client = Backend()
+    device._joint_state_callback(leader_message([0.0, 0.5]))
+    assert not device._first_state_received
+    joy = Joy()
+    joy.header.stamp.sec = 10
+    joy.axes = [0.5] * 8
+    joy.buttons = [0] * 6
+    device._process_joy_event(joy)
+    assert device._latest_joy is None
+    joy.buttons[0] = 1
+    device._process_joy_event(joy)
+    assert device.get_joint_targets() == {}
+
+
 def load_input_class():
     path = Path(__file__).resolve().parents[2] / "robots/so101/so101_hardware/so101_hardware/leader_input.py"
     spec = importlib.util.spec_from_file_location("sdk_leader_input_test", path)
@@ -565,3 +694,75 @@ def test_real_runtime_projection_composes_executor_and_all_inputs(monkeypatch):
         item["teleoperation"]["active_device"] = device
         nodes = teleop.generate_teleop_nodes(item)
         assert any(node["package"] == "robot_teleop" for node in nodes)
+
+
+def _provider_launch_config(name):
+    item = config()
+    item["teleoperation"].update(
+        {
+            "active_device": name,
+            "input_config": str(
+                Path(__file__).resolve().parents[2] / "robot_config/config/teleop/so101_leader_inputs.yaml"
+            ),
+        }
+    )
+    return item
+
+
+@pytest.mark.parametrize("name", ["so101_leader", "xbox_controller", "vr_teleop"])
+def test_provider_teleop_nodes_follow_simulated_time(monkeypatch, name):
+    # Issue #197: every provider-path node (incl. joy_node) must follow /clock.
+    from robot_teleop.launch_builders import teleop
+
+    nodes = []
+    monkeypatch.setattr(teleop, "Node", lambda **kwargs: nodes.append(kwargs) or kwargs)
+    teleop.generate_teleop_nodes(_provider_launch_config(name), {"use_sim_time": True})
+    assert nodes
+    for node in nodes:
+        assert node["parameters"][0]["use_sim_time"] is True
+
+
+@pytest.mark.parametrize("name", ["so101_leader", "xbox_controller", "vr_teleop"])
+def test_provider_teleop_nodes_default_to_wall_time(monkeypatch, name):
+    from robot_teleop.launch_builders import teleop
+
+    nodes = []
+    monkeypatch.setattr(teleop, "Node", lambda **kwargs: nodes.append(kwargs) or kwargs)
+    teleop.generate_teleop_nodes(_provider_launch_config(name))
+    assert nodes
+    for node in nodes:
+        assert "use_sim_time" not in node["parameters"][0]
+
+
+def test_provider_teleop_nodes_accept_the_explicit_sim_time_flag(monkeypatch):
+    # The launch context passes the flag explicitly; it must reach every node.
+    from robot_teleop.launch_builders import teleop
+
+    nodes = []
+    monkeypatch.setattr(teleop, "Node", lambda **kwargs: nodes.append(kwargs) or kwargs)
+    teleop.generate_teleop_nodes(_provider_launch_config("xbox_controller"), {}, use_sim_time=True)
+    executables = {node["executable"] for node in nodes}
+    assert {"teleop_node", "joy_node"} <= executables
+    for node in nodes:
+        assert node["parameters"][0]["use_sim_time"] is True
+
+
+@pytest.mark.parametrize("node_use_sim_time,expected", [(True, True), (False, None)])
+def test_build_teleop_forwards_the_prepared_sim_time_flag(monkeypatch, node_use_sim_time, expected):
+    from robot_config.launch_registry.registry import LaunchBuildContext
+    from robot_teleop.launch_builders import teleop as teleop_builder
+
+    nodes = []
+    monkeypatch.setattr(teleop_builder, "Node", lambda **kwargs: nodes.append(kwargs) or kwargs)
+    context = LaunchBuildContext(
+        robot_config=_provider_launch_config("xbox_controller"),
+        control_mode="teleop",
+        node_use_sim_time=node_use_sim_time,
+    )
+    result = teleop_builder.build_teleop(context)
+    assert result.actions
+    for node in nodes:
+        if expected is True:
+            assert node["parameters"][0]["use_sim_time"] is True
+        else:
+            assert "use_sim_time" not in node["parameters"][0]
