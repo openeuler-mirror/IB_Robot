@@ -1,9 +1,11 @@
-"""Platform backends for the pick_banana scene task (D9).
+"""Platform backends for the pick_banana scene task (D9, issue #195).
 
 Unit tests with fake clients: the shared randomisation (index k → identical
-banana placement on both platforms), default placement, stale-pose rejection,
-bounded readiness (a delayed Gazebo bridge, missing pose stream, MuJoCo
-readiness) and the ``ign``/``gz`` ``service`` CLI fallback for set_pose.
+banana placement on both platforms), the atomic MuJoCo ``ResetWorld`` request
+content (startup-state keyframe, arm rest joint override with zero velocity,
+banana/plate free-joint overrides), default placement, stale-pose rejection,
+and bounded readiness (a delayed Gazebo bridge, missing pose streams, the
+MuJoCo reset_world service and free_joint_states stream).
 """
 
 import threading
@@ -11,8 +13,9 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+from mujoco_ros2_control_msgs.srv import ResetWorld
 
-from sim_models.scene_compiler import _quat_from_extrinsic_xyz, get_scene_layout, randomization_grid
+from sim_models.scene_compiler import _quat_from_extrinsic_xyz, get_scene_layout, randomization_placements
 from sim_models.tasks.backends import GazeboBackend, MujocoBackend
 
 
@@ -98,15 +101,6 @@ class FakeNode:
         self.subscriptions.append((topic, callback))
 
 
-class FakeShadow:
-    def __init__(self):
-        self.keyframes = []
-
-    def reset_to_keyframe(self, name):
-        self.keyframes.append(name)
-        return True
-
-
 def _layout():
     return get_scene_layout("pick_banana")
 
@@ -114,8 +108,11 @@ def _layout():
 def make_mujoco_backend(*, reset_client=None):
     node = FakeNode()
     if reset_client is not None:
+        reset_client.request_factory = ResetWorld.Request
         node.clients["/mujoco_ros2_control_node/reset_world"] = reset_client
-    backend = MujocoBackend(node, _layout(), scene_model_path="", callback_group=None)
+    else:
+        node.clients["/mujoco_ros2_control_node/reset_world"] = FakeServiceClient(request_factory=ResetWorld.Request)
+    backend = MujocoBackend(node, _layout(), scene="pick_banana", callback_group=None)
     return backend, node
 
 
@@ -141,19 +138,46 @@ def _pose_message(name, x, y, z):
     )
 
 
+def _free_joint_message(*entries):
+    return SimpleNamespace(
+        free_joints=[
+            SimpleNamespace(
+                name=name,
+                pose=SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=x, y=y, z=z))),
+            )
+            for name, x, y, z in entries
+        ]
+    )
+
+
+def _feed_fresh_samples(node):
+    _, callback = next(sub for sub in node.subscriptions if sub[0] == "/sim/pick_banana/free_joint_states")
+    callback(_free_joint_message(("banana", 0.0, 0.0, 0.05), ("plate", 0.22, 0.02, 0.02)))
+
+
 # ── shared randomisation ──────────────────────────────────────────────────────
 
 
 def test_index_k_places_the_same_banana_pose_on_both_backends():
-    grid = randomization_grid(_layout())
+    placements = randomization_placements(_layout())
     k = 137
-    x, y, z, yaw = grid[k]
+    x, y, z, yaw = placements[k]
 
-    mujoco, _ = make_mujoco_backend(reset_client=FakeServiceClient())
+    mujoco, _ = make_mujoco_backend()
     ok, _ = mujoco.place(k)
     assert ok
-    reset_request = mujoco._reset_world.requests[0]
-    assert reset_request.keyframe == f"random_{k:03d}"
+    request = mujoco._reset_world.requests[0]
+    assert request.keyframe == "", "startup-state reset; the placement rides in state_overrides"
+    overrides = {entry.name: entry for entry in request.state_overrides.free_joints}
+    banana = overrides["banana"]
+    assert (banana.pose.pose.position.x, banana.pose.pose.position.y, banana.pose.pose.position.z) == (x, y, z)
+    quat_wxyz = _quat_from_extrinsic_xyz(0.0, 0.0, yaw)
+    assert (
+        banana.pose.pose.orientation.w,
+        banana.pose.pose.orientation.x,
+        banana.pose.pose.orientation.y,
+        banana.pose.pose.orientation.z,
+    ) == (quat_wxyz)
 
     gazebo, _ = make_gazebo_backend()
     ok, _ = gazebo.place(k)
@@ -161,7 +185,6 @@ def test_index_k_places_the_same_banana_pose_on_both_backends():
     requests = gazebo._set_pose.requests
     banana = next(r for r in requests if r.entity.name == "banana")
     assert (banana.pose.position.x, banana.pose.position.y, banana.pose.position.z) == (x, y, z)
-    quat_wxyz = _quat_from_extrinsic_xyz(0.0, 0.0, yaw)
     assert (
         banana.pose.orientation.w,
         banana.pose.orientation.x,
@@ -170,15 +193,50 @@ def test_index_k_places_the_same_banana_pose_on_both_backends():
     ) == (quat_wxyz)
 
 
-def test_default_placement_uses_the_layout_poses_and_the_default_keyframe():
+def test_mujoco_place_is_one_atomic_reset_world_with_arm_rest_and_both_objects():
+    layout = _layout()
+    backend, _ = make_mujoco_backend()
+
+    ok, _ = backend.place(4)
+
+    assert ok
+    assert len(backend._reset_world.requests) == 1, "one atomic ResetWorld call places the whole scene"
+    request = backend._reset_world.requests[0]
+    assert request.keyframe == "", "never a named keyframe: the startup capture has zero arm joints"
+    joints = request.state_overrides.joint_states
+    rand = layout["randomization"]
+    assert list(joints.name) == [str(j) for j in rand["arm_joint_names"]]
+    assert list(joints.position) == [float(q) for q in rand["arm_rest_qpos"]]
+    assert list(joints.velocity) == [0.0] * len(joints.name), "arm velocity pinned to zero explicitly"
+    assert list(joints.effort) == [], "effort is not supported and must stay empty"
+    overrides = {entry.name: entry for entry in request.state_overrides.free_joints}
+    assert set(overrides) == {"banana", "plate"}
+    x, y, z, yaw = randomization_placements(layout)[4]
+    banana = overrides["banana"]
+    assert (banana.pose.pose.position.x, banana.pose.pose.position.y, banana.pose.pose.position.z) == (x, y, z)
+    plate = overrides["plate"]
+    plate_default = next(o for o in layout["objects"] if o["name"] == "plate")
+    assert (plate.pose.pose.position.x, plate.pose.pose.position.y, plate.pose.pose.position.z) == tuple(
+        plate_default["position"]
+    )
+
+
+def test_default_placement_uses_the_layout_poses_on_both_backends():
     layout = _layout()
     banana_default = next(o for o in layout["objects"] if o["name"] == "banana")["position"]
     plate_default = next(o for o in layout["objects"] if o["name"] == "plate")["position"]
 
-    mujoco, _ = make_mujoco_backend(reset_client=FakeServiceClient())
+    mujoco, _ = make_mujoco_backend()
     ok, _ = mujoco.place(None)
     assert ok
-    assert mujoco._reset_world.requests[0].keyframe == "default", "never the empty startup-state keyframe"
+    request = mujoco._reset_world.requests[0]
+    assert request.keyframe == ""
+    overrides = {entry.name: entry for entry in request.state_overrides.free_joints}
+    assert (
+        overrides["banana"].pose.pose.position.x,
+        overrides["banana"].pose.pose.position.y,
+        overrides["banana"].pose.pose.position.z,
+    ) == tuple(banana_default)
 
     gazebo, _ = make_gazebo_backend()
     ok, _ = gazebo.place(None)
@@ -188,16 +246,6 @@ def test_default_placement_uses_the_layout_poses_and_the_default_keyframe():
     plate = next(r for r in requests if r.entity.name == "plate")
     assert (banana.pose.position.x, banana.pose.position.y, banana.pose.position.z) == tuple(banana_default)
     assert (plate.pose.position.x, plate.pose.position.y, plate.pose.position.z) == tuple(plate_default)
-
-
-def test_mujoco_place_applies_the_keyframe_to_the_shadow_model():
-    backend, _ = make_mujoco_backend(reset_client=FakeServiceClient())
-    backend._shadow = FakeShadow()
-
-    ok, _ = backend.place(4)
-
-    assert ok
-    assert backend._shadow.keyframes == ["random_004"]
 
 
 # ── object position freshness ─────────────────────────────────────────────────
@@ -212,13 +260,13 @@ def test_gazebo_object_position_rejects_stale_samples():
     assert gazebo.object_position("banana") is not None
 
 
-def test_mujoco_object_position_requires_fresh_joint_states():
-    backend, _ = make_mujoco_backend()
-    backend._shadow = FakeShadow()
-    backend._last_joint_update = time.monotonic() - 2.0
+def test_mujoco_object_position_rejects_stale_samples():
+    backend, node = make_mujoco_backend()
+    _feed_fresh_samples(node)
+    backend._poses["banana"] = (np.array([0.05, 0.04, 0.05]), time.monotonic() - 2.0)
     assert backend.object_position("banana") is None
-    backend._last_joint_update = time.monotonic()
-    backend._shadow.get_body_pos = lambda name: np.array([0.1, 0.0, 0.05])
+
+    backend._poses["banana"] = (np.array([0.05, 0.04, 0.05]), time.monotonic())
     assert backend.object_position("banana") is not None
 
 
@@ -229,6 +277,15 @@ def test_gazebo_object_position_selects_by_child_frame_id():
 
     assert np.allclose(gazebo.object_position("banana"), [0.05, 0.04, 0.05])
     assert gazebo.object_position("plate") is None
+
+
+def test_mujoco_object_position_selects_by_free_joint_entry_name():
+    backend, node = make_mujoco_backend()
+    topic, callback = next(sub for sub in node.subscriptions if sub[0] == "/sim/pick_banana/free_joint_states")
+    callback(_free_joint_message(("banana", 0.05, 0.04, 0.05)))
+
+    assert np.allclose(backend.object_position("banana"), [0.05, 0.04, 0.05])
+    assert backend.object_position("plate") is None
 
 
 # ── bounded readiness ─────────────────────────────────────────────────────────
@@ -286,29 +343,61 @@ def test_gazebo_place_without_the_bridge_fails_without_a_fallback():
     assert not backend._set_pose.requests, "nothing is sent when the bridge is down"
 
 
-def test_mujoco_readiness_needs_the_service_and_the_composed_model():
-    backend, _ = make_mujoco_backend(reset_client=FakeServiceClient())
+def test_mujoco_readiness_needs_the_service_and_fresh_object_samples():
+    backend, node = make_mujoco_backend()
     ok, message = backend.check_ready()
-    assert not ok and "shadow model unavailable" in message
+    assert not ok and "free_joint_states" in message, "no pose stream is not readiness"
 
-    backend._shadow = FakeShadow()
+    _feed_fresh_samples(node)
     ok, message = backend.check_ready()
     assert ok, message
 
-    missing_service, _ = make_mujoco_backend(reset_client=FakeServiceClient(available=False))
-    missing_service._shadow = FakeShadow()
+    missing_service, node2 = make_mujoco_backend(reset_client=FakeServiceClient(available=False))
+    _feed_fresh_samples(node2)
     ok, message = missing_service.check_ready()
     assert not ok and "reset_world" in message
 
 
+def test_mujoco_check_ready_requires_fresh_samples_of_every_placed_object():
+    backend, node = make_mujoco_backend()
+    _, callback = next(sub for sub in node.subscriptions if sub[0] == "/sim/pick_banana/free_joint_states")
+    callback(_free_joint_message(("banana", 0.0, 0.0, 0.05)))
+
+    ok, message = backend.check_ready()
+
+    assert not ok and "plate" in message, "a fresh banana alone is not readiness"
+
+
 def test_mujoco_readiness_is_revalidated_not_latched():
-    backend, _ = make_mujoco_backend(reset_client=FakeServiceClient())
-    backend._shadow = FakeShadow()
+    backend, node = make_mujoco_backend()
+    _feed_fresh_samples(node)
     assert backend.check_ready()[0]
 
     backend._reset_world.available = False  # the service dropped between calls
     ok, message = backend.check_ready()
     assert not ok and "reset_world" in message
+
+    backend._reset_world.available = True
+    backend._poses["banana"] = (np.array([0.0, 0.0, 0.05]), time.monotonic() - 2.0)  # the stream went stale
+    ok, message = backend.check_ready()
+    assert not ok and "banana" in message
+
+
+def test_mujoco_not_ready_without_the_pose_stream():
+    backend, _ = make_mujoco_backend()
+
+    ok, message = backend.wait_ready(0.4)
+
+    assert not ok and "free_joint_states" in message
+
+
+def test_mujoco_place_without_the_service_fails_without_a_fallback():
+    backend, _ = make_mujoco_backend(reset_client=FakeServiceClient(available=False))
+
+    ok, message = backend.place(0)
+
+    assert not ok and "reset_world service not available" in message
+    assert not backend._reset_world.requests, "nothing is sent when the service is down"
 
 
 # ── startup readiness thread ──────────────────────────────────────────────────
@@ -346,3 +435,21 @@ def test_concurrent_place_requests_stay_thread_safe():
 
     assert not errors
     assert len(gazebo._set_pose.requests) == 16, "8 workers × (banana + plate)"
+
+    mujoco, _ = make_mujoco_backend()
+    mujoco_errors = []
+
+    def mujoco_worker(index):
+        try:
+            mujoco.place(index % mujoco.grid_size)
+        except Exception as exc:  # noqa: BLE001
+            mujoco_errors.append(exc)
+
+    threads = [threading.Thread(target=mujoco_worker, args=(i,)) for i in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not mujoco_errors
+    assert len(mujoco._reset_world.requests) == 8, "8 workers × one atomic ResetWorld each"

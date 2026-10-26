@@ -727,9 +727,10 @@ def test_scene_task_emits_exactly_one_node_per_launch(sim_platform):
     assert parameters["gripper_joint_names"] == ("6",)
 
     if sim_platform == "mujoco":
-        from sim_models.scene_compiler import composed_model_path
-
-        assert parameters["scene_model_path"] == str(composed_model_path("pick_banana"))
+        # issue #195: no model path crosses the boundary — the backend places
+        # through ResetWorld state overrides and observes the scene through
+        # the provider-configured FreeJointStatePublisherPlugin topic.
+        assert "scene_model_path" not in parameters
         assert "world_name" not in parameters
         assert not [n for n in outputs.actions if isinstance(n, Node) and n._Node__package == "ros_gz_bridge"]
     else:

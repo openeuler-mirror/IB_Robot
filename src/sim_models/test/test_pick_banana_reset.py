@@ -45,9 +45,15 @@ class FakeNode:
     def __init__(self):
         self.clients = {}
         self.subscriptions = []
+        self.parameters = {"autotest_indices": []}
 
     def get_logger(self):
         return self.logger
+
+    def get_parameter(self, name):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(value=self.parameters.get(name, []))
 
     def create_client(self, srv_type, name, callback_group=None):
         return self.clients.get(name, FakeServiceClient())
@@ -221,9 +227,9 @@ def make_task(
     task._rest_duration_s = 0.0
     task._accept_timeout_s = 0.2
     task._mode_timeout_s = 0.5
-    task._kf_idx = -1
-    task._n_keyframes = 210
-    task._grid = [(0.0, 0.0, 0.05, 0.0)] * task._n_keyframes
+    task._placement_idx = -1
+    task._n_placements = 210
+    task._placements = [(0.0, 0.0, 0.05, 0.0)] * task._n_placements
     task._rest_positions = {"1": 0.0, "2": -1.5854, "3": 1.5708, "4": 0.7854, "5": 0.0, "6": 0.0}
     task._arm_endpoint = "/arm_trajectory_controller/follow_joint_trajectory"
     task._arm_joints = ["1", "2", "3", "4", "5"]
@@ -425,7 +431,7 @@ def test_autotest_holds_ownership_through_evaluation():
     backend = FakeBackend()
     with tempfile.TemporaryDirectory() as tmp:
         task = make_task(active_mode="trajectory", backend=backend, eval_root=Path(tmp))
-        task._n_keyframes = 1
+        task._n_placements = 1
         entered_evaluate = threading.Event()
         release_evaluate = threading.Event()
 
@@ -456,7 +462,7 @@ def test_autotest_holds_ownership_through_evaluation():
 def test_shutdown_stops_and_joins_the_autotest_worker():
     with tempfile.TemporaryDirectory() as tmp:
         task = make_task(active_mode="trajectory", backend=FakeBackend(), eval_root=Path(tmp))
-        task._n_keyframes = 1
+        task._n_placements = 1
         entered_evaluate = threading.Event()
 
         def slow_evaluate(duration_s=30.0):
@@ -710,7 +716,7 @@ def test_shutdown_interrupts_a_worker_blocked_in_an_rpc_wait():
 
     with tempfile.TemporaryDirectory() as tmp:
         task = make_task(active_mode="idle", backend=ShutdownTrackingBackend(), eval_root=Path(tmp))
-        task._n_keyframes = 1
+        task._n_placements = 1
         task._set_mode = PendingModeClient(responses=None)
         response = Trigger.Response()
         task._svc_autotest(Trigger.Request(), response)
@@ -729,7 +735,7 @@ def test_shutdown_leaves_the_backend_alone_when_the_worker_never_exits():
         backend = ShutdownTrackingBackend()
         backend.place_gate = threading.Event()  # stop-blind block inside place()
         task = make_task(active_mode="trajectory", backend=backend, eval_root=Path(tmp))
-        task._n_keyframes = 1
+        task._n_placements = 1
         response = Trigger.Response()
         task._svc_autotest(Trigger.Request(), response)
         assert response.success
@@ -842,17 +848,18 @@ def test_ambiguous_switch_with_unknown_status_reports_without_restoring():
 # ── final round 2: cancellation through the backend and dispatcher ────────────
 
 
-class StopAwareShadow:
-    """Minimal shadow stand-in so MujocoBackend reports ready."""
+def _free_joint_samples_message():
+    from types import SimpleNamespace
 
-    def __init__(self):
-        self.shutdown_called = threading.Event()
-
-    def reset_to_keyframe(self, name):
-        return True
-
-    def shutdown(self):
-        self.shutdown_called.set()
+    return SimpleNamespace(
+        free_joints=[
+            SimpleNamespace(
+                name=name,
+                pose=SimpleNamespace(pose=SimpleNamespace(position=SimpleNamespace(x=x, y=y, z=z))),
+            )
+            for name, x, y, z in (("banana", 0.0, 0.0, 0.05), ("plate", 0.22, 0.02, 0.02))
+        ]
+    )
 
 
 class PendingRpcClient(FakeServiceClient):
@@ -886,10 +893,12 @@ class BackendShutdownRecorder:
 def test_shutdown_interrupts_a_worker_blocked_in_reset_world():
     import tempfile
 
+    from mujoco_ros2_control_msgs.srv import ResetWorld
+
     from sim_models.tasks.backends import MujocoBackend
 
     with tempfile.TemporaryDirectory() as tmp:
-        reset_client = PendingRpcClient()
+        reset_client = PendingRpcClient(request_factory=ResetWorld.Request)
         node = FakeNode()
         node.clients["/mujoco_ros2_control_node/reset_world"] = reset_client
         layout = {
@@ -903,12 +912,15 @@ def test_shutdown_interrupts_a_worker_blocked_in_reset_world():
                 {"name": "plate", "type": "dynamic", "position": [0.22, 0.02, 0.02], "rotation_euler_rad": [0, 0, 0]},
             ],
         }
-        backend = MujocoBackend(node, layout, scene_model_path="", callback_group=None)
-        backend._shadow = StopAwareShadow()
+        backend = MujocoBackend(node, layout, scene="pick_banana", callback_group=None)
+        # readiness needs fresh samples of every placed object
+        for topic, callback in node.subscriptions:
+            if topic == "/sim/pick_banana/free_joint_states":
+                callback(_free_joint_samples_message())
         recorder = BackendShutdownRecorder(backend)
 
         task = make_task(active_mode="trajectory", backend=recorder, eval_root=Path(tmp))
-        task._n_keyframes = 1
+        task._n_placements = 1
         response = Trigger.Response()
         task._svc_autotest(Trigger.Request(), response)
         assert response.success and reset_client.entered.wait(timeout=5.0), "worker parked in ResetWorld"
@@ -938,7 +950,7 @@ def test_shutdown_interrupts_a_worker_blocked_in_set_entity_pose():
         recorder = BackendShutdownRecorder(backend)
 
         task = make_task(active_mode="trajectory", backend=recorder, eval_root=Path(tmp))
-        task._n_keyframes = 1
+        task._n_placements = 1
         response = Trigger.Response()
         task._svc_autotest(Trigger.Request(), response)
         assert response.success and set_pose_client.entered.wait(timeout=5.0), "worker parked in SetEntityPose"
@@ -982,6 +994,57 @@ def test_cancelled_reset_issues_no_dispatcher_resume():
     assert task._disp_reset.requests == [], "no dispatcher reset after cancellation"
     assert task._disp_start.requests == [], "no dispatcher start after cancellation"
     assert any("skipping dispatcher reset/start" in text for _level, text in task._node.logger.messages)
+
+
+# ── autotest_indices selection (issue #195) ──────────────────────────────────
+
+
+def test_svc_autotest_rejects_out_of_range_indices():
+    task = make_task(active_mode="trajectory")
+    task._node.parameters["autotest_indices"] = [0, 999]
+    response = Trigger.Response()
+
+    task._svc_autotest(Trigger.Request(), response)
+
+    assert response.success is False and "autotest_indices" in response.message and "999" in response.message
+    assert task._autotest_thread is None
+    assert not task._operation.locked(), "ownership released"
+
+
+def test_autotest_runs_exactly_the_selected_indices_and_records_them():
+    import json
+
+    backend = FakeBackend()
+    with tempfile.TemporaryDirectory() as tmp:
+        task = make_task(active_mode="trajectory", backend=backend, eval_root=Path(tmp))
+        task._node.parameters["autotest_indices"] = [7, 3]
+        task.evaluate = lambda duration_s=30.0: EvalResult(success=False, reason="timeout", duration_s=0.1)
+
+        response = Trigger.Response()
+        task._svc_autotest(Trigger.Request(), response)
+        assert response.success and "2 episodes" in response.message
+
+        worker = task._autotest_thread
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+        assert not task._operation.locked(), "ownership released after the run"
+
+        run_dir = next(iter(sorted(Path(tmp).iterdir())))
+        records = [json.loads(line) for line in (Path(tmp) / run_dir / "results.jsonl").read_text().splitlines()]
+
+    assert backend.place_calls == [7, 3], "each episode places exactly its selected index"
+    assert task._placement_idx == 3, "the counter follows the last placed index"
+    assert [record["idx"] for record in records] == [7, 3]
+    assert [record["placement_index"] for record in records] == [7, 3]
+    assert [record["banana_spawn"] for record in records] == [[0.0, 0.0, 0.05, 0.0], [0.0, 0.0, 0.05, 0.0]]
+
+
+def test_selected_indices_default_to_all_when_empty():
+    task = make_task(active_mode="trajectory")
+    assert task._selected_indices() == list(range(210))
+
+    task._node.parameters["autotest_indices"] = []
+    assert task._selected_indices() == list(range(210)), "an empty parameter means the full placement list"
 
 
 def _pick_banana_layout_stub():

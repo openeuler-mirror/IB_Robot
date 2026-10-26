@@ -29,12 +29,16 @@ from robot_runtime.launch_support import (
 from robot_runtime.mujoco import (
     CAMERA_PLUGIN_INSTANCE,
     CAMERA_PLUGIN_TYPE,
+    FREE_JOINT_STATE_PLUGIN_INSTANCE,
+    FREE_JOINT_STATE_PLUGIN_TYPE,
     SimulatorVersions,
     camera_mjcf_elements,
     camera_plugin_parameters,
     camera_tf_urdf,
     check_simulator_versions,
+    free_joint_state_plugin_parameters,
     gazebo_rpy_to_mujoco_rpy,
+    merge_mujoco_plugin_parameters,
     mujoco_camera_publish_rate,
     mujoco_camera_relays,
     render_robot_mjcf,
@@ -418,6 +422,52 @@ def test_camera_plugin_parameters_without_cameras_is_empty(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# issue #195: the FreeJointStatePublisherPlugin parameters for scene objects
+# ---------------------------------------------------------------------------
+
+
+def test_free_joint_state_plugin_parameters_publish_dynamic_scene_bodies():
+    parameters = free_joint_state_plugin_parameters("pick_banana")
+    instance = parameters["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE]
+    assert instance["type"] == FREE_JOINT_STATE_PLUGIN_TYPE
+    assert instance["body_names"] == ["plate", "banana"], "every layout dynamic body, in layout order"
+    assert instance["topic"] == "/sim/pick_banana/free_joint_states", "scene-namespaced, like Gazebo's object_poses"
+    assert instance["frame_id"] == "", "world frame"
+    assert instance["publish_rate"] == 50.0
+
+
+def test_free_joint_state_plugin_parameters_are_empty_without_dynamic_objects():
+    assert free_joint_state_plugin_parameters("") == {}, "robot-only launch: no plugin"
+    assert free_joint_state_plugin_parameters("empty") == {}, "empty scene has no dynamic bodies"
+    assert free_joint_state_plugin_parameters("does_not_exist") == {}
+
+
+def test_merge_mujoco_plugin_parameters_combines_trees_instance_wise(tmp_path):
+    peripherals = [TOP]
+    cameras = camera_plugin_parameters(_profile(tmp_path, peripherals=peripherals), peripherals)
+    objects = free_joint_state_plugin_parameters("pick_banana")
+
+    merged = merge_mujoco_plugin_parameters(cameras, objects)
+
+    assert set(merged["mujoco_plugins"]) == {CAMERA_PLUGIN_INSTANCE, FREE_JOINT_STATE_PLUGIN_INSTANCE}
+    assert merged["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE] == cameras["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]
+    assert (
+        merged["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE]
+        == (objects["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE])
+    )
+    assert merge_mujoco_plugin_parameters() == {}
+    assert merge_mujoco_plugin_parameters({}, {}) == {}
+    # a later tree wins per key inside one instance
+    later = {"mujoco_plugins": {FREE_JOINT_STATE_PLUGIN_INSTANCE: {"publish_rate": 10.0}}}
+    assert (
+        merge_mujoco_plugin_parameters(objects, later)["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE][
+            "publish_rate"
+        ]
+        == 10.0
+    )
+
+
+# ---------------------------------------------------------------------------
 # D2: the simulator version check
 # ---------------------------------------------------------------------------
 
@@ -637,6 +687,48 @@ def test_mujoco_embodiment_passes_the_camera_plugin_params_file(tmp_path, monkey
     keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in yaml.safe_load(path.read_text())]
     assert len(keyed) == 1, f"exactly one {MUJOCO_SIMULATION_NODE} params file, got {param_files}"
     tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
+    assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
+    # the empty scene composes no dynamic objects: no free-joint publisher
+    assert FREE_JOINT_STATE_PLUGIN_INSTANCE not in tree["mujoco_plugins"]
+
+
+def test_mujoco_embodiment_adds_the_free_joint_state_plugin_for_dynamic_scenes(tmp_path, monkeypatch):
+    """Issue #195: a scene with dynamic objects gets the
+    FreeJointStatePublisherPlugin in the same params file as the cameras."""
+    import yaml
+
+    import robot_runtime.mujoco as mujoco_helpers
+    import sim_models.scene_compiler as scene_compiler
+
+    monkeypatch.setattr(
+        mujoco_helpers,
+        "simulator_versions",
+        lambda: mujoco_helpers.SimulatorVersions(control="0.1.2", mujoco=mujoco.__version__),
+    )
+    monkeypatch.setattr(
+        scene_compiler, "compose_mujoco_model", lambda *args, **kwargs: Path("/tmp/ibrobot_fake_composed.mjb")
+    )
+    profile = _profile(tmp_path)
+    description = render_mujoco_description(profile, tmp_path / "profile.yaml")
+    actions = mujoco_embodiment_actions(
+        profile, tmp_path / "profile.yaml", robot_description=description, mujoco_scene="pick_banana"
+    )
+    simulator_nodes = [node for node in _nodes(actions) if node._Node__node_executable == "ros2_control_node"]
+    from launch_ros.parameter_descriptions import ParameterFile
+
+    param_files = [
+        Path("".join(getattr(part, "text", None) or str(part) for part in entry.param_file))
+        for entry in simulator_nodes[0]._Node__parameters
+        if isinstance(entry, ParameterFile)
+    ]
+    keyed = [path for path in param_files if MUJOCO_SIMULATION_NODE in yaml.safe_load(path.read_text())]
+    assert len(keyed) == 1
+    tree = yaml.safe_load(Path(keyed[0]).read_text())[MUJOCO_SIMULATION_NODE]["ros__parameters"]
+    instance = tree["mujoco_plugins"][FREE_JOINT_STATE_PLUGIN_INSTANCE]
+    assert instance["type"] == FREE_JOINT_STATE_PLUGIN_TYPE
+    assert instance["body_names"] == ["plate", "banana"]
+    assert instance["topic"] == "/sim/pick_banana/free_joint_states"
+    # the cameras still ride in the same file
     assert tree["mujoco_plugins"][CAMERA_PLUGIN_INSTANCE]["type"] == CAMERA_PLUGIN_TYPE
 
 

@@ -693,13 +693,19 @@ def mujoco_embodiment_actions(
     ``--controller-manager-timeout`` waits for the in-process controller
     manager. ``IBROBOT_MUJOCO_HEADLESS=1`` mirrors the Gazebo headless mode:
     with no display the CameraPlugin renders through EGL (D4), so no
-    ``xvfb-run`` wrapper is needed. The cameras are configured through a
-    per-launch params file keyed under ``MUJOCO_SIMULATION_NODE`` carrying the
-    ``mujoco_plugins`` CameraPlugin tree (D3); MuJoCo plugins load from the
-    executable directory and ament resources only, so no ``MUJOCO_PLUGIN_PATH``
-    is set.
+    ``xvfb-run`` wrapper is needed. The cameras (and, for scenes with
+    dynamic objects, the FreeJointStatePublisherPlugin the scene task
+    observes, issue #195) are configured through a per-launch params file
+    keyed under ``MUJOCO_SIMULATION_NODE`` carrying the merged
+    ``mujoco_plugins`` tree; MuJoCo plugins load from the executable
+    directory and ament resources only, so no ``MUJOCO_PLUGIN_PATH`` is set.
     """
-    from robot_runtime.mujoco import camera_plugin_parameters, mujoco_camera_relays
+    from robot_runtime.mujoco import (
+        camera_plugin_parameters,
+        free_joint_state_plugin_parameters,
+        merge_mujoco_plugin_parameters,
+        mujoco_camera_relays,
+    )
 
     if robot_description is None:
         robot_description = render_mujoco_description(profile, profile_path, spawn_pose=spawn_pose, scene=mujoco_scene)
@@ -716,7 +722,13 @@ def mujoco_embodiment_actions(
     )
     cm_params = write_controller_manager_params(robot_description)
     mujoco_node_parameters = [cm_params, controllers_config, {"use_sim_time": True}]
-    plugin_parameters = camera_plugin_parameters(profile, peripherals)
+    # One params file carries every simulator plugin: the cameras and, when
+    # the composed scene has dynamic objects, the free-joint state publisher
+    # the scene task observes (issue #195).
+    plugin_parameters = merge_mujoco_plugin_parameters(
+        camera_plugin_parameters(profile, peripherals),
+        free_joint_state_plugin_parameters(mujoco_scene),
+    )
     if plugin_parameters:
         mujoco_node_parameters.append(write_node_params(MUJOCO_SIMULATION_NODE, plugin_parameters))
     return [

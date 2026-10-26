@@ -409,6 +409,63 @@ def camera_plugin_parameters(profile: dict, peripherals: list) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Scene object observation (issue #195): FreeJointStatePublisherPlugin
+# ---------------------------------------------------------------------------
+
+# One plugin instance publishes every dynamic scene body; the scene task's
+# MuJoCo backend subscribes to the same topic through
+# sim_models.scene_compiler.free_joint_states_topic.
+FREE_JOINT_STATE_PLUGIN_INSTANCE = "ibrobot_object_states"
+FREE_JOINT_STATE_PLUGIN_TYPE = "mujoco_ros2_control_plugins/FreeJointStatePublisherPlugin"
+
+
+def free_joint_state_plugin_parameters(scene: str) -> dict:
+    """The nested ``mujoco_plugins`` FreeJointStatePublisherPlugin tree (issue #195).
+
+    Scenes with dynamic objects (``type: dynamic`` in their layout.yaml) get
+    one plugin instance publishing every dynamic body's pose at 50 Hz on the
+    scene-namespaced absolute topic ``/sim/<scene>/free_joint_states`` — the
+    MuJoCo counterpart of Gazebo's ``/sim/<scene>/object_poses``. The topic
+    name resolves through ``sim_models.scene_compiler.free_joint_states_topic``
+    so the provider and the scene task's backend can never drift apart. An
+    empty scene, a robot-only launch (``scene=""``/None) or a scene without
+    dynamic objects returns ``{}`` — no plugin is configured.
+    """
+    if not scene:
+        return {}
+    from sim_models.scene_compiler import free_joint_states_topic, scene_dynamic_objects
+
+    body_names = scene_dynamic_objects(scene)
+    if not body_names:
+        return {}
+    return {
+        "mujoco_plugins": {
+            FREE_JOINT_STATE_PLUGIN_INSTANCE: {
+                "type": FREE_JOINT_STATE_PLUGIN_TYPE,
+                "body_names": body_names,
+                "frame_id": "",
+                "topic": free_joint_states_topic(scene),
+                "publish_rate": 50.0,
+            }
+        }
+    }
+
+
+def merge_mujoco_plugin_parameters(*param_trees: dict) -> dict:
+    """Merge ``mujoco_plugins`` parameter trees into one (later trees win per key).
+
+    Every generator (cameras, scene object states) returns a tree keyed
+    ``{"mujoco_plugins": {<instance>: {...}}}``; the simulator node takes a
+    single params file, so the trees merge instance-wise before being written.
+    """
+    instances: dict[str, Any] = {}
+    for tree in param_trees:
+        for instance, params in (tree.get("mujoco_plugins") or {}).items():
+            instances[instance] = {**instances.get(instance, {}), **params}
+    return {"mujoco_plugins": instances} if instances else {}
+
+
+# ---------------------------------------------------------------------------
 # The single camera rate (D5): the plugin has one rate for all cameras
 # ---------------------------------------------------------------------------
 

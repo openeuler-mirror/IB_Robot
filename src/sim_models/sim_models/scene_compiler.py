@@ -19,11 +19,22 @@ Public API
       Generate the resolved Gazebo world file.
       Used by GazeboAdapter.start_backend() when simulation.scene is set.
 
-  randomization_grid(layout) -> list[(x, y, z, yaw)]
+  randomization_placements(layout) -> list[(x, y, z, yaw)]
       The single randomisation generator shared by both physics platforms
-      (so101-mujoco-runtime-platform D9): randomisation index *k* maps to
-      the same banana placement on MuJoCo (keyframe ``random_KKK``) and on
-      Gazebo (``SetEntityPose`` with the same index).
+      (so101-mujoco-runtime-platform D9 / issue #195): randomisation index
+      *k* maps to the same banana placement on MuJoCo (``ResetWorld`` state
+      overrides) and on Gazebo (``SetEntityPose`` with the same index).
+      ``mode: grid`` (default) is bit-identical to the historical keyframe
+      grid; ``mode: uniform`` samples deterministically from ``seed``.
+
+  scene_dynamic_objects(scene_name) -> list[str]
+      Names of the scene's dynamic objects (``type: dynamic`` in layout.yaml).
+
+  free_joint_states_topic(scene) -> str
+      The scene-namespaced free-joint observation topic the MuJoCo
+      FreeJointStatePublisherPlugin publishes to (and the scene task's
+      MuJoCo backend subscribes to); the Gazebo counterpart is
+      ``/sim/<scene>/object_poses``.
 
   composed_model_path(scene) -> Path
       The single composed-model location (D3), keyed by ``ROS_DOMAIN_ID`` so
@@ -32,10 +43,10 @@ Public API
 
   compose_mujoco_model(robot_mjcf_path, scene, sdf_mesh_names) -> Path
       Robot-agnostic composition (D3): substitute the robot MJCF into the
-      named scene (or compile it alone when ``scene`` is None), inject the
-      shared keyframes, apply SDF collision to the given meshes, compile and
-      save the ``.mjb``. Falls back to the ``.xml`` only when the ``mujoco``
-      package is missing; the provider treats that as fatal.
+      named scene (or compile it alone when ``scene`` is None), apply SDF
+      collision to the given meshes, compile and save the ``.mjb``. Falls
+      back to the ``.xml`` only when the ``mujoco`` package is missing; the
+      provider treats that as fatal.
 
   get_scene_layout(scene_name) -> dict
       The parsed layout.yaml of a scene (or {}).
@@ -47,6 +58,7 @@ Public API
 import logging
 import math
 import os
+import random
 import tempfile
 from pathlib import Path
 
@@ -63,14 +75,23 @@ _PLATFORM_EXT = {
 }
 
 
-def randomization_grid(layout: dict) -> list[tuple[float, float, float, float]]:
-    """The single randomisation generator shared by both physics platforms (D9).
+def randomization_placements(layout: dict) -> list[tuple[float, float, float, float]]:
+    """The single randomisation generator shared by both physics platforms (D9, issue #195).
 
     Index *k* of the returned list maps to the same banana placement on every
-    platform: MuJoCo keyframe ``random_{k:03d}`` and the Gazebo backend's
-    ``SetEntityPose`` with the same index. The order is stable: x outer,
-    y middle, yaw inner, exactly as the previous keyframe-only generator
-    produced, so existing randomisation indices keep their meaning.
+    platform: the MuJoCo backend's ``ResetWorld`` state overrides and the
+    Gazebo backend's ``SetEntityPose`` both consume ``placements[k]``.
+
+    ``randomization.banana.mode`` selects the generator:
+
+    - ``grid`` (default, also when the key is absent): the historical
+      keyframe-era grid — x outer, y middle, yaw inner, values from
+      ``numpy.linspace`` — reproduced bit-identically, so existing
+      randomisation indices keep their meaning.
+    - ``uniform``: ``count`` poses sampled deterministically from ``seed``
+      across the x/y/yaw ranges (``z`` stays ``z_spawn``); the same seed and
+      count give the same sequence on every platform, so index *k* is still
+      platform-independent.
     """
     rand = layout.get("randomization", {})
     banana_cfg = rand.get("banana", {})
@@ -79,13 +100,32 @@ def randomization_grid(layout: dict) -> list[tuple[float, float, float, float]]:
     x_min, x_max = banana_cfg.get("x_range", [-0.03, 0.10])
     y_min, y_max = banana_cfg.get("y_range", [-0.02, 0.10])
     z_spawn = float(banana_cfg.get("z_spawn", 0.05))
-    grid_cols = int(banana_cfg.get("grid_cols", 5))
-    grid_rows = int(banana_cfg.get("grid_rows", 7))
-    yaw_steps = int(banana_cfg.get("yaw_steps", 6))
-    xs = np.linspace(x_min, x_max, grid_cols)
-    ys = np.linspace(y_min, y_max, grid_rows)
-    yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
-    return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+    mode = str(banana_cfg.get("mode", "grid")).lower()
+    if mode == "grid":
+        grid_cols = int(banana_cfg.get("grid_cols", 5))
+        grid_rows = int(banana_cfg.get("grid_rows", 7))
+        yaw_steps = int(banana_cfg.get("yaw_steps", 6))
+        xs = np.linspace(x_min, x_max, grid_cols)
+        ys = np.linspace(y_min, y_max, grid_rows)
+        yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
+        return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+    if mode == "uniform":
+        if "seed" not in banana_cfg or "count" not in banana_cfg:
+            raise ValueError("randomization.banana uniform mode requires 'seed' and 'count'")
+        count = int(banana_cfg["count"])
+        if count < 0:
+            raise ValueError(f"randomization.banana count must be >= 0, got {count}")
+        rng = random.Random(int(banana_cfg["seed"]))
+        return [
+            (
+                rng.uniform(float(x_min), float(x_max)),
+                rng.uniform(float(y_min), float(y_max)),
+                z_spawn,
+                rng.uniform(0.0, 2.0 * math.pi),
+            )
+            for _ in range(count)
+        ]
+    raise ValueError(f"randomization.banana mode must be 'grid' or 'uniform', got {mode!r}")
 
 
 def _quat_from_extrinsic_xyz(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
@@ -118,84 +158,28 @@ def _layout_dynamic_objects(layout: dict) -> list[tuple[str, list[float], list[f
     return out
 
 
-def _inject_random_keyframes(xml_content: str, layout: dict) -> str:
-    """Inject the shared randomisation keyframes plus a named default (D3/D9).
+def scene_dynamic_objects(scene_name: str) -> list[str]:
+    """Names of the scene's dynamic objects (``type: dynamic`` in layout.yaml).
 
-    ``random_KKK`` keyframes come from ``randomization_grid`` (index k → pose);
-    the ``default`` keyframe holds the layout's default object poses and
-    ``arm_rest_qpos``, so a default reset and the trajectory controller's
-    hold setpoint agree. Uses the mujoco Python API to resolve qpos addresses
-    by joint name so the ordering is inferred from the model, not hardcoded.
-    If mujoco is unavailable or the model cannot compile, returns
-    xml_content unchanged.
+    The MuJoCo runtime provider publishes exactly these bodies through the
+    FreeJointStatePublisherPlugin, and the scene task's MuJoCo backend
+    observes them on the resulting topic. Unknown scenes (or scenes without
+    dynamic objects) return an empty list — no plugin is configured for them.
     """
-    try:
-        import mujoco  # noqa: PLC0415
-    except ImportError:
-        logging.warning("mujoco not available; skipping keyframe injection")
-        return xml_content
+    return [name for name, _position, _rpy in _layout_dynamic_objects(get_scene_layout(scene_name))]
 
-    grid = randomization_grid(layout)
-    if not grid:
-        return xml_content
 
-    rand = layout.get("randomization", {})
-    arm_joint_names = rand.get("arm_joint_names", [])
-    arm_rest_qpos = rand.get("arm_rest_qpos", [])
-    dynamics = _layout_dynamic_objects(layout)
+def free_joint_states_topic(scene: str) -> str:
+    """The scene-namespaced free-joint observation topic on the MuJoCo platform.
 
-    try:
-        spec = mujoco.MjSpec.from_string(xml_content)
-        model = spec.compile()
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Keyframe injection: model compile failed (%s); skipping", exc)
-        return xml_content
-
-    data = mujoco.MjData(model)
-
-    def _adr(name: str) -> int:
-        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
-        return int(model.jnt_qposadr[jid]) if jid >= 0 else -1
-
-    def _set_arm(qpos) -> None:
-        for jname, qval in zip(arm_joint_names, arm_rest_qpos, strict=False):
-            adr = _adr(jname)
-            if adr >= 0:
-                qpos[adr] = float(qval)
-
-    def _set_freejoint(qpos, name: str, position: list[float], rpy: list[float]) -> None:
-        adr = _adr(f"{name}_free")
-        if adr < 0:
-            return
-        qw, qx, qy, qz = _quat_from_extrinsic_xyz(rpy[0], rpy[1], rpy[2])
-        qpos[adr : adr + 7] = [position[0], position[1], position[2], qw, qx, qy, qz]
-
-    banana = next((entry for entry in dynamics if entry[0] == "banana"), None)
-
-    lines = ["  <keyframe>"]
-
-    def _emit(name: str, qpos) -> None:
-        qstr = " ".join(f"{v:.6f}" for v in qpos)
-        lines.append(f'    <key name="{name}" qpos="{qstr}"/>')
-
-    # named default: the arm at rest and every dynamic object at its layout pose
-    qpos = data.qpos.copy()
-    _set_arm(qpos)
-    for obj_name, position, rpy in dynamics:
-        _set_freejoint(qpos, obj_name, position, rpy)
-    _emit("default", qpos)
-
-    # randomisation grid: index k → random_KKK (banana at grid[k], arm at rest)
-    for idx, (x, y, z, yaw) in enumerate(grid):
-        qpos = data.qpos.copy()
-        _set_arm(qpos)
-        if banana is not None:
-            # banana_free freejoint: [tx, ty, tz, qw, qx, qy, qz]
-            _set_freejoint(qpos, banana[0], [x, y, z], [0.0, 0.0, yaw])
-        _emit(f"random_{idx:03d}", qpos)
-    lines.append("  </keyframe>")
-
-    return xml_content.replace("</mujoco>", "\n".join(lines) + "\n</mujoco>")
+    ``/sim/<scene>/free_joint_states`` mirrors Gazebo's
+    ``/sim/<scene>/object_poses``: one scene-namespaced absolute stream with
+    every dynamic object's live pose. Both the runtime provider (which
+    configures the plugin's ``topic`` parameter) and the scene task's
+    ``MujocoBackend`` (which subscribes) resolve the name through this
+    function, so the two ends can never drift apart.
+    """
+    return f"/sim/{scene}/free_joint_states"
 
 
 def get_scene_file(scene_name: str, platform: str) -> Path:
@@ -264,12 +248,13 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
     """Robot-agnostic robot+scene composition for the MuJoCo provider (D3).
 
     Substitutes the robot MJCF into the named scene template (``scene=None``
-    compiles the robot MJCF alone), injects the shared keyframes when the
-    layout has randomisation, enables SDF collision on the given mesh names,
-    compiles and saves the ``.mjb`` at ``composed_model_path(scene)``. The
-    intermediate XML is kept beside it for debugging. Falls back to the
+    compiles the robot MJCF alone), enables SDF collision on the given mesh
+    names, compiles and saves the ``.mjb`` at ``composed_model_path(scene)``.
+    The intermediate XML is kept beside it for debugging. Falls back to the
     ``.xml`` path only when the ``mujoco`` package is missing; the provider
-    treats that as fatal.
+    treats that as fatal. Issue #195: no keyframes are injected any more —
+    scene placements travel through ``ResetWorld`` state overrides built
+    from the layout, not through compiled-in ``random_KKK`` keys.
 
     Args:
         robot_mjcf_path:  Absolute path to the fully substituted robot MJCF.
@@ -288,12 +273,8 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
         meshes_dir = tmpl.parent / "meshes"
         content = tmpl.read_text().replace(_MESHES_PLACEHOLDER, str(meshes_dir))
         content = content.replace(_ROBOT_XML_PLACEHOLDER, str(robot_path))
-        layout = get_scene_layout(scene)
     else:
         content = robot_path.read_text()
-        layout = {}
-    if layout.get("randomization"):
-        content = _inject_random_keyframes(content, layout)
 
     xml_out = composed_model_path(scene).with_suffix(".xml")
     xml_out.parent.mkdir(parents=True, exist_ok=True)

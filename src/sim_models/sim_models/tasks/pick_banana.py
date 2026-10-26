@@ -1,14 +1,18 @@
 """PickBananaTask — scene task for the pick_banana scene (D9 refactor).
 
 Exposes three ROS2 services:
-  /sim/pick_banana/random_set     (Trigger) — advance the shared grid and place the banana
+  /sim/pick_banana/random_set     (Trigger) — advance the shared placements and place the banana
   /sim/pick_banana/reset          (Trigger) — reset the scene to the layout default
-  /sim/pick_banana/autotest/start (Trigger) — run the full AutoTest loop (non-blocking)
+  /sim/pick_banana/autotest/start (Trigger) — run the AutoTest loop (non-blocking)
 
-Platform specifics live in :mod:`sim_models.tasks.backends` (MuJoCo ResetWorld +
-ShadowSim, Gazebo SetEntityPose through the bridge); both use the single
-``scene_compiler.randomization_grid`` generator so index *k* is the same banana
-placement on every platform.
+Platform specifics live in :mod:`sim_models.tasks.backends` (MuJoCo atomic
+``ResetWorld`` state overrides with observation through the
+FreeJointStatePublisherPlugin stream, Gazebo ``SetEntityPose`` through the
+bridge); both use the single ``scene_compiler.randomization_placements``
+generator so index *k* is the same banana placement on every platform. The
+``autotest_indices`` parameter (INTEGER_ARRAY, empty = all) selects the
+episode placement indices and is re-read when AutoTest starts, so a runtime
+``ros2 param set`` picks it up.
 
 Safety properties (each covered by a service-callback regression test):
 
@@ -50,7 +54,7 @@ from rclpy.node import Node
 from std_srvs.srv import Empty, Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from sim_models.scene_compiler import get_scene_layout, randomization_grid
+from sim_models.scene_compiler import get_scene_layout, randomization_placements
 from sim_models.tasks.backends import GazeboBackend, MujocoBackend, PickBananaBackend
 from sim_models.tasks.base import EvalResult, SceneTask
 
@@ -75,9 +79,9 @@ class PickBananaTask(SceneTask):
 
         layout = get_scene_layout("pick_banana")
         rand = layout.get("randomization", {})
-        self._grid = randomization_grid(layout)
-        self._n_keyframes = len(self._grid)
-        self._kf_idx = -1
+        self._placements = randomization_placements(layout)
+        self._n_placements = len(self._placements)
+        self._placement_idx = -1
 
         # Layout-driven evaluation (D9): plate centre from the layout objects,
         # thresholds from the optional evaluation section.
@@ -103,7 +107,15 @@ class PickBananaTask(SceneTask):
         def string_array_param(name):
             from rclpy.parameter import Parameter
 
-            return [str(j) for j in node.declare_parameter(name, Parameter.Type.STRING_ARRAY).value]
+            # A typed declaration without an override leaves .value None.
+            value = node.declare_parameter(name, Parameter.Type.STRING_ARRAY).value
+            return [str(j) for j in (value or [])]
+
+        def int_array_param(name):
+            from rclpy.parameter import Parameter
+
+            value = node.declare_parameter(name, Parameter.Type.INTEGER_ARRAY).value
+            return [int(i) for i in (value or [])]
 
         sim_platform = str(param("sim_platform", ""))
         self._trajectory_mode = str(param("trajectory_mode", "trajectory"))
@@ -115,6 +127,7 @@ class PickBananaTask(SceneTask):
         self._arm_joints = string_array_param("arm_joint_names")
         gripper_endpoint = str(param("gripper_trajectory_endpoint", ""))
         self._gripper_joints = string_array_param("gripper_joint_names")
+        self._autotest_indices = int_array_param("autotest_indices")
 
         # Platform backend (lazy platform imports inside the backends).
         self._backend: PickBananaBackend | None = None
@@ -122,7 +135,7 @@ class PickBananaTask(SceneTask):
             self._backend = MujocoBackend(
                 node,
                 layout,
-                scene_model_path=str(param("scene_model_path", "")),
+                scene=self.scene_name,
                 reset_world_service=str(param("reset_world_service", "")),
                 callback_group=self._cbg,
             )
@@ -177,12 +190,16 @@ class PickBananaTask(SceneTask):
 
     # ── SceneTask interface ────────────────────────────────────────────────────
 
-    def randomize(self, stop_event: threading.Event | None = None) -> tuple[bool, str]:
+    def randomize(self, stop_event: threading.Event | None = None, index: int | None = None) -> tuple[bool, str]:
+        """Advance to the next placement (or jump to ``index``) and place it."""
         ready_ok, ready_message = self._check_backend_ready()
         if not ready_ok:
             return False, f"backend not ready: {ready_message}"
-        self._kf_idx = (self._kf_idx + 1) % self._n_keyframes
-        return self._backend.place(self._kf_idx, stop_event=stop_event)
+        if index is None:
+            self._placement_idx = (self._placement_idx + 1) % self._n_placements
+        else:
+            self._placement_idx = index
+        return self._backend.place(self._placement_idx, stop_event=stop_event)
 
     def reset(self, stop_event: threading.Event | None = None) -> tuple[bool, str]:
         ready_ok, ready_message = self._check_backend_ready()
@@ -262,13 +279,35 @@ class PickBananaTask(SceneTask):
             resp.success = False
             resp.message = f"backend not ready: {ready_message}"
             return resp
+        # Re-read the parameter so a runtime `ros2 param set` between runs is
+        # honoured; empty means the full placement list.
+        try:
+            selected = self._selected_indices()
+        except ValueError as exc:
+            self._end_operation()
+            resp.success = False
+            resp.message = f"autotest_indices invalid: {exc}"
+            return resp
         # Ownership passes to the worker; it releases in its finally block.
         self._autotest_stop.clear()
-        self._autotest_thread = threading.Thread(target=self._run_autotest, daemon=True, name="pick_banana_autotest")
+        self._autotest_thread = threading.Thread(
+            target=self._run_autotest, args=(selected,), daemon=True, name="pick_banana_autotest"
+        )
         self._autotest_thread.start()
         resp.success = True
-        resp.message = f"AutoTest started ({self._n_keyframes} iterations)"
+        resp.message = f"AutoTest started ({len(selected)} episodes)"
         return resp
+
+    def _selected_indices(self) -> list[int]:
+        """The AutoTest episode placement indices: the live parameter or all."""
+        raw = list(self._node.get_parameter("autotest_indices").value or [])
+        if not raw:
+            return list(range(self._n_placements))
+        indices = [int(v) for v in raw]
+        invalid = [k for k in indices if not 0 <= k < self._n_placements]
+        if invalid:
+            raise ValueError(f"index {invalid[0]} outside 0..{self._n_placements - 1}")
+        return indices
 
     def _begin_operation(self) -> bool:
         return self._operation.acquire(blocking=False)
@@ -308,6 +347,7 @@ class PickBananaTask(SceneTask):
         resume: bool,
         settle_s: float = 0.8,
         stop_event: threading.Event | None = None,
+        index: int | None = None,
     ) -> tuple[bool, str]:
         """Revalidate readiness → pause inference → park the arm → place → resume.
 
@@ -315,7 +355,8 @@ class PickBananaTask(SceneTask):
         goal happens before the backend confirms it can place. Dispatcher
         steps are skipped (and logged) when the dispatcher is not running;
         with it present the order pause → arm reset → place → reset → resume
-        is preserved.
+        is preserved. ``index`` (AutoTest) places exactly that placement
+        instead of advancing the shared counter.
         """
         ready_ok, ready_message = self._check_backend_ready()
         if not ready_ok:
@@ -330,7 +371,7 @@ class PickBananaTask(SceneTask):
             return False, "dispatcher/stop failed; refusing to reset the scene"
 
         place = (
-            (lambda: self.randomize(stop_event=stop_event))
+            (lambda: self.randomize(stop_event=stop_event, index=index))
             if randomize
             else (lambda: self.reset(stop_event=stop_event))
         )
@@ -675,7 +716,7 @@ class PickBananaTask(SceneTask):
 
     # ── AutoTest loop ─────────────────────────────────────────────────────────
 
-    def _run_autotest(self) -> None:
+    def _run_autotest(self, indices: list[int]) -> None:
         log = self._node.get_logger()
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -685,20 +726,20 @@ class PickBananaTask(SceneTask):
             summary_path = run_dir / "summary.yaml"
             log.info(f"AutoTest: saving to {run_dir}")
 
+            total = len(indices)
             passed = 0
-            total = self._n_keyframes
             completed = 0
 
             with results_path.open("w") as fh:
-                for i in range(total):
+                for episode, k in enumerate(indices):
                     if self._autotest_stop.is_set():
                         log.info("AutoTest: stop requested; ending the run")
                         break
                     ok, _ = self._clean_world_reset(
-                        randomize=True, resume=True, settle_s=1.5, stop_event=self._autotest_stop
+                        randomize=True, resume=True, settle_s=1.5, stop_event=self._autotest_stop, index=k
                     )
                     if not ok:
-                        log.warning(f"AutoTest {i}: random_set failed, skipping")
+                        log.warning(f"AutoTest {k}: random_set failed, skipping")
                         continue
                     completed += 1
 
@@ -706,10 +747,11 @@ class PickBananaTask(SceneTask):
                     if result.success:
                         passed += 1
 
-                    placement = list(self._grid[self._kf_idx]) if 0 <= self._kf_idx < total else []
+                    placement = list(self._placements[k]) if 0 <= k < len(self._placements) else []
                     record = {
-                        "idx": i,
-                        "placement_index": self._kf_idx,
+                        "episode": episode,
+                        "idx": k,
+                        "placement_index": k,
                         "banana_spawn": placement,
                         "success": result.success,
                         "reason": result.reason,
@@ -720,7 +762,7 @@ class PickBananaTask(SceneTask):
                     fh.flush()
 
                     sym = "✓" if result.success else "✗"
-                    log.info(f"AutoTest {i + 1}/{total} {sym} {result.reason} ({result.duration_s:.1f}s)")
+                    log.info(f"AutoTest {episode + 1}/{total} {sym} {result.reason} ({result.duration_s:.1f}s)")
 
             # Leave the robot idle after the batch completes.
             self._dispatcher_step(self._disp_stop, Trigger.Request(), "dispatcher/stop", check_success=True)

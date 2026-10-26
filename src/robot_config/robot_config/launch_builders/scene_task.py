@@ -16,6 +16,9 @@ controller names. On Gazebo the builder also starts the single
 ``ros_gz_bridge`` the backend needs (set_pose service bridge plus the dynamic
 pose stream remapped to ``/sim/<scene>/object_poses`` — the spike T0 choice,
 with the ``gz service`` subprocess fallback living in the backend, not here).
+On MuJoCo the builder adds no transport: the runtime provider configures the
+FreeJointStatePublisherPlugin for the scene's dynamic bodies and the backend
+places through ``ResetWorld`` state overrides (issue #195).
 """
 
 from typing import Any
@@ -117,11 +120,7 @@ def build_scene_task(context: LaunchBuildContext) -> BuildResult:
 
     actions: list[Any] = []
 
-    if context.sim_platform == "mujoco":
-        from sim_models.scene_compiler import composed_model_path
-
-        parameters["scene_model_path"] = str(composed_model_path(scene))
-    elif context.sim_platform == "gazebo":
+    if context.sim_platform == "gazebo":
         world_name = (startup.world_name if startup is not None else "") or str(
             robot_config.get("gazebo_world_name", "demo")
         )
@@ -142,6 +141,10 @@ def build_scene_task(context: LaunchBuildContext) -> BuildResult:
                 output="screen",
             )
         )
+    # On MuJoCo the task needs no extra transport: the runtime provider
+    # configures the FreeJointStatePublisherPlugin for the scene's dynamic
+    # bodies (issue #195) and the backend places through ResetWorld state
+    # overrides — both endpoints resolve the shared topic/layout themselves.
 
     actions.append(
         Node(

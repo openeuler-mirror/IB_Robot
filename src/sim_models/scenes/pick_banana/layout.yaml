@@ -72,14 +72,23 @@ evaluation:
   flew_out_radius_m: 0.40
   fell_off_z: -0.05
 
-# ── Randomisation config (used by scene_compiler keyframe injection) ─────────
+# ── Randomisation config (shared placement generator, issue #195) ─────────────
+# scene_compiler.randomization_placements turns this into the single placement
+# list both platforms index: the MuJoCo backend applies placements[k] through
+# ResetWorld state overrides, the Gazebo backend through SetEntityPose.
+# mode: grid (default) | uniform (deterministic sampling from seed+count).
 randomization:
   banana:
+    mode: grid               # grid keeps the historical index order/values
     x_range: [-0.03, 0.10]   # 13 cm span, avoids plate at x=0.22
     y_range: [-0.02, 0.10]   # 12 cm span, 20-32 cm from robot base (y=0.30)
     z_spawn: 0.05             # drops under gravity
     grid_cols: 5              # x divisions
-    grid_rows: 7              # y divisions  →  35 positions × 6 yaw = 210 keyframes
+    grid_rows: 7              # y divisions  →  35 positions × 6 yaw = 210 placements
     yaw_steps: 6              # 0°, 60°, 120°, 180°, 240°, 300°
+    # uniform mode instead:
+    #   mode: uniform
+    #   seed: 42              # same seed+count → same sequence on both platforms
+    #   count: 50
   arm_joint_names: ["1", "2", "3", "4", "5", "6"]     # from so101.xml
-  arm_rest_qpos: [0.0, -1.5854, 1.5708, 0.7854, 0.0, 0.0]
+  arm_rest_qpos: [0.0, -1.5854, 1.5708, 0.7854, 0.0, 0.0]  # ResetWorld joint override target

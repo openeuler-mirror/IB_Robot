@@ -1,8 +1,11 @@
 """Scene composition tests (so101-mujoco-runtime-platform tasks 2.1/2.2).
 
-Covers the robot-agnostic composition API, the shared randomisation grid, the
-domain-keyed composed-model path, the layout task declaration and the
-dependency direction (sim_models never imports robot_runtime).
+Covers the robot-agnostic composition API, the shared randomisation
+placements (grid bit-compatibility with the historical keyframe grid, seeded
+uniform sampling, and the issue #195 requirement that the composed model
+carries no injected keyframes), the domain-keyed composed-model path, the
+layout task declaration, the shared scene helpers and the dependency
+direction (sim_models never imports robot_runtime).
 """
 
 from __future__ import annotations
@@ -11,17 +14,21 @@ import ast
 import importlib
 import math
 import pkgutil
+import random
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from sim_models.scene_compiler import (
     compose_mujoco_model,
     composed_model_path,
+    free_joint_states_topic,
     get_scene_layout,
     get_scene_task,
-    randomization_grid,
+    randomization_placements,
+    scene_dynamic_objects,
 )
 
 mujoco = pytest.importorskip("mujoco")
@@ -83,51 +90,111 @@ def _model_of(path: Path):
     return mujoco.MjModel.from_binary_path(str(path))
 
 
-def _keyframe_id(model, name: str) -> int:
-    kid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, name)
-    assert kid >= 0, f"keyframe {name!r} missing (nkey={model.nkey})"
-    return kid
-
-
-def _free_qpos(model, key_id: int, joint: str):
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
-    adr = int(model.jnt_qposadr[jid])
-    return model.key_qpos[key_id][adr : adr + 7]
-
-
-def _scalar_qpos(model, key_id: int, joint: str):
-    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint)
-    adr = int(model.jnt_qposadr[jid])
-    return model.key_qpos[key_id][adr]
-
-
 # ---------------------------------------------------------------------------
-# 2.1: randomization_grid
+# 2.1: randomization_placements
 # ---------------------------------------------------------------------------
+
+
+def _historical_grid(banana_cfg: dict) -> list[tuple[float, float, float, float]]:
+    """The pre-issue-195 keyframe grid computation, inlined verbatim."""
+    x_min, x_max = banana_cfg["x_range"]
+    y_min, y_max = banana_cfg["y_range"]
+    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
+    xs = np.linspace(x_min, x_max, int(banana_cfg.get("grid_cols", 5)))
+    ys = np.linspace(y_min, y_max, int(banana_cfg.get("grid_rows", 7)))
+    yaws = [2.0 * math.pi * i / int(banana_cfg.get("yaw_steps", 6)) for i in range(int(banana_cfg.get("yaw_steps", 6)))]
+    return [(float(x), float(y), z_spawn, float(yaw)) for x in xs for y in ys for yaw in yaws]
+
+
+def test_grid_placements_are_bit_identical_to_the_historical_grid():
+    layout = get_scene_layout("pick_banana")
+    placements = randomization_placements(layout)
+    assert placements == _historical_grid(layout["randomization"]["banana"]), (
+        "grid mode must reproduce the historical keyframe grid exactly (old indices keep their meaning)"
+    )
 
 
 def test_grid_size_and_order_are_stable():
     layout = get_scene_layout("pick_banana")
-    grid = randomization_grid(layout)
+    placements = randomization_placements(layout)
     # 5 x divisions × 7 y divisions × 6 yaw steps
-    assert len(grid) == 5 * 7 * 6
+    assert len(placements) == 5 * 7 * 6
     rand = layout["randomization"]["banana"]
     x_min, x_max = rand["x_range"]
     y_min, y_max = rand["y_range"]
     yaw_step = 2.0 * math.pi / 6
     # index 0 → (x_min, y_min, z_spawn, 0); the innermost loop is yaw
-    assert grid[0] == pytest.approx((x_min, y_min, 0.05, 0.0), abs=1e-9)
-    assert grid[1] == pytest.approx((x_min, y_min, 0.05, yaw_step), abs=1e-9)
+    assert placements[0] == pytest.approx((x_min, y_min, 0.05, 0.0), abs=1e-9)
+    assert placements[1] == pytest.approx((x_min, y_min, 0.05, yaw_step), abs=1e-9)
     # after yaw_steps indices the y advances
-    assert grid[6] == pytest.approx((x_min, y_min + (y_max - y_min) / 6, 0.05, 0.0), abs=1e-9)
+    assert placements[6] == pytest.approx((x_min, y_min + (y_max - y_min) / 6, 0.05, 0.0), abs=1e-9)
     # the last entry is (x_max, y_max, last yaw)
-    assert grid[-1] == pytest.approx((x_max, y_max, 0.05, 5 * yaw_step), abs=1e-9)
+    assert placements[-1] == pytest.approx((x_max, y_max, 0.05, 5 * yaw_step), abs=1e-9)
 
 
-def test_grid_is_empty_without_randomization():
-    assert randomization_grid({}) == []
-    assert randomization_grid({"randomization": {}}) == []
-    assert randomization_grid({"randomization": {"banana": {}}}) == []
+def test_placements_are_empty_without_randomization():
+    assert randomization_placements({}) == []
+    assert randomization_placements({"randomization": {}}) == []
+    assert randomization_placements({"randomization": {"banana": {}}}) == []
+
+
+def test_uniform_mode_is_deterministic_and_seeded():
+    base = {
+        "x_range": [-0.03, 0.10],
+        "y_range": [-0.02, 0.10],
+        "z_spawn": 0.05,
+        "mode": "uniform",
+        "seed": 42,
+        "count": 25,
+    }
+    first = randomization_placements({"randomization": {"banana": dict(base)}})
+    second = randomization_placements({"randomization": {"banana": dict(base)}})
+    assert len(first) == 25
+    assert first == second, "same seed + count must give the same sequence"
+
+    # an independent reference implementation with the same seed agrees
+    rng = random.Random(42)
+    expected = [
+        (
+            rng.uniform(-0.03, 0.10),
+            rng.uniform(-0.02, 0.10),
+            0.05,
+            rng.uniform(0.0, 2.0 * math.pi),
+        )
+        for _ in range(25)
+    ]
+    assert first == expected
+
+    other_seed = randomization_placements({"randomization": {"banana": {**base, "seed": 43}}})
+    assert other_seed != first, "a different seed changes the sequence"
+
+
+def test_uniform_mode_rejects_missing_seed_or_count():
+    with pytest.raises(ValueError, match="seed"):
+        randomization_placements({"randomization": {"banana": {"mode": "uniform", "count": 5}}})
+    with pytest.raises(ValueError, match="seed"):
+        randomization_placements({"randomization": {"banana": {"mode": "uniform"}}})
+
+
+def test_unknown_mode_is_rejected():
+    with pytest.raises(ValueError, match="mode"):
+        randomization_placements({"randomization": {"banana": {"mode": "spiral", "seed": 1, "count": 2}}})
+
+
+# ---------------------------------------------------------------------------
+# 2.1: the shared scene helpers (issue #195)
+# ---------------------------------------------------------------------------
+
+
+def test_scene_dynamic_objects_lists_dynamic_bodies_only():
+    assert scene_dynamic_objects("pick_banana") == ["plate", "banana"]
+    assert scene_dynamic_objects("empty") == []
+    assert scene_dynamic_objects("does_not_exist") == []
+
+
+def test_free_joint_states_topic_is_scene_namespaced():
+    assert free_joint_states_topic("pick_banana") == "/sim/pick_banana/free_joint_states"
+    assert free_joint_states_topic("other_scene") == "/sim/other_scene/free_joint_states"
 
 
 # ---------------------------------------------------------------------------
@@ -150,37 +217,19 @@ def test_composed_model_path_is_keyed_by_domain(monkeypatch):
     assert composed_model_path(None).name == "robot.mjb"
 
 
-def test_compose_with_pick_banana_compiles_and_injects_keyframes(robot_mjcf, clean_domain):
+def test_compose_with_pick_banana_compiles_without_injected_keyframes(robot_mjcf, clean_domain):
+    """Issue #195: placements travel through ResetWorld state overrides, not
+    compiled-in keyframes — the composed model must carry no injected keys."""
     out = compose_mujoco_model(robot_mjcf, "pick_banana", ())
     assert out == composed_model_path("pick_banana")
     assert out.exists() and out.suffix == ".mjb"
     model = _model_of(out)
-    assert model.nkey == 1 + 5 * 7 * 6  # default + random grid
-
-    grid = randomization_grid(get_scene_layout("pick_banana"))
-    for k in (0, 1, 17, 209):
-        kid = _keyframe_id(model, f"random_{k:03d}")
-        banana = _free_qpos(model, kid, "banana_free")
-        x, y, z, yaw = grid[k]
-        assert list(banana[:3]) == pytest.approx([x, y, z], abs=1e-5)
-        assert list(banana[3:]) == pytest.approx([math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)], abs=1e-5)
-
-
-def test_compose_default_keyframe_holds_layout_poses_and_rest(robot_mjcf, clean_domain):
-    out = compose_mujoco_model(robot_mjcf, "pick_banana", ())
-    model = _model_of(out)
-    kid = _keyframe_id(model, "default")
-    layout = get_scene_layout("pick_banana")
-    objects = {obj["name"]: obj for obj in layout["objects"]}
-    banana = _free_qpos(model, kid, "banana_free")
-    assert list(banana[:3]) == pytest.approx(objects["banana"]["position"], abs=1e-5)
-    plate = _free_qpos(model, kid, "plate_free")
-    assert list(plate[:3]) == pytest.approx(objects["plate"]["position"], abs=1e-5)
-    # plate rotation [pi/2, 0, 0] → quaternion w-x-y-z (0.7071, 0.7071, 0, 0)
-    assert list(plate[3:]) == pytest.approx([0.7071068, 0.7071068, 0.0, 0.0], abs=1e-5)
-    rest = layout["randomization"]["arm_rest_qpos"]
-    for j in range(1, 7):
-        assert _scalar_qpos(model, kid, str(j)) == pytest.approx(rest[j - 1], abs=1e-5)
+    assert model.nkey == 0, "no random_KKK/default keyframes may be injected any more"
+    # the placement targets themselves are still part of the composed world
+    for body in ("banana", "plate"):
+        assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body) >= 0
+    grid = randomization_placements(get_scene_layout("pick_banana"))
+    assert len(grid) == 5 * 7 * 6
 
 
 def test_compose_with_empty_scene_includes_the_robot(robot_mjcf, clean_domain):
