@@ -16,6 +16,8 @@ import shutil
 from pathlib import Path
 from uuid import uuid4
 
+import yaml
+
 from inference_manifest import (
     BundleFile,
     DeploymentArtifact,
@@ -178,6 +180,23 @@ def _bundle_files(bundle_root: Path) -> tuple[str, ...]:
     )
 
 
+def _object_point_budget(config: Path) -> int:
+    """The object-cloud size this checkpoint was trained on, from its own config.
+
+    Upstream resamples a served cloud to ``cfg.data.num_points`` to match the training
+    distribution (``graspgenx.grasp_server.run_inference_batch``), so the budget belongs
+    to the checkpoint, not to this packager. It is copied into adapter.json rather than
+    re-read at serve time, the way num_grasps and topk already are; adapter.json's
+    source_sha256 covers gen/config.yaml, so editing the config later changes the bundle
+    revision.
+    """
+    data = yaml.safe_load(config.read_text(encoding="utf-8")).get("data") or {}
+    budget = data.get("num_points")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+        raise ValueError(f"{config} must declare a positive data.num_points, got {budget!r}")
+    return budget
+
+
 def package_graspgenx_torch_bundle(
     bundle_root: Path,
     *,
@@ -198,9 +217,13 @@ def package_graspgenx_torch_bundle(
         raise ValueError("an npu deployment needs --diffusion-loop, and no other deployment takes one")
     if (checkpoint_root is None) != (gripper_dir is None):
         raise ValueError("pass both --checkpoint-root and --gripper-dir, or neither to repackage in place")
-    # Preflight every retained NPU deployment against the prospective sources,
-    # before copying any checkpoints or rewriting adapter/manifest digests.
-    # Updating only CUDA still changes the assets shared with an existing OM.
+    # Preflight the prospective sources before copying any checkpoints or
+    # rewriting adapter/manifest digests, so a refused update leaves the bundle as
+    # it was: first the point budget the adapter will declare, then every retained
+    # NPU deployment (updating only CUDA still changes the assets an existing OM shares).
+    config = checkpoint_root / "gen/config.yaml" if checkpoint_root else bundle_root / _CHECKPOINTS / "gen/config.yaml"
+    # A bundle missing its config is reported with everything else it lacks below.
+    object_points = _object_point_budget(config) if config.is_file() else None
     loops = [diffusion_loop] if diffusion_loop is not None else []
     manifest_path = bundle_root / "inference_manifest.json"
     if manifest_path.is_file():
@@ -214,9 +237,6 @@ def package_graspgenx_torch_bundle(
                 )
     if loops:
         checkpoint = _latest_checkpoint(checkpoint_root / "gen") if checkpoint_root else bundle_root / _GENERATOR
-        config = (
-            checkpoint_root / "gen/config.yaml" if checkpoint_root else bundle_root / _CHECKPOINTS / "gen/config.yaml"
-        )
         binding = generator_binding(checkpoint, config)
         for loop in loops:
             _validate_diffusion_loop(loop, num_grasps, binding)
@@ -236,6 +256,8 @@ def package_graspgenx_torch_bundle(
     if diffusion_loop is not None:
         _materialize_diffusion_loop(bundle_root, diffusion_loop)
 
+    if object_points is None:
+        object_points = _object_point_budget(bundle_root / _CHECKPOINTS / "gen/config.yaml")
     adapter = {
         "interface": "tensor_model",
         "model_type": "graspgenx",
@@ -244,6 +266,7 @@ def package_graspgenx_torch_bundle(
         "postprocessing": GRASPGENX_POSTPROCESSING,
         "torch_module_loader": "perception_service.torch_model_loaders:load_graspgenx",
         "gripper_name": gripper_name,
+        "object_points": object_points,
         "num_grasps": num_grasps,
         "topk": topk,
         "checkpoints_dir": _CHECKPOINTS,

@@ -95,7 +95,9 @@ def bundle(tmp_path) -> Path:
     release = tmp_path / "release"
     for network in ("gen", "dis"):
         (release / network).mkdir(parents=True)
-        (release / network / "config.yaml").write_text("{}\n", encoding="utf-8")
+        # data.num_points is the object-cloud budget the packager copies into
+        # adapter.json, so a bundle cannot be built without it.
+        (release / network / "config.yaml").write_text("data:\n  num_points: 3500\n", encoding="utf-8")
         (release / network / "epoch_1.pth").write_bytes(network.encode())
     gripper = tmp_path / "omnihand_left_x2"
     gripper.mkdir()

@@ -25,7 +25,8 @@ def _sources(tmp_path):
     for network, epochs in (("gen", (90, 736)), ("dis", (1056,))):
         (release / network).mkdir(parents=True)
         (release / network / "config.yaml").write_text(
-            f"network: {network}\ndiffusion:\n  num_diffusion_iters: 20\n  num_diffusion_iters_eval: 20\n",
+            f"network: {network}\ndata:\n  num_points: 3500\n"
+            "diffusion:\n  num_diffusion_iters: 20\n  num_diffusion_iters_eval: 20\n",
             encoding="utf-8",
         )
         for epoch in epochs:
@@ -143,6 +144,21 @@ def test_matching_loop_is_packaged_and_repackaged_without_changing_revision(tmp_
         root, deployment_name="torch_npu", device="npu", diffusion_loop=root / "artifacts/ascend_310p/diffusion_loop.om"
     )
     assert load_inference_manifest(root, "torch_npu").manifest.bundle.revision == first.bundle.revision
+
+
+def test_a_config_without_a_point_budget_is_refused_before_touching_the_bundle(tmp_path):
+    release, gripper = _sources(tmp_path)
+    root = tmp_path / "bundle"
+    package_graspgenx_torch_bundle(root, checkpoint_root=release, gripper_dir=gripper)
+    before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+    (release / "gen" / "epoch_800.pth").write_bytes(b"gen-800")
+    config = release / "gen" / "config.yaml"
+    config.write_text(config.read_text(encoding="utf-8").replace("  num_points: 3500\n", ""), encoding="utf-8")
+    with pytest.raises(ValueError, match="data.num_points"):
+        package_graspgenx_torch_bundle(root, checkpoint_root=release, gripper_dir=gripper)
+
+    assert {path: path.read_bytes() for path in root.rglob("*") if path.is_file()} == before
 
 
 @pytest.mark.parametrize("change", ["checkpoint", "config", "steps", "grasps", "missing_binding"])

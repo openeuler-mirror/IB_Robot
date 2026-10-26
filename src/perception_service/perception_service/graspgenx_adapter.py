@@ -27,7 +27,7 @@ from .graspgen_adapter import GraspCandidatePose
 from .graspgen_geometry import positive_float, positive_int, remove_point_cloud_outliers
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
-GRASPGENX_PREPROCESSING = "object-points-finite-outlier-filtered-source-frame-v1"
+GRASPGENX_PREPROCESSING = "object-points-finite-outlier-filtered-resampled-source-frame-v1"
 GRASPGENX_POSTPROCESSING = "grasp-pose-matrix-orthonormal-confidence-sorted-v1"
 # How many grasps the diffusion sampler draws for one request. It is an input rather
 # than a load-time constant because a caller asking for more candidates than the default
@@ -57,6 +57,7 @@ class GraspGenXConfig:
     """
 
     gripper_name: str
+    object_points: int
     num_grasps: int = 400
     topk: int = 400
     outlier_threshold: float = 0.014
@@ -67,13 +68,21 @@ class GraspGenXConfig:
         gripper_name = assets.get("gripper_name")
         if not isinstance(gripper_name, str) or not gripper_name:
             raise ValueError("GraspGenX adapter.json must name the gripper")
+        if "object_points" not in assets:
+            raise ValueError(
+                "GraspGenX adapter.json must declare object_points (the checkpoint's "
+                "data.num_points); repackage the bundle with package_graspgenx_torch_bundle"
+            )
         config = cls(
             gripper_name=gripper_name,
+            object_points=positive_int(assets.get("object_points"), "object_points"),
             num_grasps=positive_int(assets.get("num_grasps", 400), "num_grasps"),
             topk=positive_int(assets.get("topk", 400), "topk"),
             outlier_threshold=positive_float(assets.get("outlier_threshold", 0.014), "outlier_threshold"),
             outlier_neighbors=positive_int(assets.get("outlier_neighbors", 20), "outlier_neighbors"),
         )
+        if config.object_points < GRASPGENX_MIN_POINTS:
+            raise ValueError(f"GraspGenX object_points {config.object_points} is below {GRASPGENX_MIN_POINTS}")
         if config.num_grasps > GRASPGENX_MAX_SAMPLE_COUNT:
             raise ValueError(f"GraspGenX num_grasps {config.num_grasps} exceeds {GRASPGENX_MAX_SAMPLE_COUNT}")
         if config.topk > config.num_grasps:
@@ -122,13 +131,17 @@ class GraspGenXAdapter(PerceptionAdapter):
             raise ValueError(f"GraspGenX needs at least {GRASPGENX_MIN_POINTS} object points")
         return prepared
 
-    def prepare(self, points_xyz: np.ndarray, *, max_grasps: int = 0) -> dict[str, np.ndarray] | None:
-        """Filter an object cloud for the sampler, or ``None`` when it is too small to grasp.
+    def filter_points(self, points_xyz: np.ndarray) -> np.ndarray | None:
+        """The cloud the sampler should see, before it is resampled to the budget.
 
-        Outliers are removed with the sampler's own rule (mean L1 distance to the 20
-        nearest neighbours under 1.4 cm), computed on the host so a dense cloud does not
-        allocate the official implementation's N x N GPU buffer. Points stay in the
-        source frame: the sampler centres them and puts the poses back itself.
+        Non-finite rows go first, then outliers, with the sampler's own rule (mean L1
+        distance to the 20 nearest neighbours under 1.4 cm) computed on the host so a
+        dense cloud does not allocate the official implementation's N x N GPU buffer.
+        Points stay in the source frame: the sampler centres them and puts the poses
+        back itself. ``None`` means too few points to grasp.
+
+        Separate from the resampling in ``prepare`` because this part is deterministic
+        and is what decides which points exist at all.
         """
         points = np.asarray(points_xyz, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 3:
@@ -143,6 +156,32 @@ class GraspGenXAdapter(PerceptionAdapter):
         )
         if len(kept) < GRASPGENX_MIN_POINTS:
             kept = finite
+        return kept
+
+    def prepare(self, points_xyz: np.ndarray, *, max_grasps: int = 0) -> dict[str, np.ndarray] | None:
+        """Filter and resample an object cloud, or ``None`` when it is too small to grasp.
+
+        Filtering is ``filter_points``. The cloud is then resampled to the checkpoint's
+        own point budget, as upstream's batched entry point does
+        (``graspgenx.grasp_server.run_inference_batch``: "Each input PC is resampled
+        (with replacement) to ``grasp_sampler.cfg.data.num_points`` ... this matches the
+        training distribution"). Upstream's single-cloud path -- ``run_inference`` ->
+        ``GraspGenXSampler.sample``, which is the one this adapter drives -- omits it, so
+        without this a served frame reached the model several times over its training
+        budget: a segmented bottle at 0.53 m gives ~12k points against a budget of 3500.
+        The count also varies per frame with object size, distance and depth validity, so
+        resampling is what makes the input, and the latency, a constant.
+        """
+        kept = self.filter_points(points_xyz)
+        if kept is None:
+            return None
+        if len(kept) != self.config.object_points:
+            # Upstream's own draw: with replacement, after outlier removal. Farthest-point
+            # sampling or a stride would cover the surface more evenly than the training
+            # data did, which is a different input distribution, not a better one. This
+            # uses numpy's global stream deliberately, so a caller that seeds it (the
+            # parity verifiers do) still gets a reproducible cloud.
+            kept = kept[np.random.randint(0, len(kept), self.config.object_points)]
         if max_grasps > GRASPGENX_MAX_SAMPLE_COUNT:
             raise ValueError(f"GraspGenX max_grasps {max_grasps} exceeds {GRASPGENX_MAX_SAMPLE_COUNT}")
         sample_count = max(self.config.num_grasps, int(max_grasps))

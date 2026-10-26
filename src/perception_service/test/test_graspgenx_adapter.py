@@ -37,7 +37,7 @@ from perception_service.graspgenx_adapter import (
 
 
 def _adapter(**overrides) -> GraspGenXAdapter:
-    return GraspGenXAdapter(GraspGenXConfig(gripper_name="omnihand_left_x2", **overrides))
+    return GraspGenXAdapter(GraspGenXConfig(gripper_name="omnihand_left_x2", **{"object_points": 3500, **overrides}))
 
 
 def _result(poses, confidence):
@@ -63,6 +63,7 @@ def _identity(**overrides) -> dict:
         "preprocessing": GRASPGENX_PREPROCESSING,
         "postprocessing": GRASPGENX_POSTPROCESSING,
         "gripper_name": "omnihand_left_x2",
+        "object_points": 3500,
     }
     identity.update(overrides)
     return identity
@@ -78,7 +79,7 @@ def test_outlier_removal_matches_the_full_mean_l1_rule_with_duplicates_and_bound
     np.fill_diagonal(distances, np.inf)
     expected = np.sort(distances, axis=1)[:, :20].mean(axis=1) < 0.014
 
-    kept = _adapter().prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+    kept = _adapter().filter_points(points)
 
     np.testing.assert_array_equal(kept, points[expected])
     assert expected[:125].all() and not expected[-1]
@@ -94,7 +95,7 @@ def test_outlier_removal_keeps_up_with_a_whole_object_mask():
     points = np.concatenate([surface, stray]).astype(np.float32)
 
     started = time.perf_counter()
-    kept = _adapter().prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+    kept = _adapter().filter_points(points)
     elapsed = time.perf_counter() - started
 
     assert elapsed < 5.0
@@ -105,7 +106,7 @@ def test_outlier_removal_keeps_up_with_a_whole_object_mask():
 def test_points_stay_in_the_source_frame_because_the_sampler_centres_them_itself():
     points = np.random.default_rng(1).normal(0, 0.002, (64, 3)).astype(np.float32) + np.float32([0.2, -0.1, 0.6])
 
-    kept = _adapter().prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+    kept = _adapter().filter_points(points)
 
     np.testing.assert_array_equal(kept, points)
 
@@ -114,7 +115,7 @@ def test_an_over_filtered_cloud_falls_back_to_every_finite_point():
     """Sparse points all fail the neighbour test; the sampler then uses the unfiltered cloud."""
     points = np.arange(36, dtype=np.float32).reshape(12, 3)
 
-    kept = _adapter().prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+    kept = _adapter().filter_points(points)
 
     np.testing.assert_array_equal(kept, points)
 
@@ -123,10 +124,76 @@ def test_non_finite_points_are_dropped_and_a_tiny_cloud_is_ungraspable():
     points = np.zeros((9, 3), dtype=np.float32)
 
     assert _adapter().prepare(np.concatenate([points, [[np.nan, 0, 0]]])) is None
+    assert _adapter().filter_points(np.concatenate([points, [[np.nan, 0, 0]]])) is None
     with pytest.raises(ValueError, match="no finite points"):
         _adapter().prepare(np.full((4, 3), np.inf, dtype=np.float32))
     with pytest.raises(ValueError, match=r"shape \[N, 3\]"):
         _adapter().prepare(np.zeros((4, 2), dtype=np.float32))
+
+
+def _cloud(count: int, seed: int = 3) -> np.ndarray:
+    """A compact blob that survives outlier filtering intact."""
+    rng = np.random.default_rng(seed)
+    return (rng.normal(0, 0.002, (count, 3)) + [0.2, -0.1, 0.6]).astype(np.float32)
+
+
+def test_a_served_cloud_is_resampled_to_the_checkpoints_point_budget():
+    """Upstream resamples to cfg.data.num_points to match the training distribution.
+
+    A real X2 bottle mask gives ~12k points against a budget of 3500, and the count
+    varies per frame with object size, distance and depth validity, so without this the
+    model sees a different input size every request -- and on Ascend anything over 4096
+    points has no working path at all.
+    """
+    points = _cloud(12201)
+
+    prepared = _adapter(object_points=3500).prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+
+    assert len(prepared) == 3500
+    # Whole rows are drawn from the filtered cloud, not synthesised or mixed across
+    # points: an elementwise check would pass even if coordinates were shuffled.
+    drawn = {row.tobytes() for row in prepared}
+    assert drawn <= {row.tobytes() for row in points}
+
+
+def test_a_cloud_under_the_budget_is_drawn_up_to_it_with_replacement():
+    """collate stacks fixed-size clouds, so a small cloud is padded by redrawing."""
+    points = _cloud(300)
+
+    prepared = _adapter(object_points=3500).prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+
+    assert len(prepared) == 3500
+    assert len(np.unique(prepared, axis=0)) <= 300
+
+
+def test_a_cloud_already_at_the_budget_is_left_alone():
+    points = _cloud(64)
+
+    prepared = _adapter(object_points=64).prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+
+    np.testing.assert_array_equal(prepared, points)
+
+
+def test_the_resampling_draw_follows_the_seeded_numpy_stream():
+    """The parity verifiers seed numpy to make a device comparison reproducible."""
+    points = _cloud(9000)
+    adapter = _adapter(object_points=3500)
+
+    np.random.seed(11)
+    first = adapter.prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+    np.random.seed(11)
+    second = adapter.prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+
+    np.testing.assert_array_equal(first, second)
+
+
+def test_a_bundle_that_does_not_declare_its_point_budget_is_rejected():
+    """Guessing it would serve a cloud the checkpoint was not trained on."""
+    assets = _identity()
+    del assets["object_points"]
+
+    with pytest.raises(ValueError, match="must declare object_points"):
+        GraspGenXConfig.from_assets(assets)
 
 
 def test_the_draw_grows_to_cover_a_larger_request_but_never_shrinks():
@@ -178,9 +245,9 @@ def test_postprocess_accepts_an_empty_draw_and_rejects_inconsistent_outputs():
 
 def test_config_rejects_an_unbounded_draw_a_top_k_larger_than_it_and_an_unnamed_gripper():
     with pytest.raises(ValueError, match="exceeds 1000"):
-        GraspGenXConfig.from_assets({"gripper_name": "g", "num_grasps": 5000, "topk": 10})
+        GraspGenXConfig.from_assets({"gripper_name": "g", "object_points": 3500, "num_grasps": 5000, "topk": 10})
     with pytest.raises(ValueError, match="exceeds the sampled count"):
-        GraspGenXConfig.from_assets({"gripper_name": "g", "num_grasps": 10, "topk": 20})
+        GraspGenXConfig.from_assets({"gripper_name": "g", "object_points": 3500, "num_grasps": 10, "topk": 20})
     with pytest.raises(ValueError, match="must name the gripper"):
         GraspGenXConfig.from_assets({})
 
@@ -192,7 +259,9 @@ def test_from_bundle_validates_the_adapter_identity(tmp_path):
 
     adapter = GraspGenXAdapter.from_bundle(tmp_path)
 
-    assert adapter.config == GraspGenXConfig(gripper_name="omnihand_left_x2", num_grasps=300, topk=120)
+    assert adapter.config == GraspGenXConfig(
+        gripper_name="omnihand_left_x2", object_points=3500, num_grasps=300, topk=120
+    )
     path.write_text(json.dumps(_identity(model_type="graspgen")), encoding="utf-8")
     with pytest.raises(ValueError, match="identity mismatch"):
         GraspGenXAdapter.from_bundle(tmp_path)
@@ -218,7 +287,8 @@ def test_a_compiled_diffusion_loop_pins_the_draw_to_the_graph():
     """A request may not push the draw off the compiled row count.
 
     The offline loop is built for one count and the generator declines any
-    other -- silently, by running the eager loop at ~320 ms against ~196 ms.
+    other -- silently, by running the eager loop, which cost ~320 ms against the
+    graph's ~196 ms when both were measured (before the 2026-10-26 recompile).
     Pinning gives nothing up: the eager loop's cost barely depends on the
     count, so the larger draw would be slower rather than richer. max_grasps
     still bounds what is returned, which is all it means on a deployment
@@ -227,7 +297,7 @@ def test_a_compiled_diffusion_loop_pins_the_draw_to_the_graph():
     points = np.zeros((32, 3), dtype=np.float32)
     # What the 310P README has an npu bundle declare, to match its graph.
     adapter = GraspGenXAdapter(
-        GraspGenXConfig(gripper_name="omnihand_left_x2", num_grasps=400, topk=400),
+        GraspGenXConfig(gripper_name="omnihand_left_x2", object_points=3500, num_grasps=400, topk=400),
         compiled_sample_count=400,
     )
 
