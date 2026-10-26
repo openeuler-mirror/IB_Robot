@@ -659,6 +659,25 @@ On the scheduled path, `~/start_evaluate`, `~/stop_evaluate`, and `~/restart_ses
 This means the requested operation was **not executed**, including Stop: a busy response
 is not a successful stop. Callers must check the response and decide whether to retry based on the state.
 
+**Startup semantics on the provider path**: when the robot config declares a `runtime.provider`
+(for example `so101_robot` on SO-101), the dispatcher initializes stopped and only begins
+inference output after an explicit `~/start_evaluate` completes runtime admission (acquiring
+the `policy_stream` mode); the legacy path without a provider auto-runs from startup. A
+stationary arm right after launch with `~/get_status` reporting `stopped` is therefore not a
+configuration error — call `~/start_evaluate`:
+
+```bash
+ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger "{}"
+```
+
+When an admission fails after its mode switch was requested, the dispatcher waits for that switch's answer,
+re-checks that the runtime still holds the policy mode, and only then requests idle; it does not request idle
+when the status it reads shows a stop latch (idle would clear it). The read and the idle request are not
+atomic: a `/runtime/stop` landing in between can still have its latch cleared by that idle request, which needs
+a conditional switch in the runtime contract to rule out (see #198). `~/stop_evaluate` reports `success=true`
+only once the runtime is confirmed to have left the policy mode, and `runtime idle transition failed`
+otherwise.
+
 ### Communication with ros2_control
 
 | Direction | Topic | Message Type | Description |

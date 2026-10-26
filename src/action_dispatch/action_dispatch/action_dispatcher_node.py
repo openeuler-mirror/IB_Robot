@@ -1514,11 +1514,14 @@ class ActionDispatcherNode(Node):
     def _start_nav_locked(self, request, response):
         """Start or resume dispatcher evaluation (idempotent clean restart).
 
-        In model_inference mode the dispatcher auto-runs, so a control panel
-        cannot rely on a strict not-running precondition. Treat start as
-        "ensure a fresh inference cycle is running": invalidate any in-flight
-        request and clear the flags that could otherwise wedge the control loop,
-        so inference reliably resumes whether or not it was already running.
+        When the robot config declares a runtime provider the dispatcher starts
+        stopped and only takes the runtime after an explicit ``~/start_evaluate``
+        completes admission, so a control panel cannot rely on a strict
+        not-running precondition. Without a provider (legacy path) the
+        dispatcher auto-runs from startup. Either way, treat start as "ensure a
+        fresh inference cycle is running": invalidate any in-flight request and
+        clear the flags that could otherwise wedge the control loop, so
+        inference reliably resumes whether or not it was already running.
 
         benchmark episode controller: benchmark mode rejects start_evaluate — it cannot bypass the
         episode gate. The caller must use PreparePolicyEpisode + RunPolicy.

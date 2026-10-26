@@ -275,6 +275,42 @@ def test_stale_future_and_invalid_stamp_rejected(admission, stamp_sec, stamp_nan
     assert runtime.requests == []
 
 
+def test_future_stamp_within_skew_tolerance_admits(admission):
+    # Sim time: the facade's /clock-driven stamp can lead this node's clock by
+    # a few ms; a bounded negative age is skew, not staleness.
+    guard, runtime, _ = admission
+    runtime.status = status()
+    runtime.status.stamp = SimpleNamespace(sec=10, nanosec=20_000_000)  # age -20 ms
+    result = Mock()
+    guard.acquire(result)
+    assert result.call_args.args[0]
+    assert guard.owned
+    assert runtime.requests == ["policy_stream"]
+
+
+def test_future_stamp_beyond_skew_tolerance_rejected(admission):
+    guard, runtime, _ = admission
+    runtime.status = status()
+    runtime.status.stamp = SimpleNamespace(sec=10, nanosec=200_000_000)  # age -200 ms
+    result = Mock()
+    guard.acquire(result)
+    assert not result.call_args.args[0]
+    assert not guard.owned
+    assert runtime.requests == []
+
+
+def test_owned_mode_survives_future_stamp_heartbeat(admission):
+    # A slightly-ahead heartbeat must not revoke a running owned session.
+    guard, runtime, _ = admission
+    guard.acquire(Mock())
+    assert guard.owned
+    heartbeat = status("policy_stream")
+    heartbeat.stamp = SimpleNamespace(sec=10, nanosec=20_000_000)  # age -20 ms
+    guard.observe(heartbeat)
+    assert guard.owned
+    guard.on_revoke.assert_not_called()
+
+
 def test_silence_revokes_even_when_ros_clock_is_frozen(admission):
     guard, runtime, node = admission
     guard.acquire(Mock())
@@ -315,8 +351,11 @@ def test_unresponsive_rpc_chain_is_bounded_and_late_success_is_ignored(admission
     pending.set_result(SimpleNamespace(status=status("policy_stream"), success=True, message="late success"))
     result.assert_called_once()
     assert not guard.owned
-    client = runtime.set_client if stage == "set_mode" else runtime.get_client
-    client.remove_pending_request.assert_called_once_with(pending)
+    if stage == "set_mode":
+        # The unanswered switch is kept so the idle rollback can wait for it.
+        runtime.set_client.remove_pending_request.assert_not_called()
+    else:
+        runtime.get_client.remove_pending_request.assert_called_once_with(pending)
 
 
 def test_completed_attempt_timer_cannot_revoke_new_owner(admission):
@@ -371,6 +410,264 @@ def test_response_after_deadline_cannot_win_delayed_timer(admission):
     assert not result.call_args.args[0]
     assert "timed out" in result.call_args.args[1]
     assert not guard.owned
+
+
+def test_failed_verification_after_mode_switch_returns_runtime_to_idle(admission):
+    # set_mode committed, then the verify status is invalid: the admission
+    # fails AND the runtime is returned to idle instead of being stranded in
+    # the admission mode; a retry can admit cleanly afterwards.
+    guard, runtime, _ = admission
+    original_get = runtime.get_client.call_async
+    state = {"calls": 0}
+
+    def get_with_faulted_verify(request):
+        state["calls"] += 1
+        if state["calls"] == 2:
+            future = Future()
+            future.set_result(SimpleNamespace(status=status("policy_stream", faults=["controller_failure"])))
+            return future
+        return original_get(request)
+
+    runtime.get_client.call_async = get_with_faulted_verify
+    result = Mock()
+    guard.acquire(result)
+    assert not result.call_args.args[0]
+    assert not guard.owned and not guard.pending
+    assert runtime.requests == ["policy_stream", "idle"]
+    assert runtime.status.active_mode == "idle"
+    second = Mock()
+    guard.acquire(second)
+    assert second.call_args.args[0] and guard.owned
+
+
+def test_pending_fail_on_observed_target_mode_rolls_back_to_idle(admission):
+    # The on-change status published after the facade committed the switch can
+    # invalidate the pending admission before the set_mode response is
+    # processed; the runtime must still be returned to idle, and a retry must
+    # be able to admit cleanly afterwards.
+    guard, runtime, _ = admission
+    runtime.defer = True
+    result = Mock()
+    guard.acquire(result)  # initial status ok; set_mode in flight
+    runtime.defer = False
+    runtime.status = status("policy_stream")  # facade committed the switch
+    invalid_target_mode = status("policy_stream")
+    invalid_target_mode.stamp = SimpleNamespace(sec=10, nanosec=900_000_000)  # age -0.9 s: beyond tolerance
+    guard.observe(invalid_target_mode)
+    assert not result.call_args.args[0]
+    assert not guard.owned and not guard.pending
+    assert runtime.requests == ["policy_stream"]  # the rollback waits for our own switch's answer
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="late"))
+    assert not guard.owned  # late set_mode response is ignored
+    assert runtime.requests == ["policy_stream", "idle"]
+    second = Mock()
+    guard.acquire(second)
+    assert second.call_args.args[0] and guard.owned
+    assert runtime.requests == ["policy_stream", "idle", "policy_stream"]
+
+
+def test_admission_failure_does_not_touch_other_producers_mode(admission):
+    guard, runtime, _ = admission
+    runtime.defer = True
+    result = Mock()
+    guard.acquire(result)  # set_mode in flight
+    runtime.defer = False
+    runtime.status = status("stream")  # another producer holds the stream mode
+    foreign = status("stream")
+    foreign.stamp = SimpleNamespace(sec=10, nanosec=900_000_000)  # invalid age
+    guard.observe(foreign)
+    runtime.deferred[0].set_result(SimpleNamespace(success=False, message="mode taken"))
+    assert not result.call_args.args[0]
+    assert runtime.requests == ["policy_stream"]  # no idle request against a foreign mode
+    # The rollback finished (it checked the foreign mode and did not touch it):
+    # a new acquire is no longer gated as "runtime transition in progress".
+    followup = Mock()
+    guard.acquire(followup)
+    assert not followup.call_args.args[0]
+    assert followup.call_args.args[1] == "runtime changed during admission"
+
+
+def test_acquire_while_idle_rollback_in_progress_fails_fast(admission):
+    guard, runtime, _ = admission
+    runtime.defer = True
+    guard.acquire(Mock())  # initial status ok; set_mode in flight
+    runtime.defer = False
+    runtime.status = status("policy_stream")  # facade committed the switch
+    invalid_target_mode = status("policy_stream")
+    invalid_target_mode.stamp = SimpleNamespace(sec=10, nanosec=900_000_000)  # invalid age
+    guard.observe(invalid_target_mode)  # admission fails; rollback waits for the unanswered switch
+    blocked = Mock()
+    guard.acquire(blocked)
+    assert not blocked.call_args.args[0]
+    assert blocked.call_args.args[1] == "runtime transition in progress"
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))  # rollback proceeds
+    assert runtime.requests == ["policy_stream", "idle"]
+    recovered = Mock()
+    guard.acquire(recovered)
+    assert recovered.call_args.args[0] and guard.owned
+    assert runtime.requests == ["policy_stream", "idle", "policy_stream"]
+
+
+def test_idle_rollback_times_out_and_clears_state(admission):
+    guard, runtime, _ = admission
+    stuck = Future()
+    runtime.defer = True
+    guard.acquire(Mock())  # set_mode in flight
+    runtime.defer = False
+    runtime.status = status("policy_stream")  # facade committed the switch
+    original_get = runtime.get_client.call_async
+    runtime.get_client.call_async = Mock(return_value=stuck)  # rollback get_status hangs
+    invalid_target_mode = status("policy_stream")
+    invalid_target_mode.stamp = SimpleNamespace(sec=10, nanosec=900_000_000)  # invalid age
+    guard.observe(invalid_target_mode)  # admission fails; rollback starts and hangs
+    blocked = Mock()
+    guard.acquire(blocked)
+    assert blocked.call_args.args[1] == "runtime transition in progress"
+    guard._rollback_timer.cancel()  # do not wait out the real 2 s bound
+    guard._rollback_expired(guard._rollback_token)  # deadline passes without a rollback response
+    runtime.get_client.call_async = original_get
+    # The gate is cleared: a new acquire is refused on the stranded mode, not
+    # on "runtime transition in progress".
+    followup = Mock()
+    guard.acquire(followup)
+    assert not followup.call_args.args[0]
+    assert followup.call_args.args[1] != "runtime transition in progress"
+    assert guard._logger.warning.called
+    # The expired attempt's late answers must not request idle on behalf of
+    # whatever owns the runtime now.
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="late"))
+    stuck.set_result(SimpleNamespace(status=status("policy_stream")))
+    assert runtime.requests == ["policy_stream"]
+
+
+def fail_after_switch_committed(guard, runtime, rollback_status):
+    """Fail a pending admission after its set_mode committed; the rollback reads ``rollback_status``."""
+    runtime.defer = True
+    guard.acquire(Mock())  # set_mode in flight
+    runtime.defer = False
+    runtime.status = status("policy_stream")  # facade committed the switch
+    runtime.get_client.call_async = Mock(return_value=rollback_status)
+    invalid_target_mode = status("policy_stream")
+    invalid_target_mode.stamp = SimpleNamespace(sec=10, nanosec=900_000_000)  # invalid age
+    guard.observe(invalid_target_mode)
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))
+
+
+def test_idle_rollback_never_requested_over_a_stop_latch(admission):
+    # A stop engaging while the rollback reads the status: idle would clear the
+    # latch (and re-energize a TORQUE_OFF stop), so it is never requested.
+    guard, runtime, _ = admission
+    stuck = Future()
+    fail_after_switch_committed(guard, runtime, stuck)
+    stuck.set_result(SimpleNamespace(status=status("policy_stream", latched=True)))
+    assert runtime.requests == ["policy_stream"]
+    assert not guard._rolling_back
+
+
+def test_release_waits_for_inflight_rollback_before_reporting_success(admission):
+    # stop_evaluate cancels first (starting the rollback), then releases: the
+    # release must not report success until the runtime is back in idle.
+    guard, runtime, _ = admission
+    runtime.defer = True
+    guard.acquire(Mock())
+    runtime.status = status("policy_stream")
+    guard.cancel()  # rollback starts and waits for the unanswered switch
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))
+    assert runtime.requests == ["policy_stream", "idle"]  # its idle request is deferred
+    released = []
+    worker = threading.Thread(target=lambda: released.append(guard.release(timeout=2.0)))
+    worker.start()
+    time.sleep(0.2)
+    assert worker.is_alive()  # still waiting for the idle confirmation
+    runtime.status = status("idle")
+    runtime.deferred[1].set_result(SimpleNamespace(success=True, message="idle"))
+    worker.join(timeout=2.0)
+    assert released == [True]
+
+
+def test_release_reports_failure_when_rollback_is_rejected(admission):
+    guard, runtime, _ = admission
+    runtime.defer = True
+    guard.acquire(Mock())
+    runtime.status = status("policy_stream")
+    guard.cancel()
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))
+    runtime.deferred[1].set_result(SimpleNamespace(success=False, message="controller switch failed"))
+    runtime.reject = True  # the runtime keeps refusing idle
+    runtime.defer = False
+    assert not guard.release(timeout=0.5)
+    assert runtime.requests == ["policy_stream", "idle", "idle"]  # release re-verified and retried once
+
+
+def test_rollback_waits_for_the_switch_instead_of_trusting_a_pre_switch_idle(admission):
+    # Canceled while our set_mode is still being processed: the runtime still
+    # reports idle, then commits the switch. Reading the mode before that
+    # answer would see idle and strand the committed policy mode.
+    guard, runtime, _ = admission
+    runtime.defer = True
+    guard.acquire(Mock())
+    runtime.defer = False
+    guard.cancel()  # runtime.status is still the pre-switch idle
+    assert runtime.requests == ["policy_stream"]
+    runtime.status = status("policy_stream")  # the switch commits after the cancel
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))
+    assert runtime.requests == ["policy_stream", "idle"]
+    assert runtime.status.active_mode == "idle"
+
+
+def own_policy_mode(guard):
+    result = Mock()
+    guard.acquire(result)
+    assert result.call_args.args[0] and guard.owned
+
+
+def test_owned_release_never_requests_idle_over_a_latch(admission):
+    guard, runtime, _ = admission
+    own_policy_mode(guard)
+    runtime.status = status("policy_stream", latched=True)  # a stop is engaging
+    assert not guard.release(timeout=0.5)
+    assert runtime.requests == ["policy_stream"]
+
+
+def test_owned_release_still_returns_a_faulted_policy_mode_to_idle(admission):
+    guard, runtime, _ = admission
+    own_policy_mode(guard)
+    runtime.status = status("policy_stream", lifecycle="DEGRADED", faults=["controller_failure"])
+    assert guard.release(timeout=0.5)
+    assert runtime.requests == ["policy_stream", "idle"]
+
+
+def test_release_after_an_unconfirmed_release_reverifies_the_runtime(admission):
+    guard, runtime, _ = admission
+    own_policy_mode(guard)
+    runtime.defer = True  # the idle request goes unanswered
+    assert not guard.release(timeout=0.1)
+    runtime.defer = False
+    assert guard.release(timeout=0.5)  # not trusted as idle: checked and returned
+    assert runtime.requests == ["policy_stream", "idle", "idle"]
+    assert runtime.status.active_mode == "idle"
+
+
+def test_release_during_switch_in_flight_rolls_back_once(admission):
+    # Releasing while a pending admission's set_mode is already in flight must
+    # return the mode exactly once (rollback), not zero and not twice.
+    guard, runtime, _ = admission
+    runtime.defer = True
+    guard.acquire(Mock())
+    runtime.defer = False
+    runtime.status = status("policy_stream")
+    released = []
+    worker = threading.Thread(target=lambda: released.append(guard.release(timeout=2.0)))
+    worker.start()
+    time.sleep(0.1)
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))
+    worker.join(timeout=2.0)
+    assert released == [True]
+    assert runtime.requests == ["policy_stream", "idle"]
+    after = Mock()
+    guard.acquire(after)  # runtime is idle again; admission succeeds
+    assert after.call_args.args[0] and guard.owned
+    assert runtime.requests == ["policy_stream", "idle", "policy_stream"]
 
 
 @pytest.mark.parametrize("scheduled", [False, True])

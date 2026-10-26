@@ -598,6 +598,22 @@ scheduled 路径的 `~/start_evaluate`、`~/stop_evaluate` 和 `~/restart_sessio
 返回 `success=false`、`message="lifecycle operation in progress"`，表示本次请求的操作**未执行**。
 这同样适用于 Stop：busy 响应不代表停止成功。调用方必须检查响应，并根据状态决定是否重试。
 
+**provider 路径的启动语义**：当 robot_config 声明了 `runtime.provider`（例如 SO-101 的
+`so101_robot`）时，dispatcher 初始化为 stopped，必须显式调用 `~/start_evaluate` 完成 runtime
+admission（取得 `policy_stream` 模式）后才会开始推理输出；没有 provider 的 legacy 路径则启动即
+自动运行。因此仿真或真机启动后机械臂不动、`~/get_status` 返回 `stopped`，不是配置错误，调用
+`~/start_evaluate` 即可：
+
+```bash
+ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger "{}"
+```
+
+admission 失败时，若 mode 切换已经发出，dispatcher 先等待该切换请求的结果，再确认 runtime 仍处于 policy
+模式后请求回到 idle；读到的状态显示 stop 锁定时不请求 idle（idle 会清除锁定）。读取状态与请求 idle 之间不是原子的：
+这期间并发的 `/runtime/stop` 仍可能被 idle 请求清除锁定，需要 runtime 契约提供条件切换才能消除（见 #198）。
+`~/stop_evaluate` 只有确认 runtime 已离开 policy 模式才返回 `success=true`，否则返回
+`runtime idle transition failed`。
+
 ### 与 ros2_control 通信
 
 | 方向 | 话题 | 消息类型 | 说明 |
