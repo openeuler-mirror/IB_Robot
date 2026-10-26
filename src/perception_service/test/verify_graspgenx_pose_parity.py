@@ -14,7 +14,8 @@ poses, orthonormal rotations and a confidence range, and the package README
 reports rotation orthonormality, rotation cosine and confidence ranking. None of
 them looks at the pose **translation**, which is what decides whether the
 gripper reaches the object. Attention, the FFN and the CPE run in FP16 on the
-Ascend path -- rotation degrades to ~2e-3 there against CUDA's ~5e-7 -- and a
+Ascend path, though rotation measures 4.4e-07 there against CUDA's 3.8e-07, so that is
+not the concern an earlier ~2e-3 figure made it look like -- and a
 systematic translation error (un-centring, denormalisation, a scale slip) would
 leave every one of those figures untouched.
 
@@ -37,6 +38,7 @@ verify_graspgenx_loop_parity.py to replay identical diffusion inputs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import random
 import sys
@@ -68,6 +70,30 @@ def object_cloud(points: int, seed: int) -> np.ndarray:
     """A compact blob in front of the camera, the shape a segmented object has."""
     rng = np.random.default_rng(seed)
     return (rng.standard_normal((points, 3)).astype(np.float32) * 0.03) + np.float32([0.45, 0.02, 0.18])
+
+
+def load_cloud(path: Path) -> np.ndarray:
+    """An [N, 3] cloud from a .npz, so a real segmented frame can be served.
+
+    The synthetic blob says nothing about a frame the robot actually sees: a
+    served cloud is larger and its points lie on one visible surface. Read with
+    allow_pickle=False -- these files come from a device run, not from here.
+    """
+    data = np.load(path, allow_pickle=False)
+    for key in ("points", "cloud", "object_points"):
+        if key in data:
+            cloud = np.asarray(data[key], dtype=np.float32)
+            break
+    else:
+        raise SystemExit(f"{path} has none of points/cloud/object_points (found {sorted(data.keys())})")
+    if cloud.ndim != 2 or cloud.shape[1] != 3:
+        raise SystemExit(f"{path} holds {cloud.shape}, not [N, 3]")
+    return cloud
+
+
+def cloud_digest(cloud: np.ndarray) -> str:
+    """Identify the served cloud, so a comparison cannot mix two of them."""
+    return hashlib.sha256(np.ascontiguousarray(cloud, dtype=np.float32).tobytes()).hexdigest()
 
 
 def serve(bundle: Path, deployment: str, cloud: np.ndarray, seed: int = 20261018) -> dict[str, np.ndarray]:
@@ -137,6 +163,16 @@ def compare(left_path: Path, right_path: Path, translation_mm: float = 5.0, rota
     rows = min(len(left["confidence"]), len(right["confidence"]))
     if rows == 0:
         raise SystemExit("one of the runs returned no grasps")
+    # Coverage between runs on different clouds would look like a device
+    # difference, so the clouds have to be the same one.
+    digests = [str(run["cloud_sha256"]) if "cloud_sha256" in run else None for run in (left, right)]
+    if all(digests) and digests[0] != digests[1]:
+        raise SystemExit(
+            "these runs served different clouds and cannot be compared:\n"
+            f"  {left_path.name}: {digests[0]}\n  {right_path.name}: {digests[1]}"
+        )
+    if not all(digests):
+        print("warning: a run predates cloud digests; confirm both served the same cloud\n")
     print(f"{left_path.name}: {len(left['confidence'])} grasps   {right_path.name}: {len(right['confidence'])}\n")
 
     print(f"Independent samples; geometric coverage within {translation_mm:g} mm and {rotation_deg:g} deg.")
@@ -159,6 +195,13 @@ def main() -> int:
     parser.add_argument("--bundle", type=Path, default=WORKSPACE / "models/graspgenx_omnihand_left_x2")
     parser.add_argument("--deployment", default=os.environ.get("DEPLOYMENT", "torch_npu"))
     parser.add_argument("--points", type=int, default=2048)
+    parser.add_argument(
+        "--cloud",
+        type=Path,
+        help="Serve an [N, 3] cloud from this .npz instead of the synthetic blob "
+        "(key points/cloud/object_points). Both devices must be given the same file: "
+        "its digest is recorded and --compare refuses runs that disagree.",
+    )
     parser.add_argument("--seed", type=int, default=20261018)
     parser.add_argument("--translation-mm", type=float, default=5.0, help="Geometric match tolerance (default: 5 mm).")
     parser.add_argument("--rotation-deg", type=float, default=10.0, help="Geometric match tolerance (default: 10 deg).")
@@ -169,16 +212,20 @@ def main() -> int:
     if arguments.output is None:
         parser.error("give an output path, or --compare two of them")
 
-    cloud = object_cloud(arguments.points, arguments.seed)
+    cloud = load_cloud(arguments.cloud) if arguments.cloud else object_cloud(arguments.points, arguments.seed)
+    digest = cloud_digest(cloud)
     print(f"bundle     {arguments.bundle}")
     print(f"deployment {arguments.deployment}")
-    print(f"cloud      {cloud.shape} seed {arguments.seed}", flush=True)
+    source = str(arguments.cloud) if arguments.cloud else f"synthetic seed {arguments.seed}"
+    print(f"cloud      {cloud.shape} from {source}")
+    print(f"cloud sha  {digest}", flush=True)
     produced = serve(arguments.bundle, arguments.deployment, cloud, arguments.seed)
     np.savez(
         arguments.output,
         deployment=arguments.deployment,
         seed=arguments.seed,
-        points=arguments.points,
+        points=len(cloud),
+        cloud_sha256=digest,
         **produced,
     )
     translations = produced["pose"][:, :3, 3]
