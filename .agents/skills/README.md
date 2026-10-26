@@ -34,6 +34,7 @@
 | [deepwiki-translator](./deepwiki-translator) | 文档 | 将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（翻译、构建目录与索引、校验链接与锚点）。 |
 | [doc-link-validator](./doc-link-validator) | 文档 | 校验 Markdown/RST 文档树中的本地、外部与 AtomGit 链接有效性；断链检查、交付前链接体检。 |
 | [mermaid-syntax-validation](./mermaid-syntax-validation) | 文档 | 检查、修复并浏览器验证 Markdown/Sphinx Mermaid 图语法，确保发布 HTML 不再渲染 Mermaid 错误 SVG。 |
+| [simplified-technical-chinese](./simplified-technical-chinese) | 文档 | 简明技术中文（STC）受控写作：借鉴 ASD-STE100 方法，为中文技术文档提供编号规则、受控词表与零依赖检查脚本。 |
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
 | [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、选择 WIP/正式检视阶段、更新标题/描述；工具版本由 coding agent 先行执行版本命令后传入。 |
 | [atomgit-issue](./atomgit-issue) | AtomGit | 管理 Issue 生命周期：创建、读取详情、更新内容、关闭/重开。 |
@@ -79,6 +80,7 @@
 - **中文翻译 ([deepwiki-translator](./deepwiki-translator))**: 配置优先流程：本地化配置标题后逐页翻译，再构建目录与索引并校验链接锚点，全程保持 H1、文件名与处理器规则一致。
 - **链接校验 ([doc-link-validator](./doc-link-validator))**: 对 Markdown/RST 文档树做只读链接体检——本地相对链接存在性、外部 URL 可达性、AtomGit 源链接（blob/PR/commit/issue）API 级验证；AtomGit 访问由脚本内自含的最小只读 CLI 调用完成（argv/超时/`GC_HOST`/身份探测），技能目录可独立携带到其他 docs 仓库。
 - **Mermaid 语法验证 ([mermaid-syntax-validation](./mermaid-syntax-validation))**: 对 Markdown/Sphinx 文档中的 Mermaid 图执行语法风险扫描、最小修复、Sphinx 构建和浏览器端渲染验证。
+- **简明技术中文 ([simplified-technical-chinese](./simplified-technical-chinese))**: 受控中文技术写作规范（vendored 自上游 mzopedia/simplified-technical-chinese v0.2，CC BY 4.0 文本 + MIT 脚本，见其 PROVENANCE.md）：40 条编号规则 + 受控词表 + 零依赖 `tools/check.py`；写操作步骤、部署排障等中文文档时执行，仅对本次修改的文件运行检查。
 
 ### 🌐 AtomGit 自动化工具
 日常 PR / Issue 与评审操作由 Agent 直接调用官方 `gitcode` CLI，参数按需查询 `--help`。

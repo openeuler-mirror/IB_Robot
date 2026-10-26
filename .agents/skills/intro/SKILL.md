@@ -65,6 +65,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **deepwiki-translator** | 将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（翻译、构建目录与索引、校验链接与锚点） |
 | **doc-link-validator** | 校验文档中本地、外部与 AtomGit 链接有效性；断链检查、交付前链接体检 |
 | **mermaid-syntax-validation** | 检查、修复并验证 Markdown/Sphinx 文档中的 Mermaid 图语法 |
+| **simplified-technical-chinese** | 简明技术中文（STC）受控写作：编号规则 + 受控词表 + check.py 自动检查，写/改中文技术文档时执行 |
 
 ### 🔍 代码协作
 
@@ -131,6 +132,8 @@ Docker 验证一下 setup 和 build   → ibrobot-docker-verify
 翻译 DeepWiki 文档               → deepwiki-translator
 检查文档断链/死链               → doc-link-validator
 检查 Mermaid 图语法              → mermaid-syntax-validation
+按简明技术中文写/改这份文档     → simplified-technical-chinese
+检查中文文档的句法和用词        → simplified-technical-chinese
 检查架构合规性                  → atomgit-pr-architecture-review
 解释系统架构                    → ibrobot-architecture
 有哪些功能 / help / 入门       → intro (本技能)

@@ -276,6 +276,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [deepwiki-translator](.agents/skills/deepwiki-translator) | 将 DeepWiki 英文 Markdown 端到端转换为可交付的中文文档（翻译、构建目录与索引、校验链接与锚点） |
 | [doc-link-validator](.agents/skills/doc-link-validator) | 文档链接校验（本地/外部/AtomGit）、断链检查、交付前链接体检 |
 | [mermaid-syntax-validation](.agents/skills/mermaid-syntax-validation) | Mermaid 图语法检查、修复与渲染验证 |
+| [simplified-technical-chinese](.agents/skills/simplified-technical-chinese) | 简明技术中文（STC）受控写作：写/改中文技术文档、操作步骤、部署排障说明时按编号规则与受控词表执行，`tools/check.py` 自动检查（仅对本次修改的文件） |
 
 ### AtomGit 协作
 
