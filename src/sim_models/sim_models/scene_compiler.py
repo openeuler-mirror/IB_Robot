@@ -26,6 +26,15 @@ Public API
       overrides) and on Gazebo (``SetEntityPose`` with the same index).
       ``mode: grid`` (default) is bit-identical to the historical keyframe
       grid; ``mode: uniform`` samples deterministically from ``seed``.
+      Every input is validated (finite ordered ranges, positive-integer
+      divisions, integer seed/count with count >= 1) — ValueError names the
+      offending key and fires in the consumer's constructor.
+
+  arm_rest_pairs(layout) -> list[(joint_name, rest_qpos)]
+      The validated arm rest pairs (``arm_joint_names`` /
+      ``arm_rest_qpos``): both fields arrays, unique non-empty names,
+      equal-length arrays, finite values. Shared by the scene task's rest
+      trajectories and the MuJoCo backend's ``ResetWorld`` joint override.
 
   scene_dynamic_objects(scene_name) -> list[str]
       Names of the scene's dynamic objects (``type: dynamic`` in layout.yaml).
@@ -39,7 +48,9 @@ Public API
   composed_model_path(scene) -> Path
       The single composed-model location (D3), keyed by ``ROS_DOMAIN_ID`` so
       concurrent launches on different domains never overwrite each other's
-      model. Used by the provider (writer) and the scene task (reader).
+      model. Used by the provider (writer); the scene task no longer reads
+      the composed model since placements moved to ``ResetWorld`` state
+      overrides (issue #195).
 
   compose_mujoco_model(robot_mjcf_path, scene, sdf_mesh_names) -> Path
       Robot-agnostic composition (D3): substitute the robot MJCF into the
@@ -75,6 +86,36 @@ _PLATFORM_EXT = {
 }
 
 
+def _finite_number(value, label: str) -> float:
+    """A finite YAML number (bools are ints in Python but not valid here)."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError(f"{label} must be a number, got {value!r}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} must be finite, got {value!r}")
+    return number
+
+
+def _positive_int(value, label: str) -> int:
+    """A strictly positive integer (rejects floats, bools and zero)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"{label} must be >= 1, got {value}")
+    return value
+
+
+def _validated_range(value, label: str) -> tuple[float, float]:
+    """A finite [min, max] pair with min <= max."""
+    if not isinstance(value, list | tuple) or len(value) != 2:
+        raise ValueError(f"{label} must be a [min, max] pair, got {value!r}")
+    low = _finite_number(value[0], f"{label}[0]")
+    high = _finite_number(value[1], f"{label}[1]")
+    if low > high:
+        raise ValueError(f"{label} must satisfy min <= max, got {value!r}")
+    return low, high
+
+
 def randomization_placements(layout: dict) -> list[tuple[float, float, float, float]]:
     """The single randomisation generator shared by both physics platforms (D9, issue #195).
 
@@ -92,19 +133,26 @@ def randomization_placements(layout: dict) -> list[tuple[float, float, float, fl
       across the x/y/yaw ranges (``z`` stays ``z_spawn``); the same seed and
       count give the same sequence on every platform, so index *k* is still
       platform-independent.
+
+    Every input is validated here so a bad layout fails in the consumer's
+    constructor — before any motion is commanded —
+    with a message naming the offending key: ranges must be finite ordered
+    pairs, ``z_spawn`` finite, grid divisions positive integers, uniform
+    ``seed``/``count`` integers (bools and floats rejected) with
+    ``count >= 1``.
     """
-    rand = layout.get("randomization", {})
-    banana_cfg = rand.get("banana", {})
+    rand = layout.get("randomization", {}) or {}
+    banana_cfg = rand.get("banana", {}) or {}
     if not banana_cfg:
         return []
-    x_min, x_max = banana_cfg.get("x_range", [-0.03, 0.10])
-    y_min, y_max = banana_cfg.get("y_range", [-0.02, 0.10])
-    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
+    x_min, x_max = _validated_range(banana_cfg.get("x_range", [-0.03, 0.10]), "randomization.banana.x_range")
+    y_min, y_max = _validated_range(banana_cfg.get("y_range", [-0.02, 0.10]), "randomization.banana.y_range")
+    z_spawn = _finite_number(banana_cfg.get("z_spawn", 0.05), "randomization.banana.z_spawn")
     mode = str(banana_cfg.get("mode", "grid")).lower()
     if mode == "grid":
-        grid_cols = int(banana_cfg.get("grid_cols", 5))
-        grid_rows = int(banana_cfg.get("grid_rows", 7))
-        yaw_steps = int(banana_cfg.get("yaw_steps", 6))
+        grid_cols = _positive_int(banana_cfg.get("grid_cols", 5), "randomization.banana.grid_cols")
+        grid_rows = _positive_int(banana_cfg.get("grid_rows", 7), "randomization.banana.grid_rows")
+        yaw_steps = _positive_int(banana_cfg.get("yaw_steps", 6), "randomization.banana.yaw_steps")
         xs = np.linspace(x_min, x_max, grid_cols)
         ys = np.linspace(y_min, y_max, grid_rows)
         yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
@@ -112,20 +160,55 @@ def randomization_placements(layout: dict) -> list[tuple[float, float, float, fl
     if mode == "uniform":
         if "seed" not in banana_cfg or "count" not in banana_cfg:
             raise ValueError("randomization.banana uniform mode requires 'seed' and 'count'")
-        count = int(banana_cfg["count"])
-        if count < 0:
-            raise ValueError(f"randomization.banana count must be >= 0, got {count}")
-        rng = random.Random(int(banana_cfg["seed"]))
+        seed = banana_cfg["seed"]
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError(f"randomization.banana.seed must be an integer, got {seed!r}")
+        count = _positive_int(banana_cfg["count"], "randomization.banana.count")
+        rng = random.Random(seed)
         return [
             (
-                rng.uniform(float(x_min), float(x_max)),
-                rng.uniform(float(y_min), float(y_max)),
+                rng.uniform(x_min, x_max),
+                rng.uniform(y_min, y_max),
                 z_spawn,
                 rng.uniform(0.0, 2.0 * math.pi),
             )
             for _ in range(count)
         ]
     raise ValueError(f"randomization.banana mode must be 'grid' or 'uniform', got {mode!r}")
+
+
+def arm_rest_pairs(layout: dict) -> list[tuple[str, float]]:
+    """The validated (arm joint name, rest qpos) pairs from the layout.
+
+    The randomisation section's ``arm_joint_names`` / ``arm_rest_qpos`` feed
+    both the scene task's rest trajectories and the MuJoCo backend's
+    ``ResetWorld`` joint override, so the two arrays are parsed and validated
+    once here: both fields must be arrays (a string would otherwise be
+    iterated character by character), names must be unique non-empty
+    strings, the arrays equally long, every rest value a finite number.
+    ``ValueError`` surfaces in the consumer's constructor — before any
+    motion is commanded.
+    """
+    rand = (layout or {}).get("randomization", {}) or {}
+    names = rand.get("arm_joint_names")
+    qpos = rand.get("arm_rest_qpos")
+    names = [] if names is None else names
+    qpos = [] if qpos is None else qpos
+    for field, value in (("randomization.arm_joint_names", names), ("randomization.arm_rest_qpos", qpos)):
+        if not isinstance(value, list | tuple):
+            raise ValueError(f"{field} must be a list, got {value!r}")
+    if len(names) != len(qpos):
+        raise ValueError(
+            f"randomization.arm_joint_names ({len(names)}) and arm_rest_qpos ({len(qpos)}) must have the same length"
+        )
+    pairs = []
+    for name, value in zip(names, qpos, strict=True):
+        if not isinstance(name, str) or not name:
+            raise ValueError(f"randomization.arm_joint_names entries must be non-empty strings, got {name!r}")
+        pairs.append((name, _finite_number(value, "randomization.arm_rest_qpos entries")))
+    if len({name for name, _ in pairs}) != len(pairs):
+        raise ValueError("randomization.arm_joint_names must be unique")
+    return pairs
 
 
 def _quat_from_extrinsic_xyz(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:

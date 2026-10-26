@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 
 from sim_models.scene_compiler import (
+    arm_rest_pairs,
     compose_mujoco_model,
     composed_model_path,
     free_joint_states_topic,
@@ -174,6 +175,107 @@ def test_uniform_mode_rejects_missing_seed_or_count():
         randomization_placements({"randomization": {"banana": {"mode": "uniform", "count": 5}}})
     with pytest.raises(ValueError, match="seed"):
         randomization_placements({"randomization": {"banana": {"mode": "uniform"}}})
+
+
+# ---------------------------------------------------------------------------
+# input validation fires in the shared parser
+# ---------------------------------------------------------------------------
+
+
+def _uniform_banana(**overrides):
+    config = {
+        "mode": "uniform",
+        "seed": 42,
+        "count": 10,
+        "x_range": [-0.03, 0.10],
+        "y_range": [-0.02, 0.10],
+        "z_spawn": 0.05,
+    }
+    config.update(overrides)
+    return {"randomization": {"banana": config}}
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("count", 0), ("count", -3), ("count", 2.9), ("count", True), ("seed", 42.9), ("seed", True)],
+)
+def test_uniform_mode_rejects_non_positive_or_non_integer_seed_and_count(field, value):
+    # count=0 used to be accepted and crashed later with ZeroDivisionError in
+    # randomize(); floats and bools were silently truncated.
+    with pytest.raises(ValueError, match=f"randomization.banana.{field}"):
+        randomization_placements(_uniform_banana(**{field: value}))
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("x_range", [0.10, -0.03]),  # min > max
+        ("x_range", [float("nan"), 0.10]),
+        ("x_range", [-0.03, float("inf")]),
+        ("x_range", [-0.03]),  # wrong length
+        ("x_range", "wide"),  # not a pair at all
+        ("y_range", [0.10, -0.02]),
+        ("z_spawn", float("nan")),
+        ("z_spawn", float("inf")),
+        ("z_spawn", "high"),
+    ],
+)
+def test_ranges_and_spawn_must_be_finite_ordered_numbers(field, value):
+    # NaN ranges used to silently generate NaN coordinates.
+    with pytest.raises(ValueError, match=f"randomization.banana.{field}"):
+        randomization_placements(_uniform_banana(**{field: value}))
+
+
+@pytest.mark.parametrize("field", ["grid_cols", "grid_rows", "yaw_steps"])
+@pytest.mark.parametrize("value", [0, -1, 2.5, True])
+def test_grid_divisions_must_be_positive_integers(field, value):
+    layout = {"randomization": {"banana": {"x_range": [0, 0.1], "y_range": [0, 0.1], field: value}}}
+    with pytest.raises(ValueError, match=f"randomization.banana.{field}"):
+        randomization_placements(layout)
+
+
+def test_grid_division_validation_also_applies_to_the_default_mode():
+    # grid is the default mode, so the validation must fire without `mode:`.
+    layout = {"randomization": {"banana": {"x_range": [0, 0.1], "y_range": [0, 0.1], "grid_cols": 0}}}
+    with pytest.raises(ValueError, match="grid_cols"):
+        randomization_placements(layout)
+
+
+# ---------------------------------------------------------------------------
+# arm_rest_pairs
+# ---------------------------------------------------------------------------
+
+
+def test_arm_rest_pairs_returns_the_validated_pairs():
+    layout = {
+        "randomization": {
+            "arm_joint_names": ["1", "2", "3"],
+            "arm_rest_qpos": [0.0, -1.58, 2],
+        }
+    }
+    assert arm_rest_pairs(layout) == [("1", 0.0), ("2", -1.58), ("3", 2.0)]
+    assert arm_rest_pairs({}) == []
+    assert arm_rest_pairs({"randomization": {}}) == []
+
+
+@pytest.mark.parametrize(
+    "names,qpos,match",
+    [
+        ("12", [0.0, 1.0], "arm_joint_names must be a list"),  # a string would iterate per character
+        (["1", "2"], 0.0, "arm_rest_qpos must be a list"),
+        (["1", "2"], "01", "arm_rest_qpos must be a list"),
+        (["1", "2"], [0.0, -1.0, 1.5], "same length"),
+        (["1", "1"], [0.0, -1.0], "unique"),
+        (["1", ""], [0.0, -1.0], "non-empty strings"),
+        (["1", 2], [0.0, -1.0], "non-empty strings"),
+        (["1", "2"], [0.0, float("nan")], "arm_rest_qpos entries"),
+        (["1", "2"], [0.0, True], "arm_rest_qpos entries"),
+        (["1", "2"], [0.0, "down"], "arm_rest_qpos entries"),
+    ],
+)
+def test_arm_rest_pairs_rejects_invalid_layouts(names, qpos, match):
+    with pytest.raises(ValueError, match=match):
+        arm_rest_pairs({"randomization": {"arm_joint_names": names, "arm_rest_qpos": qpos}})
 
 
 def test_unknown_mode_is_rejected():

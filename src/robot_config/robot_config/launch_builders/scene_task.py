@@ -14,8 +14,8 @@ endpoints and joint names are read from the bound interface description
 (``joint.trajectory_arm`` / ``joint.trajectory_gripper``), never guessed from
 controller names. On Gazebo the builder also starts the single
 ``ros_gz_bridge`` the backend needs (set_pose service bridge plus the dynamic
-pose stream remapped to ``/sim/<scene>/object_poses`` — the spike T0 choice,
-with the ``gz service`` subprocess fallback living in the backend, not here).
+pose stream remapped to ``/sim/<scene>/object_poses`` — the spike T0 choice;
+the bridge is the only transport, there is no CLI fallback).
 On MuJoCo the builder adds no transport: the runtime provider configures the
 FreeJointStatePublisherPlugin for the scene's dynamic bodies and the backend
 places through ``ResetWorld`` state overrides (issue #195).

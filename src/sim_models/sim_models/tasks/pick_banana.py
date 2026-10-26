@@ -54,7 +54,7 @@ from rclpy.node import Node
 from std_srvs.srv import Empty, Trigger
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from sim_models.scene_compiler import get_scene_layout, randomization_placements
+from sim_models.scene_compiler import arm_rest_pairs, get_scene_layout, randomization_placements
 from sim_models.tasks.backends import GazeboBackend, MujocoBackend, PickBananaBackend
 from sim_models.tasks.base import EvalResult, SceneTask
 
@@ -78,7 +78,6 @@ class PickBananaTask(SceneTask):
         self._cbg = ReentrantCallbackGroup()
 
         layout = get_scene_layout("pick_banana")
-        rand = layout.get("randomization", {})
         self._placements = randomization_placements(layout)
         self._n_placements = len(self._placements)
         self._placement_idx = -1
@@ -92,30 +91,56 @@ class PickBananaTask(SceneTask):
         self._flew_out_radius_m = float(evaluation.get("flew_out_radius_m", _DEFAULT_FLEW_OUT_RADIUS_M))
         self._fell_off_z = float(evaluation.get("fell_off_z", _DEFAULT_FELL_OFF_Z))
 
-        # Rest pose keyed by joint name (D9 arm reset target).
-        rest_joints = [str(j) for j in rand.get("arm_joint_names", [])]
-        rest_values = [float(v) for v in rand.get("arm_rest_qpos", [])]
-        self._rest_positions = dict(zip(rest_joints, rest_values, strict=False))
+        # Rest pose keyed by joint name (D9 arm reset target). The layout's
+        # arm arrays are parsed through the shared validator so a bad layout
+        # fails here, before any motion is commanded.
+        self._rest_positions = {name: value for name, value in arm_rest_pairs(layout)}
 
         # Launch parameters (the scene_task builder passes these from the
         # bound effective config). Array parameters are declared with an
         # explicit type: an inferred empty default becomes BYTE_ARRAY and
-        # rejects the builder's string arrays.
+        # rejects the builder's typed arrays.
         def param(name, default):
             return node.declare_parameter(name, default).value
+
+        def declare_array_param(name, parameter_type):
+            """Declare an array parameter with an explicit empty default.
+
+            A type-only declaration leaves the parameter *uninitialized* on
+            rclpy Humble — every later ``get_parameter`` raises
+            ``ParameterUninitializedException`` — while an inferred empty
+            default becomes BYTE_ARRAY and rejects the builder's typed
+            arrays. Declaring the type (which applies any launch override)
+            and then setting an empty typed value only when no override
+            arrived gives both: a readable ``[]`` default and correctly
+            typed runtime sets. A rejected initialization aborts the
+            constructor naming the parameter.
+            """
+            from rclpy.exceptions import ParameterUninitializedException
+            from rclpy.parameter import Parameter
+
+            node.declare_parameter(name, parameter_type)
+            try:
+                value = node.get_parameter(name).value
+            except ParameterUninitializedException:
+                results = node.set_parameters([Parameter(name, type_=parameter_type, value=[])])
+                failed = next((result for result in results if not result.successful), None)
+                if failed is not None:
+                    raise RuntimeError(
+                        f"failed to initialize parameter '{name}' with an empty default: {failed.reason}"
+                    ) from None
+                return []
+            return list(value or [])
 
         def string_array_param(name):
             from rclpy.parameter import Parameter
 
-            # A typed declaration without an override leaves .value None.
-            value = node.declare_parameter(name, Parameter.Type.STRING_ARRAY).value
-            return [str(j) for j in (value or [])]
+            return [str(j) for j in declare_array_param(name, Parameter.Type.STRING_ARRAY)]
 
         def int_array_param(name):
             from rclpy.parameter import Parameter
 
-            value = node.declare_parameter(name, Parameter.Type.INTEGER_ARRAY).value
-            return [int(i) for i in (value or [])]
+            return [int(i) for i in declare_array_param(name, Parameter.Type.INTEGER_ARRAY)]
 
         sim_platform = str(param("sim_platform", ""))
         self._trajectory_mode = str(param("trajectory_mode", "trajectory"))
@@ -127,7 +152,9 @@ class PickBananaTask(SceneTask):
         self._arm_joints = string_array_param("arm_joint_names")
         gripper_endpoint = str(param("gripper_trajectory_endpoint", ""))
         self._gripper_joints = string_array_param("gripper_joint_names")
-        self._autotest_indices = int_array_param("autotest_indices")
+        # Declared at startup (not just read live in _selected_indices) so the
+        # parameter is always initialized for every later get_parameter.
+        int_array_param("autotest_indices")
 
         # Platform backend (lazy platform imports inside the backends).
         self._backend: PickBananaBackend | None = None
@@ -273,33 +300,45 @@ class PickBananaTask(SceneTask):
     def _svc_autotest(self, _req: Trigger.Request, resp: Trigger.Response):
         if not self._begin_operation():
             return self._busy(resp)
-        ready_ok, ready_message = self._check_backend_ready()
-        if not ready_ok:
-            self._end_operation()
-            resp.success = False
-            resp.message = f"backend not ready: {ready_message}"
-            return resp
-        # Re-read the parameter so a runtime `ros2 param set` between runs is
-        # honoured; empty means the full placement list.
+        # Ownership passes to the worker thread only once it has started; the
+        # finally block releases the lock on every other exit path — a
+        # rejected readiness check, an invalid index selection, or an
+        # unexpected exception must never leave later operations busy.
+        handed_over = False
         try:
-            selected = self._selected_indices()
-        except ValueError as exc:
-            self._end_operation()
-            resp.success = False
-            resp.message = f"autotest_indices invalid: {exc}"
+            ready_ok, ready_message = self._check_backend_ready()
+            if not ready_ok:
+                resp.success = False
+                resp.message = f"backend not ready: {ready_message}"
+                return resp
+            # Re-read the parameter so a runtime `ros2 param set` between runs is
+            # honoured; empty means the full placement list.
+            try:
+                selected = self._selected_indices()
+            except ValueError as exc:
+                resp.success = False
+                resp.message = f"autotest_indices invalid: {exc}"
+                return resp
+            self._autotest_stop.clear()
+            self._autotest_thread = threading.Thread(
+                target=self._run_autotest, args=(selected,), daemon=True, name="pick_banana_autotest"
+            )
+            self._autotest_thread.start()
+            handed_over = True
+            resp.success = True
+            resp.message = f"AutoTest started ({len(selected)} episodes)"
             return resp
-        # Ownership passes to the worker; it releases in its finally block.
-        self._autotest_stop.clear()
-        self._autotest_thread = threading.Thread(
-            target=self._run_autotest, args=(selected,), daemon=True, name="pick_banana_autotest"
-        )
-        self._autotest_thread.start()
-        resp.success = True
-        resp.message = f"AutoTest started ({len(selected)} episodes)"
-        return resp
+        finally:
+            if not handed_over:
+                self._end_operation()
 
     def _selected_indices(self) -> list[int]:
-        """The AutoTest episode placement indices: the live parameter or all."""
+        """The AutoTest episode placement indices: the live parameter or all.
+
+        The parameter is declared with an explicit empty default at startup
+        (``declare_array_param``), so the live read always finds an
+        initialized value; the empty list means the full placement list.
+        """
         raw = list(self._node.get_parameter("autotest_indices").value or [])
         if not raw:
             return list(range(self._n_placements))
@@ -748,9 +787,11 @@ class PickBananaTask(SceneTask):
                         passed += 1
 
                     placement = list(self._placements[k]) if 0 <= k < len(self._placements) else []
+                    # idx stays the episode ordinal (baseline semantics) so
+                    # downstream consumers keep their meaning; placement_index
+                    # names the placement actually commanded.
                     record = {
-                        "episode": episode,
-                        "idx": k,
+                        "idx": episode,
                         "placement_index": k,
                         "banana_spawn": placement,
                         "success": result.success,

@@ -44,6 +44,13 @@ must pass.
   (`$(find)` / `$(env)`), xacro rendering, controller_manager parameter
   files, spawners derived from the mode table, and the shared stack
   composition used by `<robot>_robot` launch entries.
+- **MuJoCo embodiment** (`mujoco.py`, in `launch_support.py`): the provider's
+  single `mujoco_ros2_control` process — robot+scene model composition,
+  simulator version checks, the CameraPlugin parameter tree, and, for
+  scenes with dynamic objects (issue #195), a
+  `FreeJointStatePublisherPlugin` instance publishing every dynamic body's
+  live pose on `/sim/<scene>/free_joint_states` for the scene task's
+  object observation.
 - **Conformance suite** (`test/test_conformance.py`): the executable contract.
 
 ## Prohibited

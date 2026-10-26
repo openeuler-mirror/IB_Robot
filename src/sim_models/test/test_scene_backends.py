@@ -13,6 +13,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from mujoco_ros2_control_msgs.srv import ResetWorld
 
 from sim_models.scene_compiler import _quat_from_extrinsic_xyz, get_scene_layout, randomization_placements
@@ -398,6 +399,75 @@ def test_mujoco_place_without_the_service_fails_without_a_fallback():
 
     assert not ok and "reset_world service not available" in message
     assert not backend._reset_world.requests, "nothing is sent when the service is down"
+
+
+# ── bad layouts fail at construction, before any motion ───────────────────────
+
+
+def _layout_with_randomization(banana: dict, arms: tuple | None = None) -> dict:
+    arms = arms or (["1", "2", "3", "4", "5", "6"], [0.0, -1.5854, 1.5708, 0.7854, 0.0, 0.0])
+    return {
+        "randomization": {"banana": banana, "arm_joint_names": arms[0], "arm_rest_qpos": arms[1]},
+        "objects": [
+            {"name": "banana", "type": "dynamic", "position": [0, 0.02, 0.05], "rotation_euler_rad": [0, 0, 0]},
+            {"name": "plate", "type": "dynamic", "position": [0.22, 0.02, 0.02], "rotation_euler_rad": [0, 0, 0]},
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "banana",
+    [
+        # count=0 used to reach randomize() and crash with ZeroDivisionError
+        # only after the arm's rest trajectory had already been sent.
+        {"mode": "uniform", "seed": 1, "count": 0, "x_range": [0, 0.1], "y_range": [0, 0.1]},
+        {"mode": "uniform", "seed": 1, "count": 2.9, "x_range": [0, 0.1], "y_range": [0, 0.1]},
+        {"x_range": [0.1, -0.03], "y_range": [0, 0.1]},  # min > max
+        {"x_range": [float("nan"), 0.1], "y_range": [0, 0.1]},  # NaN coordinates
+        {"x_range": [0, 0.1], "y_range": [0, 0.1], "grid_cols": 0},
+    ],
+)
+def test_mujoco_backend_construction_fails_closed_on_invalid_banana_config(banana):
+    from mujoco_ros2_control_msgs.srv import ResetWorld
+
+    reset_client = FakeServiceClient(request_factory=ResetWorld.Request)
+    node = FakeNode()
+    node.clients["/mujoco_ros2_control_node/reset_world"] = reset_client
+
+    with pytest.raises(ValueError, match="randomization.banana"):
+        MujocoBackend(node, _layout_with_randomization(banana), scene="pick_banana", callback_group=None)
+
+    assert reset_client.requests == [], "no ResetWorld request may be sent for an invalid layout"
+
+
+@pytest.mark.parametrize(
+    "arms",
+    [
+        (["1", "2"], [0.0, -1.0, 1.5]),  # length mismatch: zip(strict=False) used to ignore it
+        (["1", "1"], [0.0, -1.0]),  # duplicate joint names
+        (["1", "2"], [0.0, float("nan")]),  # non-finite rest value
+    ],
+)
+def test_mujoco_backend_construction_fails_closed_on_invalid_arm_config(arms):
+    from mujoco_ros2_control_msgs.srv import ResetWorld
+
+    reset_client = FakeServiceClient(request_factory=ResetWorld.Request)
+    node = FakeNode()
+    node.clients["/mujoco_ros2_control_node/reset_world"] = reset_client
+    banana = {"x_range": [0, 0.1], "y_range": [0, 0.1], "z_spawn": 0.05}
+
+    with pytest.raises(ValueError, match="randomization.arm_"):
+        MujocoBackend(node, _layout_with_randomization(banana, arms), scene="pick_banana", callback_group=None)
+
+    assert reset_client.requests == [], "no ResetWorld request may be sent for an invalid layout"
+
+
+def test_invalid_arm_config_reaches_reset_world_only_after_validation():
+    # The happy path still sends the full validated arrays: equal-length
+    # names/positions survive construction and reach the joint override.
+    backend, _ = make_mujoco_backend()
+    assert backend._arm_joint_names == [str(j) for j in _layout()["randomization"]["arm_joint_names"]]
+    assert len(backend._arm_joint_names) == len(backend._arm_rest_qpos) == 6
 
 
 # ── startup readiness thread ──────────────────────────────────────────────────

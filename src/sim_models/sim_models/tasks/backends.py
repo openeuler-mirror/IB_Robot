@@ -26,6 +26,7 @@ import numpy as np
 from sim_models.scene_compiler import (
     _layout_dynamic_objects,
     _quat_from_extrinsic_xyz,
+    arm_rest_pairs,
     free_joint_states_topic,
     randomization_placements,
 )
@@ -162,8 +163,11 @@ class MujocoBackend(PickBananaBackend):
         super().__init__(node, layout, callback_group=callback_group)
         self._reset_world_name = reset_world_service or "/mujoco_ros2_control_node/reset_world"
         self._reset_world = node.create_client(ResetWorld, self._reset_world_name, callback_group=callback_group)
-        self._arm_joint_names = [str(j) for j in (layout or {}).get("randomization", {}).get("arm_joint_names", [])]
-        self._arm_rest_qpos = [float(q) for q in (layout or {}).get("randomization", {}).get("arm_rest_qpos", [])]
+        # Shared validation: a bad arm section raises here, at construction,
+        # before any motion is commanded.
+        pairs = arm_rest_pairs(layout)
+        self._arm_joint_names = [name for name, _value in pairs]
+        self._arm_rest_qpos = [value for _name, value in pairs]
         self._poses: dict[str, tuple[np.ndarray, float]] = {}
         node.create_subscription(
             FreeJointStateArray,
