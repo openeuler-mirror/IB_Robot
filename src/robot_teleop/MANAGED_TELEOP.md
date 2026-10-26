@@ -30,6 +30,9 @@ call the mapper's `~/rearm` Trigger service after fresh input is available.
 The service awaits the final runtime admission response, not merely a queued
 request. For leader input it first clears the cache and requires a valid sample
 produced after the rearm request, then checks freshness again on admission.
+`~/rearm` supports leader input only; gamepad and phone sessions are armed by
+their operator gesture, and the service refuses them without touching the
+runtime.
 Receipt age and stamped source age must both fit the input freshness budget.
 Concurrent rearm calls are rejected. A separate reentrant service callback group
 and awaited rclpy Futures leave source/status subscriptions, E-stop, control
@@ -55,7 +58,8 @@ or VR secondary button). It requires fresh input throughout execution.
 One source may be selected. Runtime start refuses a second admitted session,
 policy_stream, trajectory, missing feedback, or a stop latch. Joint, pose and
 velocity intent modes cannot interleave during one admitted arm session; a
-gamepad mode switch stops the old session and requires rearm.
+gamepad mode switch stops the old session and the operator re-arms by pressing
+A again (after clearing any stop latch).
 
 Input loss, deadman release, stale runtime/robot feedback or ownership loss
 discards cached targets and requests robot-side `StopRuntime(HOLD)`. The
@@ -65,7 +69,9 @@ input timeout is checked every servo control period; subsequent execution-stop
 latencies belong to the runtime's published `runtime.stop` bounds.
 
 Reconnection does not clear a runtime stop. Explicitly request
-`SetRuntimeMode(idle)` to clear the latch, then rearm with a fresh reference.
+`SetRuntimeMode(idle)` to clear the latch, then re-admit with a fresh
+reference: `~/rearm` for leader input, the operator gesture for deadman-driven
+inputs.
 Policy/teleop handover must stop the old producer, confirm idle/clear, and only
 then admit policy_stream or teleop stream. The guarantee covers framework-managed
 producers, not arbitrary external DDS writers bypassing the public input path.

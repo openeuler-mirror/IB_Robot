@@ -223,3 +223,102 @@ def test_rearm_excludes_queued_future_stamped_samples(admission):
     until(result.done)
     assert result.result().success
     assert result.result().message == "admitted after barrier"
+
+
+@pytest.fixture(params=["xbox_controller", "phone"])
+def gesture_admission(monkeypatch, request):
+    # ROS_DOMAIN_ID / ROS_LOCALHOST_ONLY come from the workspace-root conftest
+    # (per-process reservation); a fixture-level override would break that
+    # isolation under parallel colcon test runs.
+    # Legacy VR unit tests install an action stub during collection.
+    import ibrobot_msgs.action
+    from ibrobot_msgs.action._arm_return_home import ArmReturnHome
+
+    monkeypatch.setattr(ibrobot_msgs.action, "ArmReturnHome", ArmReturnHome)
+    config = {
+        "type": request.param,
+        "managed_teleop": True,
+        "input_stale_s": 0.15,
+        "base_link_name": "base",
+        "tool_frame": "tool",
+        "gripper_closed": -0.5,
+        "gripper_open": 1.5,
+        "cartesian_solver": "runtime",
+        "cartesian_backend_config": {
+            "start_srv": "/test_gesture/start",
+            "stop_srv": "/test_gesture/stop",
+            "runtime_status_topic": "/test_gesture/status",
+        },
+    }
+    if request.param == "xbox_controller":
+        from robot_teleop.devices.xbox_controller import XboxTeleopDevice
+
+        monkeypatch.setattr(XboxTeleopDevice, "_print_usage", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(XboxTeleopDevice, "_load_mapping", lambda *_args: {})
+    else:
+        from robot_teleop.phone.web_phone import WebPhone
+
+        monkeypatch.setattr(WebPhone, "connect", lambda self: True)
+    params = {
+        "device_config": json.dumps(config),
+        "joint_limits": json.dumps({"1": {"min": -1.0, "max": 1.0}, "6": {"min": -0.5, "max": 1.5}}),
+        "managed_joint_topic": "/test_gesture/intent",
+        "estop_topic": "/test_gesture/estop",
+    }
+    args = ["--ros-args"]
+    for name, value in params.items():
+        args.extend(["-p", f"{name}:={json.dumps(value)}"])
+    rclpy.init(args=args)
+    node = TeleopNode()
+    peer = Node("test_gesture_peer", use_global_arguments=False)
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+    executor.add_node(peer)
+    state = {"starts": 0, "stops": 0}
+
+    def start(_request, response):
+        state["starts"] += 1
+        response.success = True
+        return response
+
+    def stop(_request, response):
+        state["stops"] += 1
+        response.success = True
+        return response
+
+    peer.create_service(Trigger, "/test_gesture/start", start)
+    peer.create_service(Trigger, "/test_gesture/stop", stop)
+    client = peer.create_client(Trigger, "/robot_teleop_node/rearm")
+
+    def until(predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while not predicate() and time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.01)
+        assert predicate(), "executor did not make progress before deadline"
+
+    try:
+        until(lambda: client.service_is_ready() and node._managed_backend._start_cli.service_is_ready())
+        yield node, state, client, until
+    finally:
+        node.destroy_node()
+        peer.destroy_node()
+        executor.shutdown(timeout_sec=1.0)
+        rclpy.shutdown()
+
+
+def test_rearm_refuses_gesture_armed_inputs_without_touching_the_runtime(gesture_admission):
+    # A gesture-armed session must be refused before any admission attempt:
+    # enabling it here would be undone by the first target-less cycle, which
+    # also stops and latches the runtime.
+    node, state, client, until = gesture_admission
+    result = client.call_async(Trigger.Request())
+    until(result.done)
+    assert not result.result().success
+    message = result.result().message
+    assert "only supported for leader_topic" in message
+    assert node._managed_config["type"] in message
+    assert "operator gesture" in message
+    assert not node._rearm_pending
+    assert not node._managed_backend.is_enabled
+    assert state["starts"] == 0
+    assert state["stops"] == 0

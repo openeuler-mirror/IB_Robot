@@ -422,6 +422,17 @@ class TeleopNode(Node):
             self.command_publishers[group.name].publish(msg)
 
     async def _rearm_managed(self, _request, response):
+        # ~/rearm admits a continuously publishing leader only; deadman-driven
+        # inputs are armed by their operator gesture, and admitting them here
+        # would be undone (with a latched runtime stop) by the first
+        # target-less control cycle.
+        if self._managed_config["type"] != "leader_topic":
+            response.success = False
+            response.message = (
+                f"rearm is only supported for leader_topic input; {self._managed_config['type']} sessions "
+                "are armed by the operator gesture (gamepad A / phone deadman)"
+            )
+            return response
         backend = self._managed_backend
         with self._rearm_lock:
             if self._rearm_pending:
