@@ -75,28 +75,31 @@ def remove_point_cloud_outliers(
     points: np.ndarray,
     threshold: float = 0.014,
     k: int = 20,
-    chunk_size: int = 256,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the points whose mean L1 distance to their k nearest others is below threshold.
+
+    The sampler's own rule, without its all-pairs distance matrix: exact L1
+    neighbours come from a KD tree and only their distances are computed, in
+    float32 like the sampler. An X2 bottle mask is ~27k points, which the
+    all-pairs form took ~40 s per request to filter on the model host.
+    The point's own row is excluded, duplicates of it are not.
+    """
     values = np.ascontiguousarray(points, dtype=np.float32)
     if values.ndim != 2 or values.shape[1] != 3:
         raise ValueError(f"points must have shape [N, 3], got {values.shape}")
     if len(values) <= k:
         return values.copy(), np.empty((0, 3), dtype=np.float32)
-    if k <= 0 or threshold <= 0 or chunk_size <= 0:
-        raise ValueError("outlier threshold, k, and chunk_size must be positive")
+    if k <= 0 or threshold <= 0:
+        raise ValueError("outlier threshold and k must be positive")
 
-    keep = np.empty(len(values), dtype=np.bool_)
-    for start in range(0, len(values), chunk_size):
-        end = min(start + chunk_size, len(values))
-        distance = np.sum(
-            np.abs(values[start:end, None, :] - values[None, :, :]),
-            axis=-1,
-            dtype=np.float32,
-        )
-        rows = np.arange(end - start)
-        distance[rows, np.arange(start, end)] = np.float32(np.inf)
-        nearest = np.partition(distance, k - 1, axis=1)[:, :k]
-        keep[start:end] = np.mean(nearest, axis=1, dtype=np.float32) < np.float32(threshold)
+    from scipy.spatial import cKDTree
+
+    # k + 1 so the k nearest others are there whether or not the row itself is.
+    _, indices = cKDTree(values).query(values, k=k + 1, p=1, workers=-1)
+    distance = np.sum(np.abs(values[:, None, :] - values[indices]), axis=-1, dtype=np.float32)
+    distance[indices == np.arange(len(values))[:, None]] = np.float32(np.inf)
+    distance.sort(axis=1)
+    keep = np.mean(distance[:, :k], axis=1, dtype=np.float32) < np.float32(threshold)
     return values[keep], values[~keep]
 
 

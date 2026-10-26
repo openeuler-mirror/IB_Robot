@@ -16,6 +16,7 @@ top-100 default and orthonormality screening of every returned pose.
 from __future__ import annotations
 
 import json
+import time
 from types import SimpleNamespace
 
 import numpy as np
@@ -81,6 +82,24 @@ def test_outlier_removal_matches_the_full_mean_l1_rule_with_duplicates_and_bound
 
     np.testing.assert_array_equal(kept, points[expected])
     assert expected[:125].all() and not expected[-1]
+
+
+def test_outlier_removal_keeps_up_with_a_whole_object_mask():
+    """A real X2 bottle mask is ~27k points; filtering it must not cost the request its deadline."""
+    rng = np.random.default_rng(7)
+    # A 6 cm x 20 cm bottle side seen at 2 mm pixel spacing, plus stray depth far behind it.
+    angle, height = rng.uniform(0, np.pi, 30000), rng.uniform(0, 0.2, 30000)
+    surface = np.column_stack([0.03 * np.cos(angle), height, 0.6 + 0.03 * np.sin(angle)])
+    stray = rng.uniform(-0.3, 0.3, (40, 3)) + [0.0, 0.0, 1.5]
+    points = np.concatenate([surface, stray]).astype(np.float32)
+
+    started = time.perf_counter()
+    kept = _adapter().prepare(points)[GRASPGEN_POINT_CLOUD_SEMANTIC]
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 5.0
+    assert len(kept) == len(surface)
+    assert (kept[:, 2] < 1.0).all()
 
 
 def test_points_stay_in_the_source_frame_because_the_sampler_centres_them_itself():
