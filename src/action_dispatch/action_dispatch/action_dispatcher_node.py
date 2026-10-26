@@ -475,6 +475,23 @@ class ActionDispatcherNode(Node):
             self._runtime_admission = PolicyAdmission(
                 self, robot_config_path, runtime, self._dispatch_lock, self._runtime_revoked
             )
+            # Config-driven auto start (control_modes.model_inference.auto_start,
+            # default true): armed here; the admission layer fires the acquire
+            # once a healthy idle runtime is observed and this callback runs the
+            # same start body as an explicit start_evaluate. Benchmark (RunPolicy
+            # gate) and navigation mode keep the explicit-start contract.
+            if self._runtime_admission.auto_start and not self._is_benchmark and not self._navigation_mode:
+                self._runtime_admission.arm_auto_start(self._auto_start_admitted)
+
+    def _auto_start_admitted(self, success, message):
+        """Admission completion for the config-driven auto start.
+
+        Runs under the dispatch lock (the admission shares it; RLock) from the
+        admission's callback context and must not block.
+        """
+        if not success:
+            return  # the admission layer already logged the retryable reason
+        self._begin_evaluation_locked()
 
     @_dispatch_locked
     def _runtime_revoked(self):
@@ -1495,6 +1512,7 @@ class ActionDispatcherNode(Node):
         admission = getattr(self, "_runtime_admission", None)
         if admission is None or self._is_benchmark:
             return self._start_nav_locked(request, response)
+        admission.disarm("explicit start_evaluate")
         event = threading.Event()
 
         def admitted(success, message):
@@ -1511,25 +1529,17 @@ class ActionDispatcherNode(Node):
         return response
 
     @_dispatch_locked
-    def _start_nav_locked(self, request, response):
-        """Start or resume dispatcher evaluation (idempotent clean restart).
+    def _begin_evaluation_locked(self):
+        """Shared start body for the explicit service and the auto start.
 
-        When the robot config declares a runtime provider the dispatcher starts
-        stopped and only takes the runtime after an explicit ``~/start_evaluate``
-        completes admission, so a control panel cannot rely on a strict
-        not-running precondition. Without a provider (legacy path) the
-        dispatcher auto-runs from startup. Either way, treat start as "ensure a
-        fresh inference cycle is running": invalidate any in-flight request and
-        clear the flags that could otherwise wedge the control loop, so
-        inference reliably resumes whether or not it was already running.
-
-        benchmark episode controller: benchmark mode rejects start_evaluate — it cannot bypass the
-        episode gate. The caller must use PreparePolicyEpisode + RunPolicy.
+        Returns (success, message): benchmark mode rejects (the RunPolicy gate
+        cannot be bypassed); otherwise this is an idempotent clean restart:
+        invalidate any in-flight request and clear the flags that could
+        otherwise wedge the control loop, so inference reliably resumes
+        whether or not it was already running.
         """
         if self._is_benchmark:
-            response.success = False
-            response.message = "benchmark mode requires RunPolicy goal; start_evaluate cannot bypass gate"
-            return response
+            return False, "benchmark mode requires RunPolicy goal; start_evaluate cannot bypass gate"
         was_running = self._is_running
         self._request_generation += 1
         self._inference_in_progress = False
@@ -1538,15 +1548,30 @@ class ActionDispatcherNode(Node):
         self._policy_reset_in_progress = False
         self._policy_reset_started_at = 0.0
         self._is_running = True
-        response.success = True
-        response.message = "Evaluate resumed" if was_running else "Evaluate started"
-        self.get_logger().info(response.message)
+        message = "Evaluate resumed" if was_running else "Evaluate started"
+        self.get_logger().info(message)
+        return True, message
+
+    @_dispatch_locked
+    def _start_nav_locked(self, request, response):
+        """Start or resume dispatcher evaluation (idempotent clean restart).
+
+        With a runtime provider the dispatcher starts stopped; by default
+        (``control_modes.model_inference.auto_start``, default true) the
+        admission layer starts it automatically once a healthy idle runtime is
+        observed, and ``auto_start: false`` deployments start through an
+        explicit ``~/start_evaluate``. A stop, a revocation or a latched stop
+        always requires an explicit ``~/start_evaluate`` to resume. Without a
+        provider (legacy path) the dispatcher auto-runs from startup.
+        """
+        response.success, response.message = self._begin_evaluation_locked()
         return response
 
     def _stop_nav_cb(self, request, response):
         admission = getattr(self, "_runtime_admission", None)
         if admission is None or self._is_benchmark:
             return self._stop_nav_locked(request, response)
+        admission.disarm("explicit stop_evaluate")
         with self._dispatch_lock:
             admission.cancel()
             self._runtime_revoked()

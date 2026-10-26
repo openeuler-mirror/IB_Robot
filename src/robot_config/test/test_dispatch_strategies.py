@@ -226,6 +226,43 @@ def test_config_loaders_reject_removed_smoothing(tmp_path, loader_name, value, i
         getattr(loader, loader_name)(path)
 
 
+@pytest.mark.parametrize("loader_name", ["load_robot_config_dict", "load_robot_config"])
+@pytest.mark.parametrize("value", ["true", 1, [], {}])
+def test_config_loaders_reject_non_bool_auto_start(tmp_path, loader_name, value):
+    import yaml
+
+    from robot_config import loader
+
+    config = {
+        "robot": {
+            "name": "test",
+            "control_modes": {"model_inference": {"runtime_mode": "policy_stream", "auto_start": value}},
+        }
+    }
+    path = tmp_path / "robot.yaml"
+    path.write_text(yaml.safe_dump(config))
+    with pytest.raises(ValueError, match=r"control_modes.model_inference.auto_start must be a boolean"):
+        getattr(loader, loader_name)(path)
+
+
+@pytest.mark.parametrize("auto_start", [None, False, True])
+def test_config_loader_accepts_bool_or_absent_auto_start(tmp_path, auto_start):
+    import yaml
+
+    from robot_config.loader import load_robot_config_dict
+
+    mode = {"runtime_mode": "policy_stream"}
+    if auto_start is not None:
+        mode["auto_start"] = auto_start
+    config = {"robot": {"name": "test", "control_modes": {"model_inference": mode}}}
+    path = tmp_path / "robot.yaml"
+    path.write_text(yaml.safe_dump(config))
+    loaded = load_robot_config_dict(path)
+    assert loaded["control_modes"]["model_inference"].get("auto_start", True) is (
+        auto_start if auto_start is not None else True
+    )
+
+
 @pytest.mark.parametrize("blending", ["none", "temporal_ensemble"])
 def test_config_loader_preserves_blending_and_executor_settings(tmp_path, blending):
     import yaml

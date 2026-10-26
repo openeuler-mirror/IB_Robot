@@ -1457,6 +1457,14 @@ def _load_robot_section_with_sources(
             reject_legacy_smoothing_config(mode_config.get("executor", {}) or {})
         except ValueError as exc:
             raise ValueError(f"{resolved_config_path}:robot.control_modes.{mode_name}.{exc}") from exc
+        # control_modes.<mode>.auto_start (consumed by the action dispatcher's
+        # admission): absent means true; an explicit value must be a boolean.
+        if (
+            isinstance(mode_config, dict)
+            and "auto_start" in mode_config
+            and not isinstance(mode_config["auto_start"], bool)
+        ):
+            raise ValueError(f"{resolved_config_path}:robot.control_modes.{mode_name}.auto_start must be a boolean")
 
     base_ref = robot_data.pop("base_config", None)
     if base_ref is not None:

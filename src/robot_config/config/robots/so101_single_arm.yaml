@@ -72,6 +72,10 @@ robot:
       # Policy owns a dedicated stream mode; it must admit from idle and
       # never share the teleop stream mode.
       runtime_mode: policy_stream
+      # auto_start (default true): the dispatcher starts evaluating as soon as
+      # a healthy idle runtime is observed. Conservative hardware deployments
+      # can set `auto_start: false` to require an explicit
+      # `ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger "{}"`.
       inference:
         enabled: true
         pipelines:

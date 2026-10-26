@@ -14,17 +14,20 @@ from std_srvs.srv import Trigger
 from action_dispatch.action_dispatcher_node import ActionDispatcherNode
 from action_dispatch.active_plan import ActivePlan, PlanSource
 from action_dispatch.chunk_planning import ChunkPlan
-from action_dispatch.policy_admission import PolicyAdmission
+from action_dispatch.policy_admission import InterfaceBindingError, PolicyAdmission
 from action_dispatch.scheduled_action_dispatcher_node import DispatcherState, ScheduledActionDispatcherNode
 
 IDENTITY = {"id": "unit-1", "type": "unit", "runtime_name": "unit_runtime", "runtime_version": "1.0.0"}
 
 
-def status(mode="idle", lifecycle="ACTIVE", latched=False, *, name="unit_runtime", version="1.0.0", faults=()):
+def status(
+    mode="idle", lifecycle="ACTIVE", latched=False, *, name="unit_runtime", version="1.0.0", faults=(), policy=None
+):
     return SimpleNamespace(
         active_mode=mode,
         lifecycle=lifecycle,
         stop_latched=latched,
+        stop_policy=policy if policy is not None else ("HOLD" if latched else ""),
         runtime_name=name,
         runtime_version=version,
         faults=list(faults),
@@ -484,7 +487,7 @@ def test_admission_failure_does_not_touch_other_producers_mode(admission):
     followup = Mock()
     guard.acquire(followup)
     assert not followup.call_args.args[0]
-    assert followup.call_args.args[1] == "runtime changed during admission"
+    assert followup.call_args.args[1] == "runtime mode 'stream' is owned by another producer"
 
 
 def test_acquire_while_idle_rollback_in_progress_fails_fast(admission):
@@ -509,6 +512,8 @@ def test_acquire_while_idle_rollback_in_progress_fails_fast(admission):
 
 
 def test_idle_rollback_times_out_and_clears_state(admission):
+    # The switch was answered but the rollback's status read hangs: the
+    # rollback is bounded, clears its gate, and its late answer is ignored.
     guard, runtime, _ = admission
     stuck = Future()
     runtime.defer = True
@@ -519,7 +524,8 @@ def test_idle_rollback_times_out_and_clears_state(admission):
     runtime.get_client.call_async = Mock(return_value=stuck)  # rollback get_status hangs
     invalid_target_mode = status("policy_stream")
     invalid_target_mode.stamp = SimpleNamespace(sec=10, nanosec=900_000_000)  # invalid age
-    guard.observe(invalid_target_mode)  # admission fails; rollback starts and hangs
+    guard.observe(invalid_target_mode)  # admission fails; rollback waits for the switch's answer
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="committed"))  # then hangs on get
     blocked = Mock()
     guard.acquire(blocked)
     assert blocked.call_args.args[1] == "runtime transition in progress"
@@ -533,9 +539,8 @@ def test_idle_rollback_times_out_and_clears_state(admission):
     assert not followup.call_args.args[0]
     assert followup.call_args.args[1] != "runtime transition in progress"
     assert guard._logger.warning.called
-    # The expired attempt's late answers must not request idle on behalf of
+    # The expired attempt's late answer must not request idle on behalf of
     # whatever owns the runtime now.
-    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="late"))
     stuck.set_result(SimpleNamespace(status=status("policy_stream")))
     assert runtime.requests == ["policy_stream"]
 
@@ -559,7 +564,7 @@ def test_idle_rollback_never_requested_over_a_stop_latch(admission):
     guard, runtime, _ = admission
     stuck = Future()
     fail_after_switch_committed(guard, runtime, stuck)
-    stuck.set_result(SimpleNamespace(status=status("policy_stream", latched=True)))
+    stuck.set_result(SimpleNamespace(status=status("policy_stream", latched=True, policy="TORQUE_OFF")))
     assert runtime.requests == ["policy_stream"]
     assert not guard._rolling_back
 
@@ -648,6 +653,57 @@ def test_release_after_an_unconfirmed_release_reverifies_the_runtime(admission):
     assert runtime.status.active_mode == "idle"
 
 
+def test_unanswered_switch_keeps_the_guard_fail_closed_until_it_answers(admission):
+    # The original set_mode outlives the rollback bound: the runtime may still
+    # commit it, so neither acquire nor release may treat the runtime as idle.
+    guard, runtime, _ = admission
+    runtime.defer = True
+    guard.acquire(Mock())
+    runtime.defer = False
+    guard.cancel()  # rollback waits for the unanswered switch
+    guard._rollback_timer.cancel()  # do not wait out the real 2 s bound
+    guard._rollback_expired(guard._rollback_token)
+    blocked = Mock()
+    guard.acquire(blocked)
+    assert blocked.call_args.args[1] == "runtime transition in progress"
+    assert not guard.release(timeout=0.2)
+    assert runtime.requests == ["policy_stream"]
+    runtime.status = status("policy_stream")  # the late answer commits the switch
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="late"))
+    assert runtime.requests == ["policy_stream", "idle"]  # a fresh check-then-set cleaned it up
+    assert runtime.status.active_mode == "idle"
+    recovered = Mock()
+    guard.acquire(recovered)
+    assert recovered.call_args.args[0] and guard.owned
+
+
+def test_release_after_a_revocation_verifies_the_runtime_mode(admission):
+    guard, runtime, _ = admission
+    own_policy_mode(guard)
+    runtime.status = status("policy_stream", lifecycle="DEGRADED")
+    guard.observe(runtime.status)  # revoked locally; the runtime still holds our mode
+    assert not guard.owned
+    assert guard.release(timeout=0.5)
+    assert runtime.requests == ["policy_stream", "idle"]
+
+
+def test_release_never_requests_idle_from_a_different_runtime(admission):
+    guard, runtime, _ = admission
+    own_policy_mode(guard)
+    runtime.status = status("policy_stream", name="other_runtime")
+    assert not guard.release(timeout=0.5)
+    assert runtime.requests == ["policy_stream"]
+
+
+def test_rollback_never_requests_idle_from_a_different_runtime(admission):
+    guard, runtime, _ = admission
+    stuck = Future()
+    fail_after_switch_committed(guard, runtime, stuck)
+    stuck.set_result(SimpleNamespace(status=status("policy_stream", name="other_runtime")))
+    assert runtime.requests == ["policy_stream"]
+    assert not guard._rolling_back
+
+
 def test_release_during_switch_in_flight_rolls_back_once(admission):
     # Releasing while a pending admission's set_mode is already in flight must
     # return the mode exactly once (rollback), not zero and not twice.
@@ -668,6 +724,250 @@ def test_release_during_switch_in_flight_rolls_back_once(admission):
     guard.acquire(after)  # runtime is idle again; admission succeeds
     assert after.call_args.args[0] and guard.owned
     assert runtime.requests == ["policy_stream", "idle", "policy_stream"]
+
+
+# --- config-driven auto start --------------------------------------------------------
+
+
+def build_admission(monkeypatch, mode_config):
+    """A guard built from an explicit model_inference mode config (auto_start variants)."""
+    monkeypatch.setattr(
+        "action_dispatch.policy_admission.load_robot_section",
+        lambda _: (None, {"control_modes": {"model_inference": mode_config}}),
+    )
+    runtime = Runtime()
+    node = Mock()
+    node.get_clock.return_value.now.return_value.nanoseconds = 10_000_000_000
+    node.create_client.side_effect = [runtime.get_client, runtime.set_client]
+    interfaces = {
+        "runtime.status": {
+            "kind": "topic",
+            "direction": "publish",
+            "message_type": "ibrobot_msgs/msg/RuntimeStatus",
+            "endpoint": "/unit/status",
+            "qos": {"depth": 7, "reliability": "reliable"},
+        },
+        "runtime.get_status": {
+            "kind": "service",
+            "direction": "serve",
+            "message_type": "ibrobot_msgs/srv/GetRuntimeStatus",
+            "endpoint": "/unit/get_status",
+        },
+        "runtime.set_mode": {
+            "kind": "service",
+            "direction": "serve",
+            "message_type": "ibrobot_msgs/srv/SetRuntimeMode",
+            "endpoint": "/unit/set_mode",
+        },
+    }
+    guard = PolicyAdmission(
+        node,
+        "robot.yaml",
+        {"interface_description": {"robot": IDENTITY, "interfaces": interfaces}},
+        threading.RLock(),
+        Mock(),
+    )
+    return guard, runtime
+
+
+def test_auto_start_defaults_to_true(admission):
+    guard, _, _ = admission
+    assert guard.auto_start is True
+
+
+def test_auto_start_false_config_is_read(admission, monkeypatch):
+    guard, _ = build_admission(monkeypatch, {"runtime_mode": "policy_stream", "auto_start": False})
+    assert guard.auto_start is False
+    guard.cancel()
+
+
+def test_auto_start_non_bool_config_rejected(admission, monkeypatch):
+    with pytest.raises(InterfaceBindingError):
+        build_admission(monkeypatch, {"runtime_mode": "policy_stream", "auto_start": "yes"})
+
+
+def test_auto_start_admits_on_idle_observation_and_disarms(admission):
+    guard, runtime, _ = admission
+    started = Mock()
+    guard.arm_auto_start(started)
+    guard.observe(status())  # healthy idle status -> automatic acquire
+    assert started.call_args.args[0] and guard.owned
+    assert runtime.requests == ["policy_stream"]
+    # First success disarms permanently: later idle observations never re-acquire.
+    guard.release()
+    guard.observe(status())
+    guard.observe(status())
+    assert runtime.requests == ["policy_stream", "idle"]
+
+
+def test_auto_start_retries_rate_limited_after_failure(admission):
+    guard, runtime, _ = admission
+    guard._auto_start_retry_interval_s = 0.05  # config-level knob, keep the test fast
+    started = Mock()
+    guard.arm_auto_start(started)
+    runtime.reject = True
+    guard.observe(status())  # first attempt: set_mode rejected
+    assert not started.call_args.args[0]
+    assert runtime.requests == ["policy_stream"]
+    guard.observe(status())  # inside the retry interval: no second attempt
+    assert runtime.requests == ["policy_stream"]
+    time.sleep(0.06)
+    runtime.reject = False
+    guard.observe(status())  # past the interval: retried and admitted
+    assert started.call_args.args[0] and guard.owned
+    assert runtime.requests == ["policy_stream", "policy_stream"]
+
+
+def test_auto_start_gives_up_after_retry_limit(admission):
+    guard, runtime, _ = admission
+    guard._auto_start_retry_interval_s = 0.0  # no waiting between attempts
+    guard._auto_start_max_attempts = 3
+    started = Mock()
+    guard.arm_auto_start(started)
+    runtime.reject = True
+    for _ in range(3):
+        guard.observe(status())
+    assert runtime.requests == ["policy_stream"] * 3
+    assert all(not call.args[0] for call in started.call_args_list)
+    # The retry limit disarmed: further observations never attempt again.
+    guard.observe(status())
+    guard.observe(status())
+    assert runtime.requests == ["policy_stream"] * 3
+    assert len(started.call_args_list) == 3
+    # A manual start still goes through the normal admission path.
+    result = Mock()
+    guard.acquire(result)
+    assert not result.call_args.args[0]
+
+
+def test_auto_start_disarms_on_foreign_mode(admission):
+    guard, runtime, _ = admission
+    guard.arm_auto_start(Mock())
+    guard.observe(status("stream"))  # another producer owns the runtime
+    guard.observe(status())  # back to idle: never grab the mode back
+    assert runtime.requests == []
+
+
+def test_auto_start_disarms_on_latched_stop(admission):
+    guard, runtime, _ = admission
+    guard.arm_auto_start(Mock())
+    guard.observe(status(latched=True))
+    guard.observe(status())
+    assert runtime.requests == []
+
+
+def test_auto_start_never_resumes_after_revocation(admission):
+    guard, runtime, _ = admission
+    started = Mock()
+    guard.arm_auto_start(started)
+    guard.observe(status())  # auto admission succeeds
+    assert started.call_args.args[0] and guard.owned
+    guard.observe(status())  # revocation (idle observation while owned)
+    assert not guard.owned
+    guard.on_revoke.assert_called_once()
+    guard.observe(status())
+    guard.observe(status())
+    assert runtime.requests == ["policy_stream"]  # no automatic re-acquire
+
+
+def test_auto_start_disarmed_by_explicit_stop_service(admission):
+    guard, runtime, _ = admission
+    node = object.__new__(ActionDispatcherNode)
+    node._dispatch_lock = guard.lock
+    node._runtime_admission = guard
+    node._is_benchmark = False
+    node._is_running = True
+    node._request_generation = 0
+    node._navigation_mode = False
+    node._executor = Mock()
+    node._active_plan = ActivePlan(capacity=10, watermark=2)
+    node.get_logger = Mock()
+    guard.arm_auto_start(Mock())
+    response = node._stop_nav_cb(None, Trigger.Response())
+    assert response.success
+    guard.observe(status())  # explicit stop disarmed: no automatic restart
+    assert runtime.requests == []
+    assert not node._is_running
+
+
+# --- specific rejection reasons -------------------------------------------------------
+
+
+def test_latched_stop_rejection_names_the_recovery_path(admission):
+    guard, runtime, _ = admission
+    runtime.status = status(latched=True)
+    result = Mock()
+    guard.acquire(result)
+    message = result.call_args.args[1]
+    assert not result.call_args.args[0]
+    assert "runtime stop is latched (HOLD)" in message
+    assert "/runtime/set_mode {mode: idle}" in message
+
+
+def test_latched_stop_rejection_names_the_actual_stop_policy(admission):
+    guard, runtime, _ = admission
+    runtime.status = status(latched=True, policy="TORQUE_OFF")
+    result = Mock()
+    guard.acquire(result)
+    assert "runtime stop is latched (TORQUE_OFF)" in result.call_args.args[1]
+
+
+def test_stale_stamp_rejection_names_the_freshness_window(admission):
+    guard, runtime, _ = admission
+    runtime.status = status()
+    runtime.status.stamp = SimpleNamespace(sec=7, nanosec=0)
+    result = Mock()
+    guard.acquire(result)
+    assert not result.call_args.args[0]
+    assert "outside the freshness window" in result.call_args.args[1]
+
+
+def test_foreign_mode_rejection_names_the_owner(admission):
+    guard, runtime, _ = admission
+    runtime.status = status("stream")
+    result = Mock()
+    guard.acquire(result)
+    assert not result.call_args.args[0]
+    assert result.call_args.args[1] == "runtime mode 'stream' is owned by another producer"
+
+
+def test_lifecycle_rejection_names_the_state(admission):
+    guard, runtime, _ = admission
+    runtime.status = status(lifecycle="STOPPED")
+    result = Mock()
+    guard.acquire(result)
+    assert not result.call_args.args[0]
+    assert result.call_args.args[1] == "runtime lifecycle is 'STOPPED', not ACTIVE"
+
+
+def test_idle_after_target_keeps_the_changed_during_admission_reason(admission):
+    guard, runtime, _ = admission
+    runtime.defer = True
+    result = Mock()
+    guard.acquire(result)
+    guard.observe(status("policy_stream"))
+    guard.observe(status())
+    runtime.deferred[0].set_result(SimpleNamespace(success=True, message="late"))
+    assert not result.call_args.args[0]
+    assert result.call_args.args[1] == "runtime changed during admission"
+
+
+# --- scheduled dispatcher auto start --------------------------------------------------
+
+
+def test_scheduled_auto_start_opens_session_after_admission(admission):
+    guard, runtime, _ = admission
+    node = object.__new__(ScheduledActionDispatcherNode)
+    node._state_lock = guard.lock
+    node._state = DispatcherState.STOPPED
+    node._runtime_admission = guard
+    node._open_admitted_session = Mock()
+    node.get_logger = Mock()
+    node._auto_start_admitted(True, "policy acquired runtime mode")
+    node._open_admitted_session.assert_called_once()
+    node._auto_start_admitted(False, "not admitted")
+    node._open_admitted_session.assert_called_once()  # failures never open a session
+    assert runtime.requests == []
 
 
 @pytest.mark.parametrize("scheduled", [False, True])

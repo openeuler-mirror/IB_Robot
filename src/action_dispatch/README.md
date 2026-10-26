@@ -599,10 +599,12 @@ scheduled 路径的 `~/start_evaluate`、`~/stop_evaluate` 和 `~/restart_sessio
 这同样适用于 Stop：busy 响应不代表停止成功。调用方必须检查响应，并根据状态决定是否重试。
 
 **provider 路径的启动语义**：当 robot_config 声明了 `runtime.provider`（例如 SO-101 的
-`so101_robot`）时，dispatcher 初始化为 stopped，必须显式调用 `~/start_evaluate` 完成 runtime
-admission（取得 `policy_stream` 模式）后才会开始推理输出；没有 provider 的 legacy 路径则启动即
-自动运行。因此仿真或真机启动后机械臂不动、`~/get_status` 返回 `stopped`，不是配置错误，调用
-`~/start_evaluate` 即可：
+`so101_robot`）时，dispatcher 初始化为 stopped，默认（`control_modes.model_inference.auto_start`，
+缺省 `true`）会在观察到健康且处于 idle 的 runtime 后自动完成 admission 并开始推理输出；
+保守的真机部署可设 `auto_start: false`，改为显式调用 `~/start_evaluate`。没有 provider 的
+普通 legacy 路径则启动即自动运行（benchmark 由 `RunPolicy` 驱动，`navigation_mode=true` 需要显式
+`~/start_evaluate`）。注意：任何 stop（`~/stop_evaluate`、撤销、`/runtime/stop` 锁定）
+之后**不会**自动恢复，必须重新显式调用 `~/start_evaluate`：
 
 ```bash
 ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger "{}"
@@ -612,7 +614,8 @@ admission 失败时，若 mode 切换已经发出，dispatcher 先等待该切�
 模式后请求回到 idle；读到的状态显示 stop 锁定时不请求 idle（idle 会清除锁定）。读取状态与请求 idle 之间不是原子的：
 这期间并发的 `/runtime/stop` 仍可能被 idle 请求清除锁定，需要 runtime 契约提供条件切换才能消除（见 #198）。
 `~/stop_evaluate` 只有确认 runtime 已离开 policy 模式才返回 `success=true`，否则返回
-`runtime idle transition failed`。
+`runtime idle transition failed`；它不会向身份不符的 runtime 请求 idle。若 policy 模式的切换请求在回退时限内
+一直没有应答，dispatcher 会保持 fail-closed：拒绝新的 start、stop 返回失败，直到该请求应答（之后自动重新检查并回退）。
 
 ### 与 ros2_control 通信
 

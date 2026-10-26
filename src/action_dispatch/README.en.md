@@ -660,11 +660,14 @@ This means the requested operation was **not executed**, including Stop: a busy 
 is not a successful stop. Callers must check the response and decide whether to retry based on the state.
 
 **Startup semantics on the provider path**: when the robot config declares a `runtime.provider`
-(for example `so101_robot` on SO-101), the dispatcher initializes stopped and only begins
-inference output after an explicit `~/start_evaluate` completes runtime admission (acquiring
-the `policy_stream` mode); the legacy path without a provider auto-runs from startup. A
-stationary arm right after launch with `~/get_status` reporting `stopped` is therefore not a
-configuration error — call `~/start_evaluate`:
+(for example `so101_robot` on SO-101), the dispatcher initializes stopped and by default
+(`control_modes.model_inference.auto_start`, default `true`) starts evaluating automatically once a
+healthy idle runtime is observed; conservative hardware deployments can set `auto_start: false` to
+require an explicit `~/start_evaluate`. The ordinary legacy path without a provider
+auto-runs from startup (benchmark is driven by `RunPolicy`; `navigation_mode=true` requires an explicit
+`~/start_evaluate`).
+After any stop (`~/stop_evaluate`, a revocation, or a latched `/runtime/stop`) the dispatcher **never**
+resumes by itself — call `~/start_evaluate` again:
 
 ```bash
 ros2 service call /action_dispatcher/start_evaluate std_srvs/srv/Trigger "{}"
@@ -676,7 +679,9 @@ when the status it reads shows a stop latch (idle would clear it). The read and 
 atomic: a `/runtime/stop` landing in between can still have its latch cleared by that idle request, which needs
 a conditional switch in the runtime contract to rule out (see #198). `~/stop_evaluate` reports `success=true`
 only once the runtime is confirmed to have left the policy mode, and `runtime idle transition failed`
-otherwise.
+otherwise; it never requests idle from a runtime with a different identity. If the policy mode request
+itself stays unanswered past the rollback bound, the dispatcher stays fail-closed (starts are refused, stops
+report failure) until that request is answered, then re-checks and rolls back automatically.
 
 ### Communication with ros2_control
 

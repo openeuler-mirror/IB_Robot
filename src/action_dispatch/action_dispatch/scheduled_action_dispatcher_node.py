@@ -346,10 +346,22 @@ class ScheduledActionDispatcherNode(Node):
             with self._state_lock:
                 if self._state != DispatcherState.WAITING_READY:
                     return
-                if self._navigation_mode or getattr(self, "_runtime_admission", None) is not None:
+                if self._navigation_mode:
                     self._set_state(DispatcherState.STOPPED)
-                else:
+                    return
+                admission = getattr(self, "_runtime_admission", None)
+                if admission is None:
                     self._open_new_session()
+                elif admission.auto_start:
+                    # Same config-driven auto start as the legacy dispatcher
+                    # (control_modes.model_inference.auto_start, default true):
+                    # armed here; the admission layer fires the acquire once a
+                    # healthy idle runtime is observed, then the session opens
+                    # through the same path as an explicit start_evaluate.
+                    self._set_state(DispatcherState.STOPPED)
+                    admission.arm_auto_start(self._auto_start_admitted)
+                else:
+                    self._set_state(DispatcherState.STOPPED)
 
         future.add_done_callback(_cb)
 
@@ -388,6 +400,21 @@ class ScheduledActionDispatcherNode(Node):
                     completion.set()
 
         admission.acquire(admitted)
+
+    def _auto_start_admitted(self, success, message):
+        """Admission completion for the config-driven auto start.
+
+        Runs under the state/admission lock (RLock) from the admission's
+        callback context and must not block. On success the session opens
+        through the same path as an explicit start_evaluate; failures are
+        retried by the admission layer (rate-limited) and already logged.
+        """
+        if not success:
+            return
+        with self._state_lock:
+            if self._state not in (DispatcherState.WAITING_READY, DispatcherState.STOPPED):
+                return
+        self._open_admitted_session()
 
     def _runtime_revoked(self):
         with self._state_lock:
@@ -534,10 +561,12 @@ class ScheduledActionDispatcherNode(Node):
                 self._lifecycle_lock.release()
 
     def _start_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            admission.disarm("explicit start_evaluate")
         with self._state_lock:
             state = self._state
         if state == DispatcherState.ACTIVE:
-            admission = getattr(self, "_runtime_admission", None)
             if admission is not None:
                 completion = threading.Event()
 
@@ -575,9 +604,11 @@ class ScheduledActionDispatcherNode(Node):
 
     def _stop_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
         # Safe-stop first, then Close; both succeed -> STOPPED.
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            admission.disarm("explicit stop_evaluate")
         safe_ok = self._safe_stop()
         close_ok = self._close_session_sync()
-        admission = getattr(self, "_runtime_admission", None)
         if admission is not None:
             safe_ok = admission.release() and safe_ok
         with self._state_lock:
@@ -592,9 +623,11 @@ class ScheduledActionDispatcherNode(Node):
 
     def _restart_cb_locked(self, _req, resp: Trigger.Response) -> Trigger.Response:
         # Safe-stop -> Close -> clear local -> Open new UUID.
+        admission = getattr(self, "_runtime_admission", None)
+        if admission is not None:
+            admission.disarm("explicit restart_session")
         safe_ok = self._safe_stop()
         close_ok = self._close_session_sync()
-        admission = getattr(self, "_runtime_admission", None)
         if admission is not None:
             safe_ok = admission.release() and safe_ok
         with self._state_lock:
