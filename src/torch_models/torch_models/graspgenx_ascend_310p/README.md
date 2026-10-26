@@ -101,7 +101,9 @@ compiled graph. 400 is also what the X2 pipeline requests — its sweep over
 200, 400 and 800 settled there — so the two agree by measurement rather than
 by coincidence. Asking for fewer does not make a request faster: the eager
 loop's cost barely depends on the grasp count, so a request the graph does not
-cover costs about 315 ms against 196 ms for one it does. The adapter therefore
+cover costs about 315 ms against 196 ms for one it does (measured before the
+2026-10-26 recompile; the steady figure has moved, see Measured behaviour, but
+the eager path was not re-measured, so the pair is kept as the comparison it was). The adapter therefore
 pins the draw to the compiled count whenever the deployment carries a graph,
 and lets `max_grasps` bound only what comes back.
 
@@ -123,22 +125,63 @@ one.
 
 ## Measured behaviour
 
-On Ascend310P1, CANN 8.1.RC1, 2048 points and 400 grasps, served through the
-model session:
+Re-measured 2026-10-26 after the environment was put on CANN 8.1.RC1 alone (`latest/`
+had been mixing 8.1 and 8.3) and the loop was re-exported and recompiled on the board.
+The figures below supersede the earlier ones; where they disagree, these were measured
+on the current artifact.
+
+The operating point is now the checkpoint's own budget, 3500 points: the adapter
+resamples a served cloud to `data.num_points`, as upstream's batched entry point does.
+Through the ROS service on the X2 bottle frame, 400 grasps:
 
 ```text
 load                 63 s      once per process, not per request
-first request       ~9 s       kernel caches and internal-format conversions
-steady state       ~196 ms     generator 120, discriminator 62, sampler 15
+first request        47 s      kernel caches and internal-format conversions
+steady state        429 ms
 ```
 
-The same bundle and request on an RTX 3090 through `torch_cuda` take ~127 ms
-with a 4.6 s load. Without the offline loop the 310P takes ~320 ms, so the
-compiled graph is where the difference between 1.6x and 2.5x of CUDA lies.
+The same frame and bundle through `torch_cuda` on an RTX 3090, driven by the same
+harness, take **159 ms** steady with a 481 ms first request, so the board is 2.7x of
+CUDA here. At the 2048 points the earlier table used, the board measures 293 ms steady
+and a 62 s first request through the model session, against the 196 ms and ~9 s recorded
+before -- so the recompiled `--precision_mode=force_fp32` loop is slower than its
+predecessor on both counts, and the earlier claim of 1.6x of CUDA no longer holds.
 
-Rotations were observed orthonormal to ~2e-3 on the board versus ~5e-7 on
-CUDA. Attention, the FFN and the CPE run in FP16 on the board. These figures
-alone do not establish pose translation accuracy or device parity.
+**Rotations are not the weak point, and the recorded ~2e-3 cannot be reproduced.**
+Orthonormality measures 4.4e-07 to 5.3e-07 on the board against 3.8e-07 to 4.5e-07 on
+CUDA. The ~2e-3 this file used to report is not reproducible on either board path: on one
+cloud in one process, the compiled FP32 loop gives 4.856e-07 and the **eager** path, with
+the same FP16 attention, FFN and CPE, gives 4.849e-07. So that figure's provenance is
+unknown, and three explanations for it are ruled out by measurement rather than argument:
+
+* not the FP16 attention/FFN/CPE — the eager path has them and measures 4.8e-07;
+* not the offline loop — removing it changes the figure by 7e-10;
+* not the 2026-10-26 re-export and recompile — old and new `diffusion_loop.json` are
+  identical apart from the added `generator_binding` (same 1723 nodes, 366 initializers,
+  same shapes), and the compile log shows `--precision_mode=force_fp32` both times.
+
+Note that `_ORTHONORMAL_TOLERANCE` in the adapter, and the served-request check, are 2e-3
+— sized for the old figure and now four orders of magnitude loose. They are a filter
+against a mis-transposed or quantised graph, so leaving them wide is deliberate, but they
+cannot be read as evidence about this path's accuracy.
+
+**Translation and ranking were compared on device, with a same-device control.** On one
+real segmented cloud resampled to 3500 points, `verify_graspgenx_pose_parity.py --cloud`
+gives a cross-device grasp-centroid distance of 8.8-17.5 mm and a nearest-neighbour
+median of 15.5-16.8 mm, both inside the 8.5-27.3 mm and 16.1-17.9 mm bands that four
+CUDA seeds produce among themselves -- so no translation deviation attributable to the
+device is detectable at this level. `verify_graspgenx_confidence_ranking.py`, which
+scores one fixed pose set on both devices so the confidences are paired, gives a
+cross-device Spearman of 0.99956-0.99990 against a same-device band of 0.99946-1.0, and
+the confidence ranks the reach filter walks (8-36 and 45-99 on the 2026-09-14 X2
+recordings) retain 27-29 of 29 and 53 of 55 either way.
+
+What those two do **not** establish: pointwise numerical parity, which needs identical
+noise rather than independent draws, and anything beyond this one frame, one object and
+one point count. Note also that the coverage line
+`verify_graspgenx_pose_parity.py --compare` prints is meaningless without a same-device
+control beside it: at its 5 mm tolerance, against a ~16 mm median sample spacing, two
+independent draws scored 0/10, 0/50, 1/200, 1/400 **on one device** as well.
 
 `verify_graspgenx_loop_parity.py` fixes the loop's four input tensors and
 compares the compiled graph against an eager CUDA reference using upstream's
