@@ -82,7 +82,15 @@ def test_lidar_navigation_stage_compiles_navigation_profile(monkeypatch):
 # Drives a robot config whose perception services reference a gitignored model
 # bundle; without scripts/download_models.py the config cannot load. A missing
 # download is not a defect, so skip rather than fail. See root conftest.py.
-@pytest.mark.model_bundle("grounding_dino_swint_seq8_1280x720", "grounded_sam2_swint_ogc")
+@pytest.mark.model_bundle(
+    "yolox_x_640",
+    "pear_parameter_network",
+    "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384",
+)
 def test_hybrid_lekiwi_profile_compiles_manipulation_and_navigation_domains():
     from robot_skill_cli.catalog import compile_local_snapshot
 
@@ -123,8 +131,11 @@ def test_non_navigation_profile_keeps_v1_robot_context():
 @pytest.mark.model_bundle(
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
-    "grounded_sam2_swint_ogc_ascend",
+    "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384",
 )
 def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
     from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
@@ -170,8 +181,11 @@ def test_sound_following_overlay_compiles_with_matching_runtime_executor(stage):
 @pytest.mark.model_bundle(
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
-    "grounded_sam2_swint_ogc_ascend",
+    "grounding_dino_swint_seq8_1280x720",
+    "sam2.1_hiera_tiny_prompt_ascend",
+    "sam2.1_hiera_tiny",
+    "ram_plus_swin_large_14m",
+    "siglip2_so400m_patch14_384",
 )
 def test_lekiwi_nav_grasp_hybrid_compiles_sound_following_with_full_skill_set(tmp_path):
     from embodied_bringup.launch_builders.embodied import generate_embodied_nodes

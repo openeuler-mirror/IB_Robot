@@ -339,7 +339,7 @@ SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固�
 perception_services:
   services:
     - id: grasp_grounding
-      bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
+      bundle_path: models/grounding_dino_swint_seq8_1280x720
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/GroundingDetect
     - id: grasp_segmentation

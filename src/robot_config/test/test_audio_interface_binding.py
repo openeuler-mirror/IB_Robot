@@ -207,11 +207,11 @@ def test_lekiwi_style_description_without_vendor_interfaces_binds(description_ap
 @pytest.mark.model_bundle(
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
+    "grounding_dino_swint_seq8_1280x720",
     "sam2.1_hiera_tiny_prompt_ascend",
     "sam2.1_hiera_tiny",
     "ram_plus_swin_large_14m",
-    "siglip2_so400m_patch14_384_ascend",
+    "siglip2_so400m_patch14_384",
 )
 def test_lekiwi_nav_grasp_asr_cli_override_validates_and_binds(description_api):
     """The real lekiwi_nav_grasp accepts `voice_asr_auto_start:=true` end to end."""

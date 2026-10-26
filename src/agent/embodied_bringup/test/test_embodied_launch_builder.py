@@ -323,11 +323,11 @@ def test_sound_orientation_node_is_projected_from_robot_config():
 _LEKIWI_MODEL_BUNDLES = (
     "yolox_x_640",
     "pear_parameter_network",
-    "grounding_dino_swint_seq8_1280x720_ascend",
+    "grounding_dino_swint_seq8_1280x720",
     "sam2.1_hiera_tiny_prompt_ascend",
     "sam2.1_hiera_tiny",
     "ram_plus_swin_large_14m",
-    "siglip2_so400m_patch14_384_ascend",
+    "siglip2_so400m_patch14_384",
 )
 
 
