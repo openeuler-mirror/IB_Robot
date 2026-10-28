@@ -15,6 +15,7 @@
   <!-- docs/testing.md: every sibling imported by tests is declared as an
        explicit test_depend; <depend> covers build+exec scope only. -->
   <test_depend>robot_runtime</test_depend>
+  <test_depend>ibrobot_msgs</test_depend>
   <depend>geometry_msgs</depend>
   <depend>rclcpp_components</depend>
   <depend>rosgraph_msgs</depend>

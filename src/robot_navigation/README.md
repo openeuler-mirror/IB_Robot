@@ -693,7 +693,7 @@ colcon test --packages-select robot_navigation --base-paths src --event-handlers
 
 `test/test_lidar_odometry_gate.py` 是 LeKiwi 的 FAST-LIO 精度门禁（openspec change
 `lekiwi-gazebo-runtime-platform` D14），说明见 `lekiwi_robot` README 的「Lidar-odometry regression gate」一节。
-该门禁通过 `robot_config` 的通用入口启动 Gazebo 与 Nav2，所以放在本包，不放在 `lekiwi_robot`：运行时包的
+该门禁通过 `robot_config` 的通用入口启动仿真器（Gazebo 与 MuJoCo 各一条腿）与 Nav2，所以放在本包，不放在 `lekiwi_robot`：运行时包的
 测试依赖也计入 `scripts/verify_runtime_independence.sh` 的依赖闭包审计。Ubuntu 上默认执行；openEuler 上或设置
 `NAV_TEST_PROFILE=minimal` 时跳过。只跑该门禁：
 
@@ -703,31 +703,27 @@ NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation --base-path
 
 ### 3. robot_config minimal 测试
 
-openEuler、无 Gazebo 或无桌面环境跑 minimal profile。该 profile 会显式跳过 Gazebo/Nav2 完整仿真，只验证测试发现和 skip 策略。
+openEuler、无仿真器或无桌面环境跑 minimal profile。该 profile 跳过两个平台的导航 E2E，只验证测试发现和 skip 策略。
 
 ```bash
 NAV_TEST_PROFILE=minimal colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
 ```
 
-预期结果：`robot_config` navigation simulation 测试 `3 skipped`，skip 原因为 minimal profile 禁用 Gazebo 仿真。
+预期结果：`-k test_navigation_simulation` 选中的用例中，无仿真用例（staging 解析、决策层、map → odom 所有权归因、收集安全）全部通过，2 个 E2E 用例 skipped。skip 原因按决策顺序给出：平台能力或仿真器环境不可用时先按环境 skip（`IBROBOT_REQUIRE_SIM_PLATFORMS` 列出该平台时改为 fail）；环境可用而 `NAV_TEST_PROFILE=minimal`（或 openEuler 默认）时按 minimal profile skip。`NAV_TEST_PROFILE` 的非法取值在任何 skip 之前直接 fail。用例总数不在文档里钉死，以 `pytest --collect-only` 为准。
 
 ### 4. robot_config full 仿真测试
 
-Ubuntu 且已安装 Gazebo/ros_gz 时运行 full profile。该测试由 `robot_config` 维护，启动 Gazebo、ros2_control、控制器、Nav2、`robot_navigation` 节点和测试辅助节点。
+Ubuntu 且已安装仿真器时运行 full profile。该测试由 `robot_config` 维护，按 `PHYSICS_SIM_PLATFORMS` 参数化。每个平台启动一次 `lekiwi_lidar` 的导航 stage。stage 包含 ros2_control、控制器、FAST-LIO、AMCL、Nav2 和 `robot_navigation` 节点。两个平台的阈值与断言一致（openspec `lekiwi-mujoco-runtime-platform` D15）。
 
 ```bash
 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
 ```
 
-预期结果：3 个 Gazebo/Nav2 导航 E2E 通过。测试进程会打印临时日志目录，例如 `/tmp/robot_config_nav_sim_xxx`，其中包含 `robot_launch.log`、`odom_bridge.log`、`gt_odom_node.log` 和 `cmd_vel_relay.log`。
+预期结果：Gazebo 与 MuJoCo 各 1 个导航 E2E 通过。测试进程打印临时日志目录，例如 `/tmp/robot_config_nav_sim_<platform>_xxx`，其中包含 `robot_launch.log`。验收运行设置 `IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco`，把任一平台的 skip 变为 fail。MuJoCo 平台依赖 `ros-humble-mujoco-ros2-control` 和 `ros-humble-mujoco-3d-lidar`。缺少依赖时该平台 skip，并给出原因。
 
-### 5. Gazebo GUI 可视化测试
+### 5. GUI 可视化
 
-GUI 不是必跑项，只用于 Ubuntu 桌面环境人工观察 Gazebo 窗口。pytest 仍会自动发送导航目标，Gazebo 窗口只负责可视化。
-
-```bash
-SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
-```
+E2E 测试固定以 headless 启动仿真：Gazebo 设 `IBROBOT_GAZEBO_HEADLESS=1`，MuJoCo 设 `IBROBOT_MUJOCO_HEADLESS=1`。测试不读取 `SIM_GUI`。人工观察窗口时，按 `lekiwi_robot/README.md` 的 launch 命令手动启动带显示的仿真。
 
 ## ROS 接口
 
@@ -1088,7 +1084,7 @@ robot_navigation/
 │   ├── test_voice_control.py      # 语音控制 pytest 测试
 │   ├── test_cmd_vel_bridge.py     # cmd_vel 桥接 pytest 测试（IK/FK/里程计）
 │   ├── test_nav2_goal_client.py   # Nav2 Goal 客户端 pytest 测试
-│   ├── test_lidar_odometry_gate.py  # LeKiwi FAST-LIO 精度门禁（Gazebo）
+│   ├── test_lidar_odometry_gate.py  # LeKiwi FAST-LIO 精度门禁（Gazebo 与 MuJoCo）
 │   ├── config/lekiwi_lio_sim.yaml # 门禁 overlay（测试数据，不安装）
 │   └── e2e/
 │       ├── mock_servers.py        # Mock Trigger/Action 服务

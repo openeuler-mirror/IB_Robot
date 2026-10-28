@@ -2200,7 +2200,7 @@ camera_info_url: file:///home/user/.ros/camera_info/top.yaml
 
 ## 仿真依赖（MuJoCo）
 
-`use_sim:=true` 模式依赖 `ros-humble-mujoco-ros2-control`，通过 rosdep 声明为运行时依赖：
+`use_sim:=true` 开启仿真，仿真后端由 `sim_platform` 选择，与 profile 的 `sim_platforms` 对齐：`gazebo`/`mujoco` 是物理仿真器平台；`sdk`（默认）是厂商 SDK 虚拟总线仿真（生产硬件适配层后的虚拟总线，无物理仿真器）——它与 `use_sim:=false`（真实硬件执行）是两回事。选择 MuJoCo 后端时依赖 `ros-humble-mujoco-ros2-control`，通过 rosdep 声明为运行时依赖；Gazebo 后端依赖 gz/ign 仿真器栈：
 
 ```bash
 # 安装所有依赖（含 MuJoCo 仿真包）

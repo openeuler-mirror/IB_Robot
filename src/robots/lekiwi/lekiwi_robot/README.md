@@ -150,7 +150,7 @@ it launches the generic application entry, and this package may not declare
 test dependencies on generic packages (the independence gate below audits
 the whole dependency closure, test dependencies included). It runs the
 production navigation stage (staged from the gate's own
-`test/config/lekiwi_lio_sim.yaml` overlay) in the shipped
+`robot_navigation/test/config/lekiwi_lio_sim.yaml` overlay) in the shipped
 `nav_room` scene and, with no Nav2 goal active, drives a scripted closed
 route on **`/cmd_vel_nav`** — the production chain's entry point — so the
 velocity smoother and the collision monitor stay in the loop
@@ -201,11 +201,33 @@ NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation \
 The gate skips with a reason listing every missing capability on platforms
 without ground truth, profile support, lidar simulation or a scene template,
 and — independently — when the platform's simulator is unavailable
-(`ign` for Gazebo; the MuJoCo ament resources and a matching Python `mujoco`
-for MuJoCo). Acceptance runs set `IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco`
-to turn any such skip into a failure. The overlay is staged per platform
-(`test/config/lekiwi_lio_sim.yaml` pins `platform: gazebo`; the gate rewrites
-the staged copy).
+(`ign gazebo` or `gz sim` for Gazebo; the MuJoCo ament resources and a
+matching Python `mujoco` for MuJoCo). Acceptance runs set
+`IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco` to turn any such skip into a
+failure. The environment probe and the require-or-skip rule are shared
+through `robot_runtime.testing.sim_environment` (one copy for this gate, the
+chassis gate below and robot_config's navigation e2e). The overlay is staged
+per platform (`robot_navigation`'s `test/config/lekiwi_lio_sim.yaml` pins
+`platform: gazebo`; the gate rewrites the staged copy).
+
+### Navigation end-to-end test (D15)
+
+`robot_config/test/test_navigation_simulation.py` is the Nav2 end-to-end
+check of the same navigation stage: it sends `NavigateToPose` goals (to a
+point and back to the spawn) and a cancel-based stop, asserting the D3 stop
+thresholds and single-publisher `map -> odom` ownership (AMCL) on simulator
+ground truth. It is parametrized over `PHYSICS_SIM_PLATFORMS` — goals,
+thresholds and assertions are identical on Gazebo and MuJoCo; the staged
+`lekiwi_navi_sim` overlay (not the shipped one) carries the platform under
+test. The same capability/environment/require rule as the gate applies
+(`IBROBOT_REQUIRE_SIM_PLATFORMS` turns a skip of a listed platform into a
+failure); the shared rule lives in `robot_runtime.testing.sim_environment`
+(robot_config must not import lekiwi_robot's test assets).
+
+```bash
+NAV_TEST_PROFILE=full colcon test --packages-select robot_config \
+  --pytest-args -k test_navigation_simulation
+```
 
 Conformance and the independence gate:
 
