@@ -92,9 +92,16 @@ def validate_base_limits(profile: dict[str, Any], profile_path: str) -> None:
     bounds = realizable_limits(geometry_from_base(base))
     for axis, bound in bounds.items():
         declared = _require(cmd_vel, axis, "capabilities.base.cmd_vel.", profile_path)
-        if float(declared) > bound + _LIMIT_TOLERANCE:
+        value = float(declared)
+        if not math.isfinite(value) or value <= 0.0:
+            # NaN/Inf/negative limits are not a clamp (min/max turns NaN into
+            # +limit); the profile must declare a positive finite envelope.
             raise RuntimeProfileError(
-                f"capabilities.base.cmd_vel.{axis}={float(declared):g} exceeds what the wheels can realize "
+                f"capabilities.base.cmd_vel.{axis} must be a finite positive limit, got {declared!r}: {profile_path}"
+            )
+        if value > bound + _LIMIT_TOLERANCE:
+            raise RuntimeProfileError(
+                f"capabilities.base.cmd_vel.{axis}={value:g} exceeds what the wheels can realize "
                 f"({bound:.4f} at base.max_wheel_radps={float(base['max_wheel_radps']):g}): {profile_path}"
             )
 
@@ -121,6 +128,10 @@ def base_node_parameters(profile: dict[str, Any], profile_path: str) -> dict[str
         raise RuntimeProfileError(f"runtime profile key 'base.wheel_joints' is empty: {profile_path}")
     validate_base_limits(profile, profile_path)
     cmd_vel = _require(profile.get("capabilities") or {}, "base.cmd_vel", "capabilities.", profile_path)
+    # D3.2: the published envelope reaches the base node as parameters — the
+    # one authoritative clamp ahead of the IK and the wheel saturation. The
+    # axes are exactly LIMIT_AXES, so a missing key fails here naming it.
+    envelope = {axis: float(_require(cmd_vel, axis, "capabilities.base.cmd_vel.", profile_path)) for axis in LIMIT_AXES}
     return {
         "wheel_joints": [str(j) for j in base["wheel_joints"]],
         "wheel_radius": float(base["wheel_radius"]),
@@ -128,6 +139,7 @@ def base_node_parameters(profile: dict[str, Any], profile_path: str) -> dict[str
         "max_wheel_radps": float(base["max_wheel_radps"]),
         "control_frequency": float(base["control_frequency"]),
         "staleness_s": float(_require(cmd_vel, "staleness_s", "capabilities.base.cmd_vel.", profile_path)),
+        **envelope,
         "joint_states_topic": str(_require(profile, "joint_state_topic", "", profile_path)),
         "odom_frame": str(base["odom_frame"]),
         "base_frame": str(base["base_frame"]),

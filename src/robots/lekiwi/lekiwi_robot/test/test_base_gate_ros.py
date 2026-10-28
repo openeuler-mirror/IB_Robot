@@ -48,6 +48,11 @@ PARAMS = {
     "max_wheel_radps": "4.602",
     "control_frequency": "50.0",
     "staleness_s": "0.5",
+    # the published cmd_vel envelope (D3.2): no defaults, the node fails
+    # closed without it
+    "max_vx": "0.26",
+    "max_vy": "0.23",
+    "max_wz": "1.5",
     "odom_frame": "odom",
     "base_frame": "base_link",
     "publish_tf": "false",

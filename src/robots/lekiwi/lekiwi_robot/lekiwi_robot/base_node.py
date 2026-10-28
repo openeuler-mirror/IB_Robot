@@ -17,6 +17,7 @@ functions), so the ros2_control path and the SDK share one implementation.
 
 from __future__ import annotations
 
+import math
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ import rclpy
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.exceptions import ParameterUninitializedException
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -51,6 +53,9 @@ class LeKiwiBaseNode(Node):
         self.declare_parameter("max_wheel_radps", Parameter.Type.DOUBLE)
         self.declare_parameter("control_frequency", Parameter.Type.DOUBLE)
         self.declare_parameter("staleness_s", Parameter.Type.DOUBLE)
+        self.declare_parameter("max_vx", Parameter.Type.DOUBLE)
+        self.declare_parameter("max_vy", Parameter.Type.DOUBLE)
+        self.declare_parameter("max_wz", Parameter.Type.DOUBLE)
         self.declare_parameter("cmd_vel_topic", C.CMD_VEL_TOPIC)
         self.declare_parameter("wheel_command_topic", "/base_velocity_controller/commands")
         self.declare_parameter("joint_states_topic", "/joint_states")
@@ -66,6 +71,27 @@ class LeKiwiBaseNode(Node):
         self.declare_parameter("ack_frequency", 10.0)
 
         self._wheel_joints = [str(j) for j in self.get_parameter("wheel_joints").value]
+        # The published cmd_vel envelope (D3.2): no defaults — the profile is
+        # the only source, and a missing limit must fail at startup naming
+        # the parameter instead of driving with an unbounded fallback.
+        limits = {}
+        for key in ("max_vx", "max_vy", "max_wz"):
+            try:
+                limits[key] = float(self.get_parameter(key).value)
+            except ParameterUninitializedException as exc:
+                raise RuntimeError(
+                    f"required parameter '{key}' (the capabilities.base.cmd_vel envelope) is not set: "
+                    "the runtime profile must provide it (lekiwi_robot.base_profile)"
+                ) from exc
+            if not math.isfinite(limits[key]) or limits[key] <= 0.0:
+                # NaN/Inf/negative limits are not a clamp: min/max turns NaN
+                # into +limit, and an unbounded or inverted envelope would
+                # publish capabilities the chassis cannot honor.
+                raise RuntimeError(
+                    f"parameter '{key}' must be a finite positive limit, got {limits[key]!r}: "
+                    "the capabilities.base.cmd_vel envelope must be a positive finite bound"
+                )
+        self._max_vx, self._max_vy, self._max_wz = limits["max_vx"], limits["max_vy"], limits["max_wz"]
         self._geometry = lk.BaseGeometry()
         self._geometry.wheel_radius = float(self.get_parameter("wheel_radius").value)
         self._geometry.base_radius = float(self.get_parameter("base_radius").value)
@@ -140,6 +166,21 @@ class LeKiwiBaseNode(Node):
         # base during the window before the runtime reconciles.
         return self._status_seen and self._active_mode in self._base_modes
 
+    def _clamp_to_envelope(self, vx: float, vy: float, wz: float) -> tuple[float, float, float]:
+        """Clamp a twist to the published cmd_vel envelope (D3.2, per axis).
+
+        One authoritative clamp in the command path, before the IK and the
+        SDK wheel saturation: the published capabilities.base.cmd_vel limits
+        are what every platform executes — wheel saturation alone would allow
+        a larger yaw than the published max_wz (4.602 rad/s of wheel speed
+        gives 1.84 rad/s against the published 1.5).
+        """
+        return (
+            max(-self._max_vx, min(self._max_vx, vx)),
+            max(-self._max_vy, min(self._max_vy, vy)),
+            max(-self._max_wz, min(self._max_wz, wz)),
+        )
+
     def _on_runtime_status(self, msg: RuntimeStatus) -> None:
         with self._lock:
             self._stop_latched = bool(msg.stop_latched)
@@ -172,7 +213,17 @@ class LeKiwiBaseNode(Node):
         with self._lock:
             if not self._commands_permitted():
                 return
-            self._target = (float(msg.linear.x), float(msg.linear.y), float(msg.angular.z))
+            values = (float(msg.linear.x), float(msg.linear.y), float(msg.angular.z))
+            if not all(math.isfinite(value) for value in values):
+                # A NaN component survives min/max clamping as +limit, so a
+                # non-finite command must be rejected before the clamp: the
+                # target is zeroed and the control loop publishes a stop.
+                # (rclpy loggers take one preformatted message; printf-style
+                # positional args raise TypeError — review round 2.)
+                self._target = (0.0, 0.0, 0.0)
+                self.get_logger().warning(f"rejecting /cmd_vel with a non-finite component {values}; target zeroed")
+                return
+            self._target = values
             self._last_cmd = time.monotonic()
 
     def _publish_wheels(self, radps: list[float]) -> None:
@@ -186,7 +237,9 @@ class LeKiwiBaseNode(Node):
         with self._lock:
             stale = self._last_cmd == 0.0 or (time.monotonic() - self._last_cmd) > self._staleness
             active = self._commands_permitted() and not stale
-            vx, vy, wz = self._target if active else (0.0, 0.0, 0.0)
+            # D3.2: the published envelope clamps the target before the IK
+            # (and the SDK wheel saturation below), on every platform.
+            vx, vy, wz = self._clamp_to_envelope(*self._target) if active else (0.0, 0.0, 0.0)
             if active:
                 self._publish_wheels(lk.body_to_wheel_velocities(vx, vy, wz, self._geometry))
                 self._last_published_zero = False
@@ -217,8 +270,6 @@ class LeKiwiBaseNode(Node):
         self._publish_odom(msg.header.stamp)
 
     def _publish_odom(self, stamp) -> None:
-        import math
-
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self._odom_frame

@@ -68,6 +68,10 @@ def make_node(recorder: Recorder) -> LeKiwiBaseNode:
     node._last_published_zero = False
     node._target = (0.2, 0.0, 0.0)
     node._last_cmd = time.monotonic()
+    # the published cmd_vel envelope (D3.2): the target stays inside it here
+    node._max_vx = 0.26
+    node._max_vy = 0.23
+    node._max_wz = 1.5
     node._geometry = _geometry()
     node._publish_wheels = recorder.wheels
     node._publish_ack = lambda: recorder.ack(node._nav_enabled)
