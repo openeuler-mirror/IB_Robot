@@ -138,8 +138,8 @@ PYTHONPATH="$PWD/src/inference_manifest:$PWD/src/inference_service:$PWD/src/mode
 pytest -q \
     src/model_utils/test/test_export_onnx_rknn.py \
     src/model_utils/test/test_smolvla_rknn_export.py \
-    src/inference_service/tests/test_rknn_backend.py \
-    src/inference_service/tests/test_backend_contract.py
+    src/inference_service/test/test_rknn_backend.py \
+    src/inference_service/test/test_backend_contract.py
 ```
 
 Before board deployment, load the generated deployment through the strict manifest loader and
@@ -204,7 +204,7 @@ Transformer graphs, then validate numerical outputs and target latency on RK3588
 - `src/model_utils/model_utils/inference_manifest_export.py`
 - `src/model_utils/test/test_export_onnx_rknn.py`
 - `src/model_utils/test/test_smolvla_rknn_export.py`
-- `src/inference_service/tests/test_rknn_backend.py`
+- `src/inference_service/test/test_rknn_backend.py`
 
 ## When To Use This Skill
 

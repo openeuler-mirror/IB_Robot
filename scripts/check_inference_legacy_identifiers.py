@@ -40,9 +40,9 @@ PATTERNS = {
 # These tests intentionally prove that removed backend aliases are rejected.
 ALLOWLIST = {
     "src/model_utils/test/test_pi05_export_manifest.py": frozenset({"per_backend_manifest_option"}),
-    "src/inference_service/tests/test_backend_contract.py": frozenset({"removed_backend_alias"}),
-    "src/inference_service/tests/test_inference_manifest.py": frozenset({"removed_backend_alias"}),
-    "src/inference_service/tests/test_legacy_identifier_guard.py": frozenset(
+    "src/inference_service/test/test_backend_contract.py": frozenset({"removed_backend_alias"}),
+    "src/inference_service/test/test_inference_manifest.py": frozenset({"removed_backend_alias"}),
+    "src/inference_service/test/test_legacy_identifier_guard.py": frozenset(
         {"legacy_launch_argument", "legacy_runtime_surface"}
     ),
     "docs/Houmo_HMM_Conversion.md": frozenset({"per_backend_manifest", "legacy_artifact_override"}),

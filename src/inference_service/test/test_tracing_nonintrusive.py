@@ -20,7 +20,7 @@ from inference_service.pipeline import runtime as pipeline_runtime
 from inference_service.pipeline.runtime_core import StageFrame
 from inference_service.pipeline.stages import ModelStage
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
-from tests.test_onnx_model_session import _context, _fake_ort, _FakeGraph, _stateless_manifest
+from test.test_onnx_model_session import _context, _fake_ort, _FakeGraph, _stateless_manifest
 
 
 @pytest.mark.parametrize("enabled", [False, True])

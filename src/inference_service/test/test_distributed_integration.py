@@ -30,7 +30,7 @@ from inference_service.distributed.ros_protocol import (
 from inference_service.distributed.runtime import EdgeProcessorRuntime
 from inference_service.pipeline import PipelineState
 from inference_service.pipeline_policy_node import PipelinePolicyNode, _RoundTripProgress
-from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+from test.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
 
 def _identity(root: Path, pipeline_id: str = "policy"):

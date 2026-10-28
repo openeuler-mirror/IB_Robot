@@ -22,7 +22,7 @@ from inference_service.pipeline.stages import ModelStage
 from inference_service.runtime_composition import build_policy_runtime_dependencies
 from inference_service.unified_runtime import ExecutionFailure
 from robot_config.inference_config import parse_inference_config
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
+from test.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
 
 MODEL_NAME = "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515"
 

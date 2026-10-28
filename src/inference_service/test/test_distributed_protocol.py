@@ -38,7 +38,7 @@ from inference_service.distributed.ros_protocol import (
 from inference_service.distributed.service import align_inputs_to_selection
 from inference_service.distributed.types import PROTOCOL_VERSION, structured_error_from_exception
 from inference_service.pipeline import PipelineState
-from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+from test.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
 
 def _identity(root: Path, pipeline_id: str = "policy"):

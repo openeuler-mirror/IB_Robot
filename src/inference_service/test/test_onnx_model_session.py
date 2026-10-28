@@ -16,7 +16,7 @@ from inference_service.backends.errors import BackendLoadError
 from inference_service.backends.registry import _validate_onnx
 from inference_service.model_sessions import OnnxRuntimeModelSession, build_onnx_model_session
 from inference_service.unified_runtime import ExecutionContext, ModelRequest
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
+from test.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
 
 _STATIC_BACKEND_REGISTRY = BackendRegistry(STATIC_BACKEND_DESCRIPTORS)
 _REQUEST_CONTRACT = {

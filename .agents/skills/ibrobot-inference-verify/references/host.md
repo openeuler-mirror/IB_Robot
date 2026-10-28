@@ -13,7 +13,7 @@ deployment-name resolution); prefer them over hand-rolling.
 ## Tier 1 — Unit & Contract Tests
 
 ```bash
-source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q src/inference_service/tests
+source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q src/inference_service/test
 ```
 
 Pass criteria: all tests pass (no collection errors).

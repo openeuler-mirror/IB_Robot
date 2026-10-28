@@ -26,8 +26,8 @@ test = [
 # whole package report "collected 0 items" instead of skipping that one module.
 # colcon treats pytest's no-tests-collected exit code as success, so the package
 # would pass with zero tests run. No collected test needs this plugin - the
-# launch smoke scripts under tests/ci_smoke/ are standalone and not named
-# test_*.py - so switch it off rather than leave that trap armed.
+# launch smoke scripts under src/inference_service/test/ci_smoke/ are standalone
+# and not named test_*.py - so switch it off rather than leave that trap armed.
 addopts = "-p no:launch_testing -p no:launch_ros"
 
 norecursedirs = [

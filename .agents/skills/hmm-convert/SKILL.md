@@ -113,8 +113,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONPATH="$PWD/src/inference_manifest:$PWD/src/inference_service:$PWD/src/model_utils:$PYTHONPATH" \
 pytest -q \
     src/model_utils/test/test_hmm_export.py \
-    src/inference_service/tests/test_hmm_backend.py \
-    src/inference_service/tests/test_backend_contract.py
+    src/inference_service/test/test_hmm_backend.py \
+    src/inference_service/test/test_backend_contract.py
 ```
 
 ## Troubleshooting
@@ -147,7 +147,7 @@ Read `oh-constraints` first. Source the RoboFrame environment and `scripts/setup
 - `src/model_utils/model_utils/inference_manifest_export.py`
 - `src/inference_service/inference_service/backends/hmm/backend.py`
 - `src/model_utils/test/test_hmm_export.py`
-- `src/inference_service/tests/test_hmm_backend.py`
+- `src/inference_service/test/test_hmm_backend.py`
 
 ## When To Use This Skill
 

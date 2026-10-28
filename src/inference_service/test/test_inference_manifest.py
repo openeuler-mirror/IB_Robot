@@ -27,7 +27,7 @@ from inference_manifest import (
     write_inference_manifest,
 )
 from inference_manifest.models import DeviceLink
-from tests.manifest_fixtures import (
+from test.manifest_fixtures import (
     TEST_BUNDLE_UUID,
     create_non_policy_bundle,
     create_policy_bundle,

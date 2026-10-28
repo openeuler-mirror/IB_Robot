@@ -93,7 +93,7 @@ Not every PR needs all tiers. Use the table below to pick tiers.
 
 ## Core Workflow
 
-1. **Tier 1 — Unit tests**: `pytest -q src/inference_service/tests`
+1. **Tier 1 — Unit tests**: `pytest -q src/inference_service/test`
 2. **Tier 2 — Build**: `./scripts/build.sh --clean` (never raw `colcon build`)
 3. **Tier 3 — Policy mock**: generate YAML with
    `scripts/generate_verify_yaml.py policy`, launch with

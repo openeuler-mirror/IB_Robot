@@ -11,7 +11,7 @@ import torch
 from inference_manifest import load_inference_manifest
 from inference_service.backends import RuntimeContext
 from inference_service.pipeline.processors import create_lerobot_processor_views
-from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+from test.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
 
 def test_local_tokenizer_reference_is_resolved_against_bundle(monkeypatch, tmp_path: Path):

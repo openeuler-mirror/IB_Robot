@@ -188,7 +188,7 @@ observation.state -> pad/truncate -> state_proj -> one prefix token
 - `src/inference_service/inference_service/core/compiled_policy.py`
 - `src/inference_service/inference_service/core/rknn/smolvla/SmolVLARKNNModel.py`
 - `src/model_utils/model_utils/smolvla_export/export_rknn_modules.py`
-- `src/inference_service/tests/test_compiled_policy.py`
+- `src/inference_service/test/test_compiled_policy.py`
 
 ### 5.4 当前主工作区状态
 

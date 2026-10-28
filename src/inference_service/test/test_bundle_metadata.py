@@ -13,7 +13,7 @@ from inference_manifest import (
     load_inference_manifest_metadata,
     load_policy_metadata,
 )
-from tests.manifest_fixtures import (
+from test.manifest_fixtures import (
     TEST_BUNDLE_UUID,
     TEST_DEPLOYMENT_UUID,
     create_policy_bundle,

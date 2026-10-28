@@ -1,6 +1,6 @@
 """Package-local pytest configuration for inference_service.
 
-This package ships its own ``pytest.ini`` (dual test directories and the
+This package ships its own ``pytest.ini`` (its own testpaths and the
 launch_testing plugin opt-out), which makes this directory the pytest
 rootdir and truncates the upward conftest.py search at this directory. The
 workspace-root ``conftest.py`` therefore never loads, and with it the

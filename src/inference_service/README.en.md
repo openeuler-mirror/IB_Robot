@@ -659,7 +659,7 @@ When running from source, prefer source package paths and disable unrelated exte
 source .shrc_local
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 PYTHONPATH=src/inference_manifest:src/inference_service \
-pytest -q src/inference_service/tests
+pytest -q src/inference_service/test
 ```
 
 Check that removed identifiers have not re-entered active source, configuration, or tests:

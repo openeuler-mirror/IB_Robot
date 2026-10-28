@@ -102,7 +102,7 @@ ROS 的 `launch_testing` / `launch_ros` 插件是自动加载的，它们会把�
 
 更糟的是 colcon 把 pytest 的 `NO_TESTS_COLLECTED` 退出码**当作成功**（`colcon_core/task/python/test/pytest.py`），所以一个包可以在"零测试执行"的状态下通过。
 
-因此仓库根 `pyproject.toml` 的 `addopts` 关掉了这两个插件。没有任何被收集的测试需要它们（`tests/ci_smoke/*.py` 是独立脚本，不以 `test_` 开头）。**包内自带 `pytest.ini` 会覆盖根配置，必须同样带上这两个 `-p no:` 参数**，`src/inference_service/pytest.ini` 即是例子。
+因此仓库根 `pyproject.toml` 的 `addopts` 关掉了这两个插件。没有任何被收集的测试需要它们（`src/inference_service/test/ci_smoke/*.py` 是独立脚本，不以 `test_` 开头）。**包内自带 `pytest.ini` 会覆盖根配置，必须同样带上这两个 `-p no:` 参数**，`src/inference_service/pytest.ini` 即是例子。
 
 新增模块级 `importorskip` 前先想清楚：它的目标一旦在某个 CI 镜像里缺失，整个包的测试会静默归零而不是失败。优先用逐个测试的 `@pytest.mark.skipif`。
 

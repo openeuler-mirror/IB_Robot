@@ -11,7 +11,7 @@ from ibrobot_msgs.msg import VariantsList
 from ibrobot_tracing.definitions import BUILTIN_TRACEPOINT_REGISTRY
 from inference_service import pipeline_policy_node
 from inference_service.pipeline_policy_node import PipelinePolicyNode
-from tests.test_cpu_smoke_bundle import _TraceRecorder
+from test.test_cpu_smoke_bundle import _TraceRecorder
 
 
 @pytest.mark.parametrize("failure", [None, "admission", "inference", "canceled"])

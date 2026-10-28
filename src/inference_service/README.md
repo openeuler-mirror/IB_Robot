@@ -805,7 +805,7 @@ artifact path、binding 或 digest。
 
 ## 验证
 
-从工作区根目录加载项目环境，并禁用外部 pytest plugins。包测试同时收集 `tests/` 和 `test/`：
+从工作区根目录加载项目环境，并禁用外部 pytest plugins。包测试统一收集在 `test/`：
 
 ```bash
 source .shrc_local

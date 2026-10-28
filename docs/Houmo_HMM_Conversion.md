@@ -348,7 +348,7 @@ PI0.5 使用 prefill output -> decode input 的 device pointer；SmolVLA 使用 
 - PI0.5 HMM exporter：`src/model_utils/model_utils/pi05_export/`
 - 统一 manifest writer：`src/model_utils/model_utils/inference_manifest_export.py`
 - HMM backend：`src/inference_service/inference_service/backends/hmm/backend.py`
-- HMM backend tests：`src/inference_service/tests/test_hmm_backend.py`
+- HMM backend tests：`src/inference_service/test/test_hmm_backend.py`
 - HMM exporter tests：`src/model_utils/test/test_hmm_export.py`
 - 已迁移 bundle：`models/pi05_hmm/`、`models/smolvla_hmm/`
 - 板端环境：`scripts/setup/houmo_hmm_env.sh`
