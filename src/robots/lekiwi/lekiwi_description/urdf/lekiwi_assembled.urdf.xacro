@@ -19,6 +19,18 @@
   <xacro:arg name="simulated" default="false"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
   <xacro:arg name="mujoco_model" default=""/>
+  <!-- mujoco_sim_speed_factor: the mujoco_ros2_control <hardware>
+       "sim_speed_factor" parameter — the fraction of real time the physics
+       loop targets (0.25 => RTF ~0.25). Empty (the default) leaves the
+       simulator's own real-time sync untouched. Used by the chassis gate's
+       throttled-latency measurement (D3.4/D12); passed through the profile's
+       hardware.xacro_args by the test. -->
+  <xacro:arg name="mujoco_sim_speed_factor" default=""/>
+  <!-- mujoco_headless: the mujoco_ros2_control <hardware> "headless"
+       parameter (no Simulate UI window). Set from IBROBOT_MUJOCO_HEADLESS by
+       render_mujoco_description; the Gazebo treatment stays off under the
+       MuJoCo plugin (test_gazebo_platform.py). -->
+  <xacro:arg name="mujoco_headless" default="false"/>
   <!-- gz_ros2_control: always passed by render_gazebo_description (accepted
        even when unused); sim_effort_state is accepted and ignored here: this
        profile advertises no joint.current interface (D2). -->
@@ -28,6 +40,10 @@
        so the MuJoCo platform (a different sim_plugin) and every physical/SDK
        render (use_sim false) keep their exact pre-change output. -->
   <xacro:property name="gz_sim" value="${'$(arg use_sim)' == 'true' and '$(arg sim_plugin)' == 'gz_ros2_control/GazeboSimSystem'}"/>
+  <!-- MuJoCo platform gate (D2a/D9): the hardware parameters and the wheel
+       transmissions below appear only when the MuJoCo system interface is
+       the selected plugin, so hardware/SDK/Gazebo renders are unchanged. -->
+  <xacro:property name="mujoco_sim" value="${'$(arg use_sim)' == 'true' and '$(arg sim_plugin)' == 'mujoco_ros2_control/MujocoSystemInterface'}"/>
   <!-- Wheel joint axis under Gazebo: the SDK's mount angles (150/-90/30 deg)
        are each wheel's POSITIVE-spin drive direction, which is antiparallel
        to the URDF joints' +z rotation as simulated (positive rotation about
@@ -268,10 +284,53 @@
     <xacro:if value="$(arg use_sim)">
       <hardware>
         <plugin>$(arg sim_plugin)</plugin>
-        <xacro:if value="${'$(arg mujoco_model)' != ''}">
-          <param name="mujoco_model">$(arg mujoco_model)</param>
+        <xacro:if value="${mujoco_sim}">
+          <xacro:if value="${'$(arg mujoco_model)' != ''}">
+            <param name="mujoco_model">$(arg mujoco_model)</param>
+            <!-- Turn the deprecated URDF <sensor> camera auto-registration
+                 off: cameras are configured through the mujoco_plugins
+                 CameraPlugin parameters (mujoco_ros2_control >= 0.1.0); this
+                 model declares no cameras anyway. -->
+            <param name="auto_register_cameras">false</param>
+          </xacro:if>
+          <!-- Floating-base odometry (D9): the free-joint state the system
+               interface reports on its simulator-namespaced topic; the
+               constants match robot_runtime.mujoco
+               (ODOM_FREE_JOINT_NAME / FLOATING_BASE_STATE_TOPIC) and the
+               freejoint in mujoco/lekiwi_base.xml.template. Never advertised
+               or consumed by a runtime node. -->
+          <param name="odom_free_joint_name">floating_base_joint</param>
+          <param name="odom_topic">/simulator/floating_base_state</param>
+          <xacro:if value="${'$(arg mujoco_sim_speed_factor)' != ''}">
+            <param name="sim_speed_factor">$(arg mujoco_sim_speed_factor)</param>
+          </xacro:if>
+          <xacro:if value="$(arg mujoco_headless)">
+            <param name="headless">true</param>
+          </xacro:if>
         </xacro:if>
       </hardware>
+    </xacro:if>
+
+    <!-- D2a: the MJCF joints/actuators are named wheel_7/8/9 (a PidROS topic
+         token may not start with a digit), so the MuJoCo branch maps the
+         ros2_control joints 7/8/9 onto those actuators through
+         SimpleTransmission entries. Every ROS-facing name stays 7/8/9. -->
+    <xacro:if value="${mujoco_sim}">
+      <transmission name="wheel_7_transmission">
+        <plugin>transmission_interface/SimpleTransmission</plugin>
+        <joint name="7" role="wheel"/>
+        <actuator name="wheel_7" role="wheel"/>
+      </transmission>
+      <transmission name="wheel_8_transmission">
+        <plugin>transmission_interface/SimpleTransmission</plugin>
+        <joint name="8" role="wheel"/>
+        <actuator name="wheel_8" role="wheel"/>
+      </transmission>
+      <transmission name="wheel_9_transmission">
+        <plugin>transmission_interface/SimpleTransmission</plugin>
+        <joint name="9" role="wheel"/>
+        <actuator name="wheel_9" role="wheel"/>
+      </transmission>
     </xacro:if>
 
     <xacro:unless value="$(arg use_sim)">

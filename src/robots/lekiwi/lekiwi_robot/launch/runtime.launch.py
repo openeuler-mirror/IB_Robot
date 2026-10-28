@@ -6,16 +6,20 @@ LeKiwi base node (cmd_vel, odometry, navigation gating) + sensor peripherals
 (D12: profile defaults, deployment overrides via peripherals:=<file>) with
 the fast_lio lidar odometry chain + runtime facade.
 
-On the Gazebo platform (D7) the whole stack runs on simulation time against
-the physics simulator: the description is rendered once with the Gazebo
-renderer (the public model and interface description derive from that exact
-render), the base node, FAST-LIO and the scan converter carry
-``use_sim_time``, and ``runtime_stack_actions`` hands the embodiment the
-world name and spawn pose.
+On a physics platform the whole stack runs on simulation time against the
+simulator: the description is rendered once with the platform's renderer (the
+public model and interface description derive from that exact render), the
+base node, FAST-LIO and the scan converter carry ``use_sim_time``, and
+``runtime_stack_actions`` hands the embodiment the world/scene name and spawn
+pose. On Gazebo (D7) the world comes from ``gazebo_world``; on MuJoCo
+(lekiwi-mujoco-runtime-platform D7) the scene comes from ``mujoco_scene``
+(default the shared ``empty`` scene) and headless mode follows
+``IBROBOT_MUJOCO_HEADLESS``.
 
     ros2 launch lekiwi_robot runtime.launch.py profile:=<path-or-name> \
-        [use_sim:=true] [sim_platform:=gazebo] [gazebo_world:=<name>] \
-        [spawn_x/y/z/yaw:=…] [display:=true] [peripherals:=<fragment.yaml>]
+        [use_sim:=true] [sim_platform:=gazebo|mujoco] \
+        [gazebo_world:=<name>] [mujoco_scene:=<name>] [spawn_x/y/z/yaw:=…] \
+        [display:=true] [peripherals:=<fragment.yaml>]
 """
 
 from __future__ import annotations
@@ -35,6 +39,7 @@ from robot_runtime.launch_support import (
     motion_launch_arguments,
     peripheral_stack_actions,
     render_gazebo_description,
+    render_mujoco_description,
     render_robot_description,
     resolve_profile_argument,
     resolve_sim_selection,
@@ -104,15 +109,25 @@ def _launch_setup(context, *_args, **_kwargs):
     # robot_state_publisher load it, and the facade derives the robot model and
     # the teleoperation interfaces from the same rendering. The arm-only model
     # above is what so101_motion plans against; it is not the public model.
-    # D7: one platform-aware render — on Gazebo the public model and the
-    # interface description derive from the exact Gazebo rendering (sensors
-    # included); hardware and SDK keep the ordinary renderer.
-    if simulated and sim_platform == "gazebo":
+    # D7: one platform-aware render — on a physics platform the public model
+    # and the interface description derive from the exact platform rendering
+    # (sensors included); hardware and SDK keep the ordinary renderer. On
+    # MuJoCo (lekiwi-mujoco-runtime-platform D7) the render composes the robot
+    # MJCF into the named scene (empty scene name composes ``empty``).
+    mujoco_scene = LaunchConfiguration("mujoco_scene").perform(context).strip()
+    if simulated and sim_platform in PHYSICS_SIM_PLATFORMS:
         spawn_pose = tuple(
             float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw")
         )
+    else:
+        spawn_pose = (0.0, 0.0, 0.0, 0.0)
+    if simulated and sim_platform == "gazebo":
         robot_description = render_gazebo_description(
             {**profile, "peripherals": merged_peripherals}, profile_path, spawn_pose=spawn_pose
+        )
+    elif simulated and sim_platform == "mujoco":
+        robot_description = render_mujoco_description(
+            {**profile, "peripherals": merged_peripherals}, profile_path, spawn_pose=spawn_pose, scene=mujoco_scene
         )
     else:
         robot_description = render_robot_description(profile, profile_path, simulated)
@@ -142,11 +157,8 @@ def _launch_setup(context, *_args, **_kwargs):
             interface_description=description,
             sim_platform=sim_platform or "",
             gazebo_world=LaunchConfiguration("gazebo_world").perform(context).strip(),
-            spawn_pose=(
-                tuple(float(LaunchConfiguration(f"spawn_{axis}").perform(context)) for axis in ("x", "y", "z", "yaw"))
-                if simulated and sim_platform == "gazebo"
-                else (0.0, 0.0, 0.0, 0.0)
-            ),
+            mujoco_scene=mujoco_scene,
+            spawn_pose=spawn_pose,
         ),
         base_node,
         *motion_actions,
@@ -166,8 +178,8 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "sim_platform",
                 default_value="",
-                description="Simulation platform: sdk | gazebo (sdk: the vendor SDK virtual bus, no physics; "
-                "gazebo: the physics simulator); implies use_sim:=true when given alone",
+                description="Simulation platform: sdk | gazebo | mujoco (sdk: the vendor SDK virtual bus, no "
+                "physics; gazebo/mujoco: the physics simulators); implies use_sim:=true when given alone",
             ),
             DeclareLaunchArgument(
                 "simulated",
@@ -179,18 +191,23 @@ def generate_launch_description():
                 default_value="",
                 description="Gazebo world name to spawn into (empty: the runtime starts a minimal empty world)",
             ),
-            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (Gazebo platform)"),
-            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (Gazebo platform)"),
+            DeclareLaunchArgument(
+                "mujoco_scene",
+                default_value="",
+                description="MuJoCo scene name to compose the robot into (empty: the shared 'empty' scene)",
+            ),
+            DeclareLaunchArgument("spawn_x", default_value="0.0", description="Robot spawn pose x (physics platforms)"),
+            DeclareLaunchArgument("spawn_y", default_value="0.0", description="Robot spawn pose y (physics platforms)"),
             DeclareLaunchArgument(
                 # Default lifts the base so the wheels (lowest point at
                 # wheel_base_offset_z - wheel_radius = -0.0406 m below
                 # base_link) start just above the ground plane (D7).
                 "spawn_z",
                 default_value="0.05",
-                description="Robot spawn pose z (Gazebo platform); default lifts the wheels above the ground",
+                description="Robot spawn pose z (physics platforms); default lifts the wheels above the ground",
             ),
             DeclareLaunchArgument(
-                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (Gazebo platform)"
+                "spawn_yaw", default_value="0.0", description="Robot spawn yaw in radians (physics platforms)"
             ),
             DeclareLaunchArgument("display", default_value="false", description="Launch RViz"),
             DeclareLaunchArgument("instance_id", default_value="", description="Public robot instance identity"),

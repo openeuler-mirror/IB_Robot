@@ -113,6 +113,17 @@ def apply_mid360_mount(robot_config: dict[str, Any], mount: dict[str, Any]) -> d
             "pitch": rpy[1],
             "yaw": rpy[2],
         }
+        # lekiwi-mujoco-runtime-platform D1: the same base_link-relative mount
+        # drives the MuJoCo attachment pose (one helper, both platforms).
+        entry.setdefault("simulation", {}).setdefault("mujoco", {})["transform"] = {
+            "parent_frame": mount["parent_frame"],
+            "x": translation[0],
+            "y": translation[1],
+            "z": translation[2],
+            "roll": rpy[0],
+            "pitch": rpy[1],
+            "yaw": rpy[2],
+        }
     else:
         # runtime-peripheral-overrides D1 (revision 2): on the require_model
         # provider path the lidar mounting is runtime-owned; peripheral

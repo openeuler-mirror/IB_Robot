@@ -96,6 +96,10 @@ def test_provider_entry_update_preserves_device_settings():
     sim = entry["simulation"]["gazebo"]["transform"]
     assert (sim["x"], sim["y"], sim["z"]) == tuple(mount["translation"])
     assert (sim["roll"], sim["pitch"], sim["yaw"]) == tuple(mount["rpy"])
+    # lekiwi-mujoco-runtime-platform D1: the same base_link-relative mount
+    # drives the MuJoCo attachment pose (one helper, both platforms)
+    mujoco = entry["simulation"]["mujoco"]["transform"]
+    assert mujoco == sim
 
 
 def test_non_provider_path_keeps_the_frame_id_remount():

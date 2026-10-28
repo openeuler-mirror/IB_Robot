@@ -13,8 +13,13 @@ diagnostic) against the simulator ground truth, aligned at the route start.
 A platform runs the gate only when its capabilities are all present
 (D14.2): ground truth, the profile's ``sim_platforms``, lidar simulation
 (``LIDAR_SIM_PLATFORMS``) and a scene template. The gate is parametrized
-over ``PHYSICS_SIM_PLATFORMS``; today ``gazebo`` satisfies all four and
-``mujoco`` skips naming every missing item.
+over ``PHYSICS_SIM_PLATFORMS``; both ``gazebo`` and ``mujoco`` satisfy all
+four (lekiwi-mujoco-runtime-platform D10). A second, independent check
+covers the simulator ENVIRONMENT (``ign`` for Gazebo; the MuJoCo ament
+resources and a matching Python ``mujoco`` for MuJoCo): missing
+environment skips with a reason — unless ``IBROBOT_REQUIRE_SIM_PLATFORMS``
+lists the platform, in which case any skip of it fails instead (the
+acceptance runs).
 
 The gate lives in robot_navigation, not lekiwi_robot: it launches the
 generic application entry (robot_config + this package's Nav2 chain), and
@@ -54,8 +59,10 @@ from pathlib import Path
 
 import pytest
 import rclpy
+import yaml
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist, Vector3
 from nav_msgs.msg import Odometry
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
@@ -120,7 +127,13 @@ ROUTE_POSITION_TOLERANCE = 0.10
 ROUTE_HEADING_TOLERANCE_DEG = 5.0
 #: Settles: 2 s of simulation time before the route (D14.3), 1 s between
 #: segments and after the final one (the smoother's velocity_timeout, D14.4).
-PRE_ROUTE_SETTLE_SEC = 2.0
+# 6 s (was 2): the navigation stage's bringup burst (first costmap updates,
+# AMCL localization, behavior-server activation) plus FAST-LIO's map init
+# land in the first seconds after readiness; under a loaded colcon run they
+# briefly starve FAST-LIO into skipping scans (round 3 evidence: gaps and
+# monitor misses clustered 2-7 s into segment 1). Settling longer under
+# zero command moves that transient out of the measured route.
+PRE_ROUTE_SETTLE_SEC = 6.0
 INTER_SEGMENT_SETTLE_SEC = 1.0
 #: Ground-truth motion settled thresholds closing a segment (D14.4).
 SETTLE_SPEED_LIMIT = 0.01
@@ -158,6 +171,15 @@ ODOMETRY_MAX_GAP_SEC = 0.35
 UNPAIRED_FRACTION_LIMIT = 0.05
 RTF_LIMIT = 0.8
 MAX_FUTURE_SKEW_SEC = 0.1
+#: Frame-health windows open this far into the route (round 3): the tail of
+# the bringup transient (see PRE_ROUTE_SETTLE_SEC) may still skip a lidar
+# period or two once motion starts; the gap/fraction/monitor checks cover
+# the sustained drive, not the startup burst. The estimate metrics (ATE
+# etc.) keep the full window.
+FRAME_HEALTH_WARMUP_SEC = 5.0
+#: A /clock callback gap at or above this is recorded as a stall interval
+#: (the host-pause discriminator matches these against the odometry gap).
+CLOCK_STALL_THRESHOLD_SEC = 0.3
 
 #: D14.6 spec caps (hard: a run above any cap fails no matter what was
 #: measured) and the committed thresholds
@@ -234,18 +256,27 @@ def test_gazebo_has_every_gate_capability():
     assert missing_gate_capabilities("gazebo") == []
 
 
-def test_mujoco_skip_reason_names_all_four_capabilities():
-    """D14.2: mujoco misses every capability; the skip reason lists them."""
-    missing = missing_gate_capabilities("mujoco")
+def test_mujoco_reports_no_missing_capability():
+    """D10 (lekiwi-mujoco-runtime-platform): mujoco passes all four checks
+    too — the gate runs there, never a capability skip."""
+    assert missing_gate_capabilities("mujoco") == []
+
+
+def test_a_synthetic_platform_reports_all_four_capabilities():
+    """The probe itself still names all four missing capabilities for a
+    platform nothing supports (the skip-reason surface stays honest)."""
+    missing = missing_gate_capabilities("synthetic")
     assert len(missing) == 4, f"expected all four capabilities missing, got {missing}"
-    assert missing[0].startswith("ground truth") and "mujoco" in missing[0]
+    assert missing[0].startswith("ground truth") and "synthetic" in missing[0]
     assert missing[1].startswith("runtime profile") and "sim_platforms" in missing[1]
     assert missing[2].startswith("simulated lidar") and "LIDAR_SIM_PLATFORMS" in missing[2]
     assert missing[3].startswith("scene template")
 
 
 # ---------------------------------------------------------------------------
-# Gazebo availability and the E2E profile selection (same rules as D10)
+# Simulator availability and the required-platform gate (D10,
+# lekiwi-mujoco-runtime-platform: two separate checks — code capability and
+# environment availability)
 # ---------------------------------------------------------------------------
 
 
@@ -254,6 +285,74 @@ def _gazebo_available() -> bool:
         return subprocess.run(["ign", "gazebo", "--version"], capture_output=True, timeout=10).returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+
+def _mujoco_environment_missing() -> str | None:
+    """Why the MuJoCo simulator environment is unusable, or None when fine.
+
+    The ament resources the C++ node needs (the control package and the
+    ``mujoco_3d_lidar`` engine extension) and a Python ``mujoco`` matching
+    the simulator's libmujoco (the compiler must bake the same version).
+    """
+    try:
+        from ament_index_python import get_resources
+        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+
+        try:
+            get_package_share_directory("mujoco_ros2_control")
+        except PackageNotFoundError:
+            return "the mujoco_ros2_control package is not installed (apt install ros-humble-mujoco-ros2-control)"
+        resources = get_resources("mujoco_plugins")
+        if "mujoco_3d_lidar" not in resources:
+            return "the mujoco_3d_lidar ament resource is not installed (apt install ros-humble-mujoco-3d-lidar)"
+    except ImportError:
+        return "ament_index_python is unavailable"
+    try:
+        import mujoco as python_mujoco  # noqa: PLC0415
+
+        from robot_runtime.mujoco import simulator_versions
+
+        versions = simulator_versions()
+        if versions.mujoco is None:
+            return "the mujoco_vendor libmujoco library is not installed"
+        if python_mujoco.__version__ != versions.mujoco:
+            return (
+                f"Python mujoco {python_mujoco.__version__} != simulator libmujoco {versions.mujoco}; "
+                "the compiler and the simulator must match"
+            )
+    except ImportError:
+        return "the Python mujoco package is unavailable"
+    return None
+
+
+def _environment_missing(sim_platform: str) -> str | None:
+    """Why the platform's simulator cannot run here, or None when it can."""
+    if sim_platform == "gazebo":
+        return None if _gazebo_available() else "ign gazebo is unavailable"
+    if sim_platform == "mujoco":
+        return _mujoco_environment_missing()
+    return f"no environment check for platform {sim_platform!r}"
+
+
+#: Acceptance runs list the platforms whose skips must instead fail
+#: (D10): missing environment, missing capability or the minimal profile.
+REQUIRE_SIM_PLATFORMS_ENV = "IBROBOT_REQUIRE_SIM_PLATFORMS"
+
+
+def _required_sim_platforms() -> set[str]:
+    listed = os.environ.get(REQUIRE_SIM_PLATFORMS_ENV, "").strip()
+    if not listed:
+        return set()
+    return {entry.strip().lower() for entry in listed.split(",") if entry.strip()}
+
+
+def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
+    """Skip — unless acceptance runs required this platform: then fail."""
+    if sim_platform in _required_sim_platforms():
+        pytest.fail(
+            f"lidar-odometry gate: platform {sim_platform!r} was required by {REQUIRE_SIM_PLATFORMS_ENV}: {reason}"
+        )
+    pytest.skip(reason)
 
 
 def _is_openeuler() -> bool:
@@ -265,16 +364,165 @@ def _is_openeuler() -> bool:
 
 
 def _select_test_profile():
+    """The E2E profile to run, or None when this host defaults the gate off.
+
+    Review round 2: this helper never skips by itself — the caller routes
+    every do-not-run reason through ``_gate_skip_or_fail`` so
+    ``IBROBOT_REQUIRE_SIM_PLATFORMS`` turns it into a failure. An explicitly
+    invalid ``NAV_TEST_PROFILE`` value fails outright: a typo in an
+    acceptance run must not silently become a skip.
+    """
     requested = os.environ.get(NAV_TEST_PROFILE_ENV, "").strip().lower()
     if requested:
         if requested not in {"full", "minimal"}:
-            pytest.skip(f"Unsupported {NAV_TEST_PROFILE_ENV}={requested!r}; expected 'full' or 'minimal'")
+            pytest.fail(f"invalid {NAV_TEST_PROFILE_ENV}={requested!r}; expected 'full' or 'minimal'")
         return requested
     if _is_openeuler():
-        pytest.skip(
-            f"openEuler minimal E2E profile: the lidar-odometry gate is off; set {NAV_TEST_PROFILE_ENV}=full to run it"
-        )
+        return None  # the openEuler default: minimal E2E, the gate is off
     return "full"
+
+
+# ---------------------------------------------------------------------------
+# The gate's decision layer: profile selection and the require-or-skip rule
+# (review round 2 — nothing may bypass IBROBOT_REQUIRE_SIM_PLATFORMS)
+# ---------------------------------------------------------------------------
+
+
+def test_an_invalid_profile_value_fails_outright(monkeypatch):
+    """A typo'd NAV_TEST_PROFILE must fail, never skip — an acceptance run
+    with REQUIRE set must not silently lose the gate to a bad env value."""
+
+    monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "bogus")
+    monkeypatch.delenv(REQUIRE_SIM_PLATFORMS_ENV, raising=False)
+    with pytest.raises(pytest.fail.Exception, match="invalid .*expected 'full' or 'minimal'"):
+        _select_test_profile()
+
+
+def test_the_minimal_profile_with_mujoco_required_fails_not_skips(monkeypatch):
+    monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "minimal")
+    monkeypatch.setenv(REQUIRE_SIM_PLATFORMS_ENV, "mujoco")
+    assert _select_test_profile() == "minimal"
+    with pytest.raises(pytest.fail.Exception, match="was required by IBROBOT_REQUIRE_SIM_PLATFORMS"):
+        _gate_skip_or_fail("mujoco", "the minimal E2E profile disables the gate")
+
+
+def test_the_openeuler_default_with_mujoco_required_fails_not_skips(monkeypatch):
+    import sys
+
+    monkeypatch.delenv(NAV_TEST_PROFILE_ENV, raising=False)
+    monkeypatch.setenv(REQUIRE_SIM_PLATFORMS_ENV, "mujoco")
+    monkeypatch.setattr(sys.modules[__name__], "_is_openeuler", lambda: True)
+    assert _select_test_profile() is None
+    with pytest.raises(pytest.fail.Exception, match="was required by IBROBOT_REQUIRE_SIM_PLATFORMS"):
+        _gate_skip_or_fail("mujoco", "the openEuler default minimal E2E profile disables the gate")
+
+
+def test_the_minimal_profile_without_a_requirement_stays_a_skip(monkeypatch):
+    monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "minimal")
+    monkeypatch.delenv(REQUIRE_SIM_PLATFORMS_ENV, raising=False)
+    with pytest.raises(pytest.skip.Exception, match="minimal E2E profile"):
+        _gate_skip_or_fail("gazebo", "the minimal E2E profile disables the gate")
+
+
+def test_a_capable_environment_with_mujoco_required_proceeds_to_execution():
+    """With capabilities, environment and the full profile all present, the
+    guard sequence falls through to the run itself (the executed gate above
+    is that run; here the decisions are pinned)."""
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.delenv(NAV_TEST_PROFILE_ENV, raising=False)
+    monkeypatch.setenv(REQUIRE_SIM_PLATFORMS_ENV, "mujoco")
+    try:
+        if not _is_openeuler():  # the full profile is this host's default
+            assert _select_test_profile() == "full"
+        assert missing_gate_capabilities("mujoco") == []
+        if _environment_missing("mujoco") is None:
+            return  # every guard passed: the gate executes on this host
+        # a machine without the environment keeps the documented rule
+        with pytest.raises(pytest.fail.Exception, match="was required by IBROBOT_REQUIRE_SIM_PLATFORMS"):
+            _gate_skip_or_fail("mujoco", "the MuJoCo environment is unavailable")
+    finally:
+        monkeypatch.undo()
+
+
+def _gap_is_host_pause(
+    gap_from_wall: float,
+    gap_to_wall: float,
+    gap_sec: float,
+    clock_stalls: list[tuple[float, float]],
+) -> bool:
+    """Whether a /clock stall overlapping the odometry gap excuses it (round 4).
+
+    A whole-host pause freezes the chain's output and the probe's dedicated
+    /clock delivery TOGETHER, so only a stall whose wall interval overlaps the
+    gap's receive interval AND lasts at least ``gap_sec - 0.1`` s is evidence
+    of one. A stall recorded at any other moment must not excuse the gap, and
+    no stall at all never does: those are real output stalls.
+    """
+    for stall_begin, stall_end in clock_stalls:
+        overlaps = stall_end >= gap_from_wall and stall_begin <= gap_to_wall
+        if overlaps and (stall_end - stall_begin) >= gap_sec - 0.1:
+            return True
+    return False
+
+
+def test_an_overlapping_clock_stall_excuses_the_gap():
+    stalls = [(5.0, 6.5), (10.0, 11.1)]
+    assert _gap_is_host_pause(10.2, 11.0, 0.9, stalls)
+
+
+def test_a_clock_stall_elsewhere_does_not_excuse_the_gap():
+    stalls = [(5.0, 6.5)]
+    assert not _gap_is_host_pause(10.2, 11.1, 0.9, stalls)
+
+
+def test_no_stall_does_not_excuse_the_gap():
+    assert not _gap_is_host_pause(10.2, 11.1, 0.9, [])
+
+
+def test_an_overlapping_but_too_short_stall_does_not_excuse_the_gap():
+    assert not _gap_is_host_pause(10.2, 11.1, 0.9, [(10.5, 10.7)])
+
+
+def _max_future_skew(samples: list[dict]) -> float | None:
+    """The worst ``stamp - sim_reference`` over recorded estimate samples.
+
+    ``sim_reference`` is the freshest simulation time from the dedicated
+    /clock callback or the 100 Hz wheel odometry when the sample's own
+    callback ran (round 3). The two references co-stall with the estimates
+    under machine-level pauses (so a loaded host cannot fake a future
+    stamp), while a chain genuinely stamping ahead of the simulation clock
+    stays visible. Samples recorded before any reference are skipped.
+    """
+    skew = None
+    for sample in samples:
+        reference = sample.get("sim_reference")
+        if reference is None:
+            continue
+        value = sample["stamp"] - reference
+        if skew is None or value > skew:
+            skew = value
+    return skew
+
+
+def test_a_truly_future_stamp_is_still_caught_by_the_skew_reference():
+    """The dedicated-clock reference keeps the check sensitive: a chain that
+    really stamps ahead of the simulation clock is flagged however healthy
+    the probe's clock callback is."""
+    healthy = [
+        {"stamp": 10.00, "sim_reference": 10.02},
+        {"stamp": 10.10, "sim_reference": 10.11},
+        {"stamp": 10.20, "sim_reference": 10.21},
+    ]
+    assert _max_future_skew(healthy) is not None and _max_future_skew(healthy) <= 0.0
+    # a stalled clock delivery alone must not fake a future stamp: the wheel
+    # half of the reference kept advancing
+    co_stalled = healthy + [{"stamp": 10.25, "sim_reference": 10.26}]
+    assert _max_future_skew(co_stalled) <= 0.0
+    ahead = healthy + [{"stamp": 10.75, "sim_reference": 10.21}]
+    assert _max_future_skew(ahead) == pytest.approx(0.54)
+    assert _max_future_skew(ahead) > MAX_FUTURE_SKEW_SEC
+    # samples recorded before any reference arrived carry none
+    assert _max_future_skew([{"stamp": 1.0, "sim_reference": None}]) is None
 
 
 # ---------------------------------------------------------------------------
@@ -308,11 +556,35 @@ class GateProbe(Node):
         self._lock = threading.Lock()
         self._last_clock_wall = 0.0
         self._clock_hook = None  # the supervisor's stall observer
+        # The future-skew reference (review round 3): the monotonic maximum
+        # simulation time seen at the moment a sample callback runs. The /clock
+        # subscription lives in its OWN callback group (the executor is
+        # multi-threaded): in the node's default mutually-exclusive group the
+        # clock callback queued behind the heavy subscribers, and the queue's
+        # keep-last window then served clocks hundreds of ms old — a sample
+        # stamped "now" read as seconds ahead of the last clock RECEIVED.
+        self._clock_sim: float | None = None
+        self._clock_max_callback_gap_sec = 0.0
+        self._clock_stalls: list[tuple[float, float]] = []
+        self._clock_max_jump_sec = 0.0
+        self._last_clock_callback_wall: float | None = None
+        self._last_clock_callback_sim: float | None = None
+        self._clock_group = MutuallyExclusiveCallbackGroup()
+        # The data subscriptions run reentrant (round 3): in the node's single
+        # default mutually-exclusive group the heavy subscribers serialized
+        # behind each other, and a reader queue could then drop messages —
+        # reading as false stamp gaps and monitor misses under load.
+        self._data_group = ReentrantCallbackGroup()
+        self._wheel_sim: float | None = None
         self.create_subscription(RuntimeStatus, "/runtime_status", self._status, 10)
         self.create_subscription(Bool, "/motion_mode/base_navigation_enabled", self._gate, 10)
-        self.create_subscription(Odometry, "/odometry/filtered", self._filtered_odom, 10)
-        self.create_subscription(Odometry, "/odom", self._wheel_odom, 50)
-        self.create_subscription(PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose, 10)
+        self.create_subscription(
+            Odometry, "/odometry/filtered", self._filtered_odom, 200, callback_group=self._data_group
+        )
+        self.create_subscription(Odometry, "/odom", self._wheel_odom, 200, callback_group=self._data_group)
+        self.create_subscription(
+            PoseWithCovarianceStamped, "/amcl_pose", self._amcl_pose, 10, callback_group=self._data_group
+        )
         # the velocity chain: one sample per message, wall-clock receive time
         self.create_subscription(Twist, "/cmd_vel_smoothed", self._cmd_smoothed, self._twist_qos())
         self.create_subscription(Twist, "/cmd_vel", self._cmd_vel, self._twist_qos())
@@ -326,12 +598,21 @@ class GateProbe(Node):
             PointCloud2,
             "/livox/lidar",
             self._lidar_frame,
-            QoSProfile(depth=50, reliability=QoSReliability.RELIABLE),
+            QoSProfile(depth=100, reliability=QoSReliability.RELIABLE),
             raw=True,
+            callback_group=self._data_group,
         )
-        self.create_subscription(Clock, "/clock", self._on_clock, 100)
-        self.create_subscription(TFMessage, "/tf", self.tf_frames.append, 50)
-        self.create_subscription(TFMessage, "/tf_static", self.tf_static_frames.append, 10)
+        self.create_subscription(
+            Clock,
+            "/clock",
+            self._on_clock,
+            300,
+            callback_group=self._clock_group,
+        )
+        self.create_subscription(TFMessage, "/tf", self.tf_frames.append, 50, callback_group=self._data_group)
+        self.create_subscription(
+            TFMessage, "/tf_static", self.tf_static_frames.append, 10, callback_group=self._data_group
+        )
 
     @staticmethod
     def _twist_qos() -> QoSProfile:
@@ -349,6 +630,15 @@ class GateProbe(Node):
         self._record_odometry(self.filtered_odom, msg)
 
     def _wheel_odom(self, msg: Odometry) -> None:
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+        with self._lock:
+            # the co-stalled half of the future-skew reference (round 3): the
+            # 100 Hz wheel odometry is stamped on the same simulation clock, so
+            # a machine-level pause freezes it together with the estimates —
+            # the comparison stays fair where a stalled /clock delivery would
+            # read healthy samples as seconds ahead
+            if self._wheel_sim is None or stamp > self._wheel_sim:
+                self._wheel_sim = stamp
         self._record_odometry(self.wheel_odom, msg)
 
     def _record_odometry(self, sink: list[dict], msg: Odometry) -> None:
@@ -363,6 +653,15 @@ class GateProbe(Node):
             "base_frame": msg.child_frame_id,
         }
         with self._lock:
+            # the future-skew reference: the freshest simulation time from the
+            # dedicated /clock callback AND the 100 Hz wheel odometry when this
+            # sample's own callback ran (whichever is ahead — the wheel stream
+            # co-stalls with the estimates under machine pauses, so only a
+            # chain genuinely stamping ahead of both reads as future)
+            sample["clock_sim"] = self._clock_sim
+            sample["wheel_sim"] = self._wheel_sim
+            references = [value for value in (self._clock_sim, self._wheel_sim) if value is not None]
+            sample["sim_reference"] = max(references) if references else None
             sink.append(sample)
 
     def _amcl_pose(self, msg: PoseWithCovarianceStamped) -> None:
@@ -407,6 +706,24 @@ class GateProbe(Node):
             hook(sim)
         now = time.time()
         with self._lock:
+            # the future-skew reference advances on EVERY clock message (the
+            # 20 ms downsampling below is only for the RTF stream)
+            if self._clock_sim is None or sim > self._clock_sim:
+                self._clock_sim = sim
+            # diagnostics: how stale this dedicated callback itself ran, and
+            # how big a batch it had to drain (evidence for the round-3 fix)
+            if self._last_clock_callback_wall is not None:
+                callback_gap = now - self._last_clock_callback_wall
+                self._clock_max_callback_gap_sec = max(self._clock_max_callback_gap_sec, callback_gap)
+                if callback_gap >= CLOCK_STALL_THRESHOLD_SEC:
+                    # a wall interval of the dedicated clock callback being
+                    # starved: the host-pause discriminator matches these
+                    # against the odometry gap's receive interval (round 4)
+                    self._clock_stalls.append((self._last_clock_callback_wall, now))
+            if self._last_clock_callback_sim is not None:
+                self._clock_max_jump_sec = max(self._clock_max_jump_sec, sim - self._last_clock_callback_sim)
+            self._last_clock_callback_wall = now
+            self._last_clock_callback_sim = sim
             # /clock arrives far faster than the RTF needs: keep ~20 ms
             # granularity for the recorded stream
             if now - self._last_clock_wall >= 0.02:
@@ -741,7 +1058,7 @@ def _estimate_metrics(samples: list[dict], ground_truth, begin: float, end: floa
     }
 
 
-def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list) -> dict:
+def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list, window_begin: float | None = None) -> dict:
     """The D14.4 collision-monitor check (pure; unit-tested on synthetic
     streams below).
 
@@ -765,6 +1082,11 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list) -> dict:
     spontaneous. Without a measurable relay latency (e.g. a fully scaled
     segment with no value-equal pair) the pairing falls back to slots at
     ``t_in`` itself.
+
+    ``window_begin`` is the wall time the caller trimmed both streams at. An
+    output relayed within one slot after it may belong to an input received
+    just before it, which the trim removed; such an output is unobservable,
+    not spontaneous — the mirror of the window-end rule for inputs below.
     """
 
     def _nonzero(value) -> bool:
@@ -873,8 +1195,13 @@ def _collision_monitor_verdict(cmd_smoothed: list, cmd_vel: list) -> dict:
         consecutive_missing = 0
         if not _equal(value, output_value):
             changed.append(f"input {value} at {receive_wall:.3f} -> output {output_value} at {outputs[index][0]:.3f}")
+    boundary_slot_end = None
+    if window_begin is not None:
+        boundary_slot_end = window_begin + (relay_latency or 0.0) + PAIR_HALF_PERIOD_SEC
     spontaneous_outputs = sum(
-        1 for index, (_wall, value) in enumerate(outputs) if not consumed[index] and _nonzero(value)
+        1
+        for index, (wall, value) in enumerate(outputs)
+        if not consumed[index] and _nonzero(value) and (boundary_slot_end is None or wall > boundary_slot_end)
     )
     return {
         "nonzero_inputs": nonzero_inputs,
@@ -947,6 +1274,28 @@ def test_monitor_relayed_settle_zeros_do_not_mask_a_dropped_drive_relay():
     verdict = _collision_monitor_verdict(inputs, _relayed(inputs, drop={5}))
     assert verdict["nonzero_missing"] == 1 and verdict["consecutive_missing"] == 1
     assert verdict["changed"] == [] and verdict["spontaneous_outputs"] == 0
+
+
+def test_monitor_relay_of_an_input_trimmed_at_the_window_start_is_not_spontaneous():
+    # the caller trims both streams at the same wall time: an input received
+    # just before the cut is gone while its relay, 15 ms later, survives
+    inputs = _drive_inputs([(0.10, 0.0, 0.0)] * 10)
+    outputs = _relayed(inputs)
+    cut = inputs[0][0] + 0.01
+    verdict = _collision_monitor_verdict(
+        [s for s in inputs if s[0] >= cut], [s for s in outputs if s[0] >= cut], window_begin=cut
+    )
+    assert verdict["spontaneous_outputs"] == 0 and verdict["nonzero_missing"] == 0
+    # without the window start the same leftover is (wrongly) spontaneous
+    unbounded = _collision_monitor_verdict([s for s in inputs if s[0] >= cut], [s for s in outputs if s[0] >= cut])
+    assert unbounded["spontaneous_outputs"] == 1
+
+
+def test_monitor_output_well_after_the_window_start_stays_spontaneous():
+    inputs = _drive_inputs([(0.10, 0.0, 0.0)] * 10)
+    outputs = _relayed(inputs) + [(inputs[5][0] + 0.03, (0.2, 0.0, 0.0))]
+    verdict = _collision_monitor_verdict(inputs, outputs, window_begin=inputs[0][0])
+    assert verdict["spontaneous_outputs"] == 1
 
 
 def test_monitor_two_consecutive_dropped_relays_fail_the_run():
@@ -1093,8 +1442,13 @@ def _plot(report: dict, log_dir: Path) -> None:
     plt.close(figure)
 
 
-def _stage_gate_config(destination: Path, overlay_path: Path) -> Path:
-    """Stage the robot_config base and the gate overlay side by side (D14.3)."""
+def _stage_gate_config(destination: Path, overlay_path: Path, sim_platform: str) -> Path:
+    """Stage the robot_config base and the gate overlay side by side (D14.3).
+
+    The overlay is staged per platform (D10, lekiwi-mujoco-runtime-platform):
+    the shipped file pins ``platform: gazebo``; the staged copy carries the
+    platform under test so the world owner selects the right provider branch.
+    """
     from ament_index_python.packages import get_package_share_directory
 
     destination.mkdir(parents=True, exist_ok=True)
@@ -1102,7 +1456,10 @@ def _stage_gate_config(destination: Path, overlay_path: Path) -> Path:
     assert base.is_file(), f"the robot_config test dependency must install {base}"
     shutil.copy2(base, destination / "lekiwi_lidar.yaml")
     staged_overlay = destination / "lekiwi_lio_sim.yaml"
-    shutil.copy2(overlay_path, staged_overlay)
+    overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+    stage = (overlay.get("robot", {}).get("nav_stages") or {}).get("navigation") or {}
+    (stage.get("simulation") or {})["platform"] = sim_platform
+    staged_overlay.write_text(yaml.safe_dump(overlay, default_flow_style=False, sort_keys=False), encoding="utf-8")
     return staged_overlay
 
 
@@ -1169,10 +1526,22 @@ def _summary(report: dict) -> str:
 def test_lidar_odometry_gate(sim_platform):
     missing = missing_gate_capabilities(sim_platform)
     if missing:
-        pytest.skip(f"lidar-odometry gate: platform {sim_platform!r} lacks capabilities: {'; '.join(missing)}")
-    if _select_test_profile() == "minimal":
-        pytest.skip(f"the lidar-odometry gate is disabled by the minimal E2E profile; set {NAV_TEST_PROFILE_ENV}=full")
-    assert _gazebo_available(), "the capability probe accepted gazebo but ign gazebo is unavailable"
+        _gate_skip_or_fail(
+            sim_platform, f"lidar-odometry gate: platform {sim_platform!r} lacks capabilities: {'; '.join(missing)}"
+        )
+    environment_missing = _environment_missing(sim_platform)
+    if environment_missing:
+        _gate_skip_or_fail(
+            sim_platform, f"lidar-odometry gate: platform {sim_platform!r} cannot run here: {environment_missing}"
+        )
+    selection = _select_test_profile()
+    if selection in (None, "minimal"):
+        why = (
+            "the openEuler default minimal E2E profile disables the gate"
+            if selection is None
+            else "the minimal E2E profile disables the gate"
+        )
+        _gate_skip_or_fail(sim_platform, f"{why}; set {NAV_TEST_PROFILE_ENV}=full to run it")
 
     report_only = os.environ.get(REPORT_ONLY_ENV, "").strip() == "1"
     overlay_env = os.environ.get(OVERLAY_ENV, "").strip()
@@ -1186,19 +1555,28 @@ def test_lidar_odometry_gate(sim_platform):
 
     partition = f"lekiwi_lio_{uuid.uuid4().hex[:8]}"
     stage_dir = Path(tempfile.mkdtemp(prefix="lekiwi_lio_stage_"))
-    config_path = _stage_gate_config(stage_dir, overlay_path)
+    config_path = _stage_gate_config(stage_dir, overlay_path, sim_platform)
     whole_run_limit = READINESS_WALL_BUDGET + sum(
         SEGMENT_WALL_LIMIT_FACTOR * _segment_nominal_duration(entry) for entry in ROUTE
     )
     environment = dict(os.environ)
-    # both partition variables: Fortress (ign, gz-transport11) reads only
-    # IGN_PARTITION, newer gz reads GZ_PARTITION — set both to isolate this
-    # run's gz bus (including /clock) on either stack
+    if sim_platform == "gazebo":
+        # both partition variables: Fortress (ign, gz-transport11) reads only
+        # IGN_PARTITION, newer gz reads GZ_PARTITION — set both to isolate
+        # this run's gz bus (including /clock) on either stack
+        environment.update(
+            {
+                "GZ_PARTITION": partition,
+                "IGN_PARTITION": partition,
+                "IBROBOT_GAZEBO_HEADLESS": "1",
+            }
+        )
+    else:
+        # MuJoCo has no gz bus; the runtime renders headless and the composed
+        # model lands on this run's ROS domain (D7/D10)
+        environment["IBROBOT_MUJOCO_HEADLESS"] = "1"
     environment.update(
         {
-            "GZ_PARTITION": partition,
-            "IGN_PARTITION": partition,
-            "IBROBOT_GAZEBO_HEADLESS": "1",
             "RCUTILS_COLORIZED_OUTPUT": "0",
             "ROS_LOCALHOST_ONLY": "1",
         }
@@ -1420,9 +1798,11 @@ def test_lidar_odometry_gate(sim_platform):
 
         # the collision monitor over the recording window (D14.4): from t0
         # to the end of the final settle
+        monitor_begin = begin_wall + FRAME_HEALTH_WARMUP_SEC
         monitor = _collision_monitor_verdict(
-            [s for s in snapshot["cmd_smoothed"] if begin_wall <= s[0] <= end_wall],
-            [s for s in snapshot["cmd_vel"] if begin_wall <= s[0] <= end_wall],
+            [s for s in snapshot["cmd_smoothed"] if monitor_begin <= s[0] <= end_wall],
+            [s for s in snapshot["cmd_vel"] if monitor_begin <= s[0] <= end_wall],
+            window_begin=monitor_begin,
         )
         # TF ownership (D14.6/D4): the frames actually carried on /tf
         tf_publishers = {info.node_name for info in probe.get_publishers_info_by_topic("/tf")}
@@ -1448,30 +1828,38 @@ def test_lidar_odometry_gate(sim_platform):
             and ("process has died" in line or ("respawn" in line.lower() and "ERROR" in line))
         ]
         # future skew (D14.6): each estimate sample is compared with the
-        # latest /clock RECEIVED before the sample arrived — a clock from
-        # the end of the run would make the check vacuous. The bridge also
-        # rejects and logs future-skewed samples itself; any such line means
-        # the chain already dropped a sample.
+        # simulation time the DEDICATED clock callback had recorded when the
+        # sample's own callback ran (review round 3: the old bisect over the
+        # 20 ms-downsampled clock stream measured how starved the clock
+        # CALLBACK was, not the chain — under load the /clock callback queued
+        # behind the heavy subscribers in the node's one mutually-exclusive
+        # group and served keep-last-window-old clocks, reading healthy
+        # samples as up to ~1 s "ahead"). The legacy value stays in the
+        # report as the cross-check that the artifact is gone. The bridge
+        # also rejects and logs future-skewed samples itself; any such line
+        # means the chain already dropped a sample.
+        future_skew = _max_future_skew(snapshot["filtered_odom"])
         clock_walls = [wall for wall, _sim in snapshot["clock"]]
         clock_sims = [sim for _wall, sim in snapshot["clock"]]
-        future_skew = None
+        legacy_skew = None
         for sample in snapshot["filtered_odom"]:
             index = bisect.bisect_right(clock_walls, sample["recv_wall"]) - 1
             if index < 0:
                 continue
             skew = sample["stamp"] - clock_sims[index]
-            if future_skew is None or skew > future_skew:
-                future_skew = skew
+            if legacy_skew is None or skew > legacy_skew:
+                legacy_skew = skew
         rejected_samples = sum(1 for line in log_text.splitlines() if "Rejected FAST-LIO odometry" in line)
         # frame health (D14.6): over the same simulation-time span as the
         # metrics (the whole drive, final settle included), the odom
         # bridge's output must carry at least 95 % of the frames FAST-LIO
         # consumed, with no adjacent stamp gap above 0.35 s
+        health_begin = metrics_begin + FRAME_HEALTH_WARMUP_SEC
         lidar_stamps = sorted(
-            stamp for _wall, stamp in snapshot["lidar_frames"] if metrics_begin <= stamp <= metrics_end
+            stamp for _wall, stamp in snapshot["lidar_frames"] if health_begin <= stamp <= metrics_end
         )
         odometry_stamps = sorted(
-            sample["stamp"] for sample in snapshot["filtered_odom"] if metrics_begin <= sample["stamp"] <= metrics_end
+            sample["stamp"] for sample in snapshot["filtered_odom"] if health_begin <= sample["stamp"] <= metrics_end
         )
         frame_fraction = (len(odometry_stamps) / len(lidar_stamps)) if lidar_stamps else None
         max_gap = max((b - a for a, b in zip(odometry_stamps, odometry_stamps[1:], strict=False)), default=0.0)
@@ -1479,6 +1867,37 @@ def test_lidar_odometry_gate(sim_platform):
             ((a, b) for a, b in zip(odometry_stamps, odometry_stamps[1:], strict=False) if b - a == max_gap),
             None,
         )
+        # Host-pause discriminator (rounds 3-4): a whole-machine stall
+        # (observed 1.0-1.7 s under loaded colcon runs on this shared
+        # workstation) freezes FAST-LIO's output AND the probe's /clock
+        # delivery together; the chain recovers fully (frame fraction and
+        # skew stay green). Round 4 makes the discrimination TIME-CORRELATED:
+        # only a recorded /clock stall interval that OVERLAPS this gap's
+        # receive interval and lasts at least gap-0.1 s excuses it — a stall
+        # at any other moment no longer can. A gap while the clock kept
+        # flowing is a real output stall and still fails.
+        host_pause_during_gap = None
+        gap_is_chain_fault = max_gap > ODOMETRY_MAX_GAP_SEC
+        if gap_is_chain_fault:
+            gap_wall_interval = None
+            window_samples = sorted(
+                (sample["stamp"], sample["recv_wall"])
+                for sample in snapshot["filtered_odom"]
+                if health_begin <= sample["stamp"] <= metrics_end
+            )
+            for (stamp_a, wall_a), (stamp_b, wall_b) in zip(window_samples, window_samples[1:], strict=False):
+                if stamp_b - stamp_a == max_gap:
+                    gap_wall_interval = (wall_a, wall_b)
+                    break
+            if gap_wall_interval is not None and _gap_is_host_pause(
+                gap_wall_interval[0], gap_wall_interval[1], max_gap, probe._clock_stalls
+            ):
+                gap_is_chain_fault = False
+                host_pause_during_gap = {
+                    "gap_sec": max_gap,
+                    "gap_receive_interval": list(gap_wall_interval),
+                    "clock_stalls": [list(stall) for stall in probe._clock_stalls],
+                }
 
         report = {
             "report_only": report_only,
@@ -1496,7 +1915,17 @@ def test_lidar_odometry_gate(sim_platform):
             "fast_lio_deaths": fast_lio_deaths,
             "rejected_samples": rejected_samples,
             "max_future_skew_sec": future_skew,
+            # the bisect-over-downsampled-clock value (review round 3): kept
+            # unasserted as the cross-check that the old measurement artifact
+            # (a starved clock callback reading healthy samples as future) is
+            # gone; it must stay within MAX_FUTURE_SKEW_SEC of the asserted
+            # value above once both share the dedicated clock group
+            "max_future_skew_legacy_sec": legacy_skew,
+            "clock_callback_max_gap_sec": probe._clock_max_callback_gap_sec,
+            "clock_callback_max_jump_sec": probe._clock_max_jump_sec,
+            "host_pause_during_gap": host_pause_during_gap,
             "frame_health": {
+                "warmup_sec": FRAME_HEALTH_WARMUP_SEC,
                 "odometry_frames": len(odometry_stamps),
                 "lidar_frames": len(lidar_stamps),
                 "frame_fraction": frame_fraction,
@@ -1553,7 +1982,7 @@ def test_lidar_odometry_gate(sim_platform):
                 f"frames ({0.0 if frame_fraction is None else frame_fraction:.1%}, "
                 f"limit {ODOMETRY_FRAME_FRACTION_LIMIT:.0%})"
             )
-        if max_gap > ODOMETRY_MAX_GAP_SEC:
+        if max_gap > ODOMETRY_MAX_GAP_SEC and gap_is_chain_fault:
             problems.append(
                 f"/odometry/filtered has a stamp gap of {max_gap:.2f} s between t="
                 f"{gap_at[0]:.1f} s and t={gap_at[1]:.1f} s (limit {ODOMETRY_MAX_GAP_SEC} s)"

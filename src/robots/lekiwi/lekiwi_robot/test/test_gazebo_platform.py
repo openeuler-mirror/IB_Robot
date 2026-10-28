@@ -39,6 +39,7 @@ def _render(profile, extra):
         "use_sim": "",
         "sim_platform": "",
         "gazebo_world": "",
+        "mujoco_scene": "",
         "spawn_x": "0.0",
         "spawn_y": "0.0",
         "spawn_z": "0.05",
@@ -100,7 +101,7 @@ def test_shipped_lidar_profile_declares_sdk_and_gazebo():
     from robot_runtime.profile import load_profile
 
     profile = load_profile(LIDAR_PROFILE)
-    assert profile["sim_platforms"] == ["sdk", "gazebo"]
+    assert profile["sim_platforms"] == ["sdk", "gazebo", "mujoco"]
     assert profile["sim_platform"] == "sdk"
     assert profile["use_sim"] is False
 
@@ -127,6 +128,9 @@ def test_profile_mount_defaults_equal_the_mount_file():
     }
     assert lidar["transform"] == expected
     assert lidar["simulation"]["gazebo"]["transform"] == expected
+    # lekiwi-mujoco-runtime-platform D1: the same mount drives the MuJoCo
+    # attachment pose (one helper, both platforms)
+    assert lidar["simulation"]["mujoco"]["transform"] == expected
 
 
 def test_nav_grasp_still_rejects_gazebo_before_any_action():

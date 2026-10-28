@@ -16,6 +16,14 @@
        LeKiwi arm IS an SO-101 arm, so the geometry is reused, not forked. -->
   <exec_depend>so101_description</exec_depend>
 
+  <!-- test_mujoco_template.py composes the shipped MJCF template through the
+       real composition path (lekiwi-mujoco-runtime-platform D2). -->
+  <test_depend>sim_models</test_depend>
+  <!-- CMakeLists finds ament_cmake_pytest (ament_add_pytest_test) and the
+       test imports pytest directly (review round 1). -->
+  <test_depend>ament_cmake_pytest</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

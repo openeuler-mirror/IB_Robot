@@ -15,12 +15,29 @@ runtime:
   version: 0.1.0
 
 use_sim: false
-sim_platforms: [sdk, gazebo]
+sim_platforms: [sdk, gazebo, mujoco]
 sim_platform: sdk
 # The single source of the lidar pose (D13): the profile's transform defaults
 # below are derived from this mount; the application path (sensor_mount) keeps
 # them consistent through the deployment fragment.
 mid360_mount_file: $(find lekiwi_description)/config/lekiwi_mid360_mount.yaml
+
+# MuJoCo runtime platform (lekiwi-mujoco-runtime-platform D1): the robot MJCF
+# template and its (decimated, D2b) mesh directory, and the floating-base
+# drive (D3). No joint_current block: this profile advertises no joint.current
+# interface, so the runtime's simulated joint-current publisher stays off.
+simulation:
+  mujoco:
+    template: $(find lekiwi_description)/mujoco/lekiwi_base.xml.template
+    meshes_dir: $(find lekiwi_description)/meshes/mujoco
+    sdf_meshes: []
+    floating_base:
+      # the MJCF body with the free joint the BaseVelocityPlugin drives; also
+      # the URDF root frame and the relay's validated odometry child frame
+      body: base_link
+      # the base's own wheel odometry (D3): the relay forwards the twist it
+      # reports to the simulator-internal floating-base command topic
+      twist_source_topic: /odom
 
 controller_manager: controller_manager
 joint_state_topic: /joint_states
@@ -46,6 +63,12 @@ modes:
   initial: idle
   idle:
     controllers: []
+    # MuJoCo platform override (D3.1): a released MuJoCo velocity actuator
+    # keeps its last target, so the base controller is NEVER deactivated
+    # there — it stays active in idle and base_node is the gate (its zero on
+    # a non-base mode, stop latch, closed gate or stale /cmd_vel).
+    controllers_by_platform:
+      mujoco: [base_velocity_controller]
     transitions: [base_navigation]
   base_navigation:
     controllers: [base_velocity_controller]
@@ -134,6 +157,27 @@ peripherals:
       # The MID-360's built-in IMU.
       imu:
         update_rate: 200.0
+    # MuJoCo platform parameters (lekiwi-mujoco-runtime-platform D1): the
+    # same mount pose; a coarser horizontal grid than Gazebo's (CPU ray
+    # casting), raisable if the real-time-factor target holds. No IMU rate
+    # key: the simulated IMU publishes on the controller-manager clock, so
+    # the advertised rate derives from the effective update_rate (D5.3).
+    mujoco:
+      transform:
+        parent_frame: base_link
+        x: -0.08
+        y: 0.0
+        z: 0.2
+        roll: 0.0
+        pitch: 0.0
+        yaw: 1.5707963267948966
+      horizontal_samples: 360
+      vertical_samples: 32
+      vertical_min_deg: -7.0
+      vertical_max_deg: 52.0
+      range_min: 0.1
+      range_max: 40.0
+      update_rate: 10.0
   scan_converter:
     enabled: true
     queue_size: 1

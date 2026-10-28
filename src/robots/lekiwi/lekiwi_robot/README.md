@@ -30,9 +30,10 @@ startup with its name (`lekiwi_robot/base_profile.py`); there are no built-in
 LeKiwi constants to fall back on.
 
 `capabilities.base.cmd_vel` (`max_vx`, `max_vy`, `max_wz`, `staleness_s`) is
-published in `RuntimeStatus`. The declared limits must be realizable: the
-runtime computes the envelope from the SDK kinematics and rejects a profile
-whose limits exceed it, naming the axis. For the shipped geometry that is
+published in `RuntimeStatus`. The declared limits must be finite positive and
+realizable: the runtime computes the envelope from the SDK kinematics and
+rejects a profile whose limits are non-finite/non-positive or exceed it,
+naming the axis. For the shipped geometry that is
 0.2657 m/s in x, 0.2301 m/s in y and 1.84 rad/s in yaw; the profiles publish
 0.26 / 0.23 / 1.5.
 
@@ -40,7 +41,10 @@ whose limits exceed it, naming the axis. For the shipped geometry that is
 
 - `/cmd_vel` (`Twist`) -> `base_velocity_controller/commands` (wheel rad/s)
   through `lekiwi_sdk_py.body_to_wheel_velocities`; commands beyond
-  `max_wheel_radps` are scaled down preserving direction. Commands are zeroed
+  `max_wheel_radps` are scaled down preserving direction, and the envelope
+  clamps each axis to the published limits first (a command with a
+  non-finite component is rejected and zeroes the target — min/max would
+  otherwise turn NaN into +limit). Commands are zeroed
   after `staleness_s` without a fresh one.
 - `/joint_states` wheel positions -> `/odom`, plus `odom -> base_link` TF.
   Positions are unwrapped with `lekiwi_sdk_py.wheel_position_deltas`. When the
@@ -195,8 +199,13 @@ NAV_TEST_PROFILE=full colcon test --packages-select robot_navigation \
 ```
 
 The gate skips with a reason listing every missing capability on platforms
-without ground truth, profile support, lidar simulation or a scene template
-(today: everything except Gazebo, e.g. MuJoCo).
+without ground truth, profile support, lidar simulation or a scene template,
+and — independently — when the platform's simulator is unavailable
+(`ign` for Gazebo; the MuJoCo ament resources and a matching Python `mujoco`
+for MuJoCo). Acceptance runs set `IBROBOT_REQUIRE_SIM_PLATFORMS=gazebo,mujoco`
+to turn any such skip into a failure. The overlay is staged per platform
+(`test/config/lekiwi_lio_sim.yaml` pins `platform: gazebo`; the gate rewrites
+the staged copy).
 
 Conformance and the independence gate:
 
@@ -208,3 +217,111 @@ scripts/verify_runtime_independence.sh runtime lekiwi_robot --profile lekiwi_nav
 The base velocity, odometry, staleness and navigation-gate tests are in scope
 and must execute, not skip. Use a fresh `ROS_DOMAIN_ID` (at most 232): a stale
 runtime left on a shared domain answers for the one under test.
+
+## MuJoCo simulation
+
+The MuJoCo platform (`sim_platform:=mujoco`) is the lidar runtime's second
+physics backend (lekiwi-mujoco-runtime-platform, #193 stage 1). It runs the
+same production chain as Gazebo — `base_node` gating, the MID-360 mount,
+FAST-LIO, the scan converter — with the sensors simulated by MuJoCo itself
+(the `mujoco_3d_lidar` engine extension for the cloud, the MJCF sensor
+triple for the integrated IMU):
+
+```bash
+# provider alone, headless (no display): sensors, admission, wheels
+IBROBOT_MUJOCO_HEADLESS=1 ros2 launch lekiwi_robot runtime.launch.py \
+  profile:=lekiwi_lidar sim_platform:=mujoco [mujoco_scene:=nav_room \
+  spawn_x:=-1.5 spawn_y:=-1.5 spawn_z:=0.05]
+
+# navigation (FAST-LIO + Nav2/AMCL) through the robot_config entry,
+# from a staged overlay whose simulation.platform is mujoco
+ros2 launch robot_config robot.launch.py config_path:=<staged>/lekiwi_lio_sim.yaml \
+  use_sim:=true sim_platform:=mujoco nav_stage:=navigation
+```
+
+An empty `mujoco_scene` composes the shared `empty` scene. Use a fresh
+`ROS_DOMAIN_ID` and kill stray `ros2_control_node` processes afterwards; the
+composed model lands under `/tmp/ibrobot_sim_models/<ROS_DOMAIN_ID>/` (an
+extension-declaring model is delivered as XML — the C++ node compiles it
+in-process; extension-free models stay `.mjb`).
+
+### Chassis model
+
+- The robot MJCF (`lekiwi_description/mujoco/lekiwi_base.xml.template`) is
+  base-only: three frictionless sphere wheels (`condim 1`, priority 2 over
+  the scenes' support planes) with velocity actuators named `wheel_7/8/9`;
+  the ros2_control joints stay `7/8/9` (SimpleTransmission mappings, MuJoCo
+  branch only — a `PidROS` topic token may not start with a digit).
+- The chassis is a KINEMATIC base: `base_node`'s wheel odometry (`/odom`)
+  drives the floating base through `robot_runtime/odometry_twist_relay`
+  (validated: frame, freshness, order) and the simulator's
+  `BaseVelocityPlugin`. There is no wheel slip — wheel odometry tracks the
+  ground truth to sub-millimetre — and walls do not stop the driven axes
+  reliably, so navigation must avoid geometry as on hardware. The IMU
+  accelerometer reads dynamics accelerations only and misses the override's
+  velocity steps; between the 10 Hz lidar corrections FAST-LIO absorbs the
+  resulting ≤ ~15 mm per-frame prediction error (measured: ATE RMSE
+  ≤ 0.0044 m over the gate route).
+- `empty` is a SMOKE scene: its invisible support plane sits at z = 0 while
+  MuJoCo rays skip alpha-0 geoms, so the lidar sees the checker floor at
+  z = −0.274 — sensors publish and FAST-LIO runs, but no accuracy claim is
+  made there; quantitative LIO acceptance runs in `nav_room` (its single
+  visible floor is both the support and the observation surface).
+
+### Controller difference on MuJoCo (D3.1)
+
+A released MuJoCo velocity actuator keeps its last target (upstream
+`mujoco_ros2_control` 0.1.2: `perform_command_mode_switch` clears control
+flags, `write()` keeps the staged `ctrl`), so `base_velocity_controller` is
+**never deactivated** on MuJoCo: the profile's mode table keeps it active in
+`idle` through `controllers_by_platform.mujoco`, and `base_node` is the gate
+on that platform — it already zeroes its target on a non-base mode, a stop
+latch, a closed navigation gate or stale `/cmd_vel`, then publishes one zero
+command. Hardware and Gazebo keep the ordinary controller lifecycle, and
+every stop path is verified on ground truth by
+`lekiwi_robot/test/test_mujoco_stop_gate.py`.
+
+Residual risk (accepted, MuJoCo only): another publisher on
+`/base_velocity_controller/commands` could move the base in `idle` —
+hardware blocks that by deactivation. TORQUE_OFF's hardware lifecycle
+transition is a no-op upstream (with ros2_control 2.54.0 an INACTIVE
+component is still written), so `base_node`'s zero keeps reaching the
+actuators — verified for that version only.
+
+### Clocks and the IMU rate
+
+The embodiment runs on simulation time (`use_sim_time`), including
+`base_node`'s control timer and the relay's freshness window; command
+staleness itself is measured on `base_node`'s monotonic wall clock, so at a
+low real-time factor the zero lands at the first control tick after
+`staleness_s` wall seconds (no exact bound is claimed). The simulated IMU
+publishes on the controller-manager clock — ~100 Hz with the shipped
+configuration — and the advertised rate derives from the effective
+controller-manager `update_rate` of the generated controllers file (no
+second hard-coded rate).
+
+### Screenshots (GUI, non-headless)
+
+The MuJoCo viewer window plus RViz showing the FAST-LIO cloud/map and the
+odometry path (acceptance evidence, `DISPLAY=:1`). The shipped profile keeps
+`fast_lio.enabled: false`, so the evidence run enables it through a one-key
+deployment fragment:
+
+```bash
+# terminal 0 — the fragment (fast_lio.enabled only)
+printf 'fast_lio:\n  enabled: true\n' > /tmp/lekiwi_fastlio.yaml
+
+# terminal 1 — the runtime with the viewer (no IBROBOT_MUJOCO_HEADLESS)
+ros2 launch lekiwi_robot runtime.launch.py profile:=lekiwi_lidar \
+  sim_platform:=mujoco mujoco_scene:=nav_room spawn_x:=-1.5 spawn_y:=-1.5 \
+  peripherals:=/tmp/lekiwi_fastlio.yaml
+
+# terminal 2 — RViz with the FAST-LIO topics (/cloud_registered with a decay
+# time, /odometry/filtered arrows, the robot model; fixed frame odom)
+rviz2
+
+# terminal 3 — capture the two windows (imagemagick; the X11 compositor keeps
+# window pixels readable even when occluded — no hand-written XWD decoder):
+xwininfo -root -tree                      # find the window ids
+import -window <id> shot.png
+```

@@ -1,0 +1,127 @@
+<mujoco model="lekiwi">
+  <!--
+    LeKiwi base MuJoCo physics model — TEMPLATE FILE
+    (lekiwi-mujoco-runtime-platform D2; base-only: the lekiwi_lidar stage).
+
+    Substitutions before XML parse (robot_runtime.mujoco.render_robot_mjcf):
+      {{MESHES_DIR}}      -> absolute path of lekiwi_description/meshes/mujoco/
+                             (the decimated visual meshes, D2b: MuJoCo 3.12.0
+                             loads at most 200000 faces per STL and the shipped
+                             lekiwi_base.stl / omni_wheel.stl exceed it)
+      {{ROBOT_BASE_POS}}  -> "x y z" spawn position (layout robot_spawn or the
+                             launch spawn arguments)
+      {{ROBOT_BASE_QUAT}} -> "w x y z" pure-yaw spawn quaternion
+
+    Conventions (match the runtime's MJCF injection and so101.xml.template):
+      eulerseq="XYZ" (extrinsic) == URDF rpy, angles copied directly;
+      angle="radian".
+
+    Geometry is taken from the URDF (lekiwi_assembled.urdf.xacro /
+    base.common.xacro / base.control.xacro):
+      base_link inertial mass 2.0, diaginertia 0.01 0.01 0.02;
+      wheel mounts at wheel_base_radius 0.132239, wheel_base_offset_z 0.01036,
+      angles 60 / 180 / -60 deg (base.control.xacro offset 60 deg, theta 120
+      deg), wheel frames rpy "0 pi/2 <angle>";
+      base visual mesh rpy "0 0 3*pi/2" (base.common.xacro base_offset_rz).
+
+    Wheel JOINT/ACTUATOR names are wheel_7/8/9 (D2a): mujoco_ros2_control
+    builds a PidROS per velocity actuator whose topic contains the MJCF joint
+    name, and a token starting with a digit is an invalid ROS topic name —
+    "7"/"8"/"9" would abort the node. The ros2_control side keeps the joint
+    names 7/8/9; SimpleTransmission entries in lekiwi_assembled.urdf.xacro
+    (MuJoCo branch only) map joints 7/8/9 to these actuators.
+
+    The wheel hinge axis is "0 0 -1" in the wheel frame (spike 1.1, C5): with
+    the URDF wheel frame rpy this reproduces the SDK motor sign convention, so
+    base_node's kinematics drive and integrate identically.
+
+    Contacts: the wheel collision is a frictionless sphere (condim 1) with
+    priority 2, outranking the scenes' priority-1 support planes, so every
+    wheel-ground pair takes the wheel's parameters (spike 1.1: 3 contacts, all
+    dim == 1). The chassis collision hull is a box clearing the ground (the
+    wheels reach lower). Parent-child contacts (base_link <-> wheels) are
+    filtered by MuJoCo's default parent filter.
+
+    Visualization groups: the collision geoms (chassis hull, wheel spheres)
+    live in group 3 — the viewer hides geom groups above 2 by default, so the
+    rendered robot is its visual meshes, not the grey analytic hulls (review
+    round 2). A geom's group is a rendering toggle only: contacts follow
+    contype/conaffinity/priority (unchanged) and the 3d-lidar ray cast has no
+    geom-group filter, so the collision surfaces stay in the self-hit set.
+
+    No peripheral sites, sensors, cameras or engine extensions here: the
+    runtime injects them from the peripheral inventory (D5.2). A profile
+    without a simulated lidar renders this file untouched.
+  -->
+
+  <compiler angle="radian" eulerseq="XYZ" meshdir="{{MESHES_DIR}}"/>
+
+  <option gravity="0 0 -9.81" integrator="implicitfast" timestep="0.001"/>
+
+  <asset>
+    <mesh name="lekiwi_base" file="lekiwi_base.stl"/>
+    <mesh name="omni_wheel" file="omni_wheel.stl"/>
+  </asset>
+
+  <default>
+    <!-- Visual geoms never collide and live in their own group (D2/D2b).
+         MuJoCo sensor rays hit every alpha != 0 geom, so these meshes are
+         part of the lidar self-hit surface (measured in the preflight). -->
+    <default class="visual">
+      <geom contype="0" conaffinity="0" group="1" rgba="0.8 0.8 0.8 1"/>
+    </default>
+    <!-- Collision geoms render in group 3 (viewer-hidden by default, review
+         round 2): the analytic hulls must not occlude the visual meshes.
+         Group affects rendering only — contacts and lidar rays ignore it. -->
+    <default class="wheel_collision">
+      <geom type="sphere" size="0.051" condim="1" priority="2" group="3"
+            friction="0 0 0" rgba="0.15 0.15 0.15 0.3"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <body name="base_link" pos="{{ROBOT_BASE_POS}}" quat="{{ROBOT_BASE_QUAT}}">
+      <freejoint name="floating_base_joint"/>
+      <inertial pos="0 0 0" mass="2.0" diaginertia="0.01 0.01 0.02"/>
+      <!-- visual mesh (D2b decimated copy); URDF visual rpy "0 0 3*pi/2" -->
+      <geom class="visual" type="mesh" mesh="lekiwi_base" euler="0 0 4.712389"/>
+      <!-- collision hull so the chassis collides with walls (clears the
+           ground: the wheels reach lower); group 3 keeps it out of the
+           default render without touching its collision role -->
+      <geom name="chassis" type="box" size="0.13 0.13 0.03" pos="0 0 0.05" group="3"/>
+
+      <!-- left wheel: URDF joint 7 at 60 deg -->
+      <body name="left_wheel" pos="0.0661195 0.1145530 0.01036" euler="0 1.5707963 0.5235988">
+        <joint name="wheel_7" type="hinge" axis="0 0 -1" armature="0.001"/>
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001"/>
+        <geom class="visual" type="mesh" mesh="omni_wheel" rgba="0.15 0.15 0.15 1"/>
+        <geom name="wheel_7" class="wheel_collision"/>
+      </body>
+      <!-- back wheel: URDF joint 8 at 180 deg -->
+      <body name="back_wheel" pos="-0.132239 0 0.01036" euler="0 1.5707963 3.1415927">
+        <joint name="wheel_8" type="hinge" axis="0 0 -1" armature="0.001"/>
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001"/>
+        <geom class="visual" type="mesh" mesh="omni_wheel" rgba="0.15 0.15 0.15 1"/>
+        <geom name="wheel_8" class="wheel_collision"/>
+      </body>
+      <!-- right wheel: URDF joint 9 at -60 deg -->
+      <body name="right_wheel" pos="0.0661195 -0.1145530 0.01036" euler="0 1.5707963 -0.5235988">
+        <joint name="wheel_9" type="hinge" axis="0 0 -1" armature="0.001"/>
+        <inertial pos="0 0 0" mass="0.1" diaginertia="0.001 0.001 0.001"/>
+        <geom class="visual" type="mesh" mesh="omni_wheel" rgba="0.15 0.15 0.15 1"/>
+        <geom name="wheel_9" class="wheel_collision"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <!-- Velocity actuators on the wheels (D2): kv such that the wheel reaches
+       the command within one controller period (spike 1.1: 9 ms at CM 100 Hz);
+       ctrlrange 1.2x the profile's max_wheel_radps 4.602. The BaseVelocityPlugin
+       drives the floating base from the wheel odometry's twist (D3), so these
+       actuators only spin the wheels. -->
+  <actuator>
+    <velocity name="wheel_7" joint="wheel_7" kv="0.6" ctrlrange="-5.5224 5.5224"/>
+    <velocity name="wheel_8" joint="wheel_8" kv="0.6" ctrlrange="-5.5224 5.5224"/>
+    <velocity name="wheel_9" joint="wheel_9" kv="0.6" ctrlrange="-5.5224 5.5224"/>
+  </actuator>
+</mujoco>

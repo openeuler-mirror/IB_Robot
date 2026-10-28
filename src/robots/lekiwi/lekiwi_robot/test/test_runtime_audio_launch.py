@@ -71,6 +71,7 @@ def _render(simulated: str, peripherals_file: str, profile: Path = _PROFILE):
             "use_sim": "",
             "sim_platform": "",
             "gazebo_world": "",
+            "mujoco_scene": "",
             "spawn_x": "0.0",
             "spawn_y": "0.0",
             "spawn_z": "0.05",

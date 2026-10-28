@@ -1,11 +1,13 @@
-"""Chassis tracking gate on Gazebo (openspec lekiwi-gazebo-runtime-platform D3).
+"""Chassis tracking gate on the physics platforms (lekiwi-gazebo-runtime-platform D3,
+lekiwi-mujoco-runtime-platform D3/D3.2).
 
-The provider-alone runtime is launched on the real Gazebo platform and driven
+The provider-alone runtime is launched on the real simulator and driven
 through the same command path as the physical robot (/cmd_vel -> base_node ->
-base_velocity_controller -> gz velocity interfaces). The test bridges the
-simulator's world pose itself (``/world/<w>/pose/info`` via ``ign topic -e``):
-nothing ground-truth is advertised on the ROS graph (D4), and every window is
-measured in simulation time through the pose stream's own stamps.
+base_velocity_controller -> the platform's velocity interfaces). The ground
+truth comes from the shared test-support stream (``open_ground_truth``):
+Gazebo bridges the world pose off the ROS graph; MuJoCo subscribes the
+simulator-private floating-base topic (D4/D9). Every window is measured in
+simulation time through the pose stream's own stamps.
 
 Gate (all windows in simulation time; wall clock only bounds the test
 timeout), with the step commands at 50 % of the published limits:
@@ -18,8 +20,15 @@ timeout), with the step commands at 50 % of the published limits:
 - stop: after the stream stops, planar speed <= 0.02 m/s and |yaw rate| <=
   0.05 rad/s within 1 s of simulation time.
 
+On MuJoCo the gate additionally exercises the published envelope (D3.2):
+full-limit, over-limit and combined-axis commands assert both the wheel
+odometry's reported twist against the ground-truth motion and the
+ground-truth speed at or below the published limits (+5 % tolerance).
+
 A failing threshold fails the test with the measured numbers in the message
-(the tasks' STOP condition).
+(the tasks' STOP condition). A platform runs only when its code capabilities
+and its simulator environment are present; ``IBROBOT_REQUIRE_SIM_PLATFORMS``
+turns any skip of a listed platform into a failure (the acceptance runs).
 """
 
 from __future__ import annotations
@@ -29,15 +38,18 @@ import os
 import subprocess
 import time
 import uuid
+from pathlib import Path
 
 import pytest
 import rclpy
 from geometry_msgs.msg import Twist, Vector3
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from std_srvs.srv import SetBool
 
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode
+from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
 from robot_runtime.testing.sim_ground_truth import open_ground_truth, terminate_partition_processes
 
 PACKAGE = "lekiwi_robot"
@@ -52,6 +64,8 @@ WZ_STEP = 1.5 / 2
 LAUNCH_STARTUP_TIMEOUT = 180.0  # wall seconds
 COMMAND_RATE_HZ = 20.0
 
+_LIDAR_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_lidar.yaml"
+
 
 def _gazebo_available() -> bool:
     try:
@@ -60,17 +74,78 @@ def _gazebo_available() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(not _gazebo_available(), reason="Gazebo (ign gazebo) is not available")
+def _mujoco_environment_missing() -> str | None:
+    try:
+        from ament_index_python import get_resources
+        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
+
+        try:
+            get_package_share_directory("mujoco_ros2_control")
+        except PackageNotFoundError:
+            return "the mujoco_ros2_control package is not installed"
+        if "mujoco_3d_lidar" not in get_resources("mujoco_plugins"):
+            return "the mujoco_3d_lidar ament resource is not installed"
+    except ImportError:
+        return "ament_index_python is unavailable"
+    try:
+        import mujoco as python_mujoco
+
+        from robot_runtime.mujoco import simulator_versions
+
+        if simulator_versions().mujoco != python_mujoco.__version__:
+            return "Python mujoco does not match the simulator's libmujoco"
+    except ImportError:
+        return "the Python mujoco package is unavailable"
+    return None
+
+
+def _environment_missing(sim_platform: str) -> str | None:
+    if sim_platform == "gazebo":
+        return None if _gazebo_available() else "ign gazebo is unavailable"
+    if sim_platform == "mujoco":
+        return _mujoco_environment_missing()
+    return f"no environment check for platform {sim_platform!r}"
+
+
+def _platform_capabilities_missing(sim_platform: str) -> list[str]:
+    """The gate's code capabilities: ground truth and the profile platform."""
+    from robot_runtime.testing.sim_ground_truth import UnsupportedGroundTruth
+
+    missing = []
+    try:
+        open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME)
+    except UnsupportedGroundTruth as error:
+        missing.append(f"ground truth: {error}")
+    supported = [str(entry) for entry in load_profile(_LIDAR_PROFILE).get("sim_platforms") or []]
+    if sim_platform not in supported:
+        missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
+    return missing
+
+
+def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
+    required = {
+        entry.strip().lower()
+        for entry in os.environ.get("IBROBOT_REQUIRE_SIM_PLATFORMS", "").split(",")
+        if entry.strip()
+    }
+    if sim_platform in required:
+        pytest.fail(f"chassis tracking gate: platform {sim_platform!r} was required: {reason}")
+    pytest.skip(reason)
 
 
 class GateNode(Node):
     def __init__(self):
         super().__init__("lekiwi_chassis_gate")
         self.status: RuntimeStatus | None = None
+        self.odom: list[Odometry] = []
         self.create_subscription(RuntimeStatus, "/runtime_status", self._status, 10)
+        self.create_subscription(Odometry, "/odom", self._odom, 20)
 
     def _status(self, msg: RuntimeStatus) -> None:
         self.status = msg
+
+    def _odom(self, msg: Odometry) -> None:
+        self.odom.append(msg)
 
 
 def _measure(window: list) -> dict:
@@ -93,34 +168,77 @@ def _measure(window: list) -> dict:
     }
 
 
+def _measure_body(window: list) -> tuple[float, float, float]:
+    """Mean body-frame twist (vx, vy, wz) over a ground-truth pose window.
+
+    The ground-truth pose is world-frame; each sample pair's displacement is
+    rotated by the midpoint yaw into the body frame, so the result compares
+    directly with the wheel odometry's body twist (D3.2).
+    """
+    vxs, vys, wzs = [], [], []
+    for previous, current in zip(window, window[1:], strict=False):
+        dt = current.stamp_sec - previous.stamp_sec
+        if dt <= 1e-6:
+            continue
+        dx, dy = current.x - previous.x, current.y - previous.y
+        yaw = 0.5 * (previous.yaw + current.yaw)
+        cos, sin = math.cos(yaw), math.sin(yaw)
+        vxs.append((cos * dx + sin * dy) / dt)
+        vys.append((-sin * dx + cos * dy) / dt)
+        dyaw = math.atan2(math.sin(current.yaw - previous.yaw), math.cos(current.yaw - previous.yaw))
+        wzs.append(dyaw / dt)
+    return (
+        sum(vxs) / len(vxs) if vxs else 0.0,
+        sum(vys) / len(vys) if vys else 0.0,
+        sum(wzs) / len(wzs) if wzs else 0.0,
+    )
+
+
 def _angle_within(measured: float, expected: float, tolerance: float) -> bool:
     return abs(math.atan2(math.sin(measured - expected), math.cos(measured - expected))) <= tolerance
 
 
-def test_chassis_tracking_gate(tmp_path):
+@pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
+def test_chassis_tracking_gate(tmp_path, sim_platform):
+    missing = _platform_capabilities_missing(sim_platform)
+    if missing:
+        _gate_skip_or_fail(
+            sim_platform, f"chassis tracking gate: platform {sim_platform!r} lacks capabilities: {missing}"
+        )
+    environment_missing = _environment_missing(sim_platform)
+    if environment_missing:
+        _gate_skip_or_fail(
+            sim_platform, f"chassis tracking gate: platform {sim_platform!r} cannot run here: {environment_missing}"
+        )
     partition = f"lekiwi_gate_{uuid.uuid4().hex[:8]}"
     environment = dict(os.environ)
-    # both partition variables: Fortress (ign, gz-transport11) reads only
-    # IGN_PARTITION, newer gz reads GZ_PARTITION — set both to isolate this
-    # run's gz bus on either stack
-    environment.update(
-        {
-            "GZ_PARTITION": partition,
-            "IGN_PARTITION": partition,
-            "IBROBOT_GAZEBO_HEADLESS": "1",
-            "RCUTILS_COLORIZED_OUTPUT": "0",
-        }
-    )
+    if sim_platform == "gazebo":
+        # both partition variables: Fortress (ign, gz-transport11) reads only
+        # IGN_PARTITION, newer gz reads GZ_PARTITION — set both to isolate
+        # this run's gz bus on either stack
+        environment.update(
+            {
+                "GZ_PARTITION": partition,
+                "IGN_PARTITION": partition,
+                "IBROBOT_GAZEBO_HEADLESS": "1",
+            }
+        )
+    else:
+        environment["IBROBOT_MUJOCO_HEADLESS"] = "1"
+    environment["RCUTILS_COLORIZED_OUTPUT"] = "0"
     launch_log = tmp_path / "launch.log"
+    launch_arguments = [
+        "ros2",
+        "launch",
+        PACKAGE,
+        "runtime.launch.py",
+        "profile:=lekiwi_lidar",
+        f"sim_platform:={sim_platform}",
+    ]
+    if sim_platform == "mujoco":
+        launch_arguments.append(f"mujoco_scene:={WORLD_NAME}")
     launch = subprocess.Popen(
-        [
-            "ros2",
-            "launch",
-            PACKAGE,
-            "runtime.launch.py",
-            "profile:=lekiwi_lidar",
-            "sim_platform:=gazebo",
-        ],
+        launch_arguments,
         stdout=launch_log.open("w"),
         stderr=subprocess.STDOUT,
         env=environment,
@@ -144,11 +262,11 @@ def test_chassis_tracking_gate(tmp_path):
         assert node.status is not None and node.status.lifecycle == "ACTIVE"
         assert node.status.active_mode == "idle"
 
-        # the shared test-support bridge (D4): nothing ground-truth on the
-        # graph. The launch env (with BOTH partition variables — Fortress
-        # reads only IGN_PARTITION) is passed so the echo joins the same
-        # isolated gz bus as the simulator it observes.
-        ground_truth = open_ground_truth("gazebo", world=WORLD_NAME, model=MODEL_NAME, env=environment).start()
+        # the shared test-support stream (D4/D9): nothing ground-truth is
+        # advertised on the ROS graph. The launch env (with BOTH partition
+        # variables — Fortress reads only IGN_PARTITION) is passed so the
+        # stream joins the same isolated bus as the simulator it observes.
+        ground_truth = open_ground_truth(sim_platform, world=WORLD_NAME, model=MODEL_NAME, env=environment).start()
         # the pose stream is the simulation clock for every window below
         deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline and ground_truth.latest_time() is None:
@@ -241,6 +359,62 @@ def test_chassis_tracking_gate(tmp_path):
         start_yaw = ground_truth.latest().yaw
         step_gate("vy", Twist(linear=Vector3(y=VY_STEP)), True, start_yaw + math.pi / 2)
         step_gate("wz", Twist(angular=Vector3(z=WZ_STEP)), False, None)
+
+        # lekiwi-mujoco-runtime-platform D3.2: the published envelope governs
+        # the executed twist on MuJoCo — full-limit, over-limit and
+        # combined-axis commands assert the wheel odometry's reported twist
+        # against the ground truth and the per-axis ground-truth speed at or
+        # below the published limits (+5 % tolerance).
+        if sim_platform == "mujoco":
+            envelope = {"vx": 0.26, "vy": 0.23, "wz": 1.5}
+
+            def _stamp(msg):
+                return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+            def envelope_step(label: str, twist: Twist) -> None:
+                hold_start, hold_end = hold(twist, 3.0)
+                window = ground_truth.window(hold_end - 2.5, hold_end - 0.05)
+                assert len(window) > 10, f"{label}: too few ground-truth samples ({len(window)})"
+                gt_vx, gt_vy, gt_wz = _measure_body(window)
+                odom_window = [msg for msg in node.odom if hold_start < _stamp(msg) <= hold_end]
+                assert len(odom_window) > 10, f"{label}: too few /odom messages ({len(odom_window)})"
+                odom_vx = sum(msg.twist.twist.linear.x for msg in odom_window) / len(odom_window)
+                odom_vy = sum(msg.twist.twist.linear.y for msg in odom_window) / len(odom_window)
+                odom_wz = sum(msg.twist.twist.angular.z for msg in odom_window) / len(odom_window)
+                measurements[label] = {
+                    "gt": (gt_vx, gt_vy, gt_wz),
+                    "odom": (odom_vx, odom_vy, odom_wz),
+                    "samples": len(window),
+                }
+                print(f"[gate] {label}: {measurements[label]}", flush=True)
+                # /odom twist against the ground-truth twist (20 %)
+                for name, reported, measured_gt in (
+                    ("vx", odom_vx, gt_vx),
+                    ("vy", odom_vy, gt_vy),
+                    ("wz", odom_wz, gt_wz),
+                ):
+                    assert reported == pytest.approx(measured_gt, rel=0.2, abs=0.02), (
+                        f"{label}: /odom {name} {reported:.4f} vs ground truth {measured_gt:.4f}"
+                    )
+                # the ground-truth per-axis speed at or below the limit (+5 %)
+                for name, measured_gt, limit in (
+                    ("vx", gt_vx, envelope["vx"]),
+                    ("vy", gt_vy, envelope["vy"]),
+                    ("wz", gt_wz, envelope["wz"]),
+                ):
+                    assert abs(measured_gt) <= limit * 1.05, (
+                        f"{label}: ground-truth {name} {measured_gt:.4f} exceeds the published limit {limit} (+5 %)"
+                    )
+
+            envelope_step("full_vx", Twist(linear=Vector3(x=envelope["vx"])))
+            envelope_step("over_vx", Twist(linear=Vector3(x=2.0 * envelope["vx"])))
+            envelope_step(
+                "combined",
+                Twist(
+                    linear=Vector3(x=envelope["vx"], y=envelope["vy"]),
+                    angular=Vector3(z=envelope["wz"]),
+                ),
+            )
 
         # stop: after the stream stops the base must settle within 1 s (sim)
         stop_start = ground_truth.latest_time()

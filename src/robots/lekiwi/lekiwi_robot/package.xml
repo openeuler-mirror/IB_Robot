@@ -66,6 +66,9 @@
        whole closure, test dependencies included. Tests that launch the
        generic application entry live in the generic packages (the
        lidar-odometry gate is robot_navigation/test). -->
+  <!-- test_mujoco_stop_gate.py drives the simulator node's pause/reset
+       services (lekiwi-mujoco-runtime-platform D3). -->
+  <test_depend>mujoco_ros2_control_msgs</test_depend>
 
   <export>
     <build_type>ament_python</build_type>
