@@ -61,6 +61,11 @@
 
   <test_depend>python3-pytest</test_depend>
   <test_depend>robot_runtime</test_depend>
+  <!-- The gates probe RuntimeStatus directly (ibrobot_msgs). It is a
+       contract package inside the independence gate's fixed member set
+       (CONTRACT_PACKAGES in scripts/verify_runtime_independence.sh), so
+       this test_depend keeps the audited closure clean. -->
+  <test_depend>ibrobot_msgs</test_depend>
   <!-- Test dependencies stay inside the runtime's member set: the
        independence gate (scripts/verify_runtime_independence.sh) audits the
        whole closure, test dependencies included. Tests that launch the

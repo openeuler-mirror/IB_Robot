@@ -21,39 +21,30 @@ package at module level: the whole file errors during collection and every
 test in it — including simulator-independent ones — disappears.
 
 Each gate module is imported in a FRESH interpreter subprocess with those
-imports blocked BEFORE anything else runs (a ``sys.modules`` entry of
-``None`` makes ``import`` raise ImportError). The subprocess isolates the
-blocking from this process's import cache (review round 2): in-process
-blocking could be bypassed by an already-cached module or leak into
-subsequent tests.
+imports blocked BEFORE anything else runs. The subprocess mechanics live in
+``robot_runtime.testing.collection_safety`` (shared with robot_navigation's
+copy of this guarantee for the moved lidar-odometry gate); this test pins the
+guarantee for this package's modules.
 """
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
+from robot_runtime.testing.collection_safety import import_module_with_blocked_imports
+
 #: The MuJoCo-only imports the gate modules must keep inside gated code paths.
 _BLOCKED_MODULES = ("mujoco", "mujoco_ros2_control_msgs", "mujoco_ros2_control")
 
-#: Every module of this package that touches the MuJoCo platform.
+#: Every module of this package that touches the MuJoCo platform. The
+#: lidar-odometry gate moved to robot_navigation/test and is covered by that
+#: package's own collection-safety test.
 _GATE_MODULES = (
     "test_mujoco_platform",
     "test_mujoco_stop_gate",
     "test_chassis_tracking_gate",
-    "test_lidar_odometry_gate",
-)
-
-_BLOCK_FIRST_SCRIPT = "\n".join(
-    [
-        "import sys",
-        *[f"sys.modules[{name!r}] = None  # import {name} now raises ImportError" for name in _BLOCKED_MODULES],
-        "import importlib",
-        "importlib.import_module(sys.argv[1])",
-    ]
 )
 
 _TEST_DIR = Path(__file__).resolve().parent
@@ -61,14 +52,7 @@ _TEST_DIR = Path(__file__).resolve().parent
 
 @pytest.mark.parametrize("module", _GATE_MODULES)
 def test_the_gate_module_collects_without_the_mujoco_environment(module):
-    completed = subprocess.run(
-        [sys.executable, "-c", _BLOCK_FIRST_SCRIPT, module],
-        cwd=_TEST_DIR,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
+    completed = import_module_with_blocked_imports(module, blocked=_BLOCKED_MODULES, cwd=_TEST_DIR)
     assert completed.returncode == 0, (
         f"{module} does not import without the MuJoCo environment "
         f"(a module-level MuJoCo import breaks collection on openEuler):\n"

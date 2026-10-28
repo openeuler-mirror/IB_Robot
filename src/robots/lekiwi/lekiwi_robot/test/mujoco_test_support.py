@@ -18,7 +18,11 @@ One rule everywhere (lekiwi-mujoco-runtime-platform D10, review round 1): a
 missing MuJoCo environment skips the test with a reason naming what is
 missing — unless ``IBROBOT_REQUIRE_SIM_PLATFORMS`` lists ``mujoco``, in which
 case the skip becomes a failure, so an acceptance run can never silently lose
-the platform. Imports of MuJoCo-only packages (the Python ``mujoco`` module,
+the platform. The probe and the require-or-skip rule are the shared
+``robot_runtime.testing.sim_environment`` implementations (one copy for the
+chassis gate, the lidar-odometry gate and robot_config's navigation e2e);
+this module keeps only the mujoco-only convenience wrapper. Imports of
+MuJoCo-only packages (the Python ``mujoco`` module, ``mujoco_ros2_control``,
 ``mujoco_ros2_control_msgs``) belong INSIDE the gated code paths: a
 module-level import breaks collection of the whole file on a machine without
 the simulator (openEuler), hiding every other test in the package
@@ -27,45 +31,19 @@ the simulator (openEuler), hiding every other test in the package
 
 from __future__ import annotations
 
-import os
-
-import pytest
-
-REQUIRE_ENV = "IBROBOT_REQUIRE_SIM_PLATFORMS"
-
-
-def mujoco_environment_missing() -> str | None:
-    """``None`` when the MuJoCo simulation environment is usable, else the reason."""
-    try:
-        from ament_index_python import get_resources
-        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
-
-        try:
-            get_package_share_directory("mujoco_ros2_control")
-        except PackageNotFoundError:
-            return "the mujoco_ros2_control package is not installed"
-        if "mujoco_3d_lidar" not in get_resources("mujoco_plugins"):
-            return "the mujoco_3d_lidar ament resource is not installed"
-    except ImportError:
-        return "ament_index_python is unavailable"
-    try:
-        import mujoco as python_mujoco
-
-        from robot_runtime.mujoco import simulator_versions
-
-        if simulator_versions().mujoco != python_mujoco.__version__:
-            return "Python mujoco does not match the simulator's libmujoco"
-    except ImportError:
-        return "the Python mujoco package is unavailable"
-    return None
+from robot_runtime.testing.sim_environment import mujoco_environment_missing, skip_or_fail
 
 
 def require_mujoco() -> None:
-    """Skip by default; fail when ``IBROBOT_REQUIRE_SIM_PLATFORMS`` demands mujoco."""
+    """Skip by default; fail when ``IBROBOT_REQUIRE_SIM_PLATFORMS`` demands mujoco.
+
+    Review round 1: this wrapper used to branch on
+    ``required_sim_platforms()`` itself — a second copy of the require-or-skip
+    rule that could drift from the shared one. It now delegates to
+    ``skip_or_fail`` (one rule everywhere, the chassis gate, the
+    lidar-odometry gate and robot_config's navigation e2e included).
+    """
     reason = mujoco_environment_missing()
     if reason is None:
         return
-    required = {entry.strip().lower() for entry in os.environ.get(REQUIRE_ENV, "").split(",") if entry.strip()}
-    if "mujoco" in required:
-        pytest.fail(f"platform 'mujoco' was required but its environment is unavailable: {reason}")
-    pytest.skip(f"the MuJoCo environment is unavailable: {reason}")
+    skip_or_fail("mujoco", f"the MuJoCo environment is unavailable: {reason}", context="lekiwi_robot simulation tests")

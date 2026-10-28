@@ -69,6 +69,15 @@ class UnsupportedGroundTruth(RuntimeError):
     """The platform has no ground-truth implementation (D14.1)."""
 
 
+#: Neutral per-run marker every test launch inherits, on every platform
+#: (review round 1): the gz partition value only exists on Gazebo runs, so
+#: ``terminate_partition_processes`` never swept a MuJoCo launch's escaped
+#: descendants — the sweep marker was missing exactly where the simulators
+#: differ most. Tests that launch a simulator set this to a unique per-run
+#: value in the child environment and sweep it in teardown.
+RUN_MARKER_ENV = "IBROBOT_TEST_RUN"
+
+
 def mirror_partition_env(env: dict[str, str] | None) -> dict[str, str] | None:
     """The child environment with the gz partition mirrored across both
     variable names (a copy; ``None`` inherits unchanged).
@@ -92,6 +101,45 @@ def mirror_partition_env(env: dict[str, str] | None) -> dict[str, str] | None:
     return child
 
 
+def terminate_marked_processes(markers: dict[str, str]) -> None:
+    """Terminate every process whose environment carries any marker pair.
+
+    Generic form of the gz partition sweep (test-support companion of
+    :func:`mirror_partition_env`): a launch marker is an environment
+    variable (``pkill -f`` cannot see it) inherited by every launch child,
+    and ``ros2 launch`` grandchildren escape the launch process group — a
+    leaked bridge, simulator or runtime node then collides with the next
+    run. Scans ``/proc`` for processes whose ``environ`` carries any
+    ``{variable: value}`` pair from ``markers`` and kills exactly that set,
+    SIGTERM first, SIGKILL on survivors.
+
+    ``markers`` should list every per-run marker the launcher set — e.g. the
+    neutral ``RUN_MARKER_ENV`` plus ``GZ_PARTITION`` (same run value), so
+    one call sweeps both a Gazebo run's gz bus escapees and a MuJoCo run's
+    descendants.
+    """
+    wanted = {f"{variable}={value}".encode() for variable, value in markers.items()}
+    for name in ("SIGTERM", "SIGKILL"):
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline:
+            matched = []
+            for proc in Path("/proc").iterdir():
+                if not proc.name.isdigit():
+                    continue
+                try:
+                    environ = (proc / "environ").read_bytes().split(b"\0")
+                except OSError:
+                    continue
+                if any(marker in environ for marker in wanted):
+                    matched.append(int(proc.name))
+            if not matched:
+                return
+            for pid in matched:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.kill(pid, getattr(signal, name))
+            time.sleep(0.5)
+
+
 def terminate_partition_processes(partition: str) -> None:
     """Terminate every process started under one gz partition value.
 
@@ -101,27 +149,80 @@ def terminate_partition_processes(partition: str) -> None:
     process group — a leaked bridge or simulator then collides with the next
     run. Scans ``/proc`` for the ``GZ_PARTITION=<partition>`` marker (the
     tests set both variables to the same value) and kills exactly that tree,
-    SIGTERM first, SIGKILL on survivors.
+    SIGTERM first, SIGKILL on survivors. Runs that also set the neutral
+    ``RUN_MARKER_ENV`` should sweep it via :func:`terminate_marked_processes`
+    instead — Gazebo's partition sweep alone never matched a MuJoCo run
+    (review round 1).
     """
-    marker = f"GZ_PARTITION={partition}".encode()
-    for name in ("SIGTERM", "SIGKILL"):
-        deadline = time.monotonic() + 8.0
-        while time.monotonic() < deadline:
-            matched = []
-            for proc in Path("/proc").iterdir():
-                if not proc.name.isdigit():
-                    continue
-                try:
-                    if marker in (proc / "environ").read_bytes().split(b"\0"):
-                        matched.append(int(proc.name))
-                except OSError:
-                    continue
-            if not matched:
-                return
-            for pid in matched:
-                with contextlib.suppress(ProcessLookupError, PermissionError):
-                    os.kill(pid, getattr(signal, name))
-            time.sleep(0.5)
+    terminate_marked_processes({"GZ_PARTITION": partition})
+
+
+def _read_ppid(pid: int) -> int:
+    """The PPid of a /proc entry, or 0 when unreadable/malformed."""
+    try:
+        status = (Path("/proc") / str(pid) / "status").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return 0
+    for line in status.splitlines():
+        if line.startswith("PPid:"):
+            return int(line.split()[1])
+    return 0
+
+
+def ancestor_pids(start_pid: int | None = None, *, read_ppid=None) -> set[int]:
+    """The calling process's pid plus every ancestor, INCLUDING PID 1.
+
+    The scan's own invocation chain — pytest, its colcon parent, the
+    wrapper shells, init — legitimately carries the ROS domain (a wrapper
+    under an exported ROS_DOMAIN_ID is the scanning process's ANCESTOR,
+    not a leftover; review round 1 flagged colcon itself). Review round 2:
+    the walk adds each pid before stopping, PID 1 included — it is an
+    ancestor like any other. ``read_ppid`` is injectable so the walk can be
+    unit-tested with a mocked chain.
+    """
+    if read_ppid is None:
+        read_ppid = _read_ppid
+    excluded: set[int] = set()
+    pid = os.getpid() if start_pid is None else start_pid
+    while pid and pid not in excluded:
+        excluded.add(pid)
+        if pid == 1:
+            break
+        pid = read_ppid(pid)
+    return excluded
+
+
+def leftover_domain_processes(domain: str, *, exclude_pids: frozenset[int] | set[int] = frozenset()) -> list[str]:
+    """Processes still carrying this ROS domain in their environment.
+
+    Passive diagnostics for the gate's two-legs-one-domain layout (review:
+    run-2 startup stall): both legs of a parametrized gate share one pytest
+    process and therefore one ``ROS_DOMAIN_ID``, so a leftover from the
+    previous leg — or a foreign runtime squattering the domain — is
+    invisible to checks that only run between whole test invocations. The
+    caller prints the result after its marker sweep: whatever still carries
+    the domain then is either a leak the sweep cannot see (a process that
+    dropped its inherited environment) or a foreign process. Never asserted.
+    """
+    if not domain:
+        return []
+    excluded = ancestor_pids() | set(exclude_pids)
+    wanted = f"ROS_DOMAIN_ID={domain}".encode()
+    leftovers = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit() or int(proc.name) in excluded:
+            continue
+        try:
+            environ = (proc / "environ").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if wanted in environ:
+            try:
+                cmd = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()[:120]
+            except OSError:
+                cmd = "<unreadable>"
+            leftovers.append(f"pid {proc.name}: {cmd}")
+    return leftovers
 
 
 class GroundTruthSample:

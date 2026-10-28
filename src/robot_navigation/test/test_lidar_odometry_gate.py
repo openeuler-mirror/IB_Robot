@@ -2,8 +2,9 @@
 
 The production ``lekiwi_lidar`` navigation stage (FAST-LIO + bridge, scan
 converter, AMCL, collision monitor, admission) runs through generic launch
-on the provider's Gazebo platform, staged from the gate's own
-``config/lekiwi_lio_sim.yaml`` overlay. With no Nav2 goal active the test
+on the provider's physics platforms (Gazebo and MuJoCo, one leg each),
+staged from the gate's own ``config/lekiwi_lio_sim.yaml`` overlay. With no
+Nav2 goal active the test
 drives the scripted D14.5 route on ``/cmd_vel_nav`` — upstream of the
 velocity smoother and the collision monitor — closing every segment on
 ground-truth progress, and scores three estimates (FAST-LIO
@@ -15,7 +16,8 @@ A platform runs the gate only when its capabilities are all present
 (``LIDAR_SIM_PLATFORMS``) and a scene template. The gate is parametrized
 over ``PHYSICS_SIM_PLATFORMS``; both ``gazebo`` and ``mujoco`` satisfy all
 four (lekiwi-mujoco-runtime-platform D10). A second, independent check
-covers the simulator ENVIRONMENT (``ign`` for Gazebo; the MuJoCo ament
+covers the simulator ENVIRONMENT (``ign`` or ``gz`` for Gazebo, either
+stack; the MuJoCo ament
 resources and a matching Python ``mujoco`` for MuJoCo): missing
 environment skips with a reason — unless ``IBROBOT_REQUIRE_SIM_PLATFORMS``
 lists the platform, in which case any skip of it fails instead (the
@@ -74,10 +76,13 @@ from tf2_msgs.msg import TFMessage
 
 from ibrobot_msgs.msg import RuntimeStatus
 from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS, load_profile
+from robot_runtime.testing.sim_environment import REQUIRED_SIM_PLATFORMS_ENV, environment_missing, skip_or_fail
 from robot_runtime.testing.sim_ground_truth import (
+    RUN_MARKER_ENV,
     UnsupportedGroundTruth,
+    leftover_domain_processes,
     open_ground_truth,
-    terminate_partition_processes,
+    terminate_marked_processes,
     wrap_angle,
     yaw_from_quaternion,
 )
@@ -276,83 +281,94 @@ def test_a_synthetic_platform_reports_all_four_capabilities():
 # ---------------------------------------------------------------------------
 # Simulator availability and the required-platform gate (D10,
 # lekiwi-mujoco-runtime-platform: two separate checks — code capability and
-# environment availability)
+# environment availability). The environment probe and the require-or-skip
+# rule live in robot_runtime.testing.sim_environment (one copy shared with
+# the chassis gate and robot_config's navigation e2e); only this gate's
+# profile policy (_is_openeuler/_select_test_profile) stays local. Note the
+# shared Gazebo probe accepts EITHER stack: ``ign gazebo`` (Fortress) or
+# ``gz sim`` (newer gz).
 # ---------------------------------------------------------------------------
-
-
-def _gazebo_available() -> bool:
-    try:
-        return subprocess.run(["ign", "gazebo", "--version"], capture_output=True, timeout=10).returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-def _mujoco_environment_missing() -> str | None:
-    """Why the MuJoCo simulator environment is unusable, or None when fine.
-
-    The ament resources the C++ node needs (the control package and the
-    ``mujoco_3d_lidar`` engine extension) and a Python ``mujoco`` matching
-    the simulator's libmujoco (the compiler must bake the same version).
-    """
-    try:
-        from ament_index_python import get_resources
-        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
-
-        try:
-            get_package_share_directory("mujoco_ros2_control")
-        except PackageNotFoundError:
-            return "the mujoco_ros2_control package is not installed (apt install ros-humble-mujoco-ros2-control)"
-        resources = get_resources("mujoco_plugins")
-        if "mujoco_3d_lidar" not in resources:
-            return "the mujoco_3d_lidar ament resource is not installed (apt install ros-humble-mujoco-3d-lidar)"
-    except ImportError:
-        return "ament_index_python is unavailable"
-    try:
-        import mujoco as python_mujoco  # noqa: PLC0415
-
-        from robot_runtime.mujoco import simulator_versions
-
-        versions = simulator_versions()
-        if versions.mujoco is None:
-            return "the mujoco_vendor libmujoco library is not installed"
-        if python_mujoco.__version__ != versions.mujoco:
-            return (
-                f"Python mujoco {python_mujoco.__version__} != simulator libmujoco {versions.mujoco}; "
-                "the compiler and the simulator must match"
-            )
-    except ImportError:
-        return "the Python mujoco package is unavailable"
-    return None
-
-
-def _environment_missing(sim_platform: str) -> str | None:
-    """Why the platform's simulator cannot run here, or None when it can."""
-    if sim_platform == "gazebo":
-        return None if _gazebo_available() else "ign gazebo is unavailable"
-    if sim_platform == "mujoco":
-        return _mujoco_environment_missing()
-    return f"no environment check for platform {sim_platform!r}"
-
-
-#: Acceptance runs list the platforms whose skips must instead fail
-#: (D10): missing environment, missing capability or the minimal profile.
-REQUIRE_SIM_PLATFORMS_ENV = "IBROBOT_REQUIRE_SIM_PLATFORMS"
-
-
-def _required_sim_platforms() -> set[str]:
-    listed = os.environ.get(REQUIRE_SIM_PLATFORMS_ENV, "").strip()
-    if not listed:
-        return set()
-    return {entry.strip().lower() for entry in listed.split(",") if entry.strip()}
 
 
 def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
     """Skip — unless acceptance runs required this platform: then fail."""
-    if sim_platform in _required_sim_platforms():
-        pytest.fail(
-            f"lidar-odometry gate: platform {sim_platform!r} was required by {REQUIRE_SIM_PLATFORMS_ENV}: {reason}"
+    skip_or_fail(sim_platform, reason, context="lidar-odometry gate")
+
+
+def _validate_requested_profile() -> None:
+    """Fail outright on an invalid explicitly-set NAV_TEST_PROFILE value.
+
+    Review round 1: the gate validated the value only AFTER the capability
+    and environment checks, so on a host whose simulator or environment is
+    unavailable a typo'd ``NAV_TEST_PROFILE`` silently became a skip — the
+    acceptance run then lost the gate without a red result. Validation runs
+    BEFORE any skip decision can fire; the effective-profile selection
+    (including the openEuler default) stays last in the sequence.
+    """
+    requested = os.environ.get(NAV_TEST_PROFILE_ENV, "").strip().lower()
+    if requested and requested not in {"full", "minimal"}:
+        pytest.fail(f"invalid {NAV_TEST_PROFILE_ENV}={requested!r}; expected 'full' or 'minimal'")
+
+
+def _readiness_evidence(probe, launch_log_path) -> str:
+    """Compact evidence for a readiness failure (passive diagnostics).
+
+    Review, run-2 startup stall: the failed leg's reason was lost twice —
+    wait_for_runtime's own timeout print never fired (the teardown SIGINT
+    beat its deadline) and the assertion only named the launch log. This
+    carries the probe's last status (lifecycle, mode, active controllers,
+    faults) and the launch log's waiter/error lines into the failure itself.
+    """
+    status = getattr(probe, "status", None)
+    lines = [
+        f"last status: lifecycle={getattr(status, 'lifecycle', None)!r} "
+        f"active_mode={getattr(status, 'active_mode', None)!r} "
+        f"active_controllers={list(getattr(status, 'active_controllers', []) or [])} "
+        f"faults={list(getattr(status, 'faults', []) or [])} "
+        f"stop_latched={getattr(status, 'stop_latched', None)}"
+    ]
+    try:
+        text = launch_log_path.read_text(encoding="utf-8", errors="replace")
+        interesting = [
+            line
+            for line in text.splitlines()
+            if "wait_for_runtime" in line or "ERROR" in line or "Runtime ready" in line or "fault" in line.lower()
+        ]
+        lines.extend(f"launch: {line.strip()[:200]}" for line in interesting[-10:])
+    except OSError as exc:
+        lines.append(f"launch log unreadable: {exc}")
+    return "\n    ".join(lines)
+
+
+def _decide_gate_run(sim_platform: str) -> None:
+    """The whole do-not-run decision sequence for one platform, in order.
+
+    Review round 1: an invalid profile value fails FIRST (before any skip
+    can fire — a typo must never degrade into a skip on a host where the
+    environment is missing), then the D14 order stays: capabilities,
+    environment, effective profile. Every do-not-run reason routes through
+    ``_gate_skip_or_fail`` so ``IBROBOT_REQUIRE_SIM_PLATFORMS`` turns it
+    into a failure.
+    """
+    _validate_requested_profile()
+    missing = missing_gate_capabilities(sim_platform)
+    if missing:
+        _gate_skip_or_fail(
+            sim_platform, f"lidar-odometry gate: platform {sim_platform!r} lacks capabilities: {'; '.join(missing)}"
         )
-    pytest.skip(reason)
+    environment_unusable = environment_missing(sim_platform)
+    if environment_unusable:
+        _gate_skip_or_fail(
+            sim_platform, f"lidar-odometry gate: platform {sim_platform!r} cannot run here: {environment_unusable}"
+        )
+    selection = _select_test_profile()
+    if selection in (None, "minimal"):
+        why = (
+            "the openEuler default minimal E2E profile disables the gate"
+            if selection is None
+            else "the minimal E2E profile disables the gate"
+        )
+        _gate_skip_or_fail(sim_platform, f"{why}; set {NAV_TEST_PROFILE_ENV}=full to run it")
 
 
 def _is_openeuler() -> bool:
@@ -393,14 +409,14 @@ def test_an_invalid_profile_value_fails_outright(monkeypatch):
     with REQUIRE set must not silently lose the gate to a bad env value."""
 
     monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "bogus")
-    monkeypatch.delenv(REQUIRE_SIM_PLATFORMS_ENV, raising=False)
+    monkeypatch.delenv(REQUIRED_SIM_PLATFORMS_ENV, raising=False)
     with pytest.raises(pytest.fail.Exception, match="invalid .*expected 'full' or 'minimal'"):
         _select_test_profile()
 
 
 def test_the_minimal_profile_with_mujoco_required_fails_not_skips(monkeypatch):
     monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "minimal")
-    monkeypatch.setenv(REQUIRE_SIM_PLATFORMS_ENV, "mujoco")
+    monkeypatch.setenv(REQUIRED_SIM_PLATFORMS_ENV, "mujoco")
     assert _select_test_profile() == "minimal"
     with pytest.raises(pytest.fail.Exception, match="was required by IBROBOT_REQUIRE_SIM_PLATFORMS"):
         _gate_skip_or_fail("mujoco", "the minimal E2E profile disables the gate")
@@ -410,7 +426,7 @@ def test_the_openeuler_default_with_mujoco_required_fails_not_skips(monkeypatch)
     import sys
 
     monkeypatch.delenv(NAV_TEST_PROFILE_ENV, raising=False)
-    monkeypatch.setenv(REQUIRE_SIM_PLATFORMS_ENV, "mujoco")
+    monkeypatch.setenv(REQUIRED_SIM_PLATFORMS_ENV, "mujoco")
     monkeypatch.setattr(sys.modules[__name__], "_is_openeuler", lambda: True)
     assert _select_test_profile() is None
     with pytest.raises(pytest.fail.Exception, match="was required by IBROBOT_REQUIRE_SIM_PLATFORMS"):
@@ -419,7 +435,7 @@ def test_the_openeuler_default_with_mujoco_required_fails_not_skips(monkeypatch)
 
 def test_the_minimal_profile_without_a_requirement_stays_a_skip(monkeypatch):
     monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "minimal")
-    monkeypatch.delenv(REQUIRE_SIM_PLATFORMS_ENV, raising=False)
+    monkeypatch.delenv(REQUIRED_SIM_PLATFORMS_ENV, raising=False)
     with pytest.raises(pytest.skip.Exception, match="minimal E2E profile"):
         _gate_skip_or_fail("gazebo", "the minimal E2E profile disables the gate")
 
@@ -430,18 +446,40 @@ def test_a_capable_environment_with_mujoco_required_proceeds_to_execution():
     is that run; here the decisions are pinned)."""
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.delenv(NAV_TEST_PROFILE_ENV, raising=False)
-    monkeypatch.setenv(REQUIRE_SIM_PLATFORMS_ENV, "mujoco")
+    monkeypatch.setenv(REQUIRED_SIM_PLATFORMS_ENV, "mujoco")
     try:
         if not _is_openeuler():  # the full profile is this host's default
             assert _select_test_profile() == "full"
         assert missing_gate_capabilities("mujoco") == []
-        if _environment_missing("mujoco") is None:
+        if environment_missing("mujoco") is None:
             return  # every guard passed: the gate executes on this host
         # a machine without the environment keeps the documented rule
         with pytest.raises(pytest.fail.Exception, match="was required by IBROBOT_REQUIRE_SIM_PLATFORMS"):
             _gate_skip_or_fail("mujoco", "the MuJoCo environment is unavailable")
     finally:
         monkeypatch.undo()
+
+
+def test_an_invalid_profile_fails_even_when_the_run_would_skip(monkeypatch):
+    """Review round 1: the invalid value fails BEFORE the capability and
+    environment skips — on a host without the simulator a typo'd
+    ``NAV_TEST_PROFILE`` must surface as a red result, not vanish into the
+    environment skip. A synthetic platform name makes every later check a
+    skip candidate (missing capabilities, no environment check), so only
+    the early validation can produce this failure."""
+    monkeypatch.setenv(NAV_TEST_PROFILE_ENV, "bogus")
+    monkeypatch.delenv(REQUIRED_SIM_PLATFORMS_ENV, raising=False)
+    with pytest.raises(pytest.fail.Exception, match="invalid .*expected 'full' or 'minimal'"):
+        _decide_gate_run("a_platform_without_capabilities_or_environment")
+
+
+def test_gate_staging_fails_loudly_without_a_simulation_section(tmp_path):
+    """An overlay without ``navigation.simulation`` must fail staging, not
+    silently stage a platform nobody set (the loud-staging rule, D15)."""
+    overlay = tmp_path / "broken_overlay.yaml"
+    overlay.write_text("robot:\n  base_config: lekiwi_lidar\n  nav_stages:\n    navigation: {}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="navigation.simulation"):
+        _stage_gate_config(tmp_path / "stage", overlay, "mujoco")
 
 
 def _gap_is_host_pause(
@@ -1458,7 +1496,15 @@ def _stage_gate_config(destination: Path, overlay_path: Path, sim_platform: str)
     staged_overlay = destination / "lekiwi_lio_sim.yaml"
     overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
     stage = (overlay.get("robot", {}).get("nav_stages") or {}).get("navigation") or {}
-    (stage.get("simulation") or {})["platform"] = sim_platform
+    simulation = stage.get("simulation")
+    if not isinstance(simulation, dict):
+        # fail loudly: the silent ``(stage.get("simulation") or {})`` write
+        # would stage an overlay whose platform nobody set
+        raise ValueError(
+            f"the gate overlay {overlay_path} must define robot.nav_stages.navigation.simulation (a mapping) "
+            f"to carry the platform under test; got {type(simulation).__name__}"
+        )
+    simulation["platform"] = sim_platform
     staged_overlay.write_text(yaml.safe_dump(overlay, default_flow_style=False, sort_keys=False), encoding="utf-8")
     return staged_overlay
 
@@ -1524,24 +1570,10 @@ def _summary(report: dict) -> str:
 
 @pytest.mark.parametrize("sim_platform", PHYSICS_SIM_PLATFORMS)
 def test_lidar_odometry_gate(sim_platform):
-    missing = missing_gate_capabilities(sim_platform)
-    if missing:
-        _gate_skip_or_fail(
-            sim_platform, f"lidar-odometry gate: platform {sim_platform!r} lacks capabilities: {'; '.join(missing)}"
-        )
-    environment_missing = _environment_missing(sim_platform)
-    if environment_missing:
-        _gate_skip_or_fail(
-            sim_platform, f"lidar-odometry gate: platform {sim_platform!r} cannot run here: {environment_missing}"
-        )
-    selection = _select_test_profile()
-    if selection in (None, "minimal"):
-        why = (
-            "the openEuler default minimal E2E profile disables the gate"
-            if selection is None
-            else "the minimal E2E profile disables the gate"
-        )
-        _gate_skip_or_fail(sim_platform, f"{why}; set {NAV_TEST_PROFILE_ENV}=full to run it")
+    # the decision sequence, with the profile value validated FIRST
+    # (review round 1): capabilities, environment, effective profile —
+    # every do-not-run reason routes through the required-platform rule
+    _decide_gate_run(sim_platform)
 
     report_only = os.environ.get(REPORT_ONLY_ENV, "").strip() == "1"
     overlay_env = os.environ.get(OVERLAY_ENV, "").strip()
@@ -1560,6 +1592,11 @@ def test_lidar_odometry_gate(sim_platform):
         SEGMENT_WALL_LIMIT_FACTOR * _segment_nominal_duration(entry) for entry in ROUTE
     )
     environment = dict(os.environ)
+    # the neutral per-run marker (review round 1): every platform's launch
+    # children carry it, so the teardown sweep below also catches MuJoCo
+    # descendants that escape the launch process group (the Gazebo-only
+    # partition marker never matched them)
+    environment[RUN_MARKER_ENV] = partition
     if sim_platform == "gazebo":
         # both partition variables: Fortress (ign, gz-transport11) reads only
         # IGN_PARTITION, newer gz reads GZ_PARTITION — set both to isolate
@@ -1635,13 +1672,17 @@ def test_lidar_odometry_gate(sim_platform):
                 break
             time.sleep(0.2)
         assert probe.status is not None and probe.status.lifecycle == "ACTIVE", (
-            f"the runtime did not reach ACTIVE; supervisor: {supervisor.failures}; see {launch_log_path}"
+            f"the runtime did not reach ACTIVE; supervisor: {supervisor.failures}; "
+            f"see {launch_log_path}; {_readiness_evidence(probe, launch_log_path)}"
         )
         assert (
             probe.status.active_mode == "base_navigation"
             and probe.gate_enabled is not None
             and probe.gate_enabled.data is True
-        ), f"navigation admission did not complete; supervisor: {supervisor.failures}; see {launch_log_path}"
+        ), (
+            f"navigation admission did not complete; supervisor: {supervisor.failures}; "
+            f"see {launch_log_path}; {_readiness_evidence(probe, launch_log_path)}"
+        )
         deadline = time.monotonic() + 90.0
         while time.monotonic() < deadline and len(probe.filtered_odom) < 5 and not supervisor.abort.is_set():
             time.sleep(0.2)
@@ -2078,13 +2119,30 @@ def test_lidar_odometry_gate(sim_platform):
             probe.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(launch.pid), signal.SIGINT)
+        # Review round 2: the kill sequence must not abort the teardown — the
+        # launch may already be gone (ProcessLookupError) and a SIGKILLed
+        # D-state process can outlive the wait; the marker sweep is
+        # UNCONDITIONAL (it is what catches process-group escapees).
         try:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(launch.pid), signal.SIGINT)
             launch.wait(timeout=20)
         except subprocess.TimeoutExpired:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(os.getpgid(launch.pid), signal.SIGKILL)
-            launch.wait(timeout=5)
-        terminate_partition_processes(partition)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                launch.wait(timeout=5)
+        finally:
+            terminate_marked_processes({RUN_MARKER_ENV: partition, "GZ_PARTITION": partition})
+            # passive leftover scan (review, run-2 startup stall): after the
+            # sweep, anything still on this domain is a leak the sweep cannot see
+            # or a foreign process — printed so the NEXT leg's health is
+            # attributable to a clean graph
+            domain_leftovers = leftover_domain_processes(os.environ.get("ROS_DOMAIN_ID", ""))
+            if domain_leftovers:
+                print(
+                    "[lio-gate] WARNING: processes still alive on ROS domain "
+                    f"{os.environ.get('ROS_DOMAIN_ID')!r} after the sweep:\n  " + "\n  ".join(domain_leftovers),
+                    flush=True,
+                )
         launch_log.close()

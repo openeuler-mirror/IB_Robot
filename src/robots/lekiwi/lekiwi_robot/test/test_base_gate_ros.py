@@ -24,7 +24,6 @@ runtime left running by another test or worktree cannot answer for it.
 """
 
 import os
-import random
 import threading
 import time
 
@@ -99,22 +98,41 @@ class Driver(Node):
 
 @pytest.fixture(scope="module")
 def graph():
-    os.environ["ROS_DOMAIN_ID"] = str(random.randint(150, 230))
+    # The workspace-root conftest reserves a per-process ROS domain
+    # (IBROBOT_TEST_ROS_DOMAIN_ID) before any fixture runs; this module
+    # must NOT roll its own unreserved random domain — a leftover value
+    # would leak into every later test in the process (review round 2).
+    assert os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID"), (
+        "the workspace-root conftest's ROS domain isolation is not active "
+        "(IBROBOT_TEST_ROS_DOMAIN_ID unset); refusing to run on an unreserved domain"
+    )
     args = ["--ros-args", *[a for k, v in PARAMS.items() for a in ("-p", f"{k}:={v}")]]
     rclpy.init(args=args)
-    base = LeKiwiBaseNode()
-    driver = Driver()
-    executor = MultiThreadedExecutor(num_threads=4)
-    executor.add_node(base)
-    executor.add_node(driver)
-    spinner = threading.Thread(target=executor.spin, daemon=True)
-    spinner.start()
-    time.sleep(0.5)  # discovery
-    yield driver
-    executor.shutdown()
-    base.destroy_node()
-    driver.destroy_node()
-    rclpy.shutdown()
+    base = None
+    driver = None
+    executor = None
+    spinner = None
+    try:
+        base = LeKiwiBaseNode()
+        driver = Driver()
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(base)
+        executor.add_node(driver)
+        spinner = threading.Thread(target=executor.spin, daemon=True)
+        spinner.start()
+        time.sleep(0.5)  # discovery
+        yield driver
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        if spinner is not None:
+            spinner.join(timeout=5.0)
+        if base is not None:
+            base.destroy_node()
+        if driver is not None:
+            driver.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def settle(driver: Driver, mode: str, stop_latched: bool = False) -> None:

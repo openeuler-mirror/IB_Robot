@@ -21,11 +21,16 @@ import pytest
 
 from robot_runtime.testing.sim_ground_truth import (
     MAX_GAP_SEC,
+    RUN_MARKER_ENV,
     GroundTruthSample,
     UnsupportedGroundTruth,
+    ancestor_pids,
+    leftover_domain_processes,
     mirror_partition_env,
     open_ground_truth,
     parse_world_pose_messages,
+    terminate_marked_processes,
+    terminate_partition_processes,
     yaw_from_quaternion,
 )
 
@@ -398,6 +403,113 @@ def test_the_child_env_mirrors_the_gz_partition_across_both_names():
     ignition_only = {"IGN_PARTITION": "lekiwi_run_b", "PATH": "/bin"}
     mirrored = mirror_partition_env(ignition_only)
     assert mirrored == {"IGN_PARTITION": "lekiwi_run_b", "GZ_PARTITION": "lekiwi_run_b", "PATH": "/bin"}
+
+
+def test_the_marker_sweep_kills_only_marked_processes():
+    """Review round 1: the neutral IBROBOT_TEST_RUN marker sweep must kill a
+    process carrying the marker (a launch child that escaped the process
+    group) and must leave every unmarked process alone — this is what makes a
+    MuJoCo teardown sweep possible where the Gazebo-only partition marker
+    never matched."""
+    run = f"lekiwi_sweep_test_{os.getpid()}"
+    marked_env = {**os.environ, RUN_MARKER_ENV: run}
+    sleeper = "/bin/sleep"
+    marked = subprocess.Popen([sleeper, "30"], env=marked_env)
+    unmarked = subprocess.Popen([sleeper, "30"], env=os.environ)
+    try:
+        assert marked.poll() is None and unmarked.poll() is None
+        terminate_marked_processes({RUN_MARKER_ENV: run})
+        assert marked.poll() is not None, "the marked process survived the SIGTERM/SIGKILL sweep"
+        assert unmarked.poll() is None, "the sweep killed a process without the marker"
+    finally:
+        for process in (marked, unmarked):
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            else:
+                process.wait(timeout=5)
+
+
+def test_leftover_domain_processes_list_only_processes_on_that_domain():
+    """The between-legs diagnostic: a process whose environment carries the
+    domain is listed (pid + command), one on another domain or none is not."""
+    domain = f"98_{os.getpid()}"  # never a real ROS domain: diagnostics only
+    on_domain_env = {**os.environ, "ROS_DOMAIN_ID": domain}
+    on_domain = subprocess.Popen(["/bin/sleep", "30"], env=on_domain_env)
+    off_domain = subprocess.Popen(["/bin/sleep", "30"], env=os.environ)
+    try:
+        listed = leftover_domain_processes(domain)
+        assert len(listed) == 1, f"expected exactly the on-domain process, got {listed}"
+        assert f"pid {on_domain.pid}" in listed[0], listed
+        assert "sleep 30" in listed[0], listed
+        assert leftover_domain_processes("") == [], "an empty domain scans nothing"
+    finally:
+        for process in (on_domain, off_domain):
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_the_scan_excludes_the_scanning_process_own_ancestor_chain():
+    """A wrapper that carries the domain (colcon under an exported
+    ROS_DOMAIN_ID) is the scanning process's PARENT, not a leftover — the
+    first version flagged colcon itself (review round 1). A bash parent
+    carrying the domain must not be listed; only foreign processes are."""
+    import shlex
+
+    domain = f"97_{os.getpid()}"  # never a real ROS domain: diagnostics only
+    script = (
+        "from robot_runtime.testing.sim_ground_truth import leftover_domain_processes\n"
+        f"found = leftover_domain_processes({domain!r})\n"
+        "print('LEFTOVERS:' + repr(found))\n"
+    )
+    completed = subprocess.run(
+        ["/bin/bash", "-c", f"python3 -c {shlex.quote(script)}; echo bash-parent-still-here"],
+        env={**os.environ, "ROS_DOMAIN_ID": domain},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert "bash-parent-still-here" in completed.stdout
+    marker = next(line for line in completed.stdout.splitlines() if line.startswith("LEFTOVERS:"))
+    assert marker == "LEFTOVERS:[]", (
+        f"the scanning process's own bash parent (carrying the domain) must be excluded, got {marker}"
+    )
+
+
+def test_the_ancestor_walk_includes_pid_one_and_stops_there():
+    """Review round 2: the walk adds each pid before stopping, PID 1
+    included, and terminates on unreadable parents and cycles."""
+    # a mocked chain: 100 -> 99 -> 1
+    chain = {100: 99, 99: 1}
+    assert ancestor_pids(100, read_ppid=chain.get) == {100, 99, 1}
+    # an unreadable parent stops the walk without looping
+    assert ancestor_pids(100, read_ppid=lambda _pid: 0) == {100}
+    # a pathological cycle terminates
+    assert ancestor_pids(100, read_ppid=lambda _pid: 100) == {100}
+    # start_pid=1 short-circuits
+    assert ancestor_pids(1, read_ppid=lambda _pid: 0) == {1}
+
+
+def test_the_partition_sweep_still_matches_the_gz_partition_marker():
+    """The Gazebo sweep keeps its contract: GZ_PARTITION matches, and a
+    process carrying only the neutral marker is not its business."""
+    run = f"lekiwi_gz_sweep_test_{os.getpid()}"
+    marked_env = {**os.environ, "GZ_PARTITION": run}
+    gz_marked = subprocess.Popen(["/bin/sleep", "30"], env=marked_env)
+    neutral_only_env = {**os.environ, RUN_MARKER_ENV: f"unrelated_{os.getpid()}"}
+    neutral_only = subprocess.Popen(["/bin/sleep", "30"], env=neutral_only_env)
+    try:
+        terminate_partition_processes(run)
+        assert gz_marked.poll() is not None, "the GZ_PARTITION-marked process survived the sweep"
+        assert neutral_only.poll() is None, "the partition sweep killed a process it must not match"
+    finally:
+        for process in (gz_marked, neutral_only):
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            else:
+                process.wait(timeout=5)
 
     # both set (possibly differently) or neither: the caller's explicit choice
     both = {"GZ_PARTITION": "a", "IGN_PARTITION": "b"}

@@ -33,8 +33,10 @@ turns any skip of a listed platform into a failure (the acceptance runs).
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
+import signal
 import subprocess
 import time
 import uuid
@@ -50,7 +52,12 @@ from std_srvs.srv import SetBool
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode
 from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, load_profile
-from robot_runtime.testing.sim_ground_truth import open_ground_truth, terminate_partition_processes
+from robot_runtime.testing.sim_environment import environment_missing, skip_or_fail
+from robot_runtime.testing.sim_ground_truth import (
+    RUN_MARKER_ENV,
+    open_ground_truth,
+    terminate_marked_processes,
+)
 
 PACKAGE = "lekiwi_robot"
 MODEL_NAME = "lekiwi_robot"  # the runtime's model name in the simulator
@@ -67,44 +74,19 @@ COMMAND_RATE_HZ = 20.0
 _LIDAR_PROFILE = Path(__file__).resolve().parents[1] / "profiles" / "lekiwi_lidar.yaml"
 
 
-def _gazebo_available() -> bool:
-    try:
-        return subprocess.run(["ign", "gazebo", "--version"], capture_output=True, timeout=10).returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-def _mujoco_environment_missing() -> str | None:
-    try:
-        from ament_index_python import get_resources
-        from ament_index_python.packages import PackageNotFoundError, get_package_share_directory
-
-        try:
-            get_package_share_directory("mujoco_ros2_control")
-        except PackageNotFoundError:
-            return "the mujoco_ros2_control package is not installed"
-        if "mujoco_3d_lidar" not in get_resources("mujoco_plugins"):
-            return "the mujoco_3d_lidar ament resource is not installed"
-    except ImportError:
-        return "ament_index_python is unavailable"
-    try:
-        import mujoco as python_mujoco
-
-        from robot_runtime.mujoco import simulator_versions
-
-        if simulator_versions().mujoco != python_mujoco.__version__:
-            return "Python mujoco does not match the simulator's libmujoco"
-    except ImportError:
-        return "the Python mujoco package is unavailable"
-    return None
-
-
 def _environment_missing(sim_platform: str) -> str | None:
-    if sim_platform == "gazebo":
-        return None if _gazebo_available() else "ign gazebo is unavailable"
-    if sim_platform == "mujoco":
-        return _mujoco_environment_missing()
-    return f"no environment check for platform {sim_platform!r}"
+    """The shared environment probe (robot_runtime.testing.sim_environment).
+
+    Kept as a local name for the call sites; the Gazebo probe accepts EITHER
+    stack (``ign gazebo`` / ``gz sim``) and the MuJoCo probe names every
+    missing piece. The decision layer is the shared require-or-skip rule.
+    """
+    return environment_missing(sim_platform)
+
+
+def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
+    """Skip — unless acceptance runs required this platform: then fail."""
+    skip_or_fail(sim_platform, reason, context="chassis tracking gate")
 
 
 def _platform_capabilities_missing(sim_platform: str) -> list[str]:
@@ -120,17 +102,6 @@ def _platform_capabilities_missing(sim_platform: str) -> list[str]:
     if sim_platform not in supported:
         missing.append(f"runtime profile: {sim_platform!r} is not in sim_platforms {supported}")
     return missing
-
-
-def _gate_skip_or_fail(sim_platform: str, reason: str) -> None:
-    required = {
-        entry.strip().lower()
-        for entry in os.environ.get("IBROBOT_REQUIRE_SIM_PLATFORMS", "").split(",")
-        if entry.strip()
-    }
-    if sim_platform in required:
-        pytest.fail(f"chassis tracking gate: platform {sim_platform!r} was required: {reason}")
-    pytest.skip(reason)
 
 
 class GateNode(Node):
@@ -212,6 +183,11 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
         )
     partition = f"lekiwi_gate_{uuid.uuid4().hex[:8]}"
     environment = dict(os.environ)
+    # the neutral per-run marker (review round 1): every platform's launch
+    # children carry it, so the teardown sweep below also catches MuJoCo
+    # descendants that escape the launch process group (the Gazebo-only
+    # partition marker never matched them)
+    environment[RUN_MARKER_ENV] = partition
     if sim_platform == "gazebo":
         # both partition variables: Fortress (ign, gz-transport11) reads only
         # IGN_PARTITION, newer gz reads GZ_PARTITION — set both to isolate
@@ -447,10 +423,19 @@ def test_chassis_tracking_gate(tmp_path, sim_platform):
             node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
-        os.killpg(os.getpgid(launch.pid), 15)
+        # Review round 2: the launch may already be gone (an early fail-fast
+        # exit), when os.getpgid raises ProcessLookupError — the kill sequence
+        # must not abort the teardown, and the marker sweep must be
+        # UNCONDITIONAL (it is what catches process-group escapees).
         try:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(launch.pid), signal.SIGINT)
             launch.wait(timeout=15)
         except subprocess.TimeoutExpired:
-            os.killpg(os.getpgid(launch.pid), 9)
-        terminate_partition_processes(partition)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(launch.pid), signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                launch.wait(timeout=5)
+        finally:
+            terminate_marked_processes({RUN_MARKER_ENV: partition, "GZ_PARTITION": partition})
         print(f"[gate] measurements: {measurements}", flush=True)

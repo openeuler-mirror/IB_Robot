@@ -33,6 +33,7 @@ unless ``IBROBOT_REQUIRE_SIM_PLATFORMS`` lists ``mujoco`` (then it fails).
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import math
 import os
@@ -40,6 +41,7 @@ import random
 import signal
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -54,7 +56,11 @@ from std_srvs.srv import SetBool
 from ibrobot_msgs.msg import RuntimeStatus
 from ibrobot_msgs.srv import SetRuntimeMode, StopRuntime
 from robot_runtime.profile import load_profile
-from robot_runtime.testing.sim_ground_truth import open_ground_truth
+from robot_runtime.testing.sim_ground_truth import (
+    RUN_MARKER_ENV,
+    open_ground_truth,
+    terminate_marked_processes,
+)
 
 # mujoco_ros2_control_msgs (SetPause/ResetWorld) is imported lazily inside the
 # tests: the package exists only where the simulator is installed, and a
@@ -125,29 +131,44 @@ def _launch(environment: dict, log_path: Path, profile_path: Path | None = None)
 
 
 def _terminate(launch) -> None:
-    if launch.poll() is None:
-        os.killpg(os.getpgid(launch.pid), signal.SIGINT)
-        try:
+    # Review round 2: the launch may already be gone, when os.getpgid
+    # raises ProcessLookupError — the kill sequence must not abort the
+    # caller's teardown (the marker sweep in the caller's finally is what
+    # catches process-group escapees, and it must always run).
+    try:
+        if launch.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(launch.pid), signal.SIGINT)
             launch.wait(timeout=15)
-        except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(launch.pid), signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
             launch.wait(timeout=10)
 
 
-def _fresh_environment() -> tuple[dict, str]:
+def _fresh_environment() -> tuple[dict, str, str]:
+    """The launch environment on a fresh domain, plus this run's sweep marker.
+
+    The neutral ``IBROBOT_TEST_RUN`` marker (review round 1) is inherited by
+    every launch child, so the teardown sweep catches MuJoCo descendants that
+    escape the launch process group — the Gazebo-only partition sweep never
+    matched this package's MuJoCo launches.
+    """
     domain = str(random.randint(150, 229))
+    run = f"lekiwi_stop_{uuid.uuid4().hex[:8]}"
     environment = dict(os.environ)
-    environment.update({"ROS_DOMAIN_ID": domain, "IBROBOT_MUJOCO_HEADLESS": "1"})
+    environment.update({"ROS_DOMAIN_ID": domain, "IBROBOT_MUJOCO_HEADLESS": "1", RUN_MARKER_ENV: run})
     # the probe joins the launch's domain (rclpy reads ROS_DOMAIN_ID at init)
     os.environ["ROS_DOMAIN_ID"] = domain
-    return environment, domain
+    return environment, domain, run
 
 
 def test_mujoco_stop_paths_latency_pause_and_reset_chain(tmp_path):
     require_mujoco()
     from mujoco_ros2_control_msgs.srv import ResetWorld, SetPause
 
-    environment, _domain = _fresh_environment()
+    environment, _domain, run = _fresh_environment()
     launch_log = tmp_path / "launch.log"
     launch = _launch(environment, launch_log)
     probe = None
@@ -474,6 +495,7 @@ def test_mujoco_stop_paths_latency_pause_and_reset_chain(tmp_path):
         if rclpy.ok():
             rclpy.shutdown()
         _terminate(launch)
+        terminate_marked_processes({RUN_MARKER_ENV: run})
         print(f"[stop-gate] measurements: {measurements}", flush=True)
 
 
@@ -489,7 +511,7 @@ def test_mujoco_command_latency_throttled(tmp_path):
     throttled["hardware"] = hardware
     staged = tmp_path / "lekiwi_lidar_throttled.yaml"
     staged.write_text(yaml.safe_dump(throttled, default_flow_style=False, sort_keys=False), encoding="utf-8")
-    environment, _domain = _fresh_environment()
+    environment, _domain, run = _fresh_environment()
     launch_log = tmp_path / "launch.log"
     launch = _launch(environment, launch_log, profile_path=staged)
     probe = None
@@ -569,3 +591,4 @@ def test_mujoco_command_latency_throttled(tmp_path):
         if rclpy.ok():
             rclpy.shutdown()
         _terminate(launch)
+        terminate_marked_processes({RUN_MARKER_ENV: run})

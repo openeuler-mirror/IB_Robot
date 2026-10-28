@@ -159,6 +159,7 @@ def main(args=None):
     client = node.create_client(GetRuntimeStatus, ns.status_service)
     future = None
     next_query = 0.0
+    next_progress_note = time.monotonic() + 10.0
     error = f"runtime {ns.runtime_name!r} did not publish status"
     try:
         deadline = time.monotonic() + ns.timeout
@@ -190,6 +191,13 @@ def main(args=None):
                     return 0
                 except (ValueError, OSError) as exc:
                     error = str(exc)
+            if time.monotonic() >= next_progress_note:
+                # passive observability (review: a startup stall must not
+                # lose its reason when the caller's teardown SIGINT beats
+                # this process's own timeout print): name the pending
+                # blocker while waiting, without changing any decision
+                print(f"still waiting for runtime {ns.runtime_name!r}: {error}", file=sys.stderr, flush=True)
+                next_progress_note = time.monotonic() + 10.0
             rclpy.spin_once(node, timeout_sec=0.1)
         print(f"ERROR: {error} (timeout {ns.timeout}s)", file=sys.stderr)
         return 1
