@@ -26,8 +26,9 @@ ACTION = "/arm_trajectory_controller/follow_joint_trajectory"
 class FakeControllerManager(Node):
     """Records every request the facade makes, in order."""
 
-    def __init__(self):
+    def __init__(self, extra_controllers: tuple[str, ...] = ()):
         super().__init__("controller_manager")
+        self._extra_controllers = tuple(extra_controllers)
         cb = ReentrantCallbackGroup()
         self.active: set[str] = set()
         self.hardware: dict[str, str] = {"so101_system": "active"}
@@ -62,7 +63,7 @@ class FakeControllerManager(Node):
         return response
 
     def _list(self, _request, response):
-        for name in ("arm_position_controller", "arm_trajectory_controller"):
+        for name in ("arm_position_controller", "arm_trajectory_controller", *self._extra_controllers):
             state = ControllerState()
             state.name = name
             state.state = "active" if name in self.active else "inactive"
@@ -140,7 +141,7 @@ class Caller(Node):
 
 
 @pytest.fixture(scope="module")
-def stack(tmp_path_factory):
+def rclpy_domain():
     # Own DDS domain: colcon runs this package's whole suite in one process
     # (the pytest extra is declared in setup.py), and torn-down runtimes from
     # the other suites leave ghost endpoints on the shared per-process domain
@@ -148,6 +149,7 @@ def stack(tmp_path_factory):
     # 5-second call timeouts. Reserve a fresh domain through the same
     # coordinator the root conftest uses instead of a fixed ID, so concurrent
     # workspaces never collide; restore the per-process domain afterwards.
+    # Shared by every facade stack in this module (rclpy initializes once).
     previous_domain = os.environ.get("ROS_DOMAIN_ID")
     reservation = contextlib.ExitStack()
     try:
@@ -157,9 +159,20 @@ def stack(tmp_path_factory):
     else:
         os.environ["ROS_DOMAIN_ID"] = str(reservation.enter_context(reserve_domain_id()))
     os.environ["ROS_LOCALHOST_ONLY"] = "1"
+    rclpy.init()
+    yield
+    rclpy.shutdown()
+    reservation.close()
+    if previous_domain is None:
+        os.environ.pop("ROS_DOMAIN_ID", None)
+    else:
+        os.environ["ROS_DOMAIN_ID"] = previous_domain
+
+
+@pytest.fixture(scope="module")
+def stack(rclpy_domain, tmp_path_factory):
     profile_path = tmp_path_factory.mktemp("profile") / "runtime.yaml"
     profile_path.write_text(yaml.safe_dump(PROFILE), encoding="utf-8")
-    rclpy.init()
     from robot_runtime.facade_node import RuntimeFacade
 
     cm = FakeControllerManager()
@@ -179,12 +192,6 @@ def stack(tmp_path_factory):
     yield cm, caller
     executor.shutdown(timeout_sec=2.0)
     caller.destroy_node()
-    rclpy.shutdown()
-    reservation.close()
-    if previous_domain is None:
-        os.environ.pop("ROS_DOMAIN_ID", None)
-    else:
-        os.environ["ROS_DOMAIN_ID"] = previous_domain
 
 
 def test_set_mode_maps_to_strict_switch(stack):

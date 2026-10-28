@@ -72,9 +72,11 @@ source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=ac
 
 ## MuJoCo 仿真版本规则（issue #190）
 
-SO-101 的 MuJoCo 仿真平台运行在 `mujoco_ros2_control` 0.1.2 /
-`mujoco_vendor` 0.1.1（libmujoco 3.12.0）上。`.mjb` 模型由工作区 Python
-`mujoco` 编译，且版本必须与仿真器的 libmujoco 完全一致，因此：
+MuJoCo 仿真平台（SO-101、LeKiwi lidar 阶段一）运行在
+`mujoco_ros2_control` 0.1.2 / `mujoco_vendor` 0.1.1（libmujoco 3.12.0）
+以及 `mujoco_3d_lidar` 0.1.2（MuJoCo 雷达引擎扩展，LeKiwi 的 MID-360
+仿真需要它）上。模型由工作区 Python `mujoco` 编译，且版本必须与仿真器的
+libmujoco 完全一致，因此：
 
 - Python 侧钉版移入独立的 `requirements/mujoco-sim.txt`（`mujoco==3.12.0`），
   只在 Ubuntu `full` profile、未启用 benchmark 且 venv 中没有
@@ -84,15 +86,18 @@ SO-101 的 MuJoCo 仿真平台运行在 `mujoco_ros2_control` 0.1.2 /
   `--with-benchmark` 生成的 pip 约束包含 `mujoco<3.9`；已有 benchmark 安装的
   venv 跳过 3.12.0 钉版并警告，要使用 MuJoCo 仿真需**重建 venv**。
 - `verify_env.sh::verify_mujoco_sim` 在钉版会安装的环境里用纯标准库脚本复核
-  同一组版本（ROS prefix 取自 `SETUP_ROS_SETUP_PATH`）；其余 profile 与
-  benchmark venv 只输出提示行。
+  同一组版本，并检查 `mujoco_3d_lidar` 的 ament `mujoco_plugins` 资源、
+  包版本（>= 0.1.2）与其指向的扩展库（ROS prefix 取自
+  `SETUP_ROS_SETUP_PATH`）；其余 profile 与 benchmark venv 只输出提示行。
+  包缺失时提示用 sudo 重新运行 `./scripts/setup.sh`，由其中的 rosdep 安装；
+  包已安装但版本过旧或已损坏时提示 apt 命令，因为 rosdep 不会升级已安装的包。
 - 运行时还有一道严格检查（`robot_runtime.mujoco.check_simulator_versions`）：
   版本不一致或仿真器过旧时，`sim_platform:=mujoco` 在模型组装前直接失败并
   给出安装诊断。
-- openEuler 无 `mujoco_ros2_control` rpm：rosdep skip 键
-  （`mujoco_ros2_control` / `mujoco_ros2_control_msgs`）保持不变，本次升级
-  未新增任何 skip 键（0.1.2 的 plugins 包由上游 `mujoco_ros2_control`
-  依赖传递带入，Ubuntu 侧同样不需要新键）。
+- openEuler 无 MuJoCo rpm：rosdep skip 键在 `mujoco_ros2_control` /
+  `mujoco_ros2_control_msgs` 之外新增 `mujoco_3d_lidar`（雷达引擎扩展同样
+  没有 openEuler rpm）。`imu_sensor_broadcaster` 属于 ros2_controllers 家族
+  （与 joint_state_broadcaster 同源），未加入 skip 键。
 
 ## 加速器轴依赖落位
 

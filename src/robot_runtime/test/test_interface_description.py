@@ -762,3 +762,102 @@ def test_gazebo_depth_streams_advertise_the_rendered_colour_dims():
     sdk = build_description(profile, use_sim=True, sim_platform="sdk")
     depth = sdk["interfaces"]["camera.front.depth"]["configured_profile"]
     assert (depth["width"], depth["height"], depth["fps"]) == (640, 360, 30)
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D5/D6: the lidar contract on MuJoCo
+# ---------------------------------------------------------------------------
+
+
+def _mujoco_lidar_profile(controllers_path, *, driver="livox_mid360", update_rate=100):
+    controllers_path.write_text(
+        "controller_manager:\n  ros__parameters:\n    update_rate: " + str(update_rate) + "\n",
+        encoding="utf-8",
+    )
+    profile = _lidar_profile(enabled_scan=False, fast_lio={"enabled": True})
+    profile["ros2_control"] = {"controllers_config": str(controllers_path)}
+    profile["peripherals"][0]["driver"] = driver
+    return profile
+
+
+def test_mujoco_advertises_the_point_cloud_and_the_imu_rate(tmp_path):
+    profile = _mujoco_lidar_profile(tmp_path / "controllers.yaml")
+    interfaces = build_description(profile, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert interfaces["lidar.mid360.points"]["message_type"] == "sensor_msgs/msg/PointCloud2"
+    assert interfaces["lidar.mid360.imu"]["message_type"] == "sensor_msgs/msg/Imu"
+    # the IMU rate is the effective controller-manager rate, not a constant (D5.3)
+    assert interfaces["lidar.mid360.imu"]["rate_hz"] == 100.0
+    # a different controllers file advertises its own rate
+    profile = _mujoco_lidar_profile(tmp_path / "controllers2.yaml", update_rate=250)
+    interfaces = build_description(profile, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert interfaces["lidar.mid360.imu"]["rate_hz"] == 250.0
+
+
+def test_mujoco_does_not_advertise_lidars_it_does_not_simulate(tmp_path):
+    profile = _mujoco_lidar_profile(tmp_path / "controllers.yaml", driver="ldlidar")
+    interfaces = build_description(profile, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert not any(key.startswith("lidar.") for key in interfaces), "ldlidar is not simulated on MuJoCo (D5)"
+    # the same driver stays advertised on Gazebo (it simulates it) and off-sim
+    gazebo = build_description(profile, use_sim=True, sim_platform="gazebo")["interfaces"]
+    assert gazebo["lidar.mid360.scan"]["message_type"] == "sensor_msgs/msg/LaserScan"
+    hardware = build_description(profile, use_sim=False)["interfaces"]
+    assert hardware["lidar.mid360.scan"]["message_type"] == "sensor_msgs/msg/LaserScan"
+
+
+def test_mujoco_without_a_simulated_lidar_needs_no_controllers_config():
+    # SO-101-shaped: no lidar at all and no ros2_control.controllers_config —
+    # the IMU rate must not be demanded for a profile without an integrated IMU
+    profile = _lidar_profile(enabled_scan=False)
+    profile["peripherals"] = []
+    interfaces = build_description(profile, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert not any(key.startswith("lidar.") for key in interfaces)
+
+
+def test_mujoco_imu_rate_follows_the_effective_inventory_not_the_raw_profile(tmp_path):
+    """Review round 1: the IMU rate is computed from the same effective
+    inventory (profile + deployment fragment) the description itself uses —
+    a fragment that adds or disables the lidar decides whether a rate is
+    needed at all, and a disabled lidar never demands a controllers file."""
+    # fragment ADDS the lidar: the raw profile has none, the effective list
+    # has the MID-360 — the IMU entry carries the controller-manager rate
+    bare = _lidar_profile(enabled_scan=False)
+    bare["peripherals"] = []
+    bare["ros2_control"] = {"controllers_config": str(tmp_path / "controllers.yaml")}
+    (tmp_path / "controllers.yaml").write_text(
+        "controller_manager:\n  ros__parameters:\n    update_rate: 125\n", encoding="utf-8"
+    )
+    effective = _lidar_profile(enabled_scan=False, fast_lio={"enabled": True})["peripherals"]
+    interfaces = build_description(bare, peripherals=effective, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert interfaces["lidar.mid360.imu"]["rate_hz"] == 125.0
+
+    # fragment DISABLES the lidar: no IMU is advertised and a missing
+    # controllers_config must not fail the description
+    disabled = _mujoco_lidar_profile(tmp_path / "unused.yaml")
+    disabled["peripherals"][0]["enabled"] = False
+    interfaces = build_description(disabled, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert not any(key.startswith("lidar.") for key in interfaces)
+
+
+def test_mujoco_points_rate_honours_the_platform_update_rate(tmp_path):
+    """The advertised cloud rate resolves the same precedence as the composed
+    MJCF: simulation.mujoco.update_rate over publish_freq (review round 1)."""
+    profile = _mujoco_lidar_profile(tmp_path / "controllers.yaml")
+    lidar = profile["peripherals"][0]
+    lidar["publish_freq"] = 10.0
+    interfaces = build_description(profile, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert interfaces["lidar.mid360.points"]["rate_hz"] == 10.0  # publish_freq stands
+
+    lidar["simulation"] = {"mujoco": {"update_rate": 20.0}}
+    interfaces = build_description(profile, use_sim=True, sim_platform="mujoco")["interfaces"]
+    assert interfaces["lidar.mid360.points"]["rate_hz"] == 20.0  # the platform override wins
+
+    # other platforms never read the mujoco section
+    gazebo = build_description(profile, use_sim=True, sim_platform="gazebo")["interfaces"]
+    assert gazebo["lidar.mid360.points"]["rate_hz"] == 10.0
+
+
+def test_mujoco_imu_rate_fails_closed_on_a_missing_update_rate(tmp_path):
+    profile = _mujoco_lidar_profile(tmp_path / "controllers.yaml")
+    (tmp_path / "controllers.yaml").write_text("controller_manager:\n  ros__parameters:\n", encoding="utf-8")
+    with pytest.raises(Exception, match="update_rate missing or invalid"):
+        build_description(profile, use_sim=True, sim_platform="mujoco")

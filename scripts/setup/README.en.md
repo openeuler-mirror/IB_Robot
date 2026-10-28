@@ -66,9 +66,11 @@ source .shrc_local && lerobot-train --dataset.repo_id=<repo_id> --policy.type=ac
 
 ## MuJoCo simulation version rule (issue #190)
 
-The SO-101 MuJoCo simulation platform runs on `mujoco_ros2_control` 0.1.2 /
-`mujoco_vendor` 0.1.1 (libmujoco 3.12.0). The `.mjb` model is compiled by the
-workspace Python `mujoco`, and its version must exactly equal the simulator's
+The MuJoCo simulation platforms (SO-101, and the LeKiwi lidar stage one) run
+on `mujoco_ros2_control` 0.1.2 / `mujoco_vendor` 0.1.1 (libmujoco 3.12.0)
+plus `mujoco_3d_lidar` 0.1.2 (the MuJoCo lidar engine extension, which the
+LeKiwi MID-360 simulation needs). The models are compiled by the workspace
+Python `mujoco`, and its version must exactly equal the simulator's
 libmujoco, therefore:
 
 - The Python pin moved into a dedicated `requirements/mujoco-sim.txt`
@@ -82,18 +84,23 @@ libmujoco, therefore:
   the 3.12.0 pin with a warning — **recreate the venv** to use the MuJoCo
   simulation.
 - `verify_env.sh::verify_mujoco_sim` re-checks the same versions with a
-  stdlib-only snippet where the pin would be installed (the ROS prefix is
-  derived from `SETUP_ROS_SETUP_PATH`); every other profile and benchmark
-  venv gets an info line at most.
+  stdlib-only snippet where the pin would be installed, and additionally
+  checks the `mujoco_3d_lidar` ament `mujoco_plugins` resource, its package
+  version (>= 0.1.2) and the extension library it points at (the ROS prefix
+  is derived from `SETUP_ROS_SETUP_PATH`); every other profile and benchmark
+  venv gets an info line at most. A missing package points at re-running
+  `./scripts/setup.sh` with sudo (its rosdep step installs it); an installed
+  package that is too old or broken names the apt command, because rosdep
+  never upgrades an installed package.
 - The runtime adds a strict check
   (`robot_runtime.mujoco.check_simulator_versions`): on an inconsistent or
   too-old simulator, `sim_platform:=mujoco` fails before model composition
   with an installation diagnostic.
-- openEuler ships no `mujoco_ros2_control` rpm: the rosdep skip keys
-  (`mujoco_ros2_control` / `mujoco_ros2_control_msgs`) stay as they are and
-  this upgrade adds **no** new skip key (the 0.1.2 plugins package arrives
-  transitively through upstream `mujoco_ros2_control`; Ubuntu needs no new
-  key either).
+- openEuler ships no MuJoCo rpm: beyond the existing
+  `mujoco_ros2_control` / `mujoco_ros2_control_msgs` rosdep skip keys, this
+  change adds `mujoco_3d_lidar` (the lidar engine extension has no openEuler
+  rpm either). `imu_sensor_broadcaster` belongs to the ros2_controllers
+  family (same source as `joint_state_broadcaster`) and is not skipped.
 
 ## CANN dependency layers
 

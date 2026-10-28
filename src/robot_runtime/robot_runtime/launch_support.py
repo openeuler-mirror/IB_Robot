@@ -121,20 +121,28 @@ def write_controller_manager_params(robot_description: str, extra_params: dict[s
     return write_node_params("controller_manager", params)
 
 
-def profile_controllers(profile: dict[str, Any]) -> tuple[list[str], list[str], list[str]]:
+def profile_controllers(
+    profile: dict[str, Any], sim_platform: str | None = None
+) -> tuple[list[str], list[str], list[str]]:
     """Return (broadcasters, initially_active, initially_inactive) controllers from the profile.
 
     Broadcasters are always active. The initial mode's controllers start
     active; every other controller named by any mode starts inactive so the
-    facade can switch activation sets without spawning.
+    facade can switch activation sets without spawning. ``sim_platform``
+    selects the mode table's per-platform overrides (D3.1) through the single
+    resolver :func:`robot_runtime.modes.mode_controller_table`, so the
+    spawners, the facade and the stop path all see one controller table.
     """
+    from robot_runtime.modes import mode_controller_table
+
     modes = dict(profile.get("modes") or {})
     initial = str(modes.pop("initial", IDLE_MODE))
     broadcasters = [str(c) for c in (profile.get("ros2_control") or {}).get("broadcasters", [])]
+    controller_table = mode_controller_table(profile, sim_platform)
     active: list[str] = []
     inactive: list[str] = []
-    for name, spec in modes.items():
-        for controller in (spec or {}).get("controllers", []):
+    for name, controllers in controller_table.items():
+        for controller in controllers:
             controller = str(controller)
             target = active if str(name) == initial else inactive
             if controller not in target and controller not in active:
@@ -486,7 +494,7 @@ def gazebo_embodiment_actions(
         raise RuntimeProfileError(
             f"runtime profile missing required key 'ros2_control.controllers_config': {profile_path}"
         )
-    broadcasters, active, inactive = profile_controllers(profile)
+    broadcasters, active, inactive = profile_controllers(profile, "gazebo")
     controller_manager = str(profile["controller_manager"])
     model_name = str(profile["runtime"]["name"])
 
@@ -656,9 +664,10 @@ def render_mujoco_description(
     from robot_runtime.mujoco import (
         camera_tf_urdf,
         check_simulator_versions,
+        imu_sensor_urdf,
         render_robot_mjcf,
     )
-    from sim_models.scene_compiler import compose_mujoco_model
+    from sim_models.scene_compiler import compose_mujoco_model, mjcf_engine_extensions
 
     description = profile.get("description") or {}
     if not description.get("xacro"):
@@ -673,7 +682,16 @@ def render_mujoco_description(
     # direct API caller) keeps the robot-only composition.
     scene_name = None if scene is None else ((scene or "").strip() or "empty")
     composed = compose_mujoco_model(str(robot_mjcf), scene_name, sdf_meshes)
-    if composed.suffix != ".mjb":
+    if composed.suffix == ".mjb":
+        pass  # the extension-free artifact, as before
+    elif composed.suffix == ".xml" and mjcf_engine_extensions(composed):
+        # D5.1: the model declares engine extensions, so the compiler
+        # delivered the XML — a .mjb would bake this process's global plugin
+        # slot ids, which the C++ node (its own registration order) cannot
+        # read back (spike evidence /tmp/lekiwi-mujoco-evidence/spike/SUMMARY.md);
+        # the C++ node compiles the XML in-process with its own registration
+        pass
+    else:
         raise RuntimeProfileError(
             f"the MuJoCo embodiment needs the mujoco Python package (composition fell back to {composed})"
         )
@@ -696,6 +714,11 @@ def render_mujoco_description(
     cameras_xml = camera_tf_urdf(effective_peripherals, spawn_pose=spawn_pose)
     if cameras_xml:
         robot_description = robot_description.replace("</robot>", cameras_xml + "\n</robot>", 1)
+    # D5.3: the integrated-IMU sensors go into the rendered ros2_control
+    # block, where the system interface's register_sensors reads them
+    imus_xml = imu_sensor_urdf(effective_peripherals)
+    if imus_xml:
+        robot_description = robot_description.replace("</ros2_control>", imus_xml + "\n  </ros2_control>", 1)
     return _resolve_package_uris(robot_description)
 
 
@@ -723,9 +746,10 @@ def mujoco_embodiment_actions(
     the place of the provider's own ``ros2_control_node``: robot_state_publisher,
     spawners, the facade, the camera depth fan-out relays and the simulated
     joint-current publisher all run on sim time against it. No world process
-    is started here — with no scene the robot model runs alone (the old
-    adapter's no-scene behaviour), with a scene the composed model already
-    contains it (D3). The spawners start immediately; their
+    is started here — the composed model already contains the scene (an
+    empty ``mujoco_scene`` composes the shared sim_models ``empty`` scene;
+    only a direct API caller passing ``scene=None`` gets a robot-only model).
+    The spawners start immediately; their
     ``--controller-manager-timeout`` waits for the in-process controller
     manager. ``IBROBOT_MUJOCO_HEADLESS=1`` mirrors the Gazebo headless mode:
     with no display the CameraPlugin renders through EGL (D4), so no
@@ -737,10 +761,17 @@ def mujoco_embodiment_actions(
     directory and ament resources only, so no ``MUJOCO_PLUGIN_PATH`` is set.
     """
     from robot_runtime.mujoco import (
+        base_velocity_plugin_parameters,
         camera_plugin_parameters,
         free_joint_state_plugin_parameters,
+        imu_broadcaster_entries,
+        imu_broadcaster_remappings,
+        lidar_plugin_parameters,
         merge_mujoco_plugin_parameters,
         mujoco_camera_relays,
+        mujoco_imu_filter_nodes,
+        mujoco_lidar_filter_nodes,
+        odometry_twist_relay_node,
     )
 
     if robot_description is None:
@@ -751,19 +782,30 @@ def mujoco_embodiment_actions(
             f"runtime profile missing required key 'ros2_control.controllers_config': {profile_path}"
         )
     controllers_config = resolve_path(ros2_control["controllers_config"])
-    broadcasters, active, inactive = profile_controllers(profile)
     peripherals = merge_peripherals(
         profile.get("peripherals"),
         (load_peripherals_file(peripherals_file) if peripherals_file else {}).get("peripherals"),
     )
+    # D5.3: the generated IMU broadcasters ride a GENERATED controllers file
+    # merging the profile's shipped configuration (the shipped file is never
+    # edited); they join the broadcaster set — always active, in no mode.
+    broadcaster_entries = imu_broadcaster_entries(peripherals)
+    broadcasters, active, inactive = profile_controllers(profile, "mujoco")
+    if broadcaster_entries:
+        controllers_config = _merged_controllers_config(controllers_config, broadcaster_entries)
+        broadcasters = [*broadcasters, *broadcaster_entries]
+    floating_base = ((profile.get("simulation") or {}).get("mujoco") or {}).get("floating_base") or {}
     cm_params = write_controller_manager_params(robot_description)
     mujoco_node_parameters = [cm_params, controllers_config, {"use_sim_time": True}]
-    # One params file carries every simulator plugin: the cameras and, when
-    # the composed scene has dynamic objects, the free-joint state publisher
-    # the scene task observes (issue #195).
+    # One params file carries every simulator plugin: the cameras, the lidars,
+    # the floating-base drive and, when the composed scene has dynamic
+    # objects, the free-joint state publisher the scene task observes
+    # (issue #195).
     plugin_parameters = merge_mujoco_plugin_parameters(
         camera_plugin_parameters(profile, peripherals),
         free_joint_state_plugin_parameters(mujoco_scene),
+        base_velocity_plugin_parameters(floating_base),
+        lidar_plugin_parameters(peripherals),
     )
     if plugin_parameters:
         mujoco_node_parameters.append(write_node_params(MUJOCO_SIMULATION_NODE, plugin_parameters))
@@ -779,6 +821,9 @@ def mujoco_embodiment_actions(
             executable="ros2_control_node",
             output="screen",
             parameters=mujoco_node_parameters,
+            # D5.3: process-wide remaps put the IMU broadcasters' ~/imu on the
+            # internal /<name>_imu/raw topics (the settle filter's input)
+            remappings=imu_broadcaster_remappings(peripherals),
         ),
         *spawner_nodes(
             broadcasters,
@@ -812,7 +857,36 @@ def mujoco_embodiment_actions(
         ),
         *simulated_joint_current_actions(profile, sim_platform="mujoco"),
         *mujoco_camera_relays(peripherals),
+        # D5.3: the raw lidar cloud and IMU streams land on the advertised
+        # endpoints through the shared filters (the cloud gains its zero
+        # intensity field; the IMU waits out the spawn settle)
+        *mujoco_lidar_filter_nodes(peripherals),
+        *mujoco_imu_filter_nodes(peripherals),
+        # D3.3: the base's own wheel odometry drives the floating base
+        *odometry_twist_relay_node(floating_base),
+        # D5: static TF only for sensor frames the rendered model lacks
+        *peripheral_tf_nodes_for_absent_frames(peripherals, robot_description),
     ]
+
+
+def _merged_controllers_config(shipped: Path | str, generated: dict) -> Path:
+    """The shipped controllers configuration plus generated entries (D5.3).
+
+    Loads the shipped file, merges the generated controllers' type entries
+    under ``controller_manager.ros__parameters`` and their parameter sections
+    at the top level, and writes the result to a per-launch temporary file —
+    the shipped file itself is never edited.
+    """
+    shipped_path = Path(shipped)
+    data = yaml.safe_load(shipped_path.read_text(encoding="utf-8")) or {}
+    manager = data.setdefault("controller_manager", {})
+    manager_params = manager.setdefault("ros__parameters", {})
+    for name, params in generated.items():
+        manager_params[name] = {"type": "imu_sensor_broadcaster/IMUSensorBroadcaster"}
+        data[name] = {"ros__parameters": dict(params)}
+    out = Path(tempfile.mkdtemp(prefix="runtime_controllers_")) / "controllers.yaml"
+    out.write_text(yaml.safe_dump(data, default_flow_style=False), encoding="utf-8")
+    return out
 
 
 def runtime_stack_actions(
@@ -876,7 +950,7 @@ def runtime_stack_actions(
         )
     controllers_config = resolve_path(ros2_control["controllers_config"])
     cm_params = write_controller_manager_params(robot_description)
-    broadcasters, active, inactive = profile_controllers(profile)
+    broadcasters, active, inactive = profile_controllers(profile, sim_platform or None)
     return [
         Node(
             package="robot_state_publisher",

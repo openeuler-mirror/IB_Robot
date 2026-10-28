@@ -104,16 +104,19 @@ def _parse_pose(text: str) -> list[float]:
     return values
 
 
-def _template_geometry(template: Path) -> dict[str, dict]:
-    """The static collision geometry of one scene template, by model name.
+def _template_geometry_sdf(template: Path) -> dict[str, dict] | None:
+    """The static collision geometry of an SDF world template, by model name.
 
     Only box/cylinder collisions are recorded — static models outside the
     layout's ``static_geometry`` (the ground plane) carry other primitives
     and are not part of the compared surface (D14.7: static collision
-    geometry means the walls and obstacles only).
+    geometry means the walls and obstacles only). ``None`` when the template
+    is not SDF.
     """
-    geometry: dict[str, dict] = {}
     root = ET.parse(template).getroot()
+    if root.tag != "sdf":
+        return None
+    geometry: dict[str, dict] = {}
     for model in root.iter("model"):
         name = model.get("name")
         static = model.find("static")
@@ -135,6 +138,49 @@ def _template_geometry(template: Path) -> dict[str, dict]:
             entry["size"] = [float(cylinder.find("radius").text), float(cylinder.find("length").text)]
         geometry[name] = entry
     return geometry
+
+
+def _template_geometry_mjcf(template: Path) -> dict[str, dict] | None:
+    """The static collision geometry of an MJCF scene template, by body name.
+
+    The MJCF counterpart of :func:`_template_geometry_sdf`
+    (lekiwi-mujoco-runtime-platform D8): named worldbody bodies carrying
+    exactly one box/cylinder geom. Conventions differ — MJCF box sizes are
+    HALF-extents and cylinder size is ``radius half-length`` — so both are
+    doubled into the layout's full-extent convention. ``None`` when the
+    template is not MJCF.
+    """
+    root = ET.parse(template).getroot()
+    if root.tag != "mujoco":
+        return None
+    geometry: dict[str, dict] = {}
+    for body in root.iter("body"):
+        name = body.get("name")
+        if name is None:
+            continue
+        geom = body.find("geom")
+        if geom is None or geom.get("type") not in ("box", "cylinder"):
+            continue  # primitives outside the convention
+        assert body.get("quat") is None, f"{template.name}: body {name!r} must stay axis-aligned"
+        pos = [float(value) for value in (body.get("pos") or "0 0 0").split()]
+        entry = {"pose": [*pos, 0.0, 0.0, 0.0]}
+        size = [float(value) for value in geom.get("size").split()]
+        if geom.get("type") == "box":
+            entry["primitive"] = "box"
+            entry["size"] = [value * 2.0 for value in size]
+        else:
+            entry["primitive"] = "cylinder"
+            entry["size"] = [size[0], size[1] * 2.0]
+        geometry[name] = entry
+    return geometry
+
+
+def _template_geometry(template: Path) -> dict[str, dict]:
+    for parser in (_template_geometry_sdf, _template_geometry_mjcf):
+        geometry = parser(template)
+        if geometry is not None:
+            return geometry
+    raise AssertionError(f"{template.name}: neither an SDF world nor an MJCF scene template")
 
 
 def _assert_template_matches_static_geometry(template: Path, static_geometry: list[dict]) -> None:
@@ -367,3 +413,59 @@ def test_a_shifted_obstacle_fails_the_route_clearance():
     segment, element, margin, rule = violations[0]
     assert segment == 1 and element == "obstacle_box" and rule == "swept footprint"
     assert margin < 0.0
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D8: the MJCF scene compiles with the same
+# geometry, read from the compiled model
+# ---------------------------------------------------------------------------
+
+
+def test_nav_room_mjcf_template_exists_and_installs():
+    template = _SCENE_DIR / "nav_room.xml.template"
+    assert template.is_file()
+    # the install glob ships every nav_room template (setup.py data_files)
+    assert "{{ROBOT_XML_PATH}}" in template.read_text(encoding="utf-8")
+
+
+def test_nav_room_mjcf_compiles_with_the_layout_geometry(tmp_path, monkeypatch):
+    """D8: the composed scene (robot-free stub include) compiles through the
+    real composition path and every layout element appears in the COMPILED
+    model with the same world pose, primitive, size and collision flags."""
+    mujoco = pytest.importorskip("mujoco")
+    from sim_models.scene_compiler import compose_mujoco_model
+
+    monkeypatch.setenv("ROS_DOMAIN_ID", "nav_room_mjcf_test")
+    stub = tmp_path / "stub_robot.xml"
+    stub.write_text('<mujoco model="stub"><worldbody/></mujoco>', encoding="utf-8")
+    out = compose_mujoco_model(str(stub), "nav_room", ())
+    assert out.suffix == ".mjb" and out.exists()
+    model = mujoco.MjModel.from_binary_path(str(out))
+
+    for element in get_scene_layout("nav_room")["static_geometry"]:
+        name = element["name"]
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        assert body_id >= 0, f"body {name!r} missing from the compiled scene"
+        # static: the body carries no joint
+        assert model.body_jntnum[body_id] == 0, f"{name} must be a static body"
+        # world pose (axis-aligned: the layout rpy is all zero)
+        assert element["pose"][3:] == [0.0, 0.0, 0.0]
+        assert list(model.body_pos[body_id]) == pytest.approx(element["pose"][:3])
+        # the geom: type and size in the layout's full-extent convention
+        geom_id = model.body_geomadr[body_id]
+        assert model.body_geomnum[body_id] == 1, f"{name} carries exactly one geom"
+        if element["primitive"] == "box":
+            assert model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_BOX
+            assert [value * 2.0 for value in model.geom_size[geom_id]] == pytest.approx(element["size"])
+        else:
+            assert model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_CYLINDER
+            assert [model.geom_size[geom_id][0], model.geom_size[geom_id][1] * 2.0] == pytest.approx(element["size"])
+        # collision flags: the element actually collides
+        assert model.geom_contype[geom_id] != 0 and model.geom_conaffinity[geom_id] != 0
+
+    # the visible floor plane at z = 0 with the empty-scene friction/priority
+    floor = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    assert floor >= 0 and model.geom_type[floor] == mujoco.mjtGeom.mjGEOM_PLANE
+    assert model.geom_pos[floor][2] == pytest.approx(0.0)
+    assert model.geom_priority[floor] == 1
+    assert list(model.geom_friction[floor]) == pytest.approx([0.8, 0.1, 0.01])

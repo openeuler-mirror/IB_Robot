@@ -52,12 +52,31 @@ Public API
       the composed model since placements moved to ``ResetWorld`` state
       overrides (issue #195).
 
+  mjcf_engine_extensions(source) -> list[str]
+      The engine-extension names an MJCF document declares
+      (``<extension><plugin plugin="..."/>``), from a path or a string.
+
+  load_mujoco_engine_plugins(required_extensions) -> None
+      Load every library registered under the ament ``mujoco_plugins``
+      resource index (D5.1): ``ctypes.CDLL(..., RTLD_GLOBAL)`` once per
+      process, then verify each required extension with a probe parse of a
+      minimal MJCF declaring it. Missing library or unregistered extension
+      raises naming the apt package to install.
+
   compose_mujoco_model(robot_mjcf_path, scene, sdf_mesh_names) -> Path
       Robot-agnostic composition (D3): substitute the robot MJCF into the
       named scene (or compile it alone when ``scene`` is None), apply SDF
       collision to the given meshes, compile and save the ``.mjb``. Falls
       back to the ``.xml`` only when the ``mujoco`` package is missing; the
-      provider treats that as fatal.
+      provider treats that as fatal. When the composed MJCF declares engine
+      extensions (lekiwi-mujoco-runtime-platform D5.1) the Python compiler
+      loads them and fully compiles as validation — compile errors raise the
+      original MuJoCo error — but the DELIVERED artifact is the XML
+      (``MjSpec.to_xml()``): ``mj_saveModel`` serialises the compiling
+      process's global plugin slot ids into the ``.mjb``, which the C++
+      node (its own registration order) cannot read back (spike evidence
+      /tmp/lekiwi-mujoco-evidence/spike/SUMMARY.md). Extension-free models
+      keep the ``.mjb`` path byte-for-byte.
 
   get_scene_layout(scene_name) -> dict
       The parsed layout.yaml of a scene (or {}).
@@ -327,6 +346,108 @@ def composed_model_path(scene: str | None) -> Path:
     return Path(tempfile.gettempdir()) / "ibrobot_sim_models" / domain / f"{name}.mjb"
 
 
+def mjcf_engine_extensions(source: str | Path) -> list[str]:
+    """The engine-extension names an MJCF document declares (D5.1).
+
+    ``source`` is a file path or the document text; the result is the sorted
+    ``plugin`` attributes of every ``<extension><plugin>`` element. Includes
+    are followed (the composed scene template declares nothing itself — the
+    robot it includes does); a document without an ``<extension>`` section
+    declares none.
+    """
+    import xml.etree.ElementTree as ET
+
+    seen: set[Path] = set()
+    names: set[str] = set()
+
+    def _collect(text: str, origin: Path | None) -> None:
+        try:
+            root = ET.fromstring(text)
+        except ET.ParseError:
+            return
+        if root.tag != "mujoco":
+            return
+        extension = root.find("extension")
+        if extension is not None:
+            names.update(str(plugin.get("plugin")) for plugin in extension.findall("plugin") if plugin.get("plugin"))
+        for include in root.findall("include"):
+            target = include.get("file")
+            if not target:
+                continue
+            resolved = (Path(target) if os.path.isabs(target) else (origin.parent / target)) if origin else Path(target)
+            resolved = resolved.resolve()
+            if resolved in seen or not resolved.is_file():
+                continue
+            seen.add(resolved)
+            _collect(resolved.read_text(encoding="utf-8"), resolved)
+
+    if isinstance(source, Path) or (isinstance(source, str) and os.path.isfile(source)):
+        origin = Path(source).resolve()
+        if origin.is_file():
+            seen.add(origin)
+            _collect(origin.read_text(encoding="utf-8"), origin)
+    else:
+        _collect(str(source), None)
+    return sorted(names)
+
+
+#: Libraries already loaded into this process by :func:`load_mujoco_engine_plugins`
+#: (one RTLD_GLOBAL load per path, per process).
+_LOADED_ENGINE_LIBRARIES: set[str] = set()
+
+
+def load_mujoco_engine_plugins(required_extensions: list[str] | tuple[str, ...]) -> None:
+    """Load the ament-registered MuJoCo engine extensions into this process (D5.1).
+
+    Mirrors what the C++ simulator does at startup: every library under the
+    ``mujoco_plugins`` ament resource index is ``ctypes.CDLL``-loaded with
+    ``RTLD_GLOBAL`` (once per process), then each required extension name is
+    verified with a probe parse of a minimal MJCF declaring it — no plugin-table
+    API is assumed. A missing resource index or an extension that stays
+    unregistered raises naming the apt package to install.
+    """
+    import ctypes
+
+    try:
+        from ament_index_python import get_resource, get_resources
+    except ImportError as exc:  # pragma: no cover - the runtime image always has it
+        raise RuntimeError(
+            "ament_index_python is needed to load the MuJoCo engine extensions "
+            "(pip install ament-index-python or run inside the ROS environment)"
+        ) from exc
+
+    resources = get_resources("mujoco_plugins")
+    if not resources:
+        raise RuntimeError(
+            "no mujoco_plugins ament resources found; the MuJoCo engine extensions need them "
+            "(install ros-humble-mujoco-3d-lidar for mujoco.plugin.lidar)"
+        )
+    for package in sorted(resources):
+        content, prefix = get_resource("mujoco_plugins", package)
+        for library in sorted((Path(prefix) / content).glob("*.so")):
+            if str(library) in _LOADED_ENGINE_LIBRARIES:
+                continue
+            try:
+                ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+            except OSError as exc:
+                raise RuntimeError(f"cannot load the MuJoCo engine extension library {library}: {exc}") from exc
+            _LOADED_ENGINE_LIBRARIES.add(str(library))
+    if not required_extensions:
+        return
+    import mujoco  # noqa: PLC0415
+
+    for name in required_extensions:
+        probe = f'<mujoco><extension><plugin plugin="{name}"/></extension><worldbody/></mujoco>'
+        try:
+            mujoco.MjSpec.from_string(probe)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"the MuJoCo engine extension {name!r} is not registered after loading "
+                f"{sorted(_LOADED_ENGINE_LIBRARIES)}; install the package providing it "
+                "(ros-humble-mujoco-3d-lidar provides mujoco.plugin.lidar)"
+            ) from exc
+
+
 def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names) -> Path:
     """Robot-agnostic robot+scene composition for the MuJoCo provider (D3).
 
@@ -339,6 +460,18 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
     scene placements travel through ``ResetWorld`` state overrides built
     from the layout, not through compiled-in ``random_KKK`` keys.
 
+    When the composed MJCF declares engine extensions (D5.1): the extensions
+    are loaded first, the full compile validates the model (compile errors
+    raise the original MuJoCo error — nothing is silently swallowed) and the
+    DELIVERED artifact is the compiled spec's XML (``MjSpec.to_xml()``),
+    written to the ``.xml`` path beside the would-be ``.mjb``. A ``.mjb``
+    bakes the compiling process's GLOBAL plugin slot ids, which the C++ node
+    (which registers the extensions in its own order) cannot read back — it
+    segfaults on the mismatched slot (spike evidence
+    /tmp/lekiwi-mujoco-evidence/spike/SUMMARY.md). Extension-free models
+    keep the ``.mjb`` path byte-for-byte. SDF mesh names combined with an
+    engine extension fail closed: ``to_xml()`` cannot carry ``needsdf``.
+
     Args:
         robot_mjcf_path:  Absolute path to the fully substituted robot MJCF.
         scene:            Scene name (e.g. ``"pick_banana"``, ``"empty"``),
@@ -347,7 +480,8 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
                           (robot-specific input, e.g. the gripper fingers).
 
     Returns:
-        :class:`pathlib.Path` to the compiled ``.mjb`` (or the ``.xml``
+        :class:`pathlib.Path` to the compiled ``.mjb`` (or the delivered
+        ``.xml`` when the model declares engine extensions; the ``.xml``
         fallback when the ``mujoco`` package is unavailable).
     """
     robot_path = Path(robot_mjcf_path)
@@ -362,16 +496,45 @@ def compose_mujoco_model(robot_mjcf_path: str, scene: str | None, sdf_mesh_names
     xml_out = composed_model_path(scene).with_suffix(".xml")
     xml_out.parent.mkdir(parents=True, exist_ok=True)
     xml_out.write_text(content)
+    engine_extensions = mjcf_engine_extensions(content)
 
     try:
         import mujoco  # noqa: PLC0415
     except ImportError:
+        if engine_extensions:
+            # D5.1 (review round 1): an extension-declaring model is only
+            # valid after a real compile in this process; returning the
+            # unvalidated XML would hand the C++ node a model whose
+            # extension parameters were never checked.
+            raise ImportError(
+                "the composed model declares engine extensions ("
+                + ", ".join(sorted(engine_extensions))
+                + ") and cannot be delivered uncompiled: the mujoco Python package is required"
+            ) from None
         logging.warning("mujoco not available; composed model left as XML at %s", xml_out)
+        return xml_out
+
+    sdf_names = {str(name) for name in sdf_mesh_names}
+    if engine_extensions:
+        # D5.1: the extension must be registered before the parse that
+        # declares it, and the compile validates the model for real.
+        if sdf_names:
+            raise ValueError(
+                "an MJCF declaring engine extensions cannot also use SDF mesh collision: "
+                "MjSpec.to_xml() does not serialise needsdf, so the delivered XML would "
+                "silently drop it (no current model combines the two; fail closed)"
+            )
+        load_mujoco_engine_plugins(engine_extensions)
+        spec = mujoco.MjSpec.from_string(content)
+        model = spec.compile()
+        # the delivered artifact: the compiled spec's XML, recompilable by the
+        # C++ node with ITS OWN (correct) extension registration
+        xml_out.write_text(spec.to_xml())
+        del model  # the compile was validation; the artifact is the XML
         return xml_out
 
     try:
         spec = mujoco.MjSpec.from_string(content)
-        sdf_names = {str(name) for name in sdf_mesh_names}
         for mesh in spec.meshes:
             if mesh.name in sdf_names:
                 mesh.needsdf = True

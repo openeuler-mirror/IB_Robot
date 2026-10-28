@@ -130,10 +130,6 @@ class RuntimeFacade(Node):
         peripherals_path = str(self.get_parameter("peripherals").value or "").strip()
         fragment = load_peripherals_file(peripherals_path) if peripherals_path else {}
         peripherals = merge_peripherals(self._profile.get("peripherals"), fragment.get("peripherals"))
-        capabilities = dict(self._profile["capabilities"])
-        capabilities.update(perception_capabilities(peripherals))
-        capabilities.update(audio_capabilities(peripherals))
-        capabilities.setdefault("runtime.status", {})
         self._profile["fast_lio"] = {**(self._profile.get("fast_lio") or {}), **(fragment.get("fast_lio") or {})}
         self.declare_parameter("interface_description_json", "")
         encoded_description = str(self.get_parameter("interface_description_json").value)
@@ -142,6 +138,14 @@ class RuntimeFacade(Node):
             bool(self.get_parameter("use_sim").value),
             str(self.get_parameter("sim_platform").value),
         )
+        # D5.4: the RuntimeStatus capability surface derives from the same
+        # platform-filtered projection as the interface description, so a
+        # sensor the platform does not stand in for is neither advertised nor
+        # claimed (capabilities computed AFTER the platform resolution).
+        capabilities = dict(self._profile["capabilities"])
+        capabilities.update(perception_capabilities(peripherals, sim_platform=self._sim_platform))
+        capabilities.update(audio_capabilities(peripherals))
+        capabilities.setdefault("runtime.status", {})
         description = (
             json.loads(encoded_description)
             if encoded_description
@@ -150,7 +154,12 @@ class RuntimeFacade(Node):
         validate_description(description)
         check_description_identity(self._profile, description, self._use_sim, self._sim_platform)
         self._interface_monitor = InterfaceMonitor(self, description)
-        self._modes = ModeModel(ModeModelConfig.from_profile(self._profile))
+        # D3.1: the mode model carries the platform-resolved controller sets,
+        # so the readiness check, the mode switch and the stop path's
+        # command-controller set all see one table (e.g. on MuJoCo the base
+        # controller stays active in idle; it is not a command controller
+        # there and no mode transition ever deactivates it).
+        self._modes = ModeModel(ModeModelConfig.from_profile(self._profile, self._sim_platform))
         self._state = RuntimeState(
             name=str(self._profile["runtime"]["name"]),
             version=str(self._profile["runtime"]["version"]),

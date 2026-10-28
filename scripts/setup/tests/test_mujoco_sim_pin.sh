@@ -178,6 +178,18 @@ cat >"${FAKE_ROS}/share/mujoco_ros2_control/package.xml" <<'EOF'
 EOF
 : >"${FAKE_ROS}/opt/mujoco_vendor/lib/libmujoco.so.3.12.0"
 : >"${FAKE_ROS}/setup.bash"
+# lekiwi-mujoco-runtime-platform D11: the fake prefix also carries the MuJoCo
+# lidar engine extension's ament resource, package version and library
+mkdir -p "${FAKE_ROS}/share/ament_index/resource_index/mujoco_plugins" \
+    "${FAKE_ROS}/share/mujoco_3d_lidar" \
+    "${FAKE_ROS}/lib/mujoco_3d_lidar/mujoco_plugin"
+printf 'lib/mujoco_3d_lidar/mujoco_plugin' \
+    >"${FAKE_ROS}/share/ament_index/resource_index/mujoco_plugins/mujoco_3d_lidar"
+cat >"${FAKE_ROS}/share/mujoco_3d_lidar/package.xml" <<'EOF'
+<?xml version="1.0"?>
+<package><name>mujoco_3d_lidar</name><version>0.1.2</version></package>
+EOF
+: >"${FAKE_ROS}/lib/mujoco_3d_lidar/mujoco_plugin/libmujoco_3d_lidar.so"
 
 make_dist_info() {
     local version="$1"
@@ -217,7 +229,7 @@ assert_contains "inference profile skips the MuJoCo verification" \
 assert_contains "the inference skip is a pass, not a failure" \
     "VERIFY inference rc=0" "${PROBE_VERIFY}"
 assert_contains "unbuilt workspace verifies through the fake prefix" \
-    "MuJoCo simulation pin verified: mujoco_ros2_control 0.1.2, libmujoco 3.12.0, python mujoco 3.12.0" "${PROBE_VERIFY}"
+    "MuJoCo simulation pin verified: mujoco_ros2_control 0.1.2, libmujoco 3.12.0, python mujoco 3.12.0, mujoco_3d_lidar 0.1.2" "${PROBE_VERIFY}"
 
 # Mismatch: a 3.4.0 dist-info next to the 3.12.0 vendor library fails and
 # names both versions.
@@ -271,6 +283,50 @@ echo "VERIFY_TOO_OLD rc=${rc}"
 assert_contains "a too-old control package fails verification" "VERIFY_TOO_OLD rc=1" "${PROBE_TOO_OLD}"
 assert_contains "the too-old diagnostic names the apt upgrade" \
     "is older than the CameraPlugin release (0.1.0)" "${PROBE_TOO_OLD}"
+
+# lekiwi-mujoco-runtime-platform D11: a missing lidar extension is rosdep's
+# job (re-run setup); an installed-but-old one names the apt upgrade, because
+# rosdep never upgrades an installed package.
+verify_lidar_probe() {
+    probe '
+set +u
+source scripts/setup.sh
+SETUP_PLATFORM_ID=ubuntu-22.04
+SETUP_PROFILE=full
+VENV_PYTHON=/usr/bin/python3
+WORKSPACE="'"${TMP_ROOT}"'/empty_ws"
+USE_SUDO=false
+ROSDEP_BIN=/bin/true
+SETUP_ROS_SETUP_PATH="'"$1"'/setup.bash"
+source scripts/setup/verify_env.sh
+export PYTHONPATH="'"${TMP_ROOT}"'/site-3.12.0"
+mujoco_sim_venv_has_libero() { return 1; }
+if verify_mujoco_sim 2>&1; then rc=0; else rc=$?; fi
+echo "VERIFY_LIDAR rc=${rc}"
+'
+}
+make_dist_info 3.12.0
+NO_LIDAR_ROS="${TMP_ROOT}/ros-no-lidar"
+cp -r "${FAKE_ROS}" "${NO_LIDAR_ROS}"
+rm -rf "${NO_LIDAR_ROS}/share/ament_index/resource_index/mujoco_plugins" \
+    "${NO_LIDAR_ROS}/share/mujoco_3d_lidar" "${NO_LIDAR_ROS}/lib/mujoco_3d_lidar"
+PROBE_NO_LIDAR="$(verify_lidar_probe "${NO_LIDAR_ROS}")"
+assert_contains "a missing lidar extension fails verification" "VERIFY_LIDAR rc=1" "${PROBE_NO_LIDAR}"
+assert_contains "the missing-package diagnostic points at setup's rosdep step" \
+    "re-run ./scripts/setup.sh with sudo, its rosdep step installs it" "${PROBE_NO_LIDAR}"
+assert_not_contains "the missing-package diagnostic does not bypass rosdep" \
+    "apt install" "${PROBE_NO_LIDAR}"
+
+OLD_LIDAR_ROS="${TMP_ROOT}/ros-old-lidar"
+cp -r "${FAKE_ROS}" "${OLD_LIDAR_ROS}"
+cat >"${OLD_LIDAR_ROS}/share/mujoco_3d_lidar/package.xml" <<'EOF2'
+<?xml version="1.0"?>
+<package><name>mujoco_3d_lidar</name><version>0.1.1</version></package>
+EOF2
+PROBE_OLD_LIDAR="$(verify_lidar_probe "${OLD_LIDAR_ROS}")"
+assert_contains "a too-old lidar extension fails verification" "VERIFY_LIDAR rc=1" "${PROBE_OLD_LIDAR}"
+assert_contains "the too-old lidar diagnostic names the apt upgrade" \
+    "sudo apt install --only-upgrade ros-humble-mujoco-3d-lidar" "${PROBE_OLD_LIDAR}"
 
 # ---------------------------------------------------------------------------
 # §8 (D5 addendum): the pin also constrains every later venv install.

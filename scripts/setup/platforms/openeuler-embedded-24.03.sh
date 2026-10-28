@@ -201,7 +201,10 @@ platform_pre_install_rosdeps() {
 platform_get_extra_skip_keys() {
     # Source-model CUDA extensions stay optional. The manifest-driven Ascend OM
     # perception/manipulation paths only require the core NumPy/OpenCV runtime.
-    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control mujoco_ros2_control_msgs python3-scipy robot_localization sam2 groundingdino grounding-dino graspgen spconv-cu120 torch-scatter pointnet2_ops"
+    # mujoco_3d_lidar (the MuJoCo lidar engine extension,
+    # lekiwi-mujoco-runtime-platform D11): openEuler has no MuJoCo rpms, so it
+    # rides the existing mujoco_ros2_control skip.
+    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control mujoco_ros2_control_msgs mujoco_3d_lidar python3-scipy robot_localization sam2 groundingdino grounding-dino graspgen spconv-cu120 torch-scatter pointnet2_ops"
 }
 
 platform_post_install_rosdeps() {

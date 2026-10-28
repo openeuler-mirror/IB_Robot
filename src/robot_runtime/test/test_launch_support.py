@@ -110,3 +110,52 @@ def test_profile_without_selection_keys_keeps_legacy_behaviour():
     profile = {"runtime": {"name": "test_robot", "version": "0.1.0"}, "simulated": True}
     assert resolve_sim_selection(profile, "", "", "") == (True, "sdk")
     assert resolve_sim_selection(profile, "", "", "false") == (False, None)
+
+
+# ---------------------------------------------------------------------------
+# D3.1: the spawner list follows the mode table's per-platform overrides
+# ---------------------------------------------------------------------------
+
+
+def _mode_profile() -> dict:
+    return {
+        "runtime": {"name": "test_robot", "version": "0.1.0"},
+        "ros2_control": {"broadcasters": ["joint_state_broadcaster"]},
+        "modes": {
+            "initial": "idle",
+            "idle": {
+                "controllers": [],
+                "controllers_by_platform": {"mujoco": ["base_velocity_controller"]},
+                "transitions": ["base_navigation"],
+            },
+            "base_navigation": {"controllers": ["base_velocity_controller"], "transitions": ["idle"]},
+        },
+    }
+
+
+def test_profile_controllers_applies_the_platform_override():
+    from robot_runtime.launch_support import profile_controllers
+
+    broadcasters, active, inactive = profile_controllers(_mode_profile(), "mujoco")
+    assert broadcasters == ["joint_state_broadcaster"]
+    # idle (initial) carries the base controller on mujoco: spawned ACTIVE
+    assert active == ["base_velocity_controller"]
+    # base_navigation resolves to the same controller: no duplicate, nothing inactive
+    assert inactive == []
+
+
+def test_profile_controllers_without_the_platform_keep_the_plain_sets():
+    from robot_runtime.launch_support import profile_controllers
+
+    for selection in (None, "gazebo", "sdk"):
+        _broadcasters, active, inactive = profile_controllers(_mode_profile(), selection)
+        assert active == [] and inactive == ["base_velocity_controller"], selection
+
+
+def test_profile_controllers_rejects_a_bad_platform_table():
+    from robot_runtime.launch_support import profile_controllers
+
+    profile = _mode_profile()
+    profile["modes"]["idle"]["controllers_by_platform"] = {"teleport": ["x"]}
+    with pytest.raises(ValueError, match="not a physics platform"):
+        profile_controllers(profile, "mujoco")

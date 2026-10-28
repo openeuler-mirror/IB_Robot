@@ -22,7 +22,7 @@ from jsonschema import Draft202012Validator
 
 from robot_runtime import contract as C
 from robot_runtime.gazebo import advertised_camera_frames
-from robot_runtime.profile import PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS
+from robot_runtime.profile import LIDAR_SIM_PLATFORMS, PHYSICS_SIM_PLATFORMS, SIM_PLATFORMS, lidar_driver_simulated
 
 
 class InterfaceDescriptionError(ValueError):
@@ -347,14 +347,18 @@ def peripheral_interfaces(
     *,
     sim_platform: str | None = None,
     camera_rate_hz: float | None = None,
+    imu_rate_hz: float | None = None,
     scan_source_runs: bool = True,
 ) -> dict[str, dict]:
     """Project the peripheral surface.
 
     ``sim_platform`` adjusts streams the platform cannot produce (the gz
-    camera gaps, the lidar wire type). ``scan_source_runs`` says whether the
-    derived scan's source (FAST-LIO's registered body cloud) runs on the
-    selected platform; a physics platform without it advertises no scan (D5).
+    camera gaps, the lidar wire type) and drops lidars the platform does not
+    stand in for (D5). ``camera_rate_hz``/``imu_rate_hz`` carry the rates the
+    simulators actually produce when they differ from the device defaults.
+    ``scan_source_runs`` says whether the derived scan's source (FAST-LIO's
+    registered body cloud) runs on the selected platform; a physics platform
+    without it advertises no scan (D5).
     """
     interfaces: dict[str, dict] = {}
     audio_counts = {"microphone": 0, "speaker": 0}
@@ -562,6 +566,13 @@ def peripheral_interfaces(
                 )
         elif kind == "lidar":
             driver = periph.get("driver")
+            simulated_lidar = sim_platform in LIDAR_SIM_PLATFORMS and lidar_driver_simulated(str(driver), sim_platform)
+            # A physics platform that simulates lidar but not THIS driver
+            # neither simulates nor advertises it (D5): same rule as an
+            # unsupported driver, so the declared surface never claims a
+            # stream nothing produces (MuJoCo: MID-360 only).
+            if sim_platform in LIDAR_SIM_PLATFORMS and not simulated_lidar:
+                continue
             if driver == "livox_mid360":
                 if periph.get("multi_topic", 0):
                     raise InterfaceDescriptionError(f"lidar {name}: multi_topic endpoints require an explicit adapter")
@@ -571,20 +582,34 @@ def peripheral_interfaces(
                     raise InterfaceDescriptionError(f"lidar {name}: unsupported xfer_format {transfer}")
                 # The simulator publishes a plain point cloud; the physical
                 # driver's CustomMsg transfer cannot be produced (D5).
-                cloud_type = "sensor_msgs/msg/PointCloud2" if sim_platform == "gazebo" else types[transfer]
+                cloud_type = "sensor_msgs/msg/PointCloud2" if simulated_lidar else types[transfer]
+                # The advertised rate is the rate the platform runs: the
+                # composed MJCF honours simulation.mujoco.update_rate over
+                # publish_freq (robot_runtime.mujoco), so the description
+                # must resolve the same precedence — never claim a rate the
+                # simulation does not produce (review round 1).
+                points_rate_hz = periph.get("publish_freq", 10.0)
+                if sim_platform == "mujoco":
+                    mujoco_section = (periph.get("simulation") or {}).get("mujoco") or {}
+                    if isinstance(mujoco_section, dict) and mujoco_section.get("update_rate") is not None:
+                        points_rate_hz = mujoco_section["update_rate"]
                 interfaces[f"lidar.{name}.points"] = _topic(
                     periph.get("pointcloud_topic", "/livox/lidar"),
                     cloud_type,
                     "perception.lidar",
                     frame_id=periph.get("frame_id", "livox_frame"),
-                    rate_hz=periph.get("publish_freq", 10.0),
+                    rate_hz=points_rate_hz,
                     units={"position": "m"},
                 )
+                # The integrated IMU's advertised rate is the rate it actually
+                # produces: on MuJoCo the imu_sensor_broadcaster publishes on
+                # the controller-manager clock (D5.3, no second hard-coded 100).
                 interfaces[f"lidar.{name}.imu"] = _topic(
                     periph.get("imu_topic", "/livox/imu"),
                     "sensor_msgs/msg/Imu",
                     "perception.lidar",
                     frame_id=periph.get("frame_id", "livox_frame"),
+                    **({"rate_hz": imu_rate_hz} if imu_rate_hz is not None else {}),
                 )
                 interfaces[f"lidar.{name}.points"]["qos"]["reliability"] = "reliable"
                 interfaces[f"lidar.{name}.imu"]["qos"]["reliability"] = "reliable"
@@ -750,6 +775,55 @@ def _mujoco_camera_rate(profile: dict) -> float:
     return mujoco_camera_publish_rate(profile)
 
 
+def _mujoco_imu_rate(profile: dict, peripherals: list | None) -> float | None:
+    """The rate the simulated IMU produces on MuJoCo (D5.3), when one runs.
+
+    The ``imu_sensor_broadcaster`` publishes on the controller-manager clock,
+    so the produced rate is the effective ``controller_manager.update_rate``
+    of the controllers configuration the embodiment generates from — read
+    from the profile's ``ros2_control.controllers_config`` (the generated
+    file adds the broadcaster entry, never a different rate). Computed only
+    when the EFFECTIVE inventory (the merged profile + deployment fragment,
+    exactly the list the description itself iterates — review round 1)
+    carries a lidar whose integrated IMU the MuJoCo platform simulates; a
+    profile without one needs no rate, and a missing update_rate on a
+    profile that does fails closed: no rate is better than a wrong one.
+    """
+    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS  # noqa: PLC0415
+    from robot_runtime.mujoco import MUJOCO_LIDAR_SIM_DRIVERS  # noqa: PLC0415
+
+    integrated_here = set(MUJOCO_LIDAR_SIM_DRIVERS) & set(LIDAR_INTEGRATED_IMU_DRIVERS)
+    effective = peripherals if peripherals is not None else (profile.get("peripherals") or [])
+    effective = [entry for entry in effective if entry.get("enabled", True)]
+    if not any(
+        periph.get("type") == "lidar" and str(periph.get("driver", "")) in integrated_here for periph in effective
+    ):
+        return None
+    import yaml
+
+    from robot_runtime.path_subst import resolve_path
+
+    config = str(((profile.get("ros2_control") or {}).get("controllers_config") or "").strip())
+    if not config:
+        raise InterfaceDescriptionError(
+            "the MuJoCo IMU rate needs ros2_control.controllers_config in the runtime profile"
+        )
+    path = resolve_path(config)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise InterfaceDescriptionError(
+            f"cannot read the controllers configuration for the MuJoCo IMU rate: {exc}"
+        ) from exc
+    rate = ((data.get("controller_manager") or {}).get("ros__parameters") or {}).get("update_rate")
+    if not isinstance(rate, int | float) or rate <= 0:
+        raise InterfaceDescriptionError(
+            f"controller_manager.update_rate missing or invalid in {path}: the MuJoCo IMU rate cannot be advertised"
+        )
+    return float(rate)
+
+
 def build_description(
     profile: dict,
     peripherals: list[dict] | None = None,
@@ -790,6 +864,7 @@ def build_description(
             if sim_platform == "mujoco"
             else None
         ),
+        imu_rate_hz=(_mujoco_imu_rate(profile, peripherals) if sim_platform == "mujoco" else None),
         # The derived scan's source (FAST-LIO's registered body cloud) runs
         # on a physics platform only when lidar odometry itself runs there;
         # without it no scan is advertised or published (D5).

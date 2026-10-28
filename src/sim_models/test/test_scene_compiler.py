@@ -28,6 +28,8 @@ from sim_models.scene_compiler import (
     free_joint_states_topic,
     get_scene_layout,
     get_scene_task,
+    load_mujoco_engine_plugins,
+    mjcf_engine_extensions,
     randomization_placements,
     scene_dynamic_objects,
 )
@@ -406,3 +408,158 @@ def test_no_sim_models_module_imports_robot_runtime():
 def test_package_xml_declares_no_robot_runtime_dependency():
     content = (PKG_ROOT / "package.xml").read_text(encoding="utf-8")
     assert "robot_runtime" not in content
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D5.1: engine extensions in the compiler and
+# the XML artifact for extension-declaring models
+# ---------------------------------------------------------------------------
+
+LIDAR_ROBOT_TEMPLATE = """<mujoco model="lidar_probe">
+  <extension><plugin plugin="mujoco.plugin.lidar"/></extension>
+  <worldbody>
+    <body name="base_link" pos="0 0 0.05">
+      <freejoint name="floating_base_joint"/>
+      <site name="probe_lidar_site" pos="0 0 0.2"/>
+      <geom type="box" size="0.1 0.1 0.03"/>
+    </body>
+  </worldbody>
+  <sensor>
+    <plugin name="probe_lidar" plugin="mujoco.plugin.lidar" objtype="site" objname="probe_lidar_site">
+      <config key="resolution" value="8 2"/>
+      <config key="azimuth_range" value="-3.14159265 3.14159265"/>
+      <config key="elevation_range" value="0 0.5"/>
+      <config key="max_range" value="20"/>
+    </plugin>
+    <framequat name="probe_imu_quat" objtype="site" objname="probe_lidar_site"/>
+    <gyro name="probe_imu_gyro" site="probe_lidar_site"/>
+    <accelerometer name="probe_imu_accel" site="probe_lidar_site"/>
+  </sensor>
+</mujoco>
+"""
+
+
+@pytest.fixture
+def lidar_robot_mjcf(tmp_path):
+    path = tmp_path / "lidar_robot.xml"
+    path.write_text(LIDAR_ROBOT_TEMPLATE, encoding="utf-8")
+    return str(path)
+
+
+def test_mjcf_engine_extensions_reads_path_and_content(lidar_robot_mjcf):
+    assert mjcf_engine_extensions(lidar_robot_mjcf) == ["mujoco.plugin.lidar"]
+    assert mjcf_engine_extensions(LIDAR_ROBOT_TEMPLATE) == ["mujoco.plugin.lidar"]
+    # no <extension> section: none declared; unparseable text is not a model
+    assert mjcf_engine_extensions(ROBOT_MJCF_TEMPLATE.format(meshes_dir="x", joints_and_geoms="", actuators="")) == []
+    assert mjcf_engine_extensions("<not-mujoco/>") == []
+
+
+def test_compose_delivers_xml_for_engine_extension_models(lidar_robot_mjcf, clean_domain):
+    """D5.1: an extension-declaring model is validated by a full compile and
+    delivered as the compiled spec's XML (never a .mjb — the binary bakes the
+    compiling process's global plugin slot ids)."""
+    # earlier tests in this domain may have left a robot .mjb behind
+    composed_model_path("empty").unlink(missing_ok=True)
+    out = compose_mujoco_model(lidar_robot_mjcf, "empty", ())
+    assert out.suffix == ".xml"
+    assert out == composed_model_path("empty").with_suffix(".xml")
+    delivered = out.read_text(encoding="utf-8")
+    assert mjcf_engine_extensions(delivered) == ["mujoco.plugin.lidar"]
+    # no .mjb artifact is written next to it
+    assert not composed_model_path("empty").exists()
+    # the delivered XML recompiles in THIS process (extension already loaded)
+    spec = mujoco.MjSpec.from_string(delivered)
+    model = spec.compile()
+    assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "probe_lidar_site") >= 0
+    names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SENSOR, i) for i in range(model.nsensor)]
+    assert "probe_lidar" in names and "probe_imu_gyro" in names
+
+
+def test_extension_free_models_keep_the_mjb_artifact(robot_mjcf, clean_domain):
+    """The rule, pinned: the same composition call produces a .mjb without an
+    extension declaration and an .xml with one (D5.1)."""
+    plain = compose_mujoco_model(robot_mjcf, "empty", ())
+    assert plain.suffix == ".mjb" and plain.exists()
+
+
+def test_extension_with_sdf_meshes_fails_closed(lidar_robot_mjcf, clean_domain):
+    with pytest.raises(ValueError, match="cannot also use SDF mesh collision"):
+        compose_mujoco_model(lidar_robot_mjcf, "empty", ("some_mesh"))
+
+
+def test_extension_model_compile_error_raises(tmp_path, clean_domain):
+    """D5.1 compile-error policy: an extension-declaring model that fails to
+    compile RAISES the original MuJoCo error — the silent XML fallback stays
+    reserved for extension-free models (there it is debugging support, here
+    it would hand the node an unvalidated model)."""
+    bad = LIDAR_ROBOT_TEMPLATE.replace(
+        '<gyro name="probe_imu_gyro" site="probe_lidar_site"/>',
+        '<gyro name="probe_imu_gyro" site="no_such_site"/>',
+    )
+    path = tmp_path / "bad_lidar_robot.xml"
+    path.write_text(bad, encoding="utf-8")
+    with pytest.raises(ValueError, match="no_such_site"):
+        compose_mujoco_model(str(path), "empty", ())
+
+
+def test_extension_model_without_the_mujoco_package_raises(robot_mjcf, tmp_path, clean_domain, monkeypatch):
+    """Review round 1: with the mujoco package unavailable, an
+    extension-declaring model must RAISE — returning the unvalidated XML
+    would defeat the D5.1 compile-error policy through the ImportError path.
+    An extension-free model keeps the documented XML fallback."""
+    import sys
+
+    monkeypatch.setitem(sys.modules, "mujoco", None)  # import mujoco now fails
+    lidar = tmp_path / "lidar_robot.xml"
+    lidar.write_text(LIDAR_ROBOT_TEMPLATE, encoding="utf-8")
+    with pytest.raises(ImportError, match="engine extensions.*mujoco Python package"):
+        compose_mujoco_model(str(lidar), "empty", ())
+    out = compose_mujoco_model(robot_mjcf, "empty", ())
+    assert out.suffix == ".xml"
+
+
+def test_load_mujoco_engine_plugins_names_the_apt_package_for_unknown_extensions():
+    with pytest.raises(RuntimeError, match="ros-humble-mujoco-3d-lidar"):
+        load_mujoco_engine_plugins(("mujoco.plugin.not_a_thing",))
+
+
+def test_fresh_process_compose_and_recompile(lidar_robot_mjcf, clean_domain, tmp_path):
+    """The real compose path in a FRESH process produces the XML, and a second
+    fresh process (its own plugin registration state) recompiles it — the
+    artifact carries no compile-process state (D5.1)."""
+    import subprocess
+    import sys
+
+    compose_script = (
+        "from sim_models.scene_compiler import compose_mujoco_model, composed_model_path\n"
+        f"out = compose_mujoco_model({lidar_robot_mjcf!r}, 'empty', ())\n"
+        "assert out.suffix == '.xml', out\n"
+        "assert out == composed_model_path('empty').with_suffix('.xml'), out\n"
+        "print(out)\n"
+    )
+    first = subprocess.run(
+        [sys.executable, "-c", compose_script], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert first.returncode == 0, first.stderr
+    delivered = Path(first.stdout.strip().splitlines()[-1])
+    assert delivered.exists() and delivered.suffix == ".xml"
+
+    recompile_script = (
+        "import ctypes\n"
+        "from pathlib import Path\n"
+        "import mujoco\n"
+        "from ament_index_python import get_resource\n"
+        "content, prefix = get_resource('mujoco_plugins', 'mujoco_3d_lidar')\n"
+        "ctypes.CDLL(str(Path(prefix) / content / 'libmujoco_3d_lidar.so'), mode=ctypes.RTLD_GLOBAL)\n"
+        f"spec = mujoco.MjSpec.from_string(Path({str(delivered)!r}).read_text())\n"
+        "model = spec.compile()\n"
+        "names = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SENSOR, i) for i in range(model.nsensor)]\n"
+        "assert 'probe_lidar' in names and 'probe_imu_accel' in names, names\n"
+        "assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, 'probe_lidar_site') >= 0\n"
+        "print('RECOMPILED', model.nbody, model.nsensor, model.nplugin)\n"
+    )
+    second = subprocess.run(
+        [sys.executable, "-c", recompile_script], capture_output=True, text=True, timeout=120, check=False
+    )
+    assert second.returncode == 0, second.stderr
+    assert "RECOMPILED" in second.stdout

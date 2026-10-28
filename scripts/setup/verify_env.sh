@@ -588,10 +588,17 @@ def fail(message):
     raise SystemExit(f"MuJoCo simulation pin verification failed: {message}")
 
 
+# A missing package is rosdep's job: setup.sh installs every ROS dependency the
+# workspace declares (not under --no-sudo, and not when this check runs on its
+# own). rosdep never upgrades an installed package, so a too-old or broken one
+# names the apt command instead.
+RERUN_SETUP = "re-run ./scripts/setup.sh with sudo, its rosdep step installs it"
+
+
 prefix = Path(sys.argv[1]).resolve()
 package_xml = prefix / "share" / "mujoco_ros2_control" / "package.xml"
 if not package_xml.is_file():
-    fail(f"mujoco_ros2_control not found; install ros-humble-mujoco-ros2-control >= 0.1.2 ({package_xml} is missing)")
+    fail(f"mujoco_ros2_control not found ({package_xml} is missing); {RERUN_SETUP}")
 control = (ET.parse(package_xml).getroot().findtext("version") or "").strip()
 if not control:
     fail(f"no <version> element in {package_xml}")
@@ -608,8 +615,37 @@ versions = sorted(
     key=version_key,
 )
 if not versions:
-    fail(f"mujoco_vendor libmujoco not found under {vendor_dir}; install ros-humble-mujoco-vendor 0.1.1")
+    fail(f"mujoco_vendor libmujoco not found under {vendor_dir}; {RERUN_SETUP}")
 vendor = versions[-1]
+
+# lekiwi-mujoco-runtime-platform D11: the MuJoCo lidar engine extension. The
+# C++ simulator registers libraries through the ament mujoco_plugins index and
+# the Python compiler loads the same index, so the resource, its package
+# version and the library it points at must all be present.
+MIN_LIDAR = "0.1.2"
+lidar_index = prefix / "share" / "ament_index" / "resource_index" / "mujoco_plugins" / "mujoco_3d_lidar"
+if not lidar_index.is_file():
+    fail(
+        f"the mujoco_3d_lidar ament resource is missing ({lidar_index}); "
+        f"the MuJoCo lidar simulation needs it: {RERUN_SETUP}"
+    )
+lidar_xml = prefix / "share" / "mujoco_3d_lidar" / "package.xml"
+if not lidar_xml.is_file():
+    fail(f"mujoco_3d_lidar not found ({lidar_xml} is missing); {RERUN_SETUP}")
+lidar = (ET.parse(lidar_xml).getroot().findtext("version") or "").strip()
+if not lidar:
+    fail(f"no <version> element in {lidar_xml}")
+if version_key(lidar) < version_key(MIN_LIDAR):
+    fail(
+        f"mujoco_3d_lidar {lidar} is older than {MIN_LIDAR}; run: "
+        "sudo apt install --only-upgrade ros-humble-mujoco-3d-lidar"
+    )
+lidar_lib_dir = prefix / lidar_index.read_text(encoding="utf-8").strip()
+if not lidar_lib_dir.is_dir() or not any(lidar_lib_dir.glob("*.so")):
+    fail(
+        f"the mujoco_3d_lidar resource points at no library under {lidar_lib_dir}; "
+        "run: sudo apt install --reinstall ros-humble-mujoco-3d-lidar"
+    )
 
 try:
     python_mujoco = importlib.metadata.version("mujoco")
@@ -621,7 +657,10 @@ if python_mujoco != vendor:
         f"install mujoco=={vendor} (requirements/mujoco-sim.txt); a venv set up with the "
         "LIBERO benchmark dependencies cannot run the MuJoCo simulation"
     )
-print(f"MuJoCo simulation pin verified: mujoco_ros2_control {control}, libmujoco {vendor}, python mujoco {python_mujoco}")
+print(
+    f"MuJoCo simulation pin verified: mujoco_ros2_control {control}, libmujoco {vendor}, "
+    f"python mujoco {python_mujoco}, mujoco_3d_lidar {lidar}"
+)
 PY
     then
         return 1

@@ -49,6 +49,13 @@ _OPTICAL_FROM_MJCF_RPY = (math.pi, 0.0, 0.0)
 _IMAGE_TYPE = "sensor_msgs/msg/Image"
 _CAMERA_INFO_TYPE = "sensor_msgs/msg/CameraInfo"
 
+#: Lidar drivers the MuJoCo platform stands in for (D5); other drivers get no
+#: simulated sensor and are not advertised on the platform, exactly like a
+#: driver Gazebo does not stand in for. Only the MID-360 in this stage: its
+#: ray grid maps to ``mujoco.plugin.lidar`` and its integrated IMU to the
+#: co-located MJCF sensor triple; 2D lidars have no MuJoCo counterpart yet.
+MUJOCO_LIDAR_SIM_DRIVERS = ("livox_mid360",)
+
 
 # ---------------------------------------------------------------------------
 # Orientation conversion (moved from robot_config camera_presets, D5)
@@ -482,6 +489,358 @@ def mujoco_camera_publish_rate(profile: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Simulated lidar and IMU on MuJoCo (lekiwi-mujoco-runtime-platform D5)
+# ---------------------------------------------------------------------------
+
+# One Mujoco3dLidarPlugin instance carries every simulated lidar; the
+# per-sensor parameter key is the MJCF sensor name (``lidar_imu_mjcf``).
+LIDAR_PLUGIN_INSTANCE = "ibrobot_lidars"
+LIDAR_PLUGIN_TYPE = "mujoco_ros2_control_plugins/Mujoco3dLidarPlugin"
+
+# One BaseVelocityPlugin instance moves the floating base from the twist the
+# base's own wheel odometry reports (D3); the command topic is
+# simulator-internal, fed by the odometry-twist relay.
+BASE_VELOCITY_PLUGIN_INSTANCE = "ibrobot_floating_base"
+BASE_VELOCITY_PLUGIN_TYPE = "mujoco_ros2_control_plugins/BaseVelocityPlugin"
+FLOATING_BASE_CMD_TOPIC = "/simulator/floating_base/cmd_vel"
+
+# Floating-base odometry constants (D9): the free joint MujocoSystemInterface
+# reports, on its simulator-namespaced topic. Never advertised, never consumed
+# by a runtime node — the ground-truth stream subscribes to it for tests.
+ODOM_FREE_JOINT_NAME = "floating_base_joint"
+FLOATING_BASE_STATE_TOPIC = "/simulator/floating_base_state"
+
+# BaseVelocityPlugin command timeout (D3.4): on the simulation clock, the
+# same order as base_node's wheel-command cadence — a relay that dies leaves
+# the base stopped within a quarter second.
+BASE_VELOCITY_CMD_TIMEOUT_S = 0.25
+
+
+def _simulated_lidars(peripherals: list) -> list[dict]:
+    """Lidar peripherals the MuJoCo platform stands in for (D5)."""
+    return [
+        periph
+        for periph in peripherals or []
+        if periph.get("type") == "lidar"
+        and str(periph.get("driver", "")) in MUJOCO_LIDAR_SIM_DRIVERS
+        and not periph.get("disabled", False)
+        and periph.get("enabled") is not False
+    ]
+
+
+def lidar_plugin_parameters(peripherals: list) -> dict:
+    """The nested ``mujoco_plugins`` Mujoco3dLidarPlugin tree (D5.3).
+
+    One plugin instance carries every simulated lidar. The per-sensor key is
+    the MJCF sensor name (``<name>_lidar``, what ``lidar_imu_mjcf`` writes);
+    the frame is the shared advertised frame id and the topic the internal
+    raw stream the finite-cloud filter consumes. An empty list returns
+    ``{}`` — no plugin is configured.
+    """
+    lidars = _simulated_lidars(peripherals)
+    if not lidars:
+        return {}
+    instance: dict[str, Any] = {"type": LIDAR_PLUGIN_TYPE}
+    for periph in lidars:
+        name = periph["name"]
+        instance[f"{name}_lidar"] = {
+            "frame_name": str(periph.get("frame_id", f"{name}_frame")),
+            "topic": f"/{name}_lidar/raw",
+        }
+    return {"mujoco_plugins": {LIDAR_PLUGIN_INSTANCE: instance}}
+
+
+def base_velocity_plugin_parameters(floating_base: dict | None) -> dict:
+    """The nested ``mujoco_plugins`` BaseVelocityPlugin tree (D3/D5.3).
+
+    ``floating_base`` is the profile's ``simulation.mujoco.floating_base``
+    section: ``body`` names the MJCF body with the free joint the plugin
+    drives and ``twist_source_topic`` the base's own wheel odometry the relay
+    forwards. The plugin takes a ``TwistStamped`` on the simulator-internal
+    command topic; a command older than ``cmd_timeout`` (simulation clock)
+    reads as zero. No ``max_linear_velocity`` / ``max_yaw_rate`` keys are
+    set: upstream defaults are +inf, so the base executes exactly the twist
+    ``/odom`` reports (D3.2 — the one authoritative clamp lives in
+    ``base_node``).
+    """
+    section = floating_base or {}
+    body = str(section.get("body", "")).strip()
+    if not body:
+        return {}
+    return {
+        "mujoco_plugins": {
+            BASE_VELOCITY_PLUGIN_INSTANCE: {
+                "type": BASE_VELOCITY_PLUGIN_TYPE,
+                "body": body,
+                "cmd_vel_topic": FLOATING_BASE_CMD_TOPIC,
+                "use_stamped_twist": True,
+                "cmd_timeout": BASE_VELOCITY_CMD_TIMEOUT_S,
+            }
+        }
+    }
+
+
+def _euler_xyz_to_quat(roll: float, pitch: float, yaw: float) -> tuple[float, float, float, float]:
+    """Extrinsic XYZ euler (URDF rpy == MJCF eulerseq="XYZ") to w-x-y-z."""
+    cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
+    cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
+    cy, sy = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+    return (
+        cr * cp * cy + sr * sp * sy,
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+    )
+
+
+def lidar_imu_mjcf(peripherals: list) -> tuple[list[tuple[str, str]], list[str], bool]:
+    """The MJCF fragments simulating the lidars and their integrated IMUs (D5.2).
+
+    Returns ``(site_elements, sensor_elements, needs_lidar_extension)``:
+    ``site_elements`` are ``(parent_body, xml)`` pairs — a ``<site>`` at the
+    resolved mount pose in the transform's parent body, positioned so the
+    base's own geoms stay out of the ray fan where the mount allows it;
+    ``sensor_elements`` are top-level ``<sensor>`` children — the
+    ``mujoco.plugin.lidar`` plugin sensor on the site plus the co-located
+    ``framequat``/``gyro``/``accelerometer`` triple of the integrated IMU
+    (zero extrinsic, as on Gazebo). ``needs_lidar_extension`` says the model
+    must declare the engine extension (exactly once; a profile without a
+    simulated lidar gets no site, sensor or extension — the SO-101 render
+    stays byte-identical).
+    """
+    from robot_runtime.gazebo import _LIDAR_DEFAULTS, LIDAR_INTEGRATED_IMU_DRIVERS, _sensor_param
+    from robot_runtime.profile import resolve_sensor_pose
+
+    sites: list[tuple[str, str]] = []
+    sensors: list[str] = []
+    needs_extension = False
+    for periph in _simulated_lidars(peripherals):
+        name = periph["name"]
+        transform = resolve_sensor_pose(periph, "mujoco")
+        parent = str(transform.get("parent_frame", "base_link"))
+        x, y, z, roll, pitch, yaw = (float(transform.get(key, 0.0)) for key in ("x", "y", "z", "roll", "pitch", "yaw"))
+        quat = _euler_xyz_to_quat(roll, pitch, yaw)
+        pos = f"{x:.6f} {y:.6f} {z:.6f}"
+        quat_text = f"{quat[0]:.6f} {quat[1]:.6f} {quat[2]:.6f} {quat[3]:.6f}"
+        sites.append((parent, f'<site name="{name}_lidar_site" pos="{pos}" quat="{quat_text}" size="0.005"/>'))
+        horizontal = int(_sensor_param(periph, "mujoco", "horizontal_samples", _LIDAR_DEFAULTS["horizontal_samples"]))
+        vertical = int(_sensor_param(periph, "mujoco", "vertical_samples", _LIDAR_DEFAULTS["vertical_samples"]))
+        if vertical <= 1:
+            # a planar scan: one elevation sample (the plugin requires a
+            # bounded range even for a single row)
+            vertical, elevation = 1, "0 0"
+        else:
+            vertical_min = math.radians(
+                float(_sensor_param(periph, "mujoco", "vertical_min_deg", _LIDAR_DEFAULTS["vertical_min_deg"]))
+            )
+            vertical_max = math.radians(
+                float(_sensor_param(periph, "mujoco", "vertical_max_deg", _LIDAR_DEFAULTS["vertical_max_deg"]))
+            )
+            elevation = f"{vertical_min:.6f} {vertical_max:.6f}"
+        range_min = float(_sensor_param(periph, "mujoco", "range_min", _LIDAR_DEFAULTS["range_min"]))
+        range_max = float(_sensor_param(periph, "mujoco", "range_max", _LIDAR_DEFAULTS["range_max"]))
+        update_rate = float(_sensor_param(periph, "mujoco", "update_rate", periph.get("publish_freq", 10.0)))
+        sensors.append(
+            f'<plugin name="{name}_lidar" plugin="mujoco.plugin.lidar" objtype="site" objname="{name}_lidar_site">\n'
+            f'  <config key="resolution" value="{horizontal} {vertical}"/>\n'
+            '  <config key="azimuth_range" value="-3.14159265 3.14159265"/>\n'
+            f'  <config key="elevation_range" value="{elevation}"/>\n'
+            f'  <config key="min_range" value="{range_min:g}"/>\n'
+            f'  <config key="max_range" value="{range_max:g}"/>\n'
+            f'  <config key="update_rate" value="{update_rate:g}"/>\n'
+            '  <config key="async" value="0"/>\n'
+            "</plugin>"
+        )
+        needs_extension = True
+        if str(periph.get("driver", "")) in LIDAR_INTEGRATED_IMU_DRIVERS:
+            sensors.extend(
+                [
+                    f'<framequat name="{name}_imu_quat" objtype="site" objname="{name}_lidar_site"/>',
+                    f'<gyro name="{name}_imu_gyro" site="{name}_lidar_site"/>',
+                    f'<accelerometer name="{name}_imu_accel" site="{name}_lidar_site"/>',
+                ]
+            )
+    return sites, sensors, needs_extension
+
+
+def imu_sensor_urdf(peripherals: list) -> str:
+    """The ros2_control ``<sensor>`` blocks for the integrated IMUs (D5.3).
+
+    One ``<sensor>`` per simulated lidar whose driver carries an integrated
+    IMU: ``mujoco_type imu`` mapping to the MJCF sensor triple
+    ``<name>_imu_quat/_gyro/_accel`` (the upstream default suffixes). The
+    ``imu_sensor_broadcaster`` spawned against it publishes the internal raw
+    stream the settle filter consumes. Rendered into the URDF's
+    ``<ros2_control>`` block by ``render_mujoco_description``.
+    """
+    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+
+    parts: list[str] = []
+    for periph in _simulated_lidars(peripherals):
+        if str(periph.get("driver", "")) not in LIDAR_INTEGRATED_IMU_DRIVERS:
+            continue
+        name = periph["name"]
+        state_interfaces = (
+            ("orientation", ("x", "y", "z", "w")),
+            ("angular_velocity", ("x", "y", "z")),
+            ("linear_acceleration", ("x", "y", "z")),
+        )
+        interfaces = "\n".join(
+            f'      <state_interface name="{group}.{axis}"/>' for group, axes in state_interfaces for axis in axes
+        )
+        parts.append(
+            f"<!-- {name} integrated IMU (generated from the peripheral declaration) -->\n"
+            f'    <sensor name="{name}_imu">\n'
+            '      <param name="mujoco_type">imu</param>\n'
+            f'      <param name="mujoco_sensor_name">{name}_imu</param>\n'
+            f"{interfaces}\n"
+            "    </sensor>"
+        )
+    return "\n".join(parts)
+
+
+def mujoco_lidar_filter_nodes(peripherals: list) -> list:
+    """The finite-point filter nodes for the MuJoCo lidars (D5.3).
+
+    One ``robot_runtime/finite_cloud_filter`` per simulated lidar: the
+    plugin's raw cloud (``/<name>_lidar/raw``, bare ``x y z`` float32 with
+    NaN misses) in, the advertised point cloud endpoint out, with the zero
+    ``intensity`` field appended for FAST-LIO's generic handler.
+    """
+    from launch_ros.actions import Node
+
+    nodes = []
+    for periph in _simulated_lidars(peripherals):
+        name = periph["name"]
+        nodes.append(
+            Node(
+                package="robot_runtime",
+                executable="finite_cloud_filter",
+                name=f"{name}_finite_cloud_filter",
+                output="screen",
+                parameters=[
+                    {
+                        "input_topic": f"/{name}_lidar/raw",
+                        "output_topic": str(periph.get("pointcloud_topic", "/livox/lidar")),
+                        "add_intensity": True,
+                    }
+                ],
+            )
+        )
+    return nodes
+
+
+def mujoco_imu_filter_nodes(peripherals: list) -> list:
+    """The pre-settle IMU filter nodes for the MuJoCo integrated IMUs (D5.3).
+
+    One ``robot_runtime/imu_settle_filter`` per simulated integrated IMU: the
+    broadcaster's raw stream (``/<name>_imu/raw`` — the ``~/imu`` publisher
+    remapped process-wide) in, the advertised IMU endpoint out, holding the
+    pre-settle samples back until gravity has been stable.
+    """
+    from launch_ros.actions import Node
+
+    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+
+    nodes = []
+    for periph in _simulated_lidars(peripherals):
+        if str(periph.get("driver", "")) not in LIDAR_INTEGRATED_IMU_DRIVERS:
+            continue
+        name = periph["name"]
+        nodes.append(
+            Node(
+                package="robot_runtime",
+                executable="imu_settle_filter",
+                name=f"{name}_imu_settle_filter",
+                output="screen",
+                parameters=[
+                    {
+                        "input_topic": f"/{name}_imu/raw",
+                        "output_topic": str(periph.get("imu_topic", "/livox/imu")),
+                    }
+                ],
+            )
+        )
+    return nodes
+
+
+def odometry_twist_relay_node(floating_base: dict | None) -> list:
+    """The odometry-twist relay node for a floating base (D3.3).
+
+    Subscribes the base's own wheel odometry (``twist_source_topic``) and
+    forwards the body twist it reports as a ``TwistStamped`` on the
+    simulator-internal command topic the ``BaseVelocityPlugin`` consumes. The
+    base frame is the floating-base body — the odometry's ``child_frame_id``.
+    A profile without a ``simulation.mujoco.floating_base`` section gets no
+    relay (no free joint to drive).
+    """
+    from launch_ros.actions import Node
+
+    section = floating_base or {}
+    body = str(section.get("body", "")).strip()
+    if not body:
+        return []
+    return [
+        Node(
+            package="robot_runtime",
+            executable="odometry_twist_relay",
+            name="odometry_twist_relay",
+            output="screen",
+            parameters=[
+                {
+                    "twist_source_topic": str(section.get("twist_source_topic", "/odom")),
+                    "cmd_vel_topic": FLOATING_BASE_CMD_TOPIC,
+                    "base_frame": body,
+                    "use_sim_time": True,
+                }
+            ],
+        )
+    ]
+
+
+def imu_broadcaster_entries(peripherals: list) -> dict:
+    """The generated IMU broadcaster controller entries (D5.3).
+
+    A mapping of controller name to its ``ros__parameters`` for every
+    simulated lidar with an integrated IMU; ``merged_controllers_config``
+    writes them next to the shipped controllers configuration (the shipped
+    file is never edited).
+    """
+    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+
+    entries: dict[str, Any] = {}
+    for periph in _simulated_lidars(peripherals):
+        if str(periph.get("driver", "")) not in LIDAR_INTEGRATED_IMU_DRIVERS:
+            continue
+        name = periph["name"]
+        entries[f"{name}_imu_broadcaster"] = {
+            "sensor_name": f"{name}_imu",
+            "frame_id": str(periph.get("frame_id", f"{name}_frame")),
+        }
+    return entries
+
+
+def imu_broadcaster_remappings(peripherals: list) -> list[tuple[str, str]]:
+    """The process-wide remaps putting the IMU broadcasters on the raw topics.
+
+    The ``imu_sensor_broadcaster`` publishes on ``~/imu`` (its node name is
+    the controller's); a process-level remap rule reaches the controller node
+    created inside the controller manager, so the raw stream lands on
+    ``/<name>_imu/raw`` — the internal topic the settle filter consumes
+    (verified against mujoco_ros2_control 0.1.2).
+    """
+    from robot_runtime.gazebo import LIDAR_INTEGRATED_IMU_DRIVERS
+
+    remaps: list[tuple[str, str]] = []
+    for periph in _simulated_lidars(peripherals):
+        if str(periph.get("driver", "")) not in LIDAR_INTEGRATED_IMU_DRIVERS:
+            continue
+        name = periph["name"]
+        remaps.append((f"/{name}_imu_broadcaster/imu", f"/{name}_imu/raw"))
+    return remaps
+
+
+# ---------------------------------------------------------------------------
 # Robot MJCF rendering (D2, D4)
 # ---------------------------------------------------------------------------
 
@@ -498,8 +857,11 @@ def render_robot_mjcf(
     / ``meshes_dir`` (``$(find …)`` resolved by ``path_subst``); the base
     placeholder takes the spawn position and the yaw quaternion
     (``{{ROBOT_BASE_POS}}`` / ``{{ROBOT_BASE_QUAT}}``, w-x-y-z); the MJCF
-    ``<camera>`` elements come from the resolved camera poses (D5). The file is
-    written to a per-launch temporary directory, never to a fixed path.
+    ``<camera>`` elements come from the resolved camera poses (D5) and the
+    lidar site / plugin sensor / integrated-IMU triple from the effective
+    inventory (D5.2 — a profile without a simulated lidar renders no site,
+    sensor or engine-extension element). The file is written to a per-launch
+    temporary directory, never to a fixed path.
     """
     from robot_runtime.path_subst import resolve_path
 
@@ -522,13 +884,12 @@ def render_robot_mjcf(
     # MuJoCo free/base orientation is w-x-y-z; a pure-yaw spawn quaternion.
     content = content.replace("{{ROBOT_BASE_QUAT}}", f"{math.cos(yaw / 2):.6f} 0.0 0.0 {math.sin(yaw / 2):.6f}")
 
+    effective = peripherals if peripherals is not None else profile.get("peripherals") or []
     root = ET.fromstring(content)
     worldbody = root.find("worldbody")
     if worldbody is None:
         raise RuntimeError(f"MuJoCo template has no <worldbody>: {template_path}")
-    for parent, camera_xml in camera_mjcf_elements(
-        peripherals if peripherals is not None else profile.get("peripherals") or []
-    ):
+    for parent, camera_xml in camera_mjcf_elements(effective):
         element = ET.fromstring(camera_xml)
         if parent is None:
             worldbody.append(element)
@@ -537,6 +898,28 @@ def render_robot_mjcf(
         if body is None:
             raise RuntimeError(f"camera parent body {parent!r} not found in the MuJoCo template {template_path}")
         body.append(element)
+
+    # D5.2: the simulated lidar site in its mount body, the plugin sensor and
+    # the integrated-IMU triple under <sensor>, and the engine extension the
+    # plugin sensor needs (exactly once).
+    sites, sensors, needs_extension = lidar_imu_mjcf(effective)
+    for parent, site_xml in sites:
+        body = worldbody.find(f'.//body[@name="{parent}"]')
+        if body is None:
+            raise RuntimeError(f"lidar parent body {parent!r} not found in the MuJoCo template {template_path}")
+        body.append(ET.fromstring(site_xml))
+    if sensors:
+        sensor_section = root.find("sensor")
+        if sensor_section is None:
+            sensor_section = ET.SubElement(root, "sensor")
+        for sensor_xml in sensors:
+            sensor_section.append(ET.fromstring(sensor_xml))
+    if needs_extension:
+        extension = root.find("extension")
+        if extension is None:
+            extension = ET.SubElement(root, "extension")
+        if extension.find('plugin[@plugin="mujoco.plugin.lidar"]') is None:
+            ET.SubElement(extension, "plugin", {"plugin": "mujoco.plugin.lidar"})
 
     out_path = Path(out_dir or tempfile.mkdtemp(prefix="ibrobot_mujoco_")) / "robot.xml"
     out_path.parent.mkdir(parents=True, exist_ok=True)

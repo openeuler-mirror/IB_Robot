@@ -1,16 +1,21 @@
 """Simulation ground truth as a shared test-support module (openspec D14.1).
 
 Tests that compare runtime estimates with the simulator read the model's
-world pose through this one platform-neutral helper: it runs the simulator's
-own topic echo (``ign topic -e -t /world/<w>/pose/info``) as a child of the
-test process and parses the protobuf-text stream into
-:class:`GroundTruthSample` values stamped in simulation time. Nothing is
-advertised on the ROS graph (D4), so no runtime can observe it.
+world pose through this one platform-neutral helper. On Gazebo it runs the
+simulator's own topic echo (``ign topic -e -t /world/<w>/pose/info``) as a
+child of the test process; on MuJoCo it subscribes, on a private ROS context,
+to the floating-base state ``mujoco_ros2_control`` publishes for the robot's
+free joint. Nothing is advertised by the runtime and no runtime node
+consumes it: the MuJoCo stream lives on a simulator-private topic that the
+interface description never lists (lekiwi-mujoco-runtime-platform D4 — a
+documented relaxation of this module's original "nothing ground-truth on the
+ROS graph": ground truth MAY exist on a simulator-private topic, never
+consumed or advertised by the runtime).
 
 This is test-support API, not runtime API: importing this module starts no
 process, imports no simulator or ``rclpy`` module and creates no ROS entity.
-Only :meth:`GroundTruthStream.start` spawns a child; :meth:`GroundTruthStream.close`
-terminates it and joins the reader thread.
+Only :meth:`GroundTruthStream.start` spawns a child or a context; each
+stream's :meth:`close` terminates it and joins the reader thread.
 
 The reader is chunked (up to 64 KiB per read, not line iteration): the pose
 stream is ~230 KB/s and a per-line append onto a growing multi-MB buffer
@@ -389,13 +394,136 @@ def open_ground_truth(
 ) -> GroundTruthStream:
     """The ground-truth stream of ``model`` in ``world`` on ``sim_platform``.
 
-    Gazebo is the only implemented platform; anything else raises
-    :class:`UnsupportedGroundTruth`. The stream is returned unstarted: only
-    :meth:`GroundTruthStream.start` spawns a process, so a capability probe
-    can call this without launching anything (D14.2).
+    Gazebo echoes the world's pose-info topic; MuJoCo subscribes to the
+    floating-base state the simulator publishes for the robot's free joint
+    (D9). Anything else raises :class:`UnsupportedGroundTruth`. The stream is
+    returned unstarted: only :meth:`GroundTruthStream.start` spawns a process
+    or a context, so a capability probe can call this without launching
+    anything (D14.2).
     """
-    if sim_platform != "gazebo":
-        raise UnsupportedGroundTruth(
-            f"no ground-truth implementation for platform {sim_platform!r} (supported: 'gazebo')"
+    if sim_platform == "gazebo":
+        return GroundTruthStream(world=world, model=model, env=env)
+    if sim_platform == "mujoco":
+        return MujocoGroundTruthStream(world=world, model=model, env=env)
+    raise UnsupportedGroundTruth(
+        f"no ground-truth implementation for platform {sim_platform!r} (supported: 'gazebo', 'mujoco')"
+    )
+
+
+#: The free-joint body each tracked model publishes as its floating-base
+#: ``child_frame_id`` on MuJoCo (D9): the gates pass their simulator-neutral
+#: model name and the stream checks the incoming messages against the body.
+_MUJOCO_GROUND_TRUTH_BODIES = {"lekiwi_robot": "base_link"}
+
+
+def mujoco_ground_truth_body(model: str) -> str:
+    """The MJCF free-joint body a model name publishes on MuJoCo (D9)."""
+    return _MUJOCO_GROUND_TRUTH_BODIES.get(model, model)
+
+
+class MujocoGroundTruthStream(GroundTruthStream):
+    """The floating-base state stream of one model (MuJoCo implementation).
+
+    ``mujoco_ros2_control`` publishes the free joint's world pose as
+    ``nav_msgs/Odometry`` on a simulator-namespaced topic — never advertised
+    by the runtime, never consumed by a runtime node (D4/D9). The stream
+    subscribes on a private ROS context (the domain taken from ``env``), so
+    it can observe a launch running on a domain of the test's choosing
+    without touching the test's own context. Only the pose is used (the
+    message's world-frame twist is not a body-frame report).
+    """
+
+    def __init__(self, world: str, model: str, env: dict[str, str] | None = None):
+        super().__init__(world=world, model=mujoco_ground_truth_body(model), env=env)
+        self._context = None
+        self._node = None
+        self._executor = None
+        self._thread = None
+
+    def start(self) -> MujocoGroundTruthStream:
+        """Create the private context, node and executor thread (no-op on restart)."""
+        if self._node is not None:
+            return self
+        import rclpy  # noqa: PLC0415  (test-support module: no ROS import at module load)
+        from nav_msgs.msg import Odometry  # noqa: PLC0415
+
+        from robot_runtime.mujoco import FLOATING_BASE_STATE_TOPIC
+
+        # The rmw layer reads ROS_DOMAIN_ID at context creation: give the
+        # private context the LAUNCH's domain (the env dict the caller
+        # captured), restoring the process environment immediately after.
+        domain = str((self._env or {}).get("ROS_DOMAIN_ID") or os.environ.get("ROS_DOMAIN_ID", "0"))
+        previous = os.environ.get("ROS_DOMAIN_ID")
+        os.environ["ROS_DOMAIN_ID"] = domain
+        try:
+            self._context = rclpy.Context()
+            rclpy.init(args=[], context=self._context)
+        finally:
+            if previous is None:
+                os.environ.pop("ROS_DOMAIN_ID", None)
+            else:
+                os.environ["ROS_DOMAIN_ID"] = previous
+        self._node = rclpy.create_node(
+            "mujoco_ground_truth",
+            context=self._context,
+            parameter_overrides=[rclpy.parameter.Parameter("use_sim_time", value=True)],
         )
-    return GroundTruthStream(world=world, model=model, env=env)
+        self._node.create_subscription(
+            Odometry,
+            FLOATING_BASE_STATE_TOPIC,
+            self._on_odom,
+            100,
+        )
+        self._executor = rclpy.executors.SingleThreadedExecutor(context=self._context)
+        self._executor.add_node(self._node)
+        self._thread = threading.Thread(target=self._executor.spin, daemon=True)
+        self._thread.start()
+        return self
+
+    def _on_odom(self, message) -> None:
+        if str(message.child_frame_id or "") != self._model:
+            return
+        pose = message.pose.pose
+        sample = GroundTruthSample(
+            message.header.stamp.sec + message.header.stamp.nanosec / 1e9,
+            pose.position.x,
+            pose.position.y,
+            pose.position.z,
+            yaw_from_quaternion(pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w),
+        )
+        with self._lock:
+            # A reset_world restores the initial state AND the clock, so the
+            # next sample's stamp goes backwards. window()/interpolate()
+            # bisect a strictly ordered span, so the stream starts a NEW
+            # epoch instead of appending (the pre-reset history is dropped;
+            # cross-epoch interpolation is refused by construction — review
+            # round 1). An equal stamp starts the epoch too: the bisected
+            # span must stay strictly increasing.
+            if self._samples and sample.stamp_sec <= self._samples[-1].stamp_sec:
+                self._samples = []
+            self._samples.append(sample)
+            # the same amortised cap as the Gazebo reader (the ROS stream
+            # has no reader thread to trim it)
+            if len(self._samples) > 2 * _SAMPLE_LIMIT:
+                del self._samples[:-_SAMPLE_LIMIT]
+            self._stamps = None
+            self._last_sample_wall = time.time()
+
+    def close(self) -> None:
+        """Shut the executor and the private context down and join the thread."""
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+        if self._node is not None:
+            self._node.destroy_node()
+            self._node = None
+        if self._context is not None:
+            try:
+                self._context.shutdown()
+                self._context.try_destroy()
+            except Exception:  # noqa: BLE001  (a torn-down context is success here)
+                pass
+            self._context = None

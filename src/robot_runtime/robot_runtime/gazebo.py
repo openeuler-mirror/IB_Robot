@@ -48,7 +48,7 @@ from xml.sax.saxutils import escape
 
 import yaml
 
-from robot_runtime.profile import LIDAR_SIM_PLATFORMS
+from robot_runtime.profile import LIDAR_SIM_PLATFORMS, resolve_sensor_pose  # noqa: F401  (re-export)
 
 
 def _override_base() -> Path:
@@ -239,22 +239,6 @@ _LIDAR_DEFAULTS = {
     "range_max": 40.0,
 }
 _IMU_DEFAULT_RATE = 200.0
-
-
-def resolve_sensor_pose(periph: dict, platform: str = "gazebo") -> dict:
-    """A non-camera sensor's simulator attachment transform (D5/D13).
-
-    Precedence mirrors :func:`resolve_camera_pose` without the user-override
-    layer (only cameras are user-calibrated): the peripheral's
-    ``simulation.<platform>.transform`` (the simulator attachment pose, D13)
-    over the plain ``transform`` (the public static TF). The resolved
-    transform's ``parent_frame`` is the URDF link the sensor attaches to.
-    """
-    section = (periph.get("simulation") or {}).get(platform) or {}
-    declared = section.get("transform") if isinstance(section, dict) else None
-    if isinstance(declared, dict) and declared:
-        return dict(declared)
-    return dict(periph.get("transform") or {})
 
 
 def _sensor_param(periph: dict, platform: str, key: str, default):

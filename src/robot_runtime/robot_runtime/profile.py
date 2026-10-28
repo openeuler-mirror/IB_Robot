@@ -60,7 +60,43 @@ PHYSICS_SIM_PLATFORMS = ("gazebo", "mujoco")
 #: sensor, and the lidar-odometry gate reads it as the "the runtime simulates
 #: lidar here" capability — a platform outside it renders no lidar, so the
 #: constant cannot drift from production behaviour.
-LIDAR_SIM_PLATFORMS = ("gazebo",)
+LIDAR_SIM_PLATFORMS = ("gazebo", "mujoco")
+
+
+def lidar_driver_simulated(driver: str, sim_platform: str | None) -> bool:
+    """Whether a physics platform's lidar injection stands in for ``driver`` (D5).
+
+    The driver sets are platform-specific (Gazebo simulates every driver in
+    ``robot_runtime.gazebo.LIDAR_SIM_DRIVERS``, MuJoCo only the MID-360 —
+    ``robot_runtime.mujoco.MUJOCO_LIDAR_SIM_DRIVERS``); a driver the selected
+    platform does not stand in for is neither simulated nor advertised there.
+    Imported lazily so the platform modules keep importing this one.
+    """
+    if sim_platform == "gazebo":
+        from robot_runtime.gazebo import LIDAR_SIM_DRIVERS
+
+        return driver in LIDAR_SIM_DRIVERS
+    if sim_platform == "mujoco":
+        from robot_runtime.mujoco import MUJOCO_LIDAR_SIM_DRIVERS
+
+        return driver in MUJOCO_LIDAR_SIM_DRIVERS
+    return False
+
+
+def resolve_sensor_pose(periph: dict, platform: str = "gazebo") -> dict:
+    """A non-camera sensor's simulator attachment transform (D5/D13).
+
+    The shared resolution for every physics platform (D5.2): the peripheral's
+    ``simulation.<platform>.transform`` (the simulator attachment pose, D13)
+    over the plain ``transform`` (the public static TF). The resolved
+    transform's ``parent_frame`` is the model frame the sensor attaches to.
+    """
+    section = (periph.get("simulation") or {}).get(platform) or {}
+    declared = section.get("transform") if isinstance(section, dict) else None
+    if isinstance(declared, dict) and declared:
+        return dict(declared)
+    return dict(periph.get("transform") or {})
+
 
 _REQUIRED_TOP_LEVEL = ("runtime", "modes", "capabilities", "joints")
 _REQUIRED_RUNTIME = ("name", "version")

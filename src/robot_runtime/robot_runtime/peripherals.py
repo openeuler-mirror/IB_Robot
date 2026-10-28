@@ -108,10 +108,18 @@ def load_peripherals_file(path: str) -> dict[str, Any]:
     return data
 
 
-def perception_capabilities(peripherals: list[dict[str, Any]] | None) -> dict[str, dict[str, Any]]:
-    """Perception capability specs (RuntimeStatus surface) for a peripheral list."""
+def perception_capabilities(
+    peripherals: list[dict[str, Any]] | None, *, sim_platform: str | None = None
+) -> dict[str, dict[str, Any]]:
+    """Perception capability specs (RuntimeStatus surface) for a peripheral list.
+
+    ``sim_platform`` filters exactly like the interface description (D5.4):
+    the RuntimeStatus capability surface and the advertised endpoints derive
+    from the same platform-filtered projection, so a lidar the platform does
+    not stand in for is neither advertised nor claimed.
+    """
     caps: dict[str, dict[str, Any]] = {}
-    for spec in peripheral_interfaces(peripherals).values():
+    for spec in peripheral_interfaces(peripherals, sim_platform=sim_platform).values():
         if not spec["capability"].startswith("perception."):
             continue  # interaction.audio_* entries carry their format via audio_capabilities
         caps.setdefault(spec["capability"], {"topics": []})["topics"].append(spec["endpoint"])

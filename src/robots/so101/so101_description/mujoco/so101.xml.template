@@ -12,9 +12,12 @@
                              robot_runtime.mujoco.render_robot_mjcf (D4)
 
     Camera convention:
-      Cameras are NOT defined here. They are injected dynamically from YAML peripherals
-      by mujoco_adapter._generate_robot_mujoco_xml(robot_spawn, peripherals).
-      Only cameras with driver="opencv" are injected.
+      Cameras are NOT defined here. They are injected dynamically from YAML
+      peripherals by robot_runtime.mujoco.render_robot_mjcf (MJCF <camera>
+      elements from the resolved camera poses; lidar sites and sensors are
+      injected the same way, lekiwi-mujoco-runtime-platform D5.2). Cameras of
+      every driver are injected — the sim-relevant set is selected by the
+      runtime's platform filtering, not by the driver name.
       Camera name convention: YAML name="top" → MJCF camera name="top_camera"
       (must match _build_camera_remappings convention: f"{name}_camera")
 

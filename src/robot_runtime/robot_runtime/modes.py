@@ -9,6 +9,14 @@ re-implemented here.
 
 Streaming commands observed on a channel while it is not active are counted
 per channel so the runtime status can surface them.
+
+A mode may additionally declare ``controllers_by_platform`` (D3.1): a
+per-simulation-platform controller set that REPLACES ``controllers`` when the
+runtime selects that platform. This is the explicit "the simulator needs a
+different controller combination" declaration (e.g. MuJoCo never releases a
+velocity actuator's last target, so the base controller stays active in
+``idle`` there and the base node is the gate). Keys are limited to physics
+platforms — a hardware/SDK execution has no platform and no override.
 """
 
 from __future__ import annotations
@@ -29,6 +37,66 @@ class ModeSpec:
     allows_stream: bool = False
     #: Whether base velocity commands are accepted in this mode.
     allows_base: bool = False
+    #: Per-physics-platform controller overrides (D3.1); the effective set for
+    #: a platform replaces ``controllers`` entirely (an empty list included).
+    controllers_by_platform: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+
+def resolve_mode_controllers(
+    controllers: tuple[str, ...],
+    by_platform: dict[str, tuple[str, ...]] | None,
+    sim_platform: str | None,
+    *,
+    mode_name: str = "<mode>",
+) -> tuple[str, ...]:
+    """One mode's effective controller set on ``sim_platform`` (D3.1).
+
+    The override replaces ``controllers`` completely when the table declares
+    the selected platform — an empty override list stays empty (no
+    ``override or controllers`` resurrection) — and ``controllers`` is kept
+    for every other platform, for no platform at all (hardware), and when the
+    mode declares no table. The table's keys must be physics platforms and
+    its values lists of names; anything else is a profile error naming the
+    mode and the key.
+    """
+    if not by_platform:
+        return controllers
+    from robot_runtime.profile import PHYSICS_SIM_PLATFORMS
+
+    for platform, override in by_platform.items():
+        if platform not in PHYSICS_SIM_PLATFORMS:
+            raise ValueError(
+                f"mode {mode_name!r} controllers_by_platform key {platform!r} is not a physics platform "
+                f"(supported: {list(PHYSICS_SIM_PLATFORMS)}); hardware and SDK executions take 'controllers'"
+            )
+        if not isinstance(override, list | tuple):
+            raise ValueError(
+                f"mode {mode_name!r} controllers_by_platform[{platform!r}] must be a list of controller names"
+            )
+    if sim_platform is not None and sim_platform in by_platform:
+        return tuple(str(controller) for controller in by_platform[sim_platform])
+    return controllers
+
+
+def mode_controller_table(profile: dict, sim_platform: str | None = None) -> dict[str, tuple[str, ...]]:
+    """Every mode's effective controller set on ``sim_platform`` (D3.1).
+
+    The single resolver every consumer of mode controllers goes through (the
+    spawner list, the facade's mode switch, its stop-path command-controller
+    set, its health check): validating the whole ``controllers_by_platform``
+    table even for an unselected platform, so a bad key fails at load, not the
+    first time its platform is selected.
+    """
+    table: dict[str, tuple[str, ...]] = {}
+    for name, raw in (profile.get("modes") or {}).items():
+        if name == "initial" or raw is None:
+            continue
+        declared = tuple(str(controller) for controller in (raw or {}).get("controllers", []))
+        by_platform = (raw or {}).get("controllers_by_platform") or {}
+        if not isinstance(by_platform, dict):
+            raise ValueError(f"mode {name!r} controllers_by_platform must be a mapping of platform to controller list")
+        table[str(name)] = resolve_mode_controllers(declared, by_platform, sim_platform, mode_name=str(name))
+    return table
 
 
 @dataclass
@@ -38,7 +106,7 @@ class ModeModelConfig:
     initial_mode: str = "idle"
 
     @classmethod
-    def from_profile(cls, profile: dict) -> ModeModelConfig:
+    def from_profile(cls, profile: dict, sim_platform: str | None = None) -> ModeModelConfig:
         """Build from the ``modes`` section of a runtime profile.
 
         Expected shape::
@@ -50,6 +118,12 @@ class ModeModelConfig:
                        transitions: [idle, trajectory]}
               trajectory: {controllers: [arm_trajectory_controller],
                            allows_trajectory: true, transitions: [idle, stream]}
+
+        ``sim_platform`` selects the per-platform controller overrides
+        (``controllers_by_platform``, D3.1): every :class:`ModeSpec` then
+        carries the effective set for that platform, so all consumers (mode
+        switch, readiness check, the stop-path command-controller set) see
+        one consistent table.
         """
         section = dict(profile.get("modes") or {})
         initial = str(section.pop("initial", "idle"))
@@ -57,9 +131,24 @@ class ModeModelConfig:
         transitions: dict[str, set[str]] = {}
         for name, raw in section.items():
             raw = raw or {}
+            by_platform_raw = raw.get("controllers_by_platform") or {}
+            if not isinstance(by_platform_raw, dict):
+                raise ValueError(
+                    f"mode {name!r} controllers_by_platform must be a mapping of platform to controller list"
+                )
+            by_platform = {
+                str(platform): tuple(str(controller) for controller in override)
+                for platform, override in by_platform_raw.items()
+            }
             modes[str(name)] = ModeSpec(
                 name=str(name),
-                controllers=tuple(str(c) for c in raw.get("controllers", [])),
+                controllers=resolve_mode_controllers(
+                    tuple(str(c) for c in raw.get("controllers", [])),
+                    by_platform_raw,
+                    sim_platform,
+                    mode_name=str(name),
+                ),
+                controllers_by_platform=by_platform,
                 allows_trajectory=bool(raw.get("allows_trajectory", False)),
                 allows_stream=bool(raw.get("allows_stream", False)),
                 allows_base=bool(raw.get("allows_base", False)),

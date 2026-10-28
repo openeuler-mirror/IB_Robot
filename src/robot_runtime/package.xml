@@ -42,6 +42,14 @@
        real guard. -->
   <exec_depend>sim_models</exec_depend>
   <exec_depend version_gte="0.1.2">mujoco_ros2_control</exec_depend>
+  <!-- lekiwi-mujoco-runtime-platform D5/D11: the MuJoCo lidar composition.
+       mujoco_3d_lidar registers the mujoco.plugin.lidar engine extension the
+       composed model declares (the C++ simulator loads it from the ament
+       mujoco_plugins index); imu_sensor_broadcaster publishes the generated
+       integrated-IMU controller's stream. 0.1.2 floor: the release paired
+       with mujoco_ros2_control 0.1.2 (verify_env.sh checks the same floor). -->
+  <exec_depend version_gte="0.1.2">mujoco_3d_lidar</exec_depend>
+  <exec_depend>imu_sensor_broadcaster</exec_depend>
 
   <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>python3-pytest</test_depend>

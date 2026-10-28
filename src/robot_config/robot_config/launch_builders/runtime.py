@@ -201,8 +201,9 @@ def generate_runtime_provider_actions(
     elif platform == "mujoco":
         # so101-mujoco-runtime-platform D3: the world owner hands the provider
         # the resolved scene NAME and spawn pose — no file path crosses the
-        # boundary and nothing is recomputed. An empty scene name means the
-        # robot model runs alone (the provider-alone behaviour).
+        # boundary and nothing is recomputed. An empty scene name composes the
+        # shared sim_models ``empty`` scene (ground + light): the provider
+        # renders the robot into a scene either way, never alone.
         startup = simulation_startup
         scene_name = str(getattr(startup, "scene_name", "") or "")
         spawn_pose = getattr(startup, "spawn_pose", None) or (0.0, 0.0, 0.0, 0.0)

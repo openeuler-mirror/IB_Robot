@@ -428,3 +428,51 @@ def test_load_peripherals_file_distinguishes_missing_keys_from_null(tmp_path):
     assert load_peripherals_file(str(_fragment(tmp_path, "fast_lio: {}\n"))) == {"fast_lio": {}}
     with pytest.raises(ValueError, match="peripherals file.*must be a mapping"):
         load_peripherals_file(str(_fragment(tmp_path, "fast_lio:\n")))
+
+
+# ---------------------------------------------------------------------------
+# lekiwi-mujoco-runtime-platform D5.4: capabilities from the platform-filtered
+# projection
+# ---------------------------------------------------------------------------
+
+
+def _lidar_inventory():
+    return [
+        {
+            "type": "lidar",
+            "name": "mid360",
+            "driver": "livox_mid360",
+            "xfer_format": 1,
+            "frame_id": "livox_frame",
+            "pointcloud_topic": "/livox/lidar",
+            "imu_topic": "/livox/imu",
+        },
+        {
+            "type": "lidar",
+            "name": "ld06",
+            "driver": "ldlidar",
+            "scan_topic": "/ld06/scan",
+            "frame_id": "ld06_frame",
+        },
+    ]
+
+
+def test_perception_capabilities_follow_the_platform_filter():
+    mujoco = perception_capabilities(_lidar_inventory(), sim_platform="mujoco")
+    # MuJoCo stands in for the MID-360 only: its cloud and IMU endpoints
+    assert mujoco["perception.lidar"]["topics"] == ["/livox/lidar", "/livox/imu"]
+    # Gazebo simulates both drivers; the sdk surface is unfiltered
+    gazebo = perception_capabilities(_lidar_inventory(), sim_platform="gazebo")
+    assert set(gazebo["perception.lidar"]["topics"]) == {"/livox/lidar", "/livox/imu", "/ld06/scan"}
+    sdk = perception_capabilities(_lidar_inventory(), sim_platform="sdk")
+    assert set(sdk["perception.lidar"]["topics"]) == {"/livox/lidar", "/livox/imu", "/ld06/scan"}
+    hardware = perception_capabilities(_lidar_inventory(), sim_platform=None)
+    assert hardware == sdk
+
+
+def test_perception_capabilities_drop_an_unsupported_only_lidar_on_mujoco():
+    ldlidar_only = [_lidar_inventory()[1]]
+    assert perception_capabilities(ldlidar_only, sim_platform="mujoco") == {}
+    # every other platform still projects it
+    assert perception_capabilities(ldlidar_only, sim_platform="gazebo")["perception.lidar"]["topics"] == ["/ld06/scan"]
+    assert perception_capabilities(ldlidar_only, sim_platform="sdk")["perception.lidar"]["topics"] == ["/ld06/scan"]

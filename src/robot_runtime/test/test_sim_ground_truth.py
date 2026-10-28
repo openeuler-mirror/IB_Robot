@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
@@ -248,15 +249,141 @@ def test_interpolate_returns_none_outside_the_span_or_across_a_gap():
     assert _stream_with([]).interpolate(1.0) is None
 
 
-def test_unsupported_platform_is_named_and_gazebo_spawns_nothing():
-    with pytest.raises(UnsupportedGroundTruth, match="mujoco"):
-        open_ground_truth("mujoco", world="demo", model="lekiwi_robot")
-    # the gazebo stream is returned unstarted: opening spawns no process
-    stream = open_ground_truth("gazebo", world="demo", model="lekiwi_robot")
-    assert stream.world == "demo" and stream.model == "lekiwi_robot"
-    assert stream._proc is None and stream._thread is None
+def test_unsupported_platform_is_named_and_both_platforms_open_without_starting():
+    with pytest.raises(UnsupportedGroundTruth, match="teleport"):
+        open_ground_truth("teleport", world="demo", model="lekiwi_robot")
+    # both implemented platforms open unstarted: no process, no context, no node
+    gazebo = open_ground_truth("gazebo", world="demo", model="lekiwi_robot")
+    assert gazebo.world == "demo" and gazebo.model == "lekiwi_robot"
+    assert gazebo._proc is None and gazebo._thread is None
+    gazebo.close()
+    mujoco = open_ground_truth("mujoco", world="demo", model="lekiwi_robot")
+    assert mujoco.model == "base_link", "the gate's model name maps to the free-joint body (D9)"
+    assert mujoco._context is None and mujoco._node is None and mujoco._thread is None
     # close() on a never-started stream terminates nothing
-    stream.close()
+    mujoco.close()
+
+
+def test_mujoco_stream_reads_a_fake_floating_base_publisher():
+    """D9: a private-domain fake publisher feeds the stream; close() joins.
+
+    Uses the same mechanics the gates do: the stream's env dict names the
+    domain of the observed launch (here: this test's own private domain), the
+    publisher stamps simulation time and the free-joint body as the
+    child_frame_id, and only matching messages become samples.
+    """
+    import rclpy
+    from nav_msgs.msg import Odometry
+
+    from robot_runtime.testing.sim_ground_truth import MujocoGroundTruthStream
+
+    domain = 215
+    previous = os.environ.get("ROS_DOMAIN_ID")
+    os.environ["ROS_DOMAIN_ID"] = str(domain)
+    try:
+        rclpy.init()
+        publisher_node = rclpy.create_node("fake_floating_base")
+        publisher = publisher_node.create_publisher(Odometry, "/simulator/floating_base_state", 10)
+
+        stream = MujocoGroundTruthStream(world="demo", model="lekiwi_robot", env={"ROS_DOMAIN_ID": str(domain)})
+        stream.start()
+
+        def publish(stamp, x, yaw):
+            message = Odometry()
+            message.header.stamp.sec = int(stamp)
+            message.header.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
+            message.child_frame_id = "base_link"
+            message.pose.pose.position.x = x
+            message.pose.pose.orientation.z = math.sin(yaw / 2.0)
+            message.pose.pose.orientation.w = math.cos(yaw / 2.0)
+            publisher.publish(message)
+
+        # a foreign child frame must not leak into the samples
+        foreign = Odometry()
+        foreign.child_frame_id = "some_other_body"
+        foreign.pose.pose.position.x = 99.0
+        publisher.publish(foreign)
+        # strictly increasing simulation-time stamps, as the real
+        # floating-base publisher emits them (a backwards stamp would start a
+        # new epoch, see test_mujoco_stream_starts_a_new_epoch_on_a_backwards_stamp)
+        for index in range(20):
+            publish(1.0 + index * 0.04, 1.0, 0.0)
+            publish(1.02 + index * 0.04, 2.0, 0.2)
+            time.sleep(0.01)
+        assert stream.wait_for(10, 10.0), f"no samples arrived (got {len(stream.samples())})"
+        samples = stream.samples()
+        assert all(s.x in (1.0, 2.0) for s in samples), "the foreign body leaked in"
+        # the recorded stamps are the messages' own simulation-time stamps
+        stamps = [s.stamp_sec for s in samples]
+        assert stamps == sorted(set(stamps))
+        # interpolation between the first RECORDED pose pair (discovery may
+        # have dropped the earliest published messages)
+        middle = stream.interpolate((stamps[0] + stamps[1]) / 2)
+        assert middle is not None and abs(middle.x - 1.5) < 1e-6 and abs(middle.yaw - 0.1) < 1e-6
+        assert stream.position() is not None
+        stream.close()
+        publisher_node.destroy_node()
+        rclpy.shutdown()
+    finally:
+        if previous is None:
+            os.environ.pop("ROS_DOMAIN_ID", None)
+        else:
+            os.environ["ROS_DOMAIN_ID"] = previous
+
+
+def _floating_base_message(stamp: float, x: float, yaw: float):
+    from nav_msgs.msg import Odometry
+
+    message = Odometry()
+    message.header.stamp.sec = int(stamp)
+    message.header.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
+    message.child_frame_id = "base_link"
+    message.pose.pose.position.x = x
+    message.pose.pose.orientation.z = math.sin(yaw / 2.0)
+    message.pose.pose.orientation.w = math.cos(yaw / 2.0)
+    return message
+
+
+def test_mujoco_stream_starts_a_new_epoch_on_a_backwards_stamp():
+    """Review round 1: a reset_world jumps the stamps back; the bisected
+    window/interpolate assume a strictly ordered span, so the pre-reset
+    history is dropped and cross-epoch interpolation is refused."""
+    from robot_runtime.testing.sim_ground_truth import MujocoGroundTruthStream
+
+    stream = MujocoGroundTruthStream(world="demo", model="lekiwi_robot", env={"ROS_DOMAIN_ID": "0"})
+    stream._on_odom(_floating_base_message(10.0, 1.0, 0.0))
+    stream._on_odom(_floating_base_message(10.04, 2.0, 0.2))
+    assert stream.interpolate(10.02).x == pytest.approx(1.5)
+    # the reset: the clock and the pose jump back
+    stream._on_odom(_floating_base_message(0.5, -1.5, 0.0))
+    assert [s.stamp_sec for s in stream.samples()] == [0.5]
+    # the old epoch's span is gone: no window, no interpolation into it
+    assert stream.window(9.0, 11.0) == []
+    assert stream.interpolate(10.02) is None
+    assert stream.interpolate(0.75) is None  # outside the new (single-sample) span
+    # the new epoch accumulates and interpolates normally
+    stream._on_odom(_floating_base_message(0.54, -1.0, 0.0))
+    middle = stream.interpolate(0.52)
+    assert middle is not None and middle.x == pytest.approx(-1.25)
+    assert [s.stamp_sec for s in stream.window(0.5, 0.54)] == [0.5, 0.54]
+    # an EQUAL stamp also starts a new epoch (the span stays strictly increasing)
+    stream._on_odom(_floating_base_message(0.54, -1.0, 0.0))
+    assert [s.stamp_sec for s in stream.samples()] == [0.54]
+
+
+def test_mujoco_stream_caps_its_history_like_the_gazebo_reader():
+    from robot_runtime.testing import sim_ground_truth
+
+    stream = sim_ground_truth.MujocoGroundTruthStream(world="demo", model="lekiwi_robot", env={})
+    limit = sim_ground_truth._SAMPLE_LIMIT
+    for index in range(2 * limit + 10):
+        stream._on_odom(_floating_base_message(index * 0.02, float(index), 0.0))
+    # the amortised Gazebo cap: the trim fires past 2x and keeps the newest
+    # limit samples (here: 60000 trimmed + the 9 appends after the trim)
+    assert len(stream.samples()) == limit + 9
+    # the newest samples survived
+    stamps = [s.stamp_sec for s in stream.samples()]
+    assert stamps[-1] == pytest.approx((2 * limit + 9) * 0.02)
 
 
 def test_the_child_env_mirrors_the_gz_partition_across_both_names():
